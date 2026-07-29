@@ -11,6 +11,7 @@ The current release completes TCP productionization. UDP, HTTP/HTTPS host routin
 ## Production TCP capabilities
 
 - TLS control channel, Argon2 client tokens, and exact policy authorization
+- Application-level heartbeats, half-open connection detection, and client TLS session reuse
 - Reconnects with exponential backoff and jitter
 - Per-policy, global, and pending-pair connection limits
 - Aggregate bidirectional bandwidth limit per policy

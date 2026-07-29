@@ -23,6 +23,7 @@ const MIN_TCP_TUNNEL_PORT: u16 = 32_000;
 const MAX_TCP_TUNNEL_PORT: u16 = 32_999;
 const CONNECTION_PAIR_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTION_MAX_LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
+const CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(35);
 
 pub(crate) struct TunnelRegistration {
     registration_id: Uuid,
@@ -361,19 +362,56 @@ async fn run_registered_control(
     mut commands: mpsc::Receiver<ControlFrame>,
     mut stop: watch::Receiver<()>,
 ) {
+    let (frames_tx, mut frames_rx) = mpsc::channel(16);
+    let reader_task = tokio::spawn(async move {
+        loop {
+            let Ok(frame) = read_control_frame(&mut reader).await else {
+                break;
+            };
+            if frames_tx.send(frame).await.is_err() {
+                break;
+            }
+        }
+    });
+    let idle_timeout = tokio::time::sleep(CONTROL_IDLE_TIMEOUT);
+    tokio::pin!(idle_timeout);
     loop {
         tokio::select! {
             _ = stop.changed() => break,
+            _ = &mut idle_timeout => {
+                tracing::warn!("TCP control session heartbeat timed out on public port {public_port}");
+                break;
+            }
             command = commands.recv() => match command {
                 Some(command) if write_control_frame(&mut writer, &command).await.is_err() => break,
                 Some(_) => {},
                 None => break,
             },
-            result = read_control_frame(&mut reader) => {
-                if result.is_err() { break; }
+            frame = frames_rx.recv() => match frame {
+                Some(ControlFrame::ControlHeartbeat { nonce }) => {
+                    idle_timeout.as_mut().reset(Instant::now() + CONTROL_IDLE_TIMEOUT);
+                    if write_control_frame(
+                        &mut writer,
+                        &ControlFrame::ControlHeartbeatAck { nonce },
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
+                Some(_) => {
+                    state
+                        .metrics
+                        .control_protocol_errors_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+                None => break,
             }
         }
     }
+    reader_task.abort();
     remove_tunnel(&state, public_port, registration_id);
 }
 

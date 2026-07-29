@@ -100,6 +100,12 @@ pub enum ControlFrame {
         client_token: String,
         connection_id: Uuid,
     },
+    ControlHeartbeat {
+        nonce: u64,
+    },
+    ControlHeartbeatAck {
+        nonce: u64,
+    },
     Error {
         message: String,
     },
@@ -188,5 +194,15 @@ mod tests {
         let read = read_control_frame(&mut reader);
         let (_, actual) = tokio::join!(write, read);
         assert_eq!(actual.expect("frame should decode"), expected);
+    }
+
+    #[tokio::test]
+    async fn control_heartbeat_frames_round_trip() {
+        let expected = ControlFrame::ControlHeartbeat { nonce: 42 };
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        let write = write_control_frame(&mut writer, &expected);
+        let read = read_control_frame(&mut reader);
+        let (_, actual) = tokio::join!(write, read);
+        assert_eq!(actual.expect("heartbeat frame should decode"), expected);
     }
 }

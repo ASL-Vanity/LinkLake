@@ -9,13 +9,21 @@ use std::{
     io::BufReader,
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
-use tokio::{io::copy_bidirectional, net::TcpStream};
+use tokio::{
+    io::{copy_bidirectional, split, ReadHalf, WriteHalf},
+    net::TcpStream,
+    time::{interval, timeout, MissedTickBehavior},
+};
 use tokio_rustls::{
     rustls::{self, pki_types::ServerName, ClientConfig, RootCertStore},
     TlsConnector,
 };
 use uuid::Uuid;
+
+const CONTROL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const CONTROL_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Parser)]
 #[command(name = "linklake-client", about = "LinkLake client control utility")]
@@ -103,6 +111,7 @@ struct TcpTunnelConfig {
 }
 
 fn main() -> anyhow::Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let _log_guard = init_logging()?;
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--windows-service")) {
         #[cfg(windows)]
@@ -120,7 +129,6 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run_cli() -> anyhow::Result<()> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
     match Cli::parse().command {
         Command::Check { server } => {
             let endpoint = format!("{}/api/v1/health", server.trim_end_matches('/'));
@@ -187,11 +195,7 @@ async fn run_cli() -> anyhow::Result<()> {
             name,
         } => {
             run_tcp_agent(
-                ControlTransport {
-                    endpoint: control,
-                    ca_cert: control_ca_cert,
-                    server_name: control_server_name,
-                },
+                ControlTransport::new(control, control_ca_cert, control_server_name)?,
                 client_id,
                 token,
                 public_port,
@@ -212,11 +216,11 @@ async fn run_configured_agents(
     let content = read_to_string(&path)?;
     let config = parse_client_config(&content)?;
     for tunnel in config.tcp_tunnels {
-        let transport = ControlTransport {
-            endpoint: tunnel.control,
-            ca_cert: tunnel.control_ca_cert,
-            server_name: tunnel.control_server_name,
-        };
+        let transport = ControlTransport::new(
+            tunnel.control,
+            tunnel.control_ca_cert,
+            tunnel.control_server_name,
+        )?;
         tokio::spawn(async move {
             if let Err(error) = run_tcp_agent(
                 transport,
@@ -308,8 +312,60 @@ mod tests {
 #[derive(Clone)]
 struct ControlTransport {
     endpoint: String,
-    ca_cert: Option<PathBuf>,
-    server_name: Option<String>,
+    tls: Option<ControlTls>,
+}
+
+#[derive(Clone)]
+struct ControlTls {
+    connector: TlsConnector,
+    server_name: ServerName<'static>,
+}
+
+impl ControlTransport {
+    fn new(
+        endpoint: String,
+        ca_cert: Option<PathBuf>,
+        server_name: Option<String>,
+    ) -> anyhow::Result<Self> {
+        let Some(ca_cert) = ca_cert else {
+            anyhow::ensure!(
+                is_loopback_control(&endpoint),
+                "--control-ca-cert is required for remote TCP control"
+            );
+            return Ok(Self {
+                endpoint,
+                tls: None,
+            });
+        };
+
+        let mut cert_file = BufReader::new(File::open(ca_cert)?);
+        let certificates = rustls_pemfile::certs(&mut cert_file).collect::<Result<Vec<_>, _>>()?;
+        anyhow::ensure!(
+            !certificates.is_empty(),
+            "control CA certificate file contains no certificates"
+        );
+        let mut roots = RootCertStore::empty();
+        for certificate in certificates {
+            roots.add(certificate)?;
+        }
+        let config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let server_name = server_name.unwrap_or_else(|| {
+            endpoint
+                .rsplit_once(':')
+                .map(|(host, _)| host.to_owned())
+                .unwrap_or_else(|| endpoint.clone())
+        });
+        let server_name = ServerName::try_from(server_name)?.to_owned();
+        Ok(Self {
+            endpoint,
+            tls: Some(ControlTls {
+                connector: TlsConnector::from(Arc::new(config)),
+                server_name,
+            }),
+        })
+    }
 }
 
 async fn run_tcp_agent(
@@ -383,8 +439,36 @@ async fn run_tcp_agent_session(
         ControlFrame::Error { message } => anyhow::bail!("server rejected TCP tunnel: {message}"),
         frame => anyhow::bail!("unexpected registration response: {frame:?}"),
     }
+    let (reader, writer) = split(stream);
+    let heartbeat = tokio::spawn(send_control_heartbeats(writer));
+    let result = read_registered_control(reader, transport, target, client_id, token).await;
+    heartbeat.abort();
+    result
+}
+
+async fn send_control_heartbeats(mut writer: WriteHalf<BoxedIo>) -> anyhow::Result<()> {
+    let mut heartbeat = interval(CONTROL_HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut nonce = 0_u64;
     loop {
-        match read_control_frame(&mut stream).await? {
+        heartbeat.tick().await;
+        nonce = nonce.wrapping_add(1);
+        write_control_frame(&mut writer, &ControlFrame::ControlHeartbeat { nonce }).await?;
+    }
+}
+
+async fn read_registered_control(
+    mut reader: ReadHalf<BoxedIo>,
+    transport: ControlTransport,
+    target: String,
+    client_id: Uuid,
+    token: String,
+) -> anyhow::Result<()> {
+    loop {
+        let frame = timeout(CONTROL_HEARTBEAT_TIMEOUT, read_control_frame(&mut reader))
+            .await
+            .map_err(|_| anyhow::anyhow!("control heartbeat acknowledgement timed out"))??;
+        match frame {
             ControlFrame::OpenTcpConnection { connection_id } => {
                 let transport = transport.clone();
                 let target = target.clone();
@@ -398,6 +482,7 @@ async fn run_tcp_agent_session(
                     }
                 });
             }
+            ControlFrame::ControlHeartbeatAck { .. } => {}
             ControlFrame::Error { message } => anyhow::bail!("server closed tunnel: {message}"),
             frame => anyhow::bail!("unexpected control frame: {frame:?}"),
         }
@@ -428,36 +513,12 @@ async fn open_tcp_data_connection(
 
 async fn connect_control(transport: &ControlTransport) -> anyhow::Result<BoxedIo> {
     let tcp_stream = TcpStream::connect(&transport.endpoint).await?;
-    let Some(ca_cert) = &transport.ca_cert else {
-        anyhow::ensure!(
-            is_loopback_control(&transport.endpoint),
-            "--control-ca-cert is required for remote TCP control"
-        );
+    let Some(tls) = &transport.tls else {
         return Ok(Box::new(tcp_stream));
     };
-    let mut cert_file = BufReader::new(File::open(ca_cert)?);
-    let certificates = rustls_pemfile::certs(&mut cert_file).collect::<Result<Vec<_>, _>>()?;
-    anyhow::ensure!(
-        !certificates.is_empty(),
-        "control CA certificate file contains no certificates"
-    );
-    let mut roots = RootCertStore::empty();
-    for certificate in certificates {
-        roots.add(certificate)?;
-    }
-    let config = ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    let server_name = transport.server_name.clone().unwrap_or_else(|| {
-        transport
-            .endpoint
-            .rsplit_once(':')
-            .map(|(host, _)| host.to_owned())
-            .unwrap_or_else(|| transport.endpoint.clone())
-    });
-    let server_name = ServerName::try_from(server_name)?.to_owned();
-    let tls_stream = TlsConnector::from(Arc::new(config))
-        .connect(server_name, tcp_stream)
+    let tls_stream = tls
+        .connector
+        .connect(tls.server_name.clone(), tcp_stream)
         .await?;
     Ok(Box::new(tls_stream))
 }
