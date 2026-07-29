@@ -174,6 +174,24 @@ pub(crate) async fn handle_connection(state: Arc<AppState>, mut stream: BoxedIo)
             )
             .await;
         }
+        ControlFrame::RegisterHttpRoute {
+            client_id,
+            client_token,
+            name,
+            hostname,
+            target_addr,
+        } => {
+            crate::http_tunnel::register_route(
+                state,
+                stream,
+                client_id,
+                client_token,
+                name,
+                hostname,
+                target_addr,
+            )
+            .await;
+        }
         ControlFrame::TcpDataConnection {
             client_id,
             client_token,
@@ -632,16 +650,12 @@ async fn pair_data_connection(
     state: Arc<AppState>,
     stream: BoxedIo,
     client_id: Uuid,
-    client_token: String,
+    _client_token: String,
     connection_id: Uuid,
 ) {
-    if !authenticated_client(&state, client_id, &client_token) {
-        state
-            .metrics
-            .authentication_failures_total
-            .fetch_add(1, Ordering::Relaxed);
-        return;
-    }
+    // connection_id 是服务端仅通过已认证控制会话下发的随机一次性能力凭据。
+    // pending 表中的原子 remove 保证它只能消费一次；同时继续校验 client_id，防止客户端串线。
+    // client_token 字段暂时保留以兼容现有控制帧，但数据连接不再重复执行 Argon2 和 SQLite 更新。
     let pending = state
         .pending_connections
         .lock()

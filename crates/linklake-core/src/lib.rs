@@ -89,8 +89,18 @@ pub enum ControlFrame {
         public_port: u16,
         target_addr: String,
     },
+    RegisterHttpRoute {
+        client_id: Uuid,
+        client_token: String,
+        name: String,
+        hostname: String,
+        target_addr: String,
+    },
     TcpTunnelRegistered {
         public_port: u16,
+    },
+    HttpRouteRegistered {
+        hostname: String,
     },
     OpenTcpConnection {
         connection_id: Uuid,

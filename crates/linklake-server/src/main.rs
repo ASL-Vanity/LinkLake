@@ -2,6 +2,8 @@ mod admin_auth;
 mod audit_log;
 mod client_registry;
 mod database_tools;
+mod http_route_catalog;
+mod http_tunnel;
 mod tcp_tunnel;
 mod tunnel_catalog;
 
@@ -16,6 +18,9 @@ use axum::{
 };
 use axum_server::tls_rustls::RustlsConfig as ManagementTlsConfig;
 use client_registry::{Authentication, ClientRegistry};
+use http_route_catalog::{
+    CreateHttpRouteError, CreateHttpRoutePolicy, HttpRouteCatalog, HttpRoutePolicy,
+};
 use linklake_core::{
     BoxedIo, ClientEnrollmentRequest, ClientEnrollmentResponse, API_VERSION, PRODUCT_NAME,
 };
@@ -59,6 +64,10 @@ struct AppState {
     tunnels: Mutex<HashMap<u16, tcp_tunnel::TunnelRegistration>>,
     tunnel_statistics: Mutex<HashMap<u16, Arc<tcp_tunnel::TunnelStatistics>>>,
     seen_tunnel_registrations: Mutex<HashSet<(Uuid, u16)>>,
+    http_route_catalog: Mutex<HttpRouteCatalog>,
+    http_routes: Mutex<HashMap<String, http_tunnel::HttpRouteRegistration>>,
+    http_route_statistics: Mutex<HashMap<String, Arc<http_tunnel::HttpRouteStatistics>>>,
+    seen_http_route_registrations: Mutex<HashSet<(Uuid, String)>>,
     pending_connections: AsyncMutex<HashMap<Uuid, (Uuid, tokio::sync::oneshot::Sender<BoxedIo>)>>,
     global_connection_permits: Arc<Semaphore>,
     pending_connection_permits: Arc<Semaphore>,
@@ -89,6 +98,7 @@ struct StatusResponse {
     api_version: &'static str,
     instance_id: String,
     tunnels: usize,
+    http_routes: usize,
     clients: usize,
 }
 
@@ -113,6 +123,12 @@ struct MetricsResponse {
     tunnel_reconnects_total: u64,
     registration_rejections_total: u64,
     authentication_failures_total: u64,
+    http_active_connections: usize,
+    http_requests_total: u64,
+    http_failed_requests: u64,
+    http_bytes_from_public: u64,
+    http_bytes_to_public: u64,
+    http_pairing_timeouts: u64,
 }
 
 #[derive(Serialize)]
@@ -165,11 +181,75 @@ struct TcpTunnelView {
     lifetime_timeouts: u64,
 }
 
+#[derive(Serialize)]
+struct HttpRouteView {
+    #[serde(flatten)]
+    policy: HttpRoutePolicy,
+    online: bool,
+    active_connections: usize,
+    requests_total: u64,
+    failed_requests: u64,
+    bytes_from_public: u64,
+    bytes_to_public: u64,
+    pairing_timeouts: u64,
+}
+
 struct ApiError(StatusCode, &'static str);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (self.0, Json(serde_json::json!({ "error": self.1 }))).into_response()
+    }
+}
+
+struct CodedApiError(StatusCode, &'static str, &'static str);
+
+impl IntoResponse for CodedApiError {
+    fn into_response(self) -> Response {
+        (
+            self.0,
+            Json(serde_json::json!({ "code": self.1, "error": self.2 })),
+        )
+            .into_response()
+    }
+}
+
+fn coded_management_error(error: ApiError) -> CodedApiError {
+    CodedApiError(error.0, "management_authorization_failed", error.1)
+}
+
+fn coded_http_route_creation_error(error: CreateHttpRouteError) -> CodedApiError {
+    match error {
+        CreateHttpRouteError::InvalidName => CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_name",
+            "HTTP route name is invalid",
+        ),
+        CreateHttpRouteError::InvalidHostname => CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_hostname",
+            "HTTP route hostname is invalid",
+        ),
+        CreateHttpRouteError::DuplicateHostname => CodedApiError(
+            StatusCode::CONFLICT,
+            "duplicate_hostname",
+            "HTTP route hostname is already in use",
+        ),
+        CreateHttpRouteError::InvalidTarget => CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_target",
+            "HTTP route target address is invalid",
+        ),
+        CreateHttpRouteError::InvalidConnectionLimit => CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_connection_limit",
+            "HTTP route connection limit is invalid",
+        ),
+        CreateHttpRouteError::Database(_) => CodedApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "could not create HTTP route",
+        ),
     }
 }
 
@@ -238,6 +318,11 @@ async fn run_server(
     let control_bind =
         std::env::var("LINKLAKE_CONTROL_BIND").unwrap_or_else(|_| "127.0.0.1:32101".to_owned());
     let control_address: SocketAddr = control_bind.parse()?;
+    let http_address = std::env::var("LINKLAKE_HTTP_BIND")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.parse::<SocketAddr>())
+        .transpose()?;
     let control_cert = std::env::var("LINKLAKE_CONTROL_CERT_PATH").ok();
     let control_key = std::env::var("LINKLAKE_CONTROL_KEY_PATH").ok();
     let management_cert = std::env::var("LINKLAKE_MANAGEMENT_CERT_PATH").ok();
@@ -303,6 +388,10 @@ async fn run_server(
         tunnels: Mutex::new(HashMap::new()),
         tunnel_statistics: Mutex::new(HashMap::new()),
         seen_tunnel_registrations: Mutex::new(HashSet::new()),
+        http_route_catalog: Mutex::new(HttpRouteCatalog::open(data_dir.as_deref())?),
+        http_routes: Mutex::new(HashMap::new()),
+        http_route_statistics: Mutex::new(HashMap::new()),
+        seen_http_route_registrations: Mutex::new(HashSet::new()),
         pending_connections: AsyncMutex::new(HashMap::new()),
         global_connection_permits: Arc::new(Semaphore::new(GLOBAL_CONNECTION_LIMIT)),
         pending_connection_permits: Arc::new(Semaphore::new(PENDING_CONNECTION_LIMIT)),
@@ -330,6 +419,18 @@ async fn run_server(
             "/api/v1/tcp-tunnels/:tunnel_id/enabled",
             post(set_tcp_tunnel_enabled),
         )
+        .route(
+            "/api/v1/http-routes",
+            get(list_http_routes).post(create_http_route),
+        )
+        .route(
+            "/api/v1/http-routes/:route_id",
+            axum::routing::delete(delete_http_route),
+        )
+        .route(
+            "/api/v1/http-routes/:route_id/enabled",
+            post(set_http_route_enabled),
+        )
         .route("/api/v1/clients/enroll", post(enroll_client))
         .route("/api/v1/clients/:client_id/heartbeat", post(heartbeat))
         .with_state(state.clone())
@@ -348,6 +449,7 @@ async fn run_server(
             "LinkLake received a shutdown signal; closing tunnels and draining requests."
         );
         tcp_tunnel::stop_all(&shutdown_state);
+        http_tunnel::stop_all(&shutdown_state);
         let _ = shutdown_tx.send(true);
     });
     let control_listener = TcpListener::bind(control_address).await?;
@@ -364,6 +466,15 @@ async fn run_server(
         tokio::spawn(tcp_tunnel::run_control_listener(
             state.clone(),
             control_listener,
+            shutdown_rx.clone(),
+        ));
+    }
+    if let Some(http_address) = http_address {
+        let http_listener = TcpListener::bind(http_address).await?;
+        tracing::info!("{PRODUCT_NAME} HTTP route listener active on {http_address}");
+        tokio::spawn(http_tunnel::run_http_listener(
+            state.clone(),
+            http_listener,
             shutdown_rx.clone(),
         ));
     }
@@ -469,11 +580,16 @@ async fn status(
     authorize_management(&state, &headers)?;
     let clients = state.clients.lock().expect("client registry lock poisoned");
     let tunnels = state.tunnels.lock().expect("tunnel registry lock poisoned");
+    let http_routes = state
+        .http_routes
+        .lock()
+        .expect("HTTP route registry lock poisoned");
     Ok(Json(StatusResponse {
         product: PRODUCT_NAME,
         api_version: API_VERSION,
         instance_id: state.instance_id.clone(),
         tunnels: tunnels.len(),
+        http_routes: http_routes.len(),
         clients: clients.count(),
     }))
 }
@@ -489,6 +605,16 @@ async fn metrics(
         .expect("tunnel statistics lock poisoned");
     let sum_u64 = |load: fn(&tcp_tunnel::TunnelStatistics) -> u64| {
         statistics.values().map(|statistics| load(statistics)).sum()
+    };
+    let http_statistics = state
+        .http_route_statistics
+        .lock()
+        .expect("HTTP route statistics lock poisoned");
+    let sum_http_u64 = |load: fn(&http_tunnel::HttpRouteStatistics) -> u64| {
+        http_statistics
+            .values()
+            .map(|statistics| load(statistics))
+            .sum()
     };
     Ok(Json(MetricsResponse {
         uptime_seconds: state.started_at.elapsed().as_secs(),
@@ -551,6 +677,25 @@ async fn metrics(
             .metrics
             .authentication_failures_total
             .load(Ordering::Relaxed),
+        http_active_connections: http_statistics
+            .values()
+            .map(|statistics| statistics.active_connections.load(Ordering::Relaxed))
+            .sum(),
+        http_requests_total: sum_http_u64(|statistics| {
+            statistics.requests_total.load(Ordering::Relaxed)
+        }),
+        http_failed_requests: sum_http_u64(|statistics| {
+            statistics.failed_requests.load(Ordering::Relaxed)
+        }),
+        http_bytes_from_public: sum_http_u64(|statistics| {
+            statistics.bytes_from_public.load(Ordering::Relaxed)
+        }),
+        http_bytes_to_public: sum_http_u64(|statistics| {
+            statistics.bytes_to_public.load(Ordering::Relaxed)
+        }),
+        http_pairing_timeouts: sum_http_u64(|statistics| {
+            statistics.pairing_timeouts.load(Ordering::Relaxed)
+        }),
     }))
 }
 
@@ -797,6 +942,205 @@ async fn delete_tcp_tunnel(
         &state,
         "tcp_tunnel.policy.deleted",
         &tunnel_id.to_string(),
+        "policy deleted",
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_http_routes(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<HttpRouteView>>, ApiError> {
+    authorize_management(&state, &headers)?;
+    let policies = state
+        .http_route_catalog
+        .lock()
+        .expect("HTTP route catalog lock poisoned")
+        .list()
+        .map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not read HTTP route policies",
+            )
+        })?;
+    let online = state
+        .http_routes
+        .lock()
+        .expect("HTTP route registry lock poisoned")
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let statistics = state
+        .http_route_statistics
+        .lock()
+        .expect("HTTP route statistics lock poisoned");
+    Ok(Json(
+        policies
+            .into_iter()
+            .map(|policy| {
+                let route_statistics = statistics.get(&policy.hostname);
+                HttpRouteView {
+                    online: online.contains(&policy.hostname),
+                    active_connections: route_statistics
+                        .map_or(0, |value| value.active_connections.load(Ordering::Relaxed)),
+                    requests_total: route_statistics
+                        .map_or(0, |value| value.requests_total.load(Ordering::Relaxed)),
+                    failed_requests: route_statistics
+                        .map_or(0, |value| value.failed_requests.load(Ordering::Relaxed)),
+                    bytes_from_public: route_statistics
+                        .map_or(0, |value| value.bytes_from_public.load(Ordering::Relaxed)),
+                    bytes_to_public: route_statistics
+                        .map_or(0, |value| value.bytes_to_public.load(Ordering::Relaxed)),
+                    pairing_timeouts: route_statistics
+                        .map_or(0, |value| value.pairing_timeouts.load(Ordering::Relaxed)),
+                    policy,
+                }
+            })
+            .collect(),
+    ))
+}
+
+async fn create_http_route(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<CreateHttpRoutePolicy>,
+) -> Result<Json<HttpRoutePolicy>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    if !state
+        .clients
+        .lock()
+        .expect("client registry lock poisoned")
+        .contains(request.client_id)
+    {
+        return Err(CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "unknown_client",
+            "unknown client for HTTP route",
+        ));
+    }
+    let policy = state
+        .http_route_catalog
+        .lock()
+        .expect("HTTP route catalog lock poisoned")
+        .create(request)
+        .map_err(coded_http_route_creation_error)?;
+    record_audit(
+        &state,
+        "http_route.policy.created",
+        &policy.id.to_string(),
+        &format!(
+            "client={}; hostname={}; name={}",
+            policy.client_id, policy.hostname, policy.name
+        ),
+    );
+    Ok(Json(policy))
+}
+
+async fn set_http_route_enabled(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(route_id): Path<Uuid>,
+    Json(request): Json<EnableTunnelRequest>,
+) -> Result<StatusCode, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let hostname = state
+        .http_route_catalog
+        .lock()
+        .expect("HTTP route catalog lock poisoned")
+        .hostname_for_id(route_id)
+        .map_err(|_| {
+            CodedApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "could not read HTTP route policy",
+            )
+        })?;
+    let updated = state
+        .http_route_catalog
+        .lock()
+        .expect("HTTP route catalog lock poisoned")
+        .set_enabled(route_id, request.enabled)
+        .map_err(|_| {
+            CodedApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "could not update HTTP route policy",
+            )
+        })?;
+    if !updated {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_http_route",
+            "unknown HTTP route",
+        ));
+    }
+    if !request.enabled {
+        if let Some(hostname) = hostname {
+            http_tunnel::stop_hostname(&state, &hostname);
+        }
+    }
+    record_audit(
+        &state,
+        "http_route.policy.updated",
+        &route_id.to_string(),
+        if request.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_http_route(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(route_id): Path<Uuid>,
+) -> Result<StatusCode, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let hostname = state
+        .http_route_catalog
+        .lock()
+        .expect("HTTP route catalog lock poisoned")
+        .hostname_for_id(route_id)
+        .map_err(|_| {
+            CodedApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "could not read HTTP route policy",
+            )
+        })?;
+    let deleted = state
+        .http_route_catalog
+        .lock()
+        .expect("HTTP route catalog lock poisoned")
+        .delete(route_id)
+        .map_err(|_| {
+            CodedApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "could not delete HTTP route policy",
+            )
+        })?;
+    if !deleted {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_http_route",
+            "unknown HTTP route",
+        ));
+    }
+    if let Some(hostname) = hostname {
+        http_tunnel::stop_hostname(&state, &hostname);
+        state
+            .http_route_statistics
+            .lock()
+            .expect("HTTP route statistics lock poisoned")
+            .remove(&hostname);
+    }
+    record_audit(
+        &state,
+        "http_route.policy.deleted",
+        &route_id.to_string(),
         "policy deleted",
     );
     Ok(StatusCode::NO_CONTENT)
@@ -1214,8 +1558,11 @@ mod windows_service_host {
 
 #[cfg(test)]
 mod tests {
-    use super::{management_session_cookie, session_cookie_header};
-    use axum::http::{header, HeaderMap, HeaderValue};
+    use super::{
+        coded_http_route_creation_error, management_session_cookie, session_cookie_header,
+    };
+    use crate::http_route_catalog::CreateHttpRouteError;
+    use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 
     #[test]
     fn management_session_cookie_is_parsed_without_accepting_other_cookies() {
@@ -1233,5 +1580,41 @@ mod tests {
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("Secure"));
         assert!(cookie.contains("SameSite=Strict"));
+    }
+
+    #[test]
+    fn http_route_creation_errors_have_stable_api_codes() {
+        let cases = [
+            (
+                CreateHttpRouteError::InvalidName,
+                StatusCode::BAD_REQUEST,
+                "invalid_name",
+            ),
+            (
+                CreateHttpRouteError::InvalidHostname,
+                StatusCode::BAD_REQUEST,
+                "invalid_hostname",
+            ),
+            (
+                CreateHttpRouteError::DuplicateHostname,
+                StatusCode::CONFLICT,
+                "duplicate_hostname",
+            ),
+            (
+                CreateHttpRouteError::InvalidTarget,
+                StatusCode::BAD_REQUEST,
+                "invalid_target",
+            ),
+            (
+                CreateHttpRouteError::InvalidConnectionLimit,
+                StatusCode::BAD_REQUEST,
+                "invalid_connection_limit",
+            ),
+        ];
+        for (error, expected_status, expected_code) in cases {
+            let response = coded_http_route_creation_error(error);
+            assert_eq!(response.0, expected_status);
+            assert_eq!(response.1, expected_code);
+        }
     }
 }

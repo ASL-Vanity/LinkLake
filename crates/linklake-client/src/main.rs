@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 const CONTROL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const CONTROL_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
+const TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Parser)]
 #[command(name = "linklake-client", about = "LinkLake client control utility")]
@@ -78,7 +79,26 @@ enum Command {
         #[arg(long, default_value = "development-tcp")]
         name: String,
     },
-    /// 运行 TOML 配置文件中声明的全部 TCP 隧道代理。
+    /// 运行开发用 HTTP 域名路由代理。
+    HttpAgent {
+        #[arg(long, default_value = "127.0.0.1:32101")]
+        control: String,
+        #[arg(long)]
+        control_ca_cert: Option<PathBuf>,
+        #[arg(long)]
+        control_server_name: Option<String>,
+        #[arg(long)]
+        client_id: Uuid,
+        #[arg(long)]
+        token: String,
+        #[arg(long)]
+        hostname: String,
+        #[arg(long)]
+        target: String,
+        #[arg(long, default_value = "development-http")]
+        name: String,
+    },
+    /// 运行 TOML 配置文件中声明的全部 TCP 隧道和 HTTP 路由代理。
     Run {
         #[arg(long, default_value = "linklake-client.toml")]
         config: PathBuf,
@@ -96,6 +116,8 @@ struct HealthResponse {
 struct ClientConfigFile {
     #[serde(default)]
     tcp_tunnels: Vec<TcpTunnelConfig>,
+    #[serde(default)]
+    http_routes: Vec<HttpRouteConfig>,
 }
 
 #[derive(Deserialize)]
@@ -106,6 +128,18 @@ struct TcpTunnelConfig {
     client_id: Uuid,
     client_token: String,
     public_port: u16,
+    target: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct HttpRouteConfig {
+    control: String,
+    control_ca_cert: Option<PathBuf>,
+    control_server_name: Option<String>,
+    client_id: Uuid,
+    client_token: String,
+    hostname: String,
     target: String,
     name: String,
 }
@@ -204,6 +238,26 @@ async fn run_cli() -> anyhow::Result<()> {
             )
             .await?;
         }
+        Command::HttpAgent {
+            control,
+            control_ca_cert,
+            control_server_name,
+            client_id,
+            token,
+            hostname,
+            target,
+            name,
+        } => {
+            run_http_agent(
+                ControlTransport::new(control, control_ca_cert, control_server_name)?,
+                client_id,
+                token,
+                hostname,
+                target,
+                name,
+            )
+            .await?;
+        }
         Command::Run { config } => run_configured_agents(config, None).await?,
     }
     Ok(())
@@ -233,6 +287,27 @@ async fn run_configured_agents(
             .await
             {
                 tracing::error!("Configured TCP tunnel failed permanently: {error}");
+            }
+        });
+    }
+    for route in config.http_routes {
+        let transport = ControlTransport::new(
+            route.control,
+            route.control_ca_cert,
+            route.control_server_name,
+        )?;
+        tokio::spawn(async move {
+            if let Err(error) = run_http_agent(
+                transport,
+                route.client_id,
+                route.client_token,
+                route.hostname,
+                route.target,
+                route.name,
+            )
+            .await
+            {
+                tracing::error!("Configured HTTP route failed permanently: {error}");
             }
         });
     }
@@ -271,8 +346,8 @@ async fn wait_for_os_shutdown() {
 fn parse_client_config(content: &str) -> anyhow::Result<ClientConfigFile> {
     let config: ClientConfigFile = toml::from_str(content)?;
     anyhow::ensure!(
-        !config.tcp_tunnels.is_empty(),
-        "the configuration has no tcp_tunnels entries"
+        !config.tcp_tunnels.is_empty() || !config.http_routes.is_empty(),
+        "the configuration has no tcp_tunnels or http_routes entries"
     );
     Ok(config)
 }
@@ -301,6 +376,28 @@ mod tests {
         assert_eq!(config.tcp_tunnels.len(), 1);
         assert_eq!(config.tcp_tunnels[0].name, "game-server");
         assert_eq!(config.tcp_tunnels[0].public_port, 32001);
+    }
+
+    #[test]
+    fn parses_http_route_configuration() {
+        let config = parse_client_config(
+            r#"
+                [[http_routes]]
+                name = "website"
+                control = "tunnel.example.com:32101"
+                control_ca_cert = "C:\\LinkLake\\control-ca.pem"
+                control_server_name = "tunnel.example.com"
+                client_id = "00000000-0000-0000-0000-000000000001"
+                client_token = "test-token"
+                hostname = "site.example.com"
+                target = "127.0.0.1:8080"
+            "#,
+        )
+        .expect("configuration should parse");
+
+        assert_eq!(config.http_routes.len(), 1);
+        assert_eq!(config.http_routes[0].name, "website");
+        assert_eq!(config.http_routes[0].hostname, "site.example.com");
     }
 
     #[test]
@@ -446,6 +543,84 @@ async fn run_tcp_agent_session(
     result
 }
 
+async fn run_http_agent(
+    transport: ControlTransport,
+    client_id: Uuid,
+    token: String,
+    hostname: String,
+    target: String,
+    name: String,
+) -> anyhow::Result<()> {
+    let mut retry_seconds = 1_u64;
+    loop {
+        let session_started = std::time::Instant::now();
+        let result = run_http_agent_session(
+            transport.clone(),
+            client_id,
+            token.clone(),
+            hostname.clone(),
+            target.clone(),
+            name.clone(),
+        )
+        .await;
+        if session_started.elapsed() >= std::time::Duration::from_secs(30) {
+            retry_seconds = 1;
+        }
+        let jitter_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_millis() as u64
+            % 750;
+        let retry_delay = std::time::Duration::from_millis(retry_seconds * 1000 + jitter_millis);
+        match result {
+            Ok(()) => {
+                tracing::warn!("HTTP route control session ended; reconnecting in {retry_delay:?}.")
+            }
+            Err(error) => tracing::warn!(
+                "HTTP route control session lost: {error}; reconnecting in {retry_delay:?}."
+            ),
+        }
+        tokio::time::sleep(retry_delay).await;
+        retry_seconds = (retry_seconds * 2).min(30);
+    }
+}
+
+async fn run_http_agent_session(
+    transport: ControlTransport,
+    client_id: Uuid,
+    token: String,
+    hostname: String,
+    target: String,
+    name: String,
+) -> anyhow::Result<()> {
+    let mut stream = connect_control(&transport).await?;
+    write_control_frame(
+        &mut stream,
+        &ControlFrame::RegisterHttpRoute {
+            client_id,
+            client_token: token.clone(),
+            name,
+            hostname,
+            target_addr: target.clone(),
+        },
+    )
+    .await?;
+    match read_control_frame(&mut stream).await? {
+        ControlFrame::HttpRouteRegistered { hostname } => {
+            tracing::info!("HTTP route registered for hostname {hostname}.")
+        }
+        ControlFrame::Error { message } => {
+            anyhow::bail!("server rejected HTTP route: {message}")
+        }
+        frame => anyhow::bail!("unexpected registration response: {frame:?}"),
+    }
+    let (reader, writer) = split(stream);
+    let heartbeat = tokio::spawn(send_control_heartbeats(writer));
+    let result = read_registered_control(reader, transport, target, client_id, token).await;
+    heartbeat.abort();
+    result
+}
+
 async fn send_control_heartbeats(mut writer: WriteHalf<BoxedIo>) -> anyhow::Result<()> {
     let mut heartbeat = interval(CONTROL_HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -506,7 +681,9 @@ async fn open_tcp_data_connection(
         },
     )
     .await?;
-    let mut target_stream = TcpStream::connect(target).await?;
+    let mut target_stream = timeout(TARGET_CONNECT_TIMEOUT, TcpStream::connect(target))
+        .await
+        .map_err(|_| anyhow::anyhow!("target connection timed out"))??;
     copy_bidirectional(&mut data_stream, &mut target_stream).await?;
     Ok(())
 }

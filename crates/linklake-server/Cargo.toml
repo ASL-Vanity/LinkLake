@@ -9,6 +9,10 @@ anyhow.workspace = true
 argon2.workspace = true
 axum.workspace = true
 axum-server.workspace = true
+bytes.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 linklake-core = { path = "../linklake-core" }
 serde.workspace = true
 serde_json.workspace = true

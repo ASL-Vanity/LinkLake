@@ -6,7 +6,7 @@ LinkLake 是一个使用 Rust 从零实现的跨平台安全隧道平台，采�
 
 LinkLake 的代码实现、自动化测试与项目文档由 OpenAI GPT-5.6 完成；项目所有者负责需求定义、基础设施授权与最终验收。
 
-当前版本已完成 TCP 生产化；UDP、HTTP/HTTPS 域名路由和 P2P 尚未实现。
+当前版本已完成 TCP 生产化和第一阶段 HTTP 域名路由；HTTPS 证书自动化、UDP 和 P2P 尚未实现。
 
 ## TCP 生产能力
 
@@ -21,6 +21,16 @@ LinkLake 的代码实现、自动化测试与项目文档由 OpenAI GPT-5.6 完�
 - 中英文 Web UI、账号密码登录、安全 Cookie 和 5 秒自动刷新
 - Windows 原生服务与 Linux systemd
 - 服务端和客户端按小时轮转日志，默认保留 168 个文件
+
+## HTTP 域名路由
+
+- 根据请求 Host 将不同域名转发到指定客户端及其本地 HTTP 服务
+- HTTP 路由策略使用 SQLite 持久化，支持创建、启停、删除和在线状态展示
+- 每条路由可配置最大并发连接数，并统计请求数、失败数、流量和配对超时
+- Web UI 提供中英文 HTTP 路由管理界面
+- 第一阶段仅处理 HTTP；HTTPS 终止、证书自动申请与续签将在后续阶段实现
+
+使用前需要把路由域名的 DNS 记录指向 LinkLake 服务端，并确保公网 HTTP 入口可以到达服务端配置的 HTTP 监听地址。
 
 ## 本地启动
 
@@ -51,7 +61,7 @@ cargo run -p linklake-client -- enroll `
   --name dev-machine
 ```
 
-注册结果中的客户端令牌只显示一次。先在 Web UI 创建完全匹配的 TCP 策略，再运行代理：
+注册结果中的客户端令牌只显示一次。TCP 隧道可以先在 Web UI 创建完全匹配的策略，再运行代理：
 
 ```powershell
 cargo run -p linklake-client -- agent `
@@ -63,7 +73,7 @@ cargo run -p linklake-client -- agent `
   --name development-tcp
 ```
 
-多隧道配置见 [examples/linklake-client.toml](examples/linklake-client.toml)：
+TCP 隧道和 HTTP 域名路由的多策略配置见 [examples/linklake-client.toml](examples/linklake-client.toml)。HTTP 路由使用 `[[http_routes]]`，其中 `hostname` 必须与 Web UI 中创建的域名完全匹配：
 
 ```powershell
 cargo run -p linklake-client -- run --config .\linklake-client.toml
@@ -75,7 +85,11 @@ cargo run -p linklake-client -- run --config .\linklake-client.toml
 
 - 健康检查：`GET /api/v1/health`
 - 登录后指标：`GET /api/v1/metrics`
-- Web UI 可配置最大连接数和聚合带宽上限
+- TCP 策略：`GET/POST /api/v1/tcp-tunnels`
+- HTTP 路由：`GET/POST /api/v1/http-routes`
+- HTTP 路由启停：`POST /api/v1/http-routes/:id/enabled`
+- HTTP 路由删除：`DELETE /api/v1/http-routes/:id`
+- Web UI 可配置 TCP 聚合带宽上限以及 TCP/HTTP 最大连接数
 - `LINKLAKE_MANAGEMENT_TOKEN` 可作为自动化 API Bearer Token，不用于 Web 登录
 
 日志目录通过 `LINKLAKE_LOG_DIR` 设置。服务端未设置时默认使用 `LINKLAKE_DATA_DIR/logs`；客户端未设置时输出到控制台，服务安装器会为其设置轮转日志目录。
@@ -122,6 +136,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\tcp-e2e.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\http-e2e.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\package-windows.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-windows-package.ps1
 ```
@@ -136,17 +151,18 @@ bash scripts/package-linux.sh
 bash scripts/verify-linux-package.sh
 ```
 
-端到端测试覆盖真实二进制回显、限速、连接限制、重连、策略生命周期、配对超时和指标。
+TCP 端到端测试覆盖真实二进制回显、限速、连接限制、重连、策略生命周期、配对超时和指标。HTTP 端到端测试覆盖 Host 路由、请求与响应传输、连接限制、客户端重连、策略生命周期和指标。
 
 打包脚本支持 `SOURCE_DATE_EPOCH`。设置相同时间戳并使用相同源码、工具链、目标平台和锁定依赖时，归档内的文件顺序、时间和发布清单保持稳定。Windows 生成 ZIP 和 SHA-256，Linux 生成 tar.gz 和 SHA-256。
 
-`.github/workflows/ci.yml` 会在推送和拉取请求中执行格式、Clippy、单元测试、脚本语法检查和 Windows TCP E2E。`.github/workflows/release.yml` 会在手动触发时构建双平台产物；推送 `v*` 标签时还会创建或更新对应 GitHub Release。
+`.github/workflows/ci.yml` 会在推送和拉取请求中执行格式、Clippy、单元测试、脚本语法检查以及 Windows TCP/HTTP E2E。`.github/workflows/release.yml` 会在手动触发时构建双平台产物；推送 `v*` 标签时还会创建或更新对应 GitHub Release。
 
 ## 后续路线
 
-1. HTTP/HTTPS 域名路由与证书自动化
-2. UDP 隧道
-3. Flutter 管理客户端
-4. 多节点和显式中继回退的 P2P
+1. HTTP 域名路由：第一阶段已完成
+2. HTTPS 终止与证书自动化
+3. UDP 隧道
+4. Flutter 管理客户端
+5. 多节点和显式中继回退的 P2P
 
 许可证将在全部功能开发完成后由项目所有者确定。

@@ -7,153 +7,382 @@
     <style>
       :root { color-scheme: dark; font-family: Inter, "Segoe UI", sans-serif; background: #07131f; color: #e8f2f7; }
       body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: radial-gradient(circle at 20% 0%, #123456, #07131f 52%); }
-      main { width: min(760px, calc(100% - 48px)); padding: 42px; border: 1px solid #22506b; border-radius: 18px; background: rgba(8, 25, 39, .9); box-shadow: 0 24px 72px #0008; }
-      .top { display: flex; justify-content: space-between; gap: 18px; align-items: center; } .mark { color: #43d9dd; font-size: 13px; letter-spacing: .16em; text-transform: uppercase; }
-      h1 { margin: 12px 0; font-size: clamp(32px, 7vw, 60px); } p { color: #a9c4d1; line-height: 1.7; }
-      section { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 28px; } article { padding: 16px; border-radius: 12px; background: #0b2234; } strong { display: block; color: #43d9dd; font-size: 24px; }
-      #audit, #tunnel-list { grid-template-columns: 1fr; } #audit article, #tunnel-list article { display: grid; gap: 4px; } #audit strong, #tunnel-list strong { font-size: 15px; } .audit-detail { color: #a9c4d1; overflow-wrap: anywhere; } .tunnel-actions { display: flex; gap: 8px; margin-top: 6px; } .tunnel-actions button { padding: 7px 10px; }
-      form { display: grid; gap: 10px; width: min(440px, 100%); } input, button { box-sizing: border-box; padding: 12px; border-radius: 9px; font: inherit; } input { width: 100%; color: #e8f2f7; background: #06101a; border: 1px solid #3a718b; }
-      button { cursor: pointer; color: #022128; border: 0; background: #43d9dd; font-weight: 700; } #language { padding: 8px 12px; background: transparent; border: 1px solid #43d9dd; color: #8ceef0; }
-      #message { min-height: 24px; color: #a9c4d1; } .error { color: #ff9f9f !important; } .hidden { display: none; }
-      @media (max-width: 600px) { main { padding: 28px; } section { grid-template-columns: 1fr; } }
+      main { width: min(1040px, calc(100% - 48px)); margin: 24px 0; padding: 42px; border: 1px solid #22506b; border-radius: 18px; background: rgba(8, 25, 39, .9); box-shadow: 0 24px 72px #0008; }
+      .top { display: flex; justify-content: space-between; gap: 18px; align-items: center; }
+      .mark { color: #43d9dd; font-size: 13px; letter-spacing: .16em; text-transform: uppercase; }
+      h1 { margin: 12px 0; font-size: clamp(32px, 7vw, 60px); }
+      h2 { margin: 0 0 16px; color: #8ceef0; font-size: 20px; }
+      p { color: #a9c4d1; line-height: 1.7; }
+      section { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-top: 28px; }
+      article { padding: 16px; border-radius: 12px; background: #0b2234; }
+      strong { display: block; color: #43d9dd; font-size: 24px; }
+      #audit, #tunnel-list, #http-route-list { grid-template-columns: 1fr; }
+      #audit article, #tunnel-list article, #http-route-list article { display: grid; gap: 4px; }
+      #audit strong, #tunnel-list strong, #http-route-list strong { font-size: 15px; }
+      .audit-detail, .policy-detail { color: #a9c4d1; overflow-wrap: anywhere; }
+      .management-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; margin-top: 28px; }
+      .management-grid > article { align-self: start; }
+      .policy-list { margin-top: 12px; }
+      .policy-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+      .policy-actions button { padding: 7px 10px; }
+      form { display: grid; gap: 10px; width: min(460px, 100%); }
+      label { display: grid; gap: 5px; color: #a9c4d1; font-size: 13px; }
+      input, select, button { box-sizing: border-box; padding: 12px; border-radius: 9px; font: inherit; }
+      input, select { width: 100%; color: #e8f2f7; background: #06101a; border: 1px solid #3a718b; }
+      button { cursor: pointer; color: #022128; border: 0; background: #43d9dd; font-weight: 700; }
+      button:disabled { cursor: wait; opacity: .65; }
+      #language { padding: 8px 12px; background: transparent; border: 1px solid #43d9dd; color: #8ceef0; }
+      #message { min-height: 24px; color: #a9c4d1; }
+      .error { color: #ff9f9f !important; }
+      .hidden { display: none; }
+      @media (max-width: 760px) { main { padding: 28px; } .management-grid { grid-template-columns: 1fr; } }
     </style>
   </head>
   <body>
     <main>
-      <div class="top"><div class="mark">LinkLake / management plane</div><button id="language" type="button">ZH</button></div>
+      <div class="top">
+        <div class="mark" data-i18n="managementPlane">LinkLake / management plane</div>
+        <button id="language" type="button">ZH</button>
+      </div>
       <h1 data-i18n="heading">Control plane online.</h1>
       <p data-i18n="intro">Sign in with an administrator account. Passwords and session secrets stay out of browser scripts.</p>
       <form id="login">
-        <input id="username" type="text" autocomplete="username" data-placeholder="username" placeholder="Administrator username" required />
-        <input id="password" type="password" autocomplete="current-password" data-placeholder="password" placeholder="Password" required />
+        <label><span data-i18n="usernameLabel">Username</span><input id="username" type="text" autocomplete="username" data-placeholder="username" placeholder="Administrator username" required /></label>
+        <label><span data-i18n="passwordLabel">Password</span><input id="password" type="password" autocomplete="current-password" data-placeholder="password" placeholder="Password" required /></label>
         <button type="submit" data-i18n="signIn">Sign in</button>
       </form>
       <form id="change-password" class="hidden">
-        <input id="new-password" type="password" autocomplete="new-password" data-placeholder="newPassword" placeholder="New password (at least 12 characters)" required />
-        <input id="confirm-password" type="password" autocomplete="new-password" data-placeholder="confirmPassword" placeholder="Confirm new password" required />
+        <label><span data-i18n="newPasswordLabel">New password</span><input id="new-password" type="password" autocomplete="new-password" data-placeholder="newPassword" placeholder="New password (at least 12 characters)" required /></label>
+        <label><span data-i18n="confirmPasswordLabel">Confirm password</span><input id="confirm-password" type="password" autocomplete="new-password" data-placeholder="confirmPassword" placeholder="Confirm new password" required /></label>
         <button type="submit" data-i18n="changePassword">Change password</button>
       </form>
-      <p id="message"></p>
+      <p id="message" aria-live="polite"></p>
       <section id="status" class="hidden"></section>
       <section id="metrics" class="hidden"></section>
       <section id="audit" class="hidden"></section>
-      <section id="tunnel-management" class="hidden">
-        <article><strong data-i18n="tcpPolicy">TCP tunnel policy</strong><form id="tunnel-form"><input id="tunnel-client-id" data-placeholder="clientId" placeholder="Client ID" required /><input id="tunnel-name" data-placeholder="tunnelName" placeholder="Tunnel name" required /><input id="tunnel-port" type="number" min="32000" max="32999" data-placeholder="publicPort" placeholder="Public port" required /><input id="tunnel-target" data-placeholder="targetAddress" placeholder="Target address, e.g. 127.0.0.1:2333" required /><input id="tunnel-max" type="number" min="1" max="1024" value="64" data-placeholder="maxConnections" placeholder="Max connections" required /><input id="tunnel-bandwidth" type="number" min="1024" max="1000000000" data-placeholder="bandwidthLimit" placeholder="Aggregate bandwidth limit (B/s, optional)" /><button type="submit" data-i18n="createTunnel">Create policy</button></form></article>
-        <section id="tunnel-list"></section>
-      </section>
+      <div id="policy-management" class="management-grid hidden">
+        <article>
+          <h2 data-i18n="tcpPolicy">TCP tunnel policy</h2>
+          <form id="tunnel-form">
+            <label><span data-i18n="client">Client</span><select id="tunnel-client-id" required></select></label>
+            <label><span data-i18n="tunnelNameLabel">Tunnel name</span><input id="tunnel-name" data-placeholder="tunnelName" placeholder="Tunnel name" required /></label>
+            <label><span data-i18n="publicPortLabel">Public port</span><input id="tunnel-port" type="number" min="32000" max="32999" data-placeholder="publicPort" placeholder="Public port" required /></label>
+            <label><span data-i18n="targetAddressLabel">Target address</span><input id="tunnel-target" data-placeholder="targetAddress" placeholder="Target address, e.g. 127.0.0.1:2333" required /></label>
+            <label><span data-i18n="maxConnectionsLabel">Max connections</span><input id="tunnel-max" type="number" min="1" max="1024" value="64" data-placeholder="maxConnections" placeholder="Max connections" required /></label>
+            <label><span data-i18n="bandwidthLimitLabel">Bandwidth limit</span><input id="tunnel-bandwidth" type="number" min="1024" max="1000000000" data-placeholder="bandwidthLimit" placeholder="Aggregate bandwidth limit (B/s, optional)" /></label>
+            <button type="submit" data-i18n="createTunnel">Create TCP policy</button>
+          </form>
+          <section id="tunnel-list" class="policy-list"></section>
+        </article>
+        <article>
+          <h2 data-i18n="httpRoutePolicy">HTTP host route</h2>
+          <form id="http-route-form">
+            <label><span data-i18n="client">Client</span><select id="http-route-client-id" required></select></label>
+            <label><span data-i18n="routeNameLabel">Route name</span><input id="http-route-name" data-placeholder="routeName" placeholder="Route name" required /></label>
+            <label><span data-i18n="hostnameLabel">Hostname</span><input id="http-route-hostname" data-placeholder="hostname" placeholder="Hostname, e.g. app.example.com" required /></label>
+            <label><span data-i18n="targetAddressLabel">Target address</span><input id="http-route-target" data-placeholder="httpTargetAddress" placeholder="Target address, e.g. 127.0.0.1:8080" required /></label>
+            <label><span data-i18n="maxConnectionsLabel">Max connections</span><input id="http-route-max" type="number" min="1" max="1024" value="64" data-placeholder="maxConnections" placeholder="Max connections" required /></label>
+            <button type="submit" data-i18n="createHttpRoute">Create HTTP route</button>
+          </form>
+          <section id="http-route-list" class="policy-list"></section>
+        </article>
+      </div>
     </main>
     <script>
       const words = {
         en: {
-          title: 'LinkLake Management', toggle: 'ZH', heading: 'Control plane online.', intro: 'Sign in with an administrator account. Passwords and session secrets stay out of browser scripts.',
-          username: 'Administrator username', password: 'Password', newPassword: 'New password (at least 12 characters)', confirmPassword: 'Confirm new password', signIn: 'Sign in', changePassword: 'Change password',
-          waiting: 'Waiting for administrator sign-in.', signingIn: 'Signing in...', signInFailed: 'Sign-in failed. Check the username and password.', requestFailed: 'The server did not respond. Check the server log and network connection.', changeRequired: 'You must change the initial password before accessing management data.', passwordsMismatch: 'The new passwords do not match.', changingPassword: 'Changing password...', passwordChangeFailed: 'Password change failed. Use at least 12 characters.', passwordChanged: 'Password changed. Management access is now enabled.', signedIn: 'Signed in. Session expires at {time}.', statusFailed: 'Unable to load management data.', api: 'API', clients: 'Clients', tunnels: 'Tunnels', auditEmpty: 'No audit events yet.', tcpPolicy: 'TCP tunnel policy', clientId: 'Client ID', tunnelName: 'Tunnel name', publicPort: 'Public port', targetAddress: 'Target address, e.g. 127.0.0.1:2333', maxConnections: 'Max connections', bandwidthLimit: 'Aggregate bandwidth limit (B/s, optional)', createTunnel: 'Create policy', noTunnels: 'No TCP tunnel policies yet.', enabled: 'Enabled', disabled: 'Disabled', online: 'Online', offline: 'Offline', enable: 'Enable', disable: 'Disable', delete: 'Delete', tunnelRequestFailed: 'Tunnel policy request failed.', activeConnections: 'Active connections', pendingPairs: 'Pending pairs', traffic: 'TCP traffic in / out', reconnects: 'Tunnel reconnects', authFailures: 'Authentication failures', uptime: 'Server uptime', seconds: 'seconds', unlimited: 'unlimited', active: 'active', rejected: 'rejected', failed: 'failed', limitBreakdown: 'policy/global/pending limits', errorBreakdown: 'pair/transfer/lifetime errors', bandwidth: 'bandwidth', auditLogin: 'Administrator signed in', auditLoginFailed: 'Administrator sign-in failed', auditPasswordChanged: 'Administrator password changed', auditLogout: 'Administrator signed out', auditClientEnrolled: 'Client enrolled', auditTunnelRegistered: 'TCP tunnel registered', auditSessionCreated: 'Session created', auditPasswordUpdated: 'Password updated'
+          title: 'LinkLake Management', toggle: 'ZH', managementPlane: 'LinkLake / management plane', heading: 'Control plane online.', intro: 'Sign in with an administrator account. Passwords and session secrets stay out of browser scripts.',
+          usernameLabel: 'Username', passwordLabel: 'Password', newPasswordLabel: 'New password', confirmPasswordLabel: 'Confirm password', username: 'Administrator username', password: 'Password', newPassword: 'New password (at least 12 characters)', confirmPassword: 'Confirm new password', signIn: 'Sign in', changePassword: 'Change password',
+          waiting: 'Waiting for administrator sign-in.', signingIn: 'Signing in...', signInFailed: 'Sign-in failed. Check the username and password.', requestFailed: 'The server did not respond. Check the server log and network connection.', changeRequired: 'You must change the initial password before accessing management data.', passwordsMismatch: 'The new passwords do not match.', changingPassword: 'Changing password...', passwordChangeFailed: 'Password change failed. Use at least 12 characters.', passwordChanged: 'Password changed. Management access is now enabled.', signedIn: 'Signed in. Session expires at {time}.', sessionExpired: 'The administrator session has expired. Sign in again.', statusFailed: 'Unable to load management data.',
+          api: 'API', clients: 'Clients', tunnels: 'TCP tunnels', httpRoutes: 'HTTP routes', auditEmpty: 'No audit events yet.', client: 'Client', selectClient: 'Select a client', noClients: 'No enrolled clients are available.',
+          tcpPolicy: 'TCP tunnel policy', tunnelNameLabel: 'Tunnel name', tunnelName: 'Tunnel name', publicPortLabel: 'Public port', publicPort: 'Public port', targetAddressLabel: 'Target address', targetAddress: 'Target address, e.g. 127.0.0.1:2333', maxConnectionsLabel: 'Max connections', maxConnections: 'Max connections', bandwidthLimitLabel: 'Bandwidth limit', bandwidthLimit: 'Aggregate bandwidth limit (B/s, optional)', createTunnel: 'Create TCP policy', noTunnels: 'No TCP tunnel policies yet.', tunnelRequestFailed: 'TCP tunnel policy request failed.',
+          httpRoutePolicy: 'HTTP host route', routeNameLabel: 'Route name', routeName: 'Route name', hostnameLabel: 'Hostname', hostname: 'Hostname, e.g. app.example.com', httpTargetAddress: 'Target address, e.g. 127.0.0.1:8080', createHttpRoute: 'Create HTTP route', noHttpRoutes: 'No HTTP host routes yet.', httpRouteRequestFailed: 'HTTP route request failed.', httpFirstStage: 'HTTP only; automatic HTTPS certificates are not available yet.',
+          enabled: 'Enabled', disabled: 'Disabled', online: 'Online', offline: 'Offline', enable: 'Enable', disable: 'Disable', delete: 'Delete', confirmDeleteTcp: 'Delete this TCP tunnel policy?', confirmDeleteHttp: 'Delete this HTTP route?', activeConnections: 'Active connections', pendingPairs: 'Pending pairs', traffic: 'TCP traffic in / out', reconnects: 'Tunnel reconnects', authFailures: 'Authentication failures', uptime: 'Server uptime', seconds: 'seconds', unlimited: 'unlimited', active: 'active', rejected: 'rejected', failed: 'failed', requests: 'requests', pairingTimeouts: 'pairing timeouts', limitBreakdown: 'policy/global/pending limits', errorBreakdown: 'pair/transfer/lifetime errors', bandwidth: 'bandwidth',
+          auditLogin: 'Administrator signed in', auditLoginFailed: 'Administrator sign-in failed', auditPasswordChanged: 'Administrator password changed', auditLogout: 'Administrator signed out', auditClientEnrolled: 'Client enrolled', auditTunnelRegistered: 'TCP tunnel registered', auditTcpCreated: 'TCP tunnel policy created', auditTcpUpdated: 'TCP tunnel policy updated', auditTcpDeleted: 'TCP tunnel policy deleted', auditHttpRegistered: 'HTTP route registered', auditHttpCreated: 'HTTP route created', auditHttpUpdated: 'HTTP route updated', auditHttpDeleted: 'HTTP route deleted', auditSessionCreated: 'Session created', auditPasswordUpdated: 'Password updated', auditEnabled: 'Enabled', auditDisabled: 'Disabled', auditPolicyDeleted: 'Policy deleted',
+          errorUnknownClient: 'The selected client does not exist.', errorInvalidName: 'The route name must contain 1 to 80 characters.', errorInvalidHostname: 'The hostname is invalid.', errorDuplicateHostname: 'The hostname is already assigned to another route.', errorInvalidTarget: 'The target address is invalid.', errorInvalidConnectionLimit: 'The maximum connection count must be between 1 and 1024.', errorUnknownHttpRoute: 'The HTTP route does not exist.'
         },
         zh: {
-          title: 'LinkLake \u7ba1\u7406\u7aef', toggle: 'EN', heading: '\u63a7\u5236\u5e73\u9762\u5df2\u5728\u7ebf\u3002', intro: '\u8bf7\u4f7f\u7528\u7ba1\u7406\u5458\u8d26\u53f7\u767b\u5f55\u3002\u5bc6\u7801\u548c\u4f1a\u8bdd\u5bc6\u94a5\u4e0d\u4f1a\u88ab\u6d4f\u89c8\u5668\u811a\u672c\u8bfb\u53d6\u3002',
-          username: '\u7ba1\u7406\u5458\u7528\u6237\u540d', password: '\u5bc6\u7801', newPassword: '\u65b0\u5bc6\u7801\uff08\u81f3\u5c11 12 \u4f4d\uff09', confirmPassword: '\u786e\u8ba4\u65b0\u5bc6\u7801', signIn: '\u767b\u5f55', changePassword: '\u4fee\u6539\u5bc6\u7801',
-          waiting: '\u7b49\u5f85\u7ba1\u7406\u5458\u767b\u5f55\u3002', signingIn: '\u6b63\u5728\u767b\u5f55...', signInFailed: '\u767b\u5f55\u5931\u8d25\uff0c\u8bf7\u68c0\u67e5\u7528\u6237\u540d\u548c\u5bc6\u7801\u3002', requestFailed: '\u670d\u52a1\u7aef\u6ca1\u6709\u54cd\u5e94\uff0c\u8bf7\u68c0\u67e5\u670d\u52a1\u7aef\u65e5\u5fd7\u548c\u7f51\u7edc\u8fde\u63a5\u3002', changeRequired: '\u5fc5\u987b\u5148\u4fee\u6539\u521d\u59cb\u5bc6\u7801\uff0c\u624d\u80fd\u8bbf\u95ee\u7ba1\u7406\u6570\u636e\u3002', passwordsMismatch: '\u4e24\u6b21\u8f93\u5165\u7684\u65b0\u5bc6\u7801\u4e0d\u4e00\u81f4\u3002', changingPassword: '\u6b63\u5728\u4fee\u6539\u5bc6\u7801...', passwordChangeFailed: '\u4fee\u6539\u5bc6\u7801\u5931\u8d25\uff0c\u8bf7\u4f7f\u7528\u81f3\u5c11 12 \u4f4d\u7684\u65b0\u5bc6\u7801\u3002', passwordChanged: '\u5bc6\u7801\u5df2\u4fee\u6539\uff0c\u73b0\u5df2\u83b7\u5f97\u7ba1\u7406\u8bbf\u95ee\u6743\u9650\u3002', signedIn: '\u767b\u5f55\u6210\u529f\uff0c\u4f1a\u8bdd\u5c06\u5728 {time} \u5230\u671f\u3002', statusFailed: '\u65e0\u6cd5\u8bfb\u53d6\u7ba1\u7406\u6570\u636e\u3002', api: 'API', clients: '\u5ba2\u6237\u7aef', tunnels: '\u96a7\u9053', auditEmpty: '\u6682\u65e0\u5ba1\u8ba1\u8bb0\u5f55\u3002', tcpPolicy: 'TCP \u96a7\u9053\u7b56\u7565', clientId: '\u5ba2\u6237\u7aef ID', tunnelName: '\u96a7\u9053\u540d\u79f0', publicPort: '\u516c\u7f51\u7aef\u53e3', targetAddress: '\u76ee\u6807\u5730\u5740\uff0c\u4f8b\u5982 127.0.0.1:2333', maxConnections: '\u6700\u5927\u8fde\u63a5\u6570', bandwidthLimit: '\u7b56\u7565\u603b\u5e26\u5bbd\u4e0a\u9650\uff08B/s\uff0c\u53ef\u9009\uff09', createTunnel: '\u521b\u5efa\u7b56\u7565', noTunnels: '\u6682\u65e0 TCP \u96a7\u9053\u7b56\u7565\u3002', enabled: '\u5df2\u542f\u7528', disabled: '\u5df2\u505c\u7528', online: '\u5728\u7ebf', offline: '\u79bb\u7ebf', enable: '\u542f\u7528', disable: '\u505c\u7528', delete: '\u5220\u9664', tunnelRequestFailed: '\u96a7\u9053\u7b56\u7565\u8bf7\u6c42\u5931\u8d25\u3002', activeConnections: '\u6d3b\u8dc3\u8fde\u63a5', pendingPairs: '\u5f85\u914d\u5bf9\u8fde\u63a5', traffic: 'TCP \u5165\u7ad9 / \u51fa\u7ad9\u6d41\u91cf', reconnects: '\u96a7\u9053\u91cd\u8fde\u6b21\u6570', authFailures: '\u8ba4\u8bc1\u5931\u8d25\u6b21\u6570', uptime: '\u670d\u52a1\u8fd0\u884c\u65f6\u95f4', seconds: '\u79d2', unlimited: '\u4e0d\u9650\u901f', active: '\u6d3b\u8dc3', rejected: '\u62d2\u7edd', failed: '\u5931\u8d25', limitBreakdown: '\u7b56\u7565/\u5168\u5c40/\u5f85\u914d\u5bf9\u9650\u5236', errorBreakdown: '\u914d\u5bf9/\u4f20\u8f93/\u751f\u5b58\u671f\u9519\u8bef', bandwidth: '\u5e26\u5bbd', auditLogin: '\u7ba1\u7406\u5458\u5df2\u767b\u5f55', auditLoginFailed: '\u7ba1\u7406\u5458\u767b\u5f55\u5931\u8d25', auditPasswordChanged: '\u7ba1\u7406\u5458\u5bc6\u7801\u5df2\u4fee\u6539', auditLogout: '\u7ba1\u7406\u5458\u5df2\u9000\u51fa', auditClientEnrolled: '\u5ba2\u6237\u7aef\u5df2\u6ce8\u518c', auditTunnelRegistered: 'TCP \u96a7\u9053\u5df2\u6ce8\u518c', auditSessionCreated: '\u4f1a\u8bdd\u5df2\u521b\u5efa', auditPasswordUpdated: '\u5bc6\u7801\u5df2\u66f4\u65b0'
+          title: 'LinkLake 管理端', toggle: 'EN', managementPlane: 'LinkLake / 管理平面', heading: '控制平面已在线。', intro: '请使用管理员账号登录。密码和会话密钥不会被浏览器脚本读取。',
+          usernameLabel: '用户名', passwordLabel: '密码', newPasswordLabel: '新密码', confirmPasswordLabel: '确认密码', username: '管理员用户名', password: '密码', newPassword: '新密码（至少 12 位）', confirmPassword: '确认新密码', signIn: '登录', changePassword: '修改密码',
+          waiting: '等待管理员登录。', signingIn: '正在登录...', signInFailed: '登录失败，请检查用户名和密码。', requestFailed: '服务端没有响应，请检查服务端日志和网络连接。', changeRequired: '必须先修改初始密码，才能访问管理数据。', passwordsMismatch: '两次输入的新密码不一致。', changingPassword: '正在修改密码...', passwordChangeFailed: '修改密码失败，请使用至少 12 位的新密码。', passwordChanged: '密码已修改，现已获得管理访问权限。', signedIn: '登录成功，会话将在 {time} 到期。', sessionExpired: '管理员会话已过期，请重新登录。', statusFailed: '无法读取管理数据。',
+          api: 'API', clients: '客户端', tunnels: 'TCP 隧道', httpRoutes: 'HTTP 路由', auditEmpty: '暂无审计记录。', client: '客户端', selectClient: '请选择客户端', noClients: '暂无可用的已注册客户端。',
+          tcpPolicy: 'TCP 隧道策略', tunnelNameLabel: '隧道名称', tunnelName: '隧道名称', publicPortLabel: '公网端口', publicPort: '公网端口', targetAddressLabel: '目标地址', targetAddress: '目标地址，例如 127.0.0.1:2333', maxConnectionsLabel: '最大连接数', maxConnections: '最大连接数', bandwidthLimitLabel: '带宽上限', bandwidthLimit: '策略总带宽上限（B/s，可选）', createTunnel: '创建 TCP 策略', noTunnels: '暂无 TCP 隧道策略。', tunnelRequestFailed: 'TCP 隧道策略请求失败。',
+          httpRoutePolicy: 'HTTP 域名路由', routeNameLabel: '路由名称', routeName: '路由名称', hostnameLabel: '域名', hostname: '域名，例如 app.example.com', httpTargetAddress: '目标地址，例如 127.0.0.1:8080', createHttpRoute: '创建 HTTP 路由', noHttpRoutes: '暂无 HTTP 域名路由。', httpRouteRequestFailed: 'HTTP 路由请求失败。', httpFirstStage: '当前仅支持 HTTP，尚未提供 HTTPS 证书自动化。',
+          enabled: '已启用', disabled: '已停用', online: '在线', offline: '离线', enable: '启用', disable: '停用', delete: '删除', confirmDeleteTcp: '确定删除这条 TCP 隧道策略吗？', confirmDeleteHttp: '确定删除这条 HTTP 路由吗？', activeConnections: '活跃连接', pendingPairs: '待配对连接', traffic: 'TCP 入站 / 出站流量', reconnects: '隧道重连次数', authFailures: '认证失败次数', uptime: '服务运行时间', seconds: '秒', unlimited: '不限速', active: '活跃', rejected: '拒绝', failed: '失败', requests: '请求', pairingTimeouts: '配对超时', limitBreakdown: '策略/全局/待配对限制', errorBreakdown: '配对/传输/生存期错误', bandwidth: '带宽',
+          auditLogin: '管理员已登录', auditLoginFailed: '管理员登录失败', auditPasswordChanged: '管理员密码已修改', auditLogout: '管理员已退出', auditClientEnrolled: '客户端已注册', auditTunnelRegistered: 'TCP 隧道已注册', auditTcpCreated: 'TCP 隧道策略已创建', auditTcpUpdated: 'TCP 隧道策略已更新', auditTcpDeleted: 'TCP 隧道策略已删除', auditHttpRegistered: 'HTTP 路由已注册', auditHttpCreated: 'HTTP 路由已创建', auditHttpUpdated: 'HTTP 路由已更新', auditHttpDeleted: 'HTTP 路由已删除', auditSessionCreated: '会话已创建', auditPasswordUpdated: '密码已更新', auditEnabled: '已启用', auditDisabled: '已停用', auditPolicyDeleted: '策略已删除',
+          errorUnknownClient: '所选客户端不存在。', errorInvalidName: '路由名称长度必须为 1 到 80 个字符。', errorInvalidHostname: '域名格式无效。', errorDuplicateHostname: '该域名已分配给其他路由。', errorInvalidTarget: '目标地址无效。', errorInvalidConnectionLimit: '最大连接数必须在 1 到 1024 之间。', errorUnknownHttpRoute: 'HTTP 路由不存在。'
         }
       };
-      const loginForm = document.querySelector('#login');
-      const changeForm = document.querySelector('#change-password');
-      const username = document.querySelector('#username');
-      const password = document.querySelector('#password');
-      const newPassword = document.querySelector('#new-password');
-      const confirmPassword = document.querySelector('#confirm-password');
-      const message = document.querySelector('#message');
-      const status = document.querySelector('#status');
-      const metrics = document.querySelector('#metrics');
-      const audit = document.querySelector('#audit');
-      const tunnelManagement = document.querySelector('#tunnel-management'); const tunnelList = document.querySelector('#tunnel-list'); const tunnelForm = document.querySelector('#tunnel-form');
-      const languageButton = document.querySelector('#language');
+
+      const elements = {
+        loginForm: document.querySelector('#login'), changeForm: document.querySelector('#change-password'), username: document.querySelector('#username'), password: document.querySelector('#password'), newPassword: document.querySelector('#new-password'), confirmPassword: document.querySelector('#confirm-password'), message: document.querySelector('#message'), status: document.querySelector('#status'), metrics: document.querySelector('#metrics'), audit: document.querySelector('#audit'), policyManagement: document.querySelector('#policy-management'), tunnelForm: document.querySelector('#tunnel-form'), tunnelList: document.querySelector('#tunnel-list'), tunnelClient: document.querySelector('#tunnel-client-id'), httpRouteForm: document.querySelector('#http-route-form'), httpRouteList: document.querySelector('#http-route-list'), httpRouteClient: document.querySelector('#http-route-client-id'), languageButton: document.querySelector('#language')
+      };
       let language = localStorage.getItem('linklake-language') || (navigator.language.toLowerCase().startsWith('zh') ? 'zh' : 'en');
       let dashboard = null;
       let refreshTimer = null;
-      function text(key) { return words[language][key]; }
-      function setMessage(key, values = {}) { message.className = ''; message.dataset.key = key; message.dataset.values = JSON.stringify(values); message.textContent = text(key).replace('{time}', values.time || ''); }
+
+      function text(key) { return words[language][key] || key; }
+      function setMessage(key, values = {}, error = false) {
+        elements.message.className = error ? 'error' : '';
+        elements.message.dataset.key = key;
+        elements.message.dataset.values = JSON.stringify(values);
+        elements.message.textContent = text(key).replace('{time}', values.time || '');
+      }
       function applyLanguage() {
-        document.documentElement.lang = language === 'zh' ? 'zh-CN' : 'en'; document.title = text('title'); languageButton.textContent = text('toggle');
+        document.documentElement.lang = language === 'zh' ? 'zh-CN' : 'en';
+        document.title = text('title');
+        elements.languageButton.textContent = text('toggle');
         document.querySelectorAll('[data-i18n]').forEach(element => { element.textContent = text(element.dataset.i18n); });
         document.querySelectorAll('[data-placeholder]').forEach(element => { element.placeholder = text(element.dataset.placeholder); });
-        if (!message.textContent) setMessage('waiting');
-        else if (message.dataset.key) { const values = JSON.parse(message.dataset.values || '{}'); message.textContent = text(message.dataset.key).replace('{time}', values.time || ''); }
+        if (!elements.message.textContent) setMessage('waiting');
+        else if (elements.message.dataset.key) setMessage(elements.message.dataset.key, JSON.parse(elements.message.dataset.values || '{}'), elements.message.classList.contains('error'));
         if (dashboard) renderDashboard();
       }
       function addCard(container, headline, caption, detail) {
-        const article = document.createElement('article'); const strong = document.createElement('strong'); const span = document.createElement('span'); strong.textContent = headline; span.textContent = caption; article.append(strong, span);
-        if (detail) { const extra = document.createElement('span'); extra.className = 'audit-detail'; extra.textContent = detail; article.append(extra); }
+        const article = document.createElement('article');
+        const strong = document.createElement('strong');
+        const span = document.createElement('span');
+        strong.textContent = headline;
+        span.textContent = caption;
+        article.append(strong, span);
+        if (detail) {
+          const extra = document.createElement('span');
+          extra.className = 'audit-detail';
+          extra.textContent = detail;
+          article.append(extra);
+        }
         container.append(article);
       }
-      function formatBytes(value) { if (value < 1024) return `${value} B`; if (value < 1048576) return `${(value / 1024).toFixed(1)} KiB`; return `${(value / 1048576).toFixed(1)} MiB`; }
+      function formatBytes(value) {
+        if (value < 1024) return `${value} B`;
+        if (value < 1048576) return `${(value / 1024).toFixed(1)} KiB`;
+        return `${(value / 1048576).toFixed(1)} MiB`;
+      }
       function formatRate(value) { return value ? `${formatBytes(value)}/s` : text('unlimited'); }
       function auditText(event) {
-        const actions = { 'management.login': 'auditLogin', 'management.login.failed': 'auditLoginFailed', 'management.password.changed': 'auditPasswordChanged', 'management.logout': 'auditLogout', 'client.enrolled': 'auditClientEnrolled', 'tcp_tunnel.registered': 'auditTunnelRegistered' };
-        const details = { 'session created': 'auditSessionCreated', 'password updated': 'auditPasswordUpdated' };
+        const actions = {
+          'management.login': 'auditLogin', 'management.login.failed': 'auditLoginFailed', 'management.password.changed': 'auditPasswordChanged', 'management.logout': 'auditLogout', 'client.enrolled': 'auditClientEnrolled', 'tcp_tunnel.registered': 'auditTunnelRegistered', 'tcp_tunnel.policy.created': 'auditTcpCreated', 'tcp_tunnel.policy.updated': 'auditTcpUpdated', 'tcp_tunnel.policy.deleted': 'auditTcpDeleted', 'http_route.registered': 'auditHttpRegistered', 'http_route.policy.created': 'auditHttpCreated', 'http_route.policy.updated': 'auditHttpUpdated', 'http_route.policy.deleted': 'auditHttpDeleted'
+        };
+        const details = { 'session created': 'auditSessionCreated', 'password updated': 'auditPasswordUpdated', enabled: 'auditEnabled', disabled: 'auditDisabled', 'policy deleted': 'auditPolicyDeleted' };
         return { action: actions[event.action] ? text(actions[event.action]) : event.action, detail: details[event.detail] ? text(details[event.detail]) : event.detail };
       }
-      languageButton.addEventListener('click', () => { language = language === 'zh' ? 'en' : 'zh'; localStorage.setItem('linklake-language', language); applyLanguage(); });
-      function renderDashboard() {
-        status.replaceChildren(); metrics.replaceChildren(); audit.replaceChildren();
-        addCard(status, dashboard.status.api_version, text('api')); addCard(status, String(dashboard.status.clients), text('clients')); addCard(status, String(dashboard.status.tunnels), text('tunnels')); status.classList.remove('hidden');
-        addCard(metrics, String(dashboard.metrics.tcp_active_connections), text('activeConnections'));
-        addCard(metrics, String(dashboard.metrics.tcp_pending_connections), text('pendingPairs'));
-        addCard(metrics, `${formatBytes(dashboard.metrics.tcp_bytes_from_public)} / ${formatBytes(dashboard.metrics.tcp_bytes_to_public)}`, text('traffic'));
-        addCard(metrics, String(dashboard.metrics.tunnel_reconnects_total), text('reconnects'));
-        addCard(metrics, String(dashboard.metrics.authentication_failures_total), text('authFailures'));
-        addCard(metrics, `${dashboard.metrics.uptime_seconds} ${text('seconds')}`, text('uptime'));
-        metrics.classList.remove('hidden');
-        if (dashboard.events.length === 0) addCard(audit, text('auditEmpty'), '');
-        else dashboard.events.forEach(event => { const translated = auditText(event); addCard(audit, `${translated.action} - ${new Date(event.occurred_unix_seconds * 1000).toLocaleString(language)}`, event.subject, translated.detail); });
-        audit.classList.remove('hidden');
-        tunnelList.replaceChildren();
-        if (dashboard.policies.length === 0) addCard(tunnelList, text('noTunnels'), '');
-        else dashboard.policies.forEach(policy => {
-          const article = document.createElement('article'); const title = document.createElement('strong'); const detail = document.createElement('span'); const actions = document.createElement('div');
-          title.textContent = `${policy.name} :${policy.public_port} (${policy.enabled ? text('enabled') : text('disabled')}, ${policy.online ? text('online') : text('offline')})`;
-          detail.textContent = `${policy.client_id} -> ${policy.target_addr} | ${policy.active_connections}/${policy.max_connections} ${text('active')} | ${policy.rejected_connections} ${text('rejected')} (${text('limitBreakdown')}: ${policy.rejected_policy_limit}/${policy.rejected_global_limit}/${policy.rejected_pending_limit}) | ${formatBytes(policy.bytes_from_public)} / ${formatBytes(policy.bytes_to_public)} | ${policy.failed_connections} ${text('failed')} (${text('errorBreakdown')}: ${policy.pairing_timeouts}/${policy.transfer_errors}/${policy.lifetime_timeouts}) | ${text('bandwidth')}: ${formatRate(policy.bandwidth_limit_bps)}`;
-          actions.className = 'tunnel-actions';
-          const toggle = document.createElement('button'); toggle.type = 'button'; toggle.textContent = policy.enabled ? text('disable') : text('enable'); toggle.onclick = () => updateTunnel(policy.id, !policy.enabled);
-          const remove = document.createElement('button'); remove.type = 'button'; remove.textContent = text('delete'); remove.onclick = () => deleteTunnel(policy.id); actions.append(toggle, remove); article.append(title, detail, actions); tunnelList.append(article);
+      function renderClientOptions(select) {
+        const selected = select.value;
+        select.replaceChildren();
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = dashboard.clients.length ? text('selectClient') : text('noClients');
+        placeholder.disabled = true;
+        placeholder.selected = true;
+        select.append(placeholder);
+        dashboard.clients.forEach(client => {
+          const option = document.createElement('option');
+          option.value = client.client_id;
+          option.textContent = `${client.name} (${client.platform}) · ${client.client_id}`;
+          select.append(option);
         });
-        tunnelManagement.classList.remove('hidden');
+        if (dashboard.clients.some(client => client.client_id === selected)) select.value = selected;
+      }
+      function addPolicyCard(container, titleText, detailText, enabled, onToggle, onDelete) {
+        const article = document.createElement('article');
+        const title = document.createElement('strong');
+        const detail = document.createElement('span');
+        const actions = document.createElement('div');
+        title.textContent = titleText;
+        detail.className = 'policy-detail';
+        detail.textContent = detailText;
+        actions.className = 'policy-actions';
+        const toggle = document.createElement('button');
+        toggle.type = 'button';
+        toggle.textContent = enabled ? text('disable') : text('enable');
+        toggle.onclick = onToggle;
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.textContent = text('delete');
+        remove.onclick = onDelete;
+        actions.append(toggle, remove);
+        article.append(title, detail, actions);
+        container.append(article);
+      }
+      function renderDashboard() {
+        elements.status.replaceChildren();
+        elements.metrics.replaceChildren();
+        elements.audit.replaceChildren();
+        elements.tunnelList.replaceChildren();
+        elements.httpRouteList.replaceChildren();
+        renderClientOptions(elements.tunnelClient);
+        renderClientOptions(elements.httpRouteClient);
+
+        addCard(elements.status, dashboard.status.api_version, text('api'));
+        addCard(elements.status, String(dashboard.status.clients), text('clients'));
+        addCard(elements.status, String(dashboard.tcpPolicies.length), text('tunnels'));
+        addCard(elements.status, String(dashboard.httpRoutes.length), text('httpRoutes'));
+        elements.status.classList.remove('hidden');
+
+        addCard(elements.metrics, String(dashboard.metrics.tcp_active_connections), text('activeConnections'));
+        addCard(elements.metrics, String(dashboard.metrics.tcp_pending_connections), text('pendingPairs'));
+        addCard(elements.metrics, `${formatBytes(dashboard.metrics.tcp_bytes_from_public)} / ${formatBytes(dashboard.metrics.tcp_bytes_to_public)}`, text('traffic'));
+        addCard(elements.metrics, String(dashboard.metrics.tunnel_reconnects_total), text('reconnects'));
+        addCard(elements.metrics, String(dashboard.metrics.authentication_failures_total), text('authFailures'));
+        addCard(elements.metrics, `${dashboard.metrics.uptime_seconds} ${text('seconds')}`, text('uptime'));
+        elements.metrics.classList.remove('hidden');
+
+        if (dashboard.events.length === 0) addCard(elements.audit, text('auditEmpty'), '');
+        else dashboard.events.forEach(event => {
+          const translated = auditText(event);
+          addCard(elements.audit, `${translated.action} - ${new Date(event.occurred_unix_seconds * 1000).toLocaleString(language)}`, event.subject, translated.detail);
+        });
+        elements.audit.classList.remove('hidden');
+
+        if (dashboard.tcpPolicies.length === 0) addCard(elements.tunnelList, text('noTunnels'), '');
+        else dashboard.tcpPolicies.forEach(policy => {
+          const title = `${policy.name} :${policy.public_port} (${policy.enabled ? text('enabled') : text('disabled')}, ${policy.online ? text('online') : text('offline')})`;
+          const detail = `${policy.client_id} -> ${policy.target_addr} | ${policy.active_connections}/${policy.max_connections} ${text('active')} | ${policy.rejected_connections} ${text('rejected')} (${text('limitBreakdown')}: ${policy.rejected_policy_limit}/${policy.rejected_global_limit}/${policy.rejected_pending_limit}) | ${formatBytes(policy.bytes_from_public)} / ${formatBytes(policy.bytes_to_public)} | ${policy.failed_connections} ${text('failed')} (${text('errorBreakdown')}: ${policy.pairing_timeouts}/${policy.transfer_errors}/${policy.lifetime_timeouts}) | ${text('bandwidth')}: ${formatRate(policy.bandwidth_limit_bps)}`;
+          addPolicyCard(elements.tunnelList, title, detail, policy.enabled, () => updatePolicy('tcp-tunnels', policy.id, !policy.enabled, 'tunnelRequestFailed'), () => deletePolicy('tcp-tunnels', policy.id, 'confirmDeleteTcp', 'tunnelRequestFailed'));
+        });
+
+        if (dashboard.httpRoutes.length === 0) addCard(elements.httpRouteList, text('noHttpRoutes'), '', text('httpFirstStage'));
+        else dashboard.httpRoutes.forEach(route => {
+          const title = `${route.name} · http://${route.hostname} (${route.enabled ? text('enabled') : text('disabled')}, ${route.online ? text('online') : text('offline')})`;
+          const detail = `${route.client_id} -> ${route.target_addr} | ${route.active_connections}/${route.max_connections} ${text('active')} | ${route.requests_total} ${text('requests')} | ${route.failed_requests} ${text('failed')} | ${formatBytes(route.bytes_from_public)} / ${formatBytes(route.bytes_to_public)} | ${route.pairing_timeouts} ${text('pairingTimeouts')}`;
+          addPolicyCard(elements.httpRouteList, title, detail, route.enabled, () => updatePolicy('http-routes', route.id, !route.enabled, 'httpRouteRequestFailed'), () => deletePolicy('http-routes', route.id, 'confirmDeleteHttp', 'httpRouteRequestFailed'));
+        });
+        elements.policyManagement.classList.remove('hidden');
+      }
+      async function readApiError(response, fallbackKey) {
+        try {
+          const error = await response.json();
+          const keys = { unknown_client: 'errorUnknownClient', invalid_name: 'errorInvalidName', invalid_hostname: 'errorInvalidHostname', duplicate_hostname: 'errorDuplicateHostname', invalid_target: 'errorInvalidTarget', invalid_connection_limit: 'errorInvalidConnectionLimit', unknown_http_route: 'errorUnknownHttpRoute' };
+          return keys[error.code] || fallbackKey;
+        } catch (_) {
+          return fallbackKey;
+        }
+      }
+      function resetForExpiredSession() {
+        if (refreshTimer) clearInterval(refreshTimer);
+        refreshTimer = null;
+        dashboard = null;
+        elements.status.classList.add('hidden');
+        elements.metrics.classList.add('hidden');
+        elements.audit.classList.add('hidden');
+        elements.policyManagement.classList.add('hidden');
+        elements.loginForm.classList.remove('hidden');
+        setMessage('sessionExpired', {}, true);
       }
       async function loadManagementData() {
-        const [statusResponse, metricsResponse, auditResponse, tunnelResponse] = await Promise.all([fetch('/api/v1/status'), fetch('/api/v1/metrics'), fetch('/api/v1/audit?limit=10'), fetch('/api/v1/tcp-tunnels')]);
-        if (!statusResponse.ok || !metricsResponse.ok || !auditResponse.ok || !tunnelResponse.ok) throw new Error(text('statusFailed'));
-        dashboard = { status: await statusResponse.json(), metrics: await metricsResponse.json(), events: await auditResponse.json(), policies: await tunnelResponse.json() };
+        const responses = await Promise.all(['/api/v1/status', '/api/v1/metrics', '/api/v1/audit?limit=10', '/api/v1/tcp-tunnels', '/api/v1/http-routes', '/api/v1/clients'].map(url => fetch(url)));
+        if (responses.some(response => response.status === 401)) {
+          resetForExpiredSession();
+          throw new Error(text('sessionExpired'));
+        }
+        if (responses.some(response => !response.ok)) throw new Error(text('statusFailed'));
+        const [statusData, metricsData, events, tcpPolicies, httpRoutes, clients] = await Promise.all(responses.map(response => response.json()));
+        dashboard = { status: statusData, metrics: metricsData, events, tcpPolicies, httpRoutes, clients };
         renderDashboard();
       }
       function startAutoRefresh() {
-        if (refreshTimer) return;
-        refreshTimer = setInterval(() => loadManagementData().catch(() => {}), 5000);
+        if (!refreshTimer) refreshTimer = setInterval(() => loadManagementData().catch(() => {}), 5000);
       }
-      async function updateTunnel(id, enabled) { const response = await fetch(`/api/v1/tcp-tunnels/${id}/enabled`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) }); if (!response.ok) { message.className = 'error'; message.textContent = text('tunnelRequestFailed'); return; } await loadManagementData(); }
-      async function deleteTunnel(id) { const response = await fetch(`/api/v1/tcp-tunnels/${id}`, { method: 'DELETE' }); if (!response.ok) { message.className = 'error'; message.textContent = text('tunnelRequestFailed'); return; } await loadManagementData(); }
-      loginForm.addEventListener('submit', async event => {
-        event.preventDefault(); setMessage('signingIn');
-        const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), 15000);
-        try {
-          const response = await fetch('/api/v1/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: username.value, password: password.value }), signal: controller.signal }); password.value = '';
-          if (!response.ok) { message.className = 'error'; message.textContent = text('signInFailed'); return; }
-          const login = await response.json(); loginForm.classList.add('hidden');
-          if (login.password_change_required) { changeForm.classList.remove('hidden'); setMessage('changeRequired'); return; }
-          try { await loadManagementData(); startAutoRefresh(); setMessage('signedIn', { time: new Date(login.expires_unix_seconds * 1000).toLocaleString(language) }); } catch (error) { message.className = 'error'; message.textContent = error.message; }
-        } catch (_) { message.className = 'error'; message.textContent = text('requestFailed'); }
-        finally { clearTimeout(timeout); }
+      async function updatePolicy(resource, id, enabled, fallbackKey) {
+        const response = await fetch(`/api/v1/${resource}/${id}/enabled`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) });
+        if (response.status === 401) return resetForExpiredSession();
+        if (!response.ok) return setMessage(await readApiError(response, fallbackKey), {}, true);
+        await loadManagementData();
+      }
+      async function deletePolicy(resource, id, confirmationKey, fallbackKey) {
+        if (!window.confirm(text(confirmationKey))) return;
+        const response = await fetch(`/api/v1/${resource}/${id}`, { method: 'DELETE' });
+        if (response.status === 401) return resetForExpiredSession();
+        if (!response.ok) return setMessage(await readApiError(response, fallbackKey), {}, true);
+        await loadManagementData();
+      }
+
+      elements.languageButton.addEventListener('click', () => {
+        language = language === 'zh' ? 'en' : 'zh';
+        localStorage.setItem('linklake-language', language);
+        applyLanguage();
       });
-      changeForm.addEventListener('submit', async event => {
+      elements.loginForm.addEventListener('submit', async event => {
         event.preventDefault();
-        if (newPassword.value !== confirmPassword.value) { message.className = 'error'; message.textContent = text('passwordsMismatch'); return; }
-        setMessage('changingPassword');
-        const response = await fetch('/api/v1/auth/change-password', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ new_password: newPassword.value }) }); newPassword.value = ''; confirmPassword.value = '';
-        if (!response.ok) { message.className = 'error'; message.textContent = text('passwordChangeFailed'); return; }
-        changeForm.classList.add('hidden');
-        try { await loadManagementData(); startAutoRefresh(); setMessage('passwordChanged'); } catch (error) { message.className = 'error'; message.textContent = error.message; }
+        setMessage('signingIn');
+        const submit = event.submitter;
+        submit.disabled = true;
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 15000);
+        try {
+          const response = await fetch('/api/v1/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: elements.username.value, password: elements.password.value }), signal: controller.signal });
+          elements.password.value = '';
+          if (!response.ok) return setMessage('signInFailed', {}, true);
+          const login = await response.json();
+          elements.loginForm.classList.add('hidden');
+          if (login.password_change_required) {
+            elements.changeForm.classList.remove('hidden');
+            setMessage('changeRequired');
+            return;
+          }
+          await loadManagementData();
+          startAutoRefresh();
+          setMessage('signedIn', { time: new Date(login.expires_unix_seconds * 1000).toLocaleString(language) });
+        } catch (_) {
+          setMessage('requestFailed', {}, true);
+        } finally {
+          clearTimeout(timeout);
+          submit.disabled = false;
+        }
       });
-      tunnelForm.addEventListener('submit', async event => {
-        event.preventDefault(); const bandwidth = document.querySelector('#tunnel-bandwidth').value; const response = await fetch('/api/v1/tcp-tunnels', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ client_id: document.querySelector('#tunnel-client-id').value, name: document.querySelector('#tunnel-name').value, public_port: Number(document.querySelector('#tunnel-port').value), target_addr: document.querySelector('#tunnel-target').value, max_connections: Number(document.querySelector('#tunnel-max').value), bandwidth_limit_bps: bandwidth ? Number(bandwidth) : null }) });
-        if (!response.ok) { message.className = 'error'; message.textContent = text('tunnelRequestFailed'); return; } tunnelForm.reset(); await loadManagementData();
+      elements.changeForm.addEventListener('submit', async event => {
+        event.preventDefault();
+        if (elements.newPassword.value !== elements.confirmPassword.value) return setMessage('passwordsMismatch', {}, true);
+        setMessage('changingPassword');
+        const submit = event.submitter;
+        submit.disabled = true;
+        try {
+          const response = await fetch('/api/v1/auth/change-password', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ new_password: elements.newPassword.value }) });
+          elements.newPassword.value = '';
+          elements.confirmPassword.value = '';
+          if (!response.ok) return setMessage('passwordChangeFailed', {}, true);
+          elements.changeForm.classList.add('hidden');
+          await loadManagementData();
+          startAutoRefresh();
+          setMessage('passwordChanged');
+        } catch (_) {
+          setMessage('requestFailed', {}, true);
+        } finally {
+          submit.disabled = false;
+        }
+      });
+      elements.tunnelForm.addEventListener('submit', async event => {
+        event.preventDefault();
+        const submit = event.submitter;
+        submit.disabled = true;
+        const bandwidth = document.querySelector('#tunnel-bandwidth').value;
+        try {
+          const response = await fetch('/api/v1/tcp-tunnels', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ client_id: elements.tunnelClient.value, name: document.querySelector('#tunnel-name').value, public_port: Number(document.querySelector('#tunnel-port').value), target_addr: document.querySelector('#tunnel-target').value, max_connections: Number(document.querySelector('#tunnel-max').value), bandwidth_limit_bps: bandwidth ? Number(bandwidth) : null }) });
+          if (response.status === 401) return resetForExpiredSession();
+          if (!response.ok) return setMessage('tunnelRequestFailed', {}, true);
+          elements.tunnelForm.reset();
+          await loadManagementData();
+        } catch (_) {
+          setMessage('requestFailed', {}, true);
+        } finally {
+          submit.disabled = false;
+        }
+      });
+      elements.httpRouteForm.addEventListener('submit', async event => {
+        event.preventDefault();
+        const submit = event.submitter;
+        submit.disabled = true;
+        try {
+          const response = await fetch('/api/v1/http-routes', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ client_id: elements.httpRouteClient.value, name: document.querySelector('#http-route-name').value, hostname: document.querySelector('#http-route-hostname').value, target_addr: document.querySelector('#http-route-target').value, max_connections: Number(document.querySelector('#http-route-max').value) }) });
+          if (response.status === 401) return resetForExpiredSession();
+          if (!response.ok) return setMessage(await readApiError(response, 'httpRouteRequestFailed'), {}, true);
+          elements.httpRouteForm.reset();
+          await loadManagementData();
+        } catch (_) {
+          setMessage('requestFailed', {}, true);
+        } finally {
+          submit.disabled = false;
+        }
       });
       applyLanguage();
     </script>
