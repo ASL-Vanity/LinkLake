@@ -1,0 +1,95 @@
+name: Release packages
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows-package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Select pinned Rust toolchain
+        shell: pwsh
+        run: rustup default 1.88.0
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~\.cargo\registry
+            ~\.cargo\git
+            target
+          key: windows-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: windows-release-
+      - name: Build Windows package
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\package-windows.ps1
+      - name: Verify Windows package
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-windows-package.ps1
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linklake-windows-x86_64
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+          if-no-files-found: error
+
+  linux-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Select pinned Rust toolchain
+        run: rustup default 1.88.0
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: linux-release-
+      - name: Build Linux package
+        run: bash scripts/package-linux.sh
+      - name: Verify Linux package
+        run: bash scripts/verify-linux-package.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linklake-linux-x86_64
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - windows-package
+      - linux-package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --verify-tag --generate-notes
+          gh release upload "$TAG" dist/* --clobber

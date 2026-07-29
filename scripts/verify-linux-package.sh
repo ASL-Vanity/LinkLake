@@ -1,0 +1,32 @@
+#!/usr/bin/env sh
+set -eu
+
+project_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+output_directory="${1:-$project_root/dist}"
+version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' "$project_root/Cargo.toml" | head -n 1)"
+archive="$output_directory/linklake-$version-linux-x86_64.tar.gz"
+checksum="$archive.sha256"
+
+test -f "$archive"
+test -f "$checksum"
+(cd "$output_directory" && sha256sum -c "$(basename "$checksum")")
+
+required='bin/linklake-server
+bin/linklake-client
+systemd/linklake-server.service
+systemd/linklake-client.service
+systemd/server.env.example
+systemd/install-linux.sh
+README.md
+README.en.md
+release.json'
+
+entries="$(tar -tzf "$archive" | sed 's#^[^/]*/##')"
+printf '%s\n' "$required" | while IFS= read -r entry; do
+  printf '%s\n' "$entries" | grep -Fx "$entry" >/dev/null || {
+    echo "Missing archive entry: $entry" >&2
+    exit 1
+  }
+done
+
+echo "Verified $archive"

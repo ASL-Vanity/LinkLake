@@ -1,0 +1,27 @@
+[package]
+name = "linklake-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+argon2.workspace = true
+axum.workspace = true
+axum-server.workspace = true
+linklake-core = { path = "../linklake-core" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tower-http.workspace = true
+uuid.workspace = true
+rustls-pemfile.workspace = true
+rustls.workspace = true
+rusqlite.workspace = true
+tracing-appender.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-service.workspace = true

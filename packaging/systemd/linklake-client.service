@@ -1,0 +1,25 @@
+[Unit]
+Description=LinkLake TCP tunnel client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=linklake
+Group=linklake
+Environment=LINKLAKE_LOG_DIR=/var/log/linklake-client
+WorkingDirectory=/var/lib/linklake-client
+ExecStart=/usr/local/bin/linklake-client run --config /etc/linklake/client.toml
+Restart=always
+RestartSec=3
+TimeoutStopSec=15
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/etc/linklake/client.toml
+ReadWritePaths=/var/lib/linklake-client /var/log/linklake-client
+
+[Install]
+WantedBy=multi-user.target

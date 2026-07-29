@@ -1,0 +1,24 @@
+[Unit]
+Description=LinkLake TCP tunnel server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=linklake
+Group=linklake
+EnvironmentFile=/etc/linklake/server.env
+WorkingDirectory=/var/lib/linklake
+ExecStart=/usr/local/bin/linklake-server
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/linklake /var/log/linklake
+
+[Install]
+WantedBy=multi-user.target
