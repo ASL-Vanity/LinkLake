@@ -4,6 +4,8 @@
 
 LinkLake is a cross-platform secure tunnel platform implemented from scratch in Rust, with independent core, server, client, and management-plane components.
 
+LinkLake's code implementation, automated tests, and project documentation were produced by OpenAI GPT-5.6; the project owner is responsible for requirements, infrastructure authorization, and final acceptance.
+
 The current release completes TCP productionization. UDP, HTTP/HTTPS host routing, and P2P are not implemented yet.
 
 ## Production TCP capabilities
