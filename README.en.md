@@ -6,7 +6,7 @@ LinkLake is a cross-platform secure tunnel platform implemented from scratch in 
 
 LinkLake's code implementation, automated tests, and project documentation were produced by OpenAI GPT-5.6; the project owner is responsible for requirements, infrastructure authorization, and final acceptance.
 
-The current release completes TCP productionization and the first stage of HTTP host routing. Automated HTTPS certificates, UDP, and P2P are not implemented yet.
+The current release completes TCP productionization, HTTP host routing, and the first stage of native HTTPS with ACME certificate automation. UDP and P2P are not implemented yet.
 
 ## Production TCP capabilities
 
@@ -22,15 +22,20 @@ The current release completes TCP productionization and the first stage of HTTP 
 - Native Windows services and Linux systemd units
 - Hourly server/client log rotation with 168 files retained by default
 
-## HTTP host routing
+## HTTP/HTTPS host routing
 
-- Routes requests by Host to a selected client and its local HTTP service
-- Persists HTTP route policies in SQLite with create, enable, disable, delete, and online-state management
+- Routes requests by HTTP Host and TLS SNI to a selected client and its local HTTP service
+- Persists HTTP/HTTPS route policies in SQLite with create, enable, disable, delete, and online-state management
 - Configures a maximum concurrent connection count per route and records requests, failures, traffic, and pairing timeouts
-- Provides bilingual HTTP route management in the Web UI
-- The first stage handles HTTP only; HTTPS termination and automated certificate issuance and renewal remain planned
+- Terminates TLS natively, selects certificates by exact SNI, and rejects missing or unknown SNI and SNI/Host mismatches
+- Supports Let's Encrypt production, staging, and custom ACME directories with HTTP-01 issuance and automatic renewal
+- Provides bilingual ACME settings, per-route TLS controls, immediate issue/renew actions, certificate status, and errors in the Web UI
+- Can return a `308` HTTP-to-HTTPS redirect after the certificate is active; the HTTP-01 challenge path always remains reachable over plain HTTP
+- The first stage supports HTTP/1.1 and WebSocket/WSS; wildcard certificates that require DNS-01 are not supported
 
-Before using a route, point its DNS record to the LinkLake server and ensure the public HTTP entry point can reach the server's configured HTTP listener.
+Before using a route, point its DNS record to the LinkLake server. HTTP-01 requires public port 80 to reach `LINKLAKE_HTTP_BIND` with the original Host, while public port 443 must deliver the TLS stream unchanged to `LINKLAKE_HTTPS_BIND` so LinkLake can select the certificate by SNI and terminate TLS.
+
+If an upstream Nginx instance already terminates business TLS on port 443, LinkLake-managed certificates are not used. Let LinkLake bind port 443 directly, or use Nginx `stream` SNI routing for TCP pass-through; the management UI can remain on a separate management TLS entry point. Port 80 may use a regular reverse proxy, but it must preserve Host and must not intercept `/.well-known/acme-challenge/`.
 
 ## Run locally
 
@@ -39,6 +44,8 @@ $env:LINKLAKE_ENROLLMENT_TOKEN = "choose-a-long-random-token"
 $env:LINKLAKE_ADMIN_USERNAME = "admin"
 $env:LINKLAKE_ADMIN_PASSWORD = "choose-a-password-with-at-least-12-characters"
 $env:LINKLAKE_DATA_DIR = "C:\LinkLake\data"
+$env:LINKLAKE_HTTP_BIND = "127.0.0.1:32102"
+$env:LINKLAKE_HTTPS_BIND = "127.0.0.1:32103"
 cargo run -p linklake-server
 ```
 
@@ -80,10 +87,14 @@ Remote control connections also require `control_ca_cert` and `control_server_na
 - Public health endpoint: `GET /api/v1/health`
 - Authenticated metrics endpoint: `GET /api/v1/metrics`
 - TCP policies: `GET/POST /api/v1/tcp-tunnels`
-- HTTP routes: `GET/POST /api/v1/http-routes`
-- Enable or disable an HTTP route: `POST /api/v1/http-routes/:id/enabled`
-- Delete an HTTP route: `DELETE /api/v1/http-routes/:id`
-- The Web UI configures TCP aggregate bandwidth limits and TCP/HTTP connection limits
+- HTTP/HTTPS routes: `GET/POST /api/v1/http-routes`
+- Enable or disable a route: `POST /api/v1/http-routes/:id/enabled`
+- Route TLS settings: `PUT /api/v1/http-routes/:id/tls`
+- Immediate issue or renewal: `POST /api/v1/http-routes/:id/certificate/issue|renew`
+- ACME settings: `GET/PUT /api/v1/acme/config`
+- Delete a route: `DELETE /api/v1/http-routes/:id`
+- The Web UI configures TCP aggregate bandwidth, TCP/HTTP connection limits, the ACME environment, and HTTPS per route
+- Metrics cover HTTP/HTTPS traffic and failures, TLS handshake failures, managed, expiring, and expired certificates, ACME orders, renewals, and HTTP-01 challenges
 - `LINKLAKE_MANAGEMENT_TOKEN` is an optional automation Bearer token, not a Web login credential
 
 Set logs with `LINKLAKE_LOG_DIR`. The server defaults to `LINKLAKE_DATA_DIR/logs`; the client writes to the console when unset, while service installers configure a rotating log directory.
@@ -103,6 +114,8 @@ linklake-server restore --data-dir C:\LinkLake\data --input D:\Backups\linklake.
 ```
 
 Restore validates SQLite integrity and preserves the old database as `linklake.sqlite3.pre-restore-<timestamp>`.
+
+ACME account credentials and certificate private keys live under `LINKLAKE_DATA_DIR/acme` and `LINKLAKE_DATA_DIR/certificates`; they are not included in the SQLite-only `backup` output. Back up those directories separately with encryption for full disaster recovery, and treat every database and certificate backup as sensitive credentials.
 
 ## Production installation
 
@@ -141,20 +154,21 @@ On Linux:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
+pwsh -NoProfile -File ./tests/https-e2e.ps1
 bash scripts/package-linux.sh
 bash scripts/verify-linux-package.sh
 ```
 
-The TCP E2E suite covers real binary echo traffic, bandwidth limits, connection limits, reconnects, policy lifecycle, pairing timeout, and metrics. The HTTP E2E suite covers Host routing, request and response transfer, connection limits, client reconnects, policy lifecycle, and metrics.
+The TCP E2E suite covers real binary echo traffic, bandwidth limits, connection limits, reconnects, policy lifecycle, pairing timeout, and metrics. The HTTP E2E suite covers Host routing, request and response transfer, connection limits, client reconnects, policy lifecycle, and metrics. Linux CI runs HTTPS/ACME E2E against a local Pebble service, covering HTTP-01, SNI, issuance and renewal, HTTPS forwarding, redirects, persistence, failure recovery, and certificate metrics without contacting a public certificate authority.
 
 Packaging scripts honor `SOURCE_DATE_EPOCH`. With the same timestamp, source, toolchain, target platform, and locked dependencies, archive ordering, timestamps, and release metadata remain stable. Windows produces a ZIP plus SHA-256; Linux produces a tar.gz plus SHA-256.
 
-`.github/workflows/ci.yml` runs formatting, Clippy, unit tests, script syntax checks, and Windows TCP/HTTP E2E for pushes and pull requests. `.github/workflows/release.yml` builds both platform packages when manually dispatched and creates or updates a GitHub Release for `v*` tags.
+`.github/workflows/ci.yml` runs formatting, Clippy, unit tests, script syntax checks, Windows TCP/HTTP E2E, and Linux Pebble HTTPS/ACME E2E for pushes and pull requests. `.github/workflows/release.yml` builds both platform packages when manually dispatched and creates or updates a GitHub Release for `v*` tags.
 
 ## Roadmap
 
 1. HTTP host routing: first stage complete
-2. HTTPS termination and certificate automation
+2. HTTPS termination and certificate automation: first stage complete
 3. UDP tunnels
 4. Flutter management client
 5. Multi-node and P2P operation with explicit relay fallback

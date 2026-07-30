@@ -1,5 +1,5 @@
 [Unit]
-Description=LinkLake TCP tunnel server
+Description=LinkLake TCP, HTTP, and HTTPS tunnel server
 After=network-online.target
 Wants=network-online.target
 

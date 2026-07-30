@@ -7,7 +7,7 @@
     <style>
       :root { color-scheme: dark; font-family: Inter, "Segoe UI", sans-serif; background: #07131f; color: #e8f2f7; }
       body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: radial-gradient(circle at 20% 0%, #123456, #07131f 52%); }
-      main { width: min(1040px, calc(100% - 48px)); margin: 24px 0; padding: 42px; border: 1px solid #22506b; border-radius: 18px; background: rgba(8, 25, 39, .9); box-shadow: 0 24px 72px #0008; }
+      main { width: min(1320px, calc(100% - 48px)); margin: 24px 0; padding: 42px; border: 1px solid #22506b; border-radius: 18px; background: rgba(8, 25, 39, .9); box-shadow: 0 24px 72px #0008; }
       .top { display: flex; justify-content: space-between; gap: 18px; align-items: center; }
       .mark { color: #43d9dd; font-size: 13px; letter-spacing: .16em; text-transform: uppercase; }
       h1 { margin: 12px 0; font-size: clamp(32px, 7vw, 60px); }
@@ -20,13 +20,15 @@
       #audit article, #tunnel-list article, #http-route-list article { display: grid; gap: 4px; }
       #audit strong, #tunnel-list strong, #http-route-list strong { font-size: 15px; }
       .audit-detail, .policy-detail { color: #a9c4d1; overflow-wrap: anywhere; }
-      .management-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; margin-top: 28px; }
+      .management-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; margin-top: 28px; }
       .management-grid > article { align-self: start; }
       .policy-list { margin-top: 12px; }
       .policy-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
       .policy-actions button { padding: 7px 10px; }
       form { display: grid; gap: 10px; width: min(460px, 100%); }
       label { display: grid; gap: 5px; color: #a9c4d1; font-size: 13px; }
+      .check-label { display: flex; align-items: center; gap: 9px; }
+      .check-label input { width: auto; }
       input, select, button { box-sizing: border-box; padding: 12px; border-radius: 9px; font: inherit; }
       input, select { width: 100%; color: #e8f2f7; background: #06101a; border: 1px solid #3a718b; }
       button { cursor: pointer; color: #022128; border: 0; background: #43d9dd; font-weight: 700; }
@@ -34,6 +36,7 @@
       #language { padding: 8px 12px; background: transparent; border: 1px solid #43d9dd; color: #8ceef0; }
       #message { min-height: 24px; color: #a9c4d1; }
       .error { color: #ff9f9f !important; }
+      .route-error { color: #ff9f9f; overflow-wrap: anywhere; }
       .hidden { display: none; }
       @media (max-width: 760px) { main { padding: 28px; } .management-grid { grid-template-columns: 1fr; } }
     </style>
@@ -82,9 +85,24 @@
             <label><span data-i18n="hostnameLabel">Hostname</span><input id="http-route-hostname" data-placeholder="hostname" placeholder="Hostname, e.g. app.example.com" required /></label>
             <label><span data-i18n="targetAddressLabel">Target address</span><input id="http-route-target" data-placeholder="httpTargetAddress" placeholder="Target address, e.g. 127.0.0.1:8080" required /></label>
             <label><span data-i18n="maxConnectionsLabel">Max connections</span><input id="http-route-max" type="number" min="1" max="1024" value="64" data-placeholder="maxConnections" placeholder="Max connections" required /></label>
-            <button type="submit" data-i18n="createHttpRoute">Create HTTP route</button>
+            <label><span data-i18n="tlsModeLabel">TLS mode</span><select id="http-route-tls-mode"><option value="disabled" data-i18n="tlsDisabled">Disabled</option><option value="acme" data-i18n="tlsAutomatic">Automatic ACME</option></select></label>
+            <label class="check-label"><input id="http-route-redirect" type="checkbox" disabled /><span data-i18n="redirectHttpsLabel">Redirect HTTP to HTTPS after a certificate becomes active</span></label>
+            <button type="submit" data-i18n="createHttpRoute">Create HTTP/HTTPS route</button>
           </form>
           <section id="http-route-list" class="policy-list"></section>
+        </article>
+        <article>
+          <h2 data-i18n="acmeSettings">ACME certificate automation</h2>
+          <form id="acme-form">
+            <label class="check-label"><input id="acme-enabled" type="checkbox" /><span data-i18n="acmeEnabledLabel">Enable automatic certificate management</span></label>
+            <label><span data-i18n="acmeEnvironmentLabel">ACME environment</span><select id="acme-environment"><option value="staging" data-i18n="acmeStaging">Let's Encrypt staging</option><option value="production" data-i18n="acmeProduction">Let's Encrypt production</option><option value="custom" data-i18n="acmeCustom">Custom directory</option></select></label>
+            <label><span data-i18n="acmeDirectoryLabel">Directory URL</span><input id="acme-directory" type="url" data-placeholder="acmeDirectory" placeholder="ACME directory URL" required /></label>
+            <label><span data-i18n="acmeEmailLabel">Contact email</span><input id="acme-email" type="email" autocomplete="email" data-placeholder="acmeEmail" placeholder="admin@example.com" /></label>
+            <label><span data-i18n="renewBeforeLabel">Renew before expiry</span><input id="acme-renew-days" type="number" min="7" max="60" value="30" data-placeholder="renewBefore" placeholder="Days before expiry" required /></label>
+            <label class="check-label"><input id="acme-terms" type="checkbox" /><span data-i18n="acmeTermsLabel">I agree to the certificate authority terms of service</span></label>
+            <button type="submit" data-i18n="saveAcme">Save ACME settings</button>
+          </form>
+          <p id="acme-account-status" aria-live="polite"></p>
         </article>
       </div>
     </main>
@@ -94,39 +112,50 @@
           title: 'LinkLake Management', toggle: 'ZH', managementPlane: 'LinkLake / management plane', heading: 'Control plane online.', intro: 'Sign in with an administrator account. Passwords and session secrets stay out of browser scripts.',
           usernameLabel: 'Username', passwordLabel: 'Password', newPasswordLabel: 'New password', confirmPasswordLabel: 'Confirm password', username: 'Administrator username', password: 'Password', newPassword: 'New password (at least 12 characters)', confirmPassword: 'Confirm new password', signIn: 'Sign in', changePassword: 'Change password',
           waiting: 'Waiting for administrator sign-in.', signingIn: 'Signing in...', signInFailed: 'Sign-in failed. Check the username and password.', requestFailed: 'The server did not respond. Check the server log and network connection.', changeRequired: 'You must change the initial password before accessing management data.', passwordsMismatch: 'The new passwords do not match.', changingPassword: 'Changing password...', passwordChangeFailed: 'Password change failed. Use at least 12 characters.', passwordChanged: 'Password changed. Management access is now enabled.', signedIn: 'Signed in. Session expires at {time}.', sessionExpired: 'The administrator session has expired. Sign in again.', statusFailed: 'Unable to load management data.',
-          api: 'API', clients: 'Clients', tunnels: 'TCP tunnels', httpRoutes: 'HTTP routes', auditEmpty: 'No audit events yet.', client: 'Client', selectClient: 'Select a client', noClients: 'No enrolled clients are available.',
+          api: 'API', clients: 'Clients', tunnels: 'TCP tunnels', httpRoutes: 'HTTP/HTTPS routes', httpsRoutes: 'HTTPS routes', auditEmpty: 'No audit events yet.', client: 'Client', selectClient: 'Select a client', noClients: 'No enrolled clients are available.',
           tcpPolicy: 'TCP tunnel policy', tunnelNameLabel: 'Tunnel name', tunnelName: 'Tunnel name', publicPortLabel: 'Public port', publicPort: 'Public port', targetAddressLabel: 'Target address', targetAddress: 'Target address, e.g. 127.0.0.1:2333', maxConnectionsLabel: 'Max connections', maxConnections: 'Max connections', bandwidthLimitLabel: 'Bandwidth limit', bandwidthLimit: 'Aggregate bandwidth limit (B/s, optional)', createTunnel: 'Create TCP policy', noTunnels: 'No TCP tunnel policies yet.', tunnelRequestFailed: 'TCP tunnel policy request failed.',
-          httpRoutePolicy: 'HTTP host route', routeNameLabel: 'Route name', routeName: 'Route name', hostnameLabel: 'Hostname', hostname: 'Hostname, e.g. app.example.com', httpTargetAddress: 'Target address, e.g. 127.0.0.1:8080', createHttpRoute: 'Create HTTP route', noHttpRoutes: 'No HTTP host routes yet.', httpRouteRequestFailed: 'HTTP route request failed.', httpFirstStage: 'HTTP only; automatic HTTPS certificates are not available yet.',
-          enabled: 'Enabled', disabled: 'Disabled', online: 'Online', offline: 'Offline', enable: 'Enable', disable: 'Disable', delete: 'Delete', confirmDeleteTcp: 'Delete this TCP tunnel policy?', confirmDeleteHttp: 'Delete this HTTP route?', activeConnections: 'Active connections', pendingPairs: 'Pending pairs', traffic: 'TCP traffic in / out', reconnects: 'Tunnel reconnects', authFailures: 'Authentication failures', uptime: 'Server uptime', seconds: 'seconds', unlimited: 'unlimited', active: 'active', rejected: 'rejected', failed: 'failed', requests: 'requests', pairingTimeouts: 'pairing timeouts', limitBreakdown: 'policy/global/pending limits', errorBreakdown: 'pair/transfer/lifetime errors', bandwidth: 'bandwidth',
-          auditLogin: 'Administrator signed in', auditLoginFailed: 'Administrator sign-in failed', auditPasswordChanged: 'Administrator password changed', auditLogout: 'Administrator signed out', auditClientEnrolled: 'Client enrolled', auditTunnelRegistered: 'TCP tunnel registered', auditTcpCreated: 'TCP tunnel policy created', auditTcpUpdated: 'TCP tunnel policy updated', auditTcpDeleted: 'TCP tunnel policy deleted', auditHttpRegistered: 'HTTP route registered', auditHttpCreated: 'HTTP route created', auditHttpUpdated: 'HTTP route updated', auditHttpDeleted: 'HTTP route deleted', auditSessionCreated: 'Session created', auditPasswordUpdated: 'Password updated', auditEnabled: 'Enabled', auditDisabled: 'Disabled', auditPolicyDeleted: 'Policy deleted',
-          errorUnknownClient: 'The selected client does not exist.', errorInvalidName: 'The route name must contain 1 to 80 characters.', errorInvalidHostname: 'The hostname is invalid.', errorDuplicateHostname: 'The hostname is already assigned to another route.', errorInvalidTarget: 'The target address is invalid.', errorInvalidConnectionLimit: 'The maximum connection count must be between 1 and 1024.', errorUnknownHttpRoute: 'The HTTP route does not exist.'
+          httpRoutePolicy: 'HTTP/HTTPS host route', routeNameLabel: 'Route name', routeName: 'Route name', hostnameLabel: 'Hostname', hostname: 'Hostname, e.g. app.example.com', httpTargetAddress: 'Target address, e.g. 127.0.0.1:8080', createHttpRoute: 'Create HTTP/HTTPS route', noHttpRoutes: 'No HTTP/HTTPS host routes yet.', httpRouteRequestFailed: 'HTTP/HTTPS route request failed.', httpFirstStage: 'Create a route, enable ACME, and issue its first certificate when DNS and public port 80 are ready.',
+          tlsModeLabel: 'TLS mode', tlsDisabled: 'Disabled', tlsAutomatic: 'Automatic ACME', redirectHttpsLabel: 'Redirect HTTP to HTTPS after a certificate becomes active', enableAutomaticHttps: 'Enable automatic HTTPS', disableHttps: 'Disable HTTPS', enableRedirect: 'Enable HTTPS redirect', disableRedirect: 'Disable HTTPS redirect', issueCertificate: 'Issue certificate', renewCertificate: 'Renew now', certificateQueued: 'The certificate operation was queued.', tlsUpdated: 'The route TLS settings were updated.',
+          acmeSettings: 'ACME certificate automation', acmeEnabledLabel: 'Enable automatic certificate management', acmeEnvironmentLabel: 'ACME environment', acmeStaging: "Let's Encrypt staging", acmeProduction: "Let's Encrypt production", acmeCustom: 'Custom directory', acmeDirectoryLabel: 'Directory URL', acmeDirectory: 'ACME directory URL', acmeEmailLabel: 'Contact email', acmeEmail: 'admin@example.com', renewBeforeLabel: 'Renew before expiry', renewBefore: 'Days before expiry', days: 'days', acmeTermsLabel: 'I agree to the certificate authority terms of service', saveAcme: 'Save ACME settings', acmeSaved: 'ACME settings were saved.', acmeAccountReady: 'ACME account registered', acmeAccountPending: 'ACME account is not registered yet', acmeDisabledStatus: 'ACME automation is disabled',
+          certificate: 'certificate', certificateDisabled: 'disabled', certificatePending: 'pending', certificateIssuing: 'issuing', certificateActive: 'active', certificateRenewing: 'renewing', certificateError: 'error', certificateExpired: 'expired', httpsReady: 'HTTPS ready', httpsUnavailable: 'HTTPS unavailable', issuer: 'issuer', expires: 'expires', remaining: 'remaining', nextRenewal: 'next renewal', lastAttempt: 'last attempt', lastSuccess: 'last success', failureCount: 'failures', never: 'never', unknown: 'unknown', redirectEnabled: 'HTTP redirect enabled', redirectDisabled: 'HTTP redirect disabled',
+          enabled: 'Enabled', disabled: 'Disabled', online: 'Online', offline: 'Offline', enable: 'Enable', disable: 'Disable', delete: 'Delete', confirmDeleteTcp: 'Delete this TCP tunnel policy?', confirmDeleteHttp: 'Delete this HTTP/HTTPS route and its managed certificate?', activeConnections: 'TCP active connections', pendingPairs: 'Pending pairs', traffic: 'TCP traffic in / out', httpTraffic: 'Web traffic in / out', httpActivity: 'HTTP active / requests / failed', httpsActivity: 'HTTPS active / requests / handshakes failed', reconnects: 'Tunnel reconnects', authFailures: 'Authentication failures', uptime: 'Server uptime', seconds: 'seconds', unlimited: 'unlimited', active: 'active', rejected: 'rejected', failed: 'failed', requests: 'requests', pairingTimeouts: 'pairing timeouts', limitBreakdown: 'policy/global/pending limits', errorBreakdown: 'pair/transfer/lifetime errors', bandwidth: 'bandwidth', certificates: 'managed / active certificates', certificatesExpiring: 'certificates expiring within 30 days', certificatesExpiredMetric: 'expired certificates', nearestExpiry: 'nearest certificate expiry', acmeOrders: 'ACME orders / failed', acmeRenewals: 'ACME renewals / failed', acmeChallenges: 'HTTP-01 challenges',
+          auditLogin: 'Administrator signed in', auditLoginFailed: 'Administrator sign-in failed', auditPasswordChanged: 'Administrator password changed', auditLogout: 'Administrator signed out', auditClientEnrolled: 'Client enrolled', auditTunnelRegistered: 'TCP tunnel registered', auditTcpCreated: 'TCP tunnel policy created', auditTcpUpdated: 'TCP tunnel policy updated', auditTcpDeleted: 'TCP tunnel policy deleted', auditHttpRegistered: 'HTTP route registered', auditHttpCreated: 'HTTP route created', auditHttpUpdated: 'HTTP route updated', auditHttpDeleted: 'HTTP route deleted', auditAcmeUpdated: 'ACME settings updated', auditCertificateIssueStarted: 'Certificate issuance started', auditCertificateIssueSucceeded: 'Certificate issued', auditCertificateIssueFailed: 'Certificate issuance failed', auditCertificateRenewStarted: 'Certificate renewal started', auditCertificateRenewSucceeded: 'Certificate renewed', auditCertificateRenewFailed: 'Certificate renewal failed', auditSessionCreated: 'Session created', auditPasswordUpdated: 'Password updated', auditEnabled: 'Enabled', auditDisabled: 'Disabled', auditPolicyDeleted: 'Policy deleted',
+          errorUnknownClient: 'The selected client does not exist.', errorInvalidName: 'The route name must contain 1 to 80 characters.', errorInvalidHostname: 'The hostname is invalid.', errorDuplicateHostname: 'The hostname is already assigned to another route.', errorInvalidTarget: 'The target address is invalid.', errorInvalidConnectionLimit: 'The maximum connection count must be between 1 and 1024.', errorUnknownHttpRoute: 'The HTTP route does not exist.', errorHttpRouteChanged: 'The HTTP route changed while the certificate operation was starting. Refresh and try again.', errorInvalidAcmeEnvironment: 'The ACME environment is invalid.', errorInvalidDirectoryUrl: 'Use a valid HTTPS ACME directory URL.', errorDirectoryMismatch: 'The directory URL does not match the selected ACME environment.', errorInvalidContactEmail: 'The ACME contact email is invalid.', errorTermsNotAccepted: 'Accept the certificate authority terms before enabling ACME.', errorInvalidRenewalWindow: 'The renewal window must be between 7 and 60 days.', errorInvalidRedirectPolicy: 'HTTP redirect requires automatic HTTPS to be enabled.', errorAcmeDisabled: 'Enable and configure ACME before issuing a certificate.', errorAcmeAccount: 'ACME account registration failed. Check the directory URL and server log.', errorTlsNotEnabled: 'Enable automatic HTTPS for this route first.', errorHttpRouteDisabled: 'Enable this HTTP route before issuing or renewing its certificate.', errorCertificateBusy: 'A certificate operation is already running for this hostname.', errorCertificateCooldown: 'A certificate operation ran recently for this hostname. Wait for the cooldown period before trying again.', errorCertificateStorage: 'Certificate storage is unavailable. Check LINKLAKE_DATA_DIR and its file permissions.', errorCertificateAlreadyValid: 'This route already has a valid certificate.', errorCertificateUnavailable: 'No usable certificate is available for this route.', errorCertificateIssue: 'Certificate issuance failed. Check DNS, public port 80, and the route error.', errorCertificateRenew: 'Certificate renewal failed. Check the route error and ACME service.', errorAcmeRequestFailed: 'The ACME settings request failed.'
         },
         zh: {
           title: 'LinkLake 管理端', toggle: 'EN', managementPlane: 'LinkLake / 管理平面', heading: '控制平面已在线。', intro: '请使用管理员账号登录。密码和会话密钥不会被浏览器脚本读取。',
           usernameLabel: '用户名', passwordLabel: '密码', newPasswordLabel: '新密码', confirmPasswordLabel: '确认密码', username: '管理员用户名', password: '密码', newPassword: '新密码（至少 12 位）', confirmPassword: '确认新密码', signIn: '登录', changePassword: '修改密码',
           waiting: '等待管理员登录。', signingIn: '正在登录...', signInFailed: '登录失败，请检查用户名和密码。', requestFailed: '服务端没有响应，请检查服务端日志和网络连接。', changeRequired: '必须先修改初始密码，才能访问管理数据。', passwordsMismatch: '两次输入的新密码不一致。', changingPassword: '正在修改密码...', passwordChangeFailed: '修改密码失败，请使用至少 12 位的新密码。', passwordChanged: '密码已修改，现已获得管理访问权限。', signedIn: '登录成功，会话将在 {time} 到期。', sessionExpired: '管理员会话已过期，请重新登录。', statusFailed: '无法读取管理数据。',
-          api: 'API', clients: '客户端', tunnels: 'TCP 隧道', httpRoutes: 'HTTP 路由', auditEmpty: '暂无审计记录。', client: '客户端', selectClient: '请选择客户端', noClients: '暂无可用的已注册客户端。',
+          api: 'API', clients: '客户端', tunnels: 'TCP 隧道', httpRoutes: 'HTTP/HTTPS 路由', httpsRoutes: 'HTTPS 路由', auditEmpty: '暂无审计记录。', client: '客户端', selectClient: '请选择客户端', noClients: '暂无可用的已注册客户端。',
           tcpPolicy: 'TCP 隧道策略', tunnelNameLabel: '隧道名称', tunnelName: '隧道名称', publicPortLabel: '公网端口', publicPort: '公网端口', targetAddressLabel: '目标地址', targetAddress: '目标地址，例如 127.0.0.1:2333', maxConnectionsLabel: '最大连接数', maxConnections: '最大连接数', bandwidthLimitLabel: '带宽上限', bandwidthLimit: '策略总带宽上限（B/s，可选）', createTunnel: '创建 TCP 策略', noTunnels: '暂无 TCP 隧道策略。', tunnelRequestFailed: 'TCP 隧道策略请求失败。',
-          httpRoutePolicy: 'HTTP 域名路由', routeNameLabel: '路由名称', routeName: '路由名称', hostnameLabel: '域名', hostname: '域名，例如 app.example.com', httpTargetAddress: '目标地址，例如 127.0.0.1:8080', createHttpRoute: '创建 HTTP 路由', noHttpRoutes: '暂无 HTTP 域名路由。', httpRouteRequestFailed: 'HTTP 路由请求失败。', httpFirstStage: '当前仅支持 HTTP，尚未提供 HTTPS 证书自动化。',
-          enabled: '已启用', disabled: '已停用', online: '在线', offline: '离线', enable: '启用', disable: '停用', delete: '删除', confirmDeleteTcp: '确定删除这条 TCP 隧道策略吗？', confirmDeleteHttp: '确定删除这条 HTTP 路由吗？', activeConnections: '活跃连接', pendingPairs: '待配对连接', traffic: 'TCP 入站 / 出站流量', reconnects: '隧道重连次数', authFailures: '认证失败次数', uptime: '服务运行时间', seconds: '秒', unlimited: '不限速', active: '活跃', rejected: '拒绝', failed: '失败', requests: '请求', pairingTimeouts: '配对超时', limitBreakdown: '策略/全局/待配对限制', errorBreakdown: '配对/传输/生存期错误', bandwidth: '带宽',
-          auditLogin: '管理员已登录', auditLoginFailed: '管理员登录失败', auditPasswordChanged: '管理员密码已修改', auditLogout: '管理员已退出', auditClientEnrolled: '客户端已注册', auditTunnelRegistered: 'TCP 隧道已注册', auditTcpCreated: 'TCP 隧道策略已创建', auditTcpUpdated: 'TCP 隧道策略已更新', auditTcpDeleted: 'TCP 隧道策略已删除', auditHttpRegistered: 'HTTP 路由已注册', auditHttpCreated: 'HTTP 路由已创建', auditHttpUpdated: 'HTTP 路由已更新', auditHttpDeleted: 'HTTP 路由已删除', auditSessionCreated: '会话已创建', auditPasswordUpdated: '密码已更新', auditEnabled: '已启用', auditDisabled: '已停用', auditPolicyDeleted: '策略已删除',
-          errorUnknownClient: '所选客户端不存在。', errorInvalidName: '路由名称长度必须为 1 到 80 个字符。', errorInvalidHostname: '域名格式无效。', errorDuplicateHostname: '该域名已分配给其他路由。', errorInvalidTarget: '目标地址无效。', errorInvalidConnectionLimit: '最大连接数必须在 1 到 1024 之间。', errorUnknownHttpRoute: 'HTTP 路由不存在。'
+          httpRoutePolicy: 'HTTP/HTTPS 域名路由', routeNameLabel: '路由名称', routeName: '路由名称', hostnameLabel: '域名', hostname: '域名，例如 app.example.com', httpTargetAddress: '目标地址，例如 127.0.0.1:8080', createHttpRoute: '创建 HTTP/HTTPS 路由', noHttpRoutes: '暂无 HTTP/HTTPS 域名路由。', httpRouteRequestFailed: 'HTTP/HTTPS 路由请求失败。', httpFirstStage: '创建路由后，在 DNS 和公网 80 端口准备完成时启用 ACME 并签发首张证书。',
+          tlsModeLabel: 'TLS 模式', tlsDisabled: '停用', tlsAutomatic: 'ACME 自动管理', redirectHttpsLabel: '证书生效后将 HTTP 自动跳转到 HTTPS', enableAutomaticHttps: '启用自动 HTTPS', disableHttps: '停用 HTTPS', enableRedirect: '启用 HTTPS 跳转', disableRedirect: '停用 HTTPS 跳转', issueCertificate: '立即签发', renewCertificate: '立即续期', certificateQueued: '证书任务已进入队列。', tlsUpdated: '路由 TLS 设置已更新。',
+          acmeSettings: 'ACME 证书自动化', acmeEnabledLabel: '启用自动证书管理', acmeEnvironmentLabel: 'ACME 环境', acmeStaging: "Let's Encrypt 测试环境", acmeProduction: "Let's Encrypt 生产环境", acmeCustom: '自定义目录', acmeDirectoryLabel: '目录 URL', acmeDirectory: 'ACME 目录 URL', acmeEmailLabel: '联系邮箱', acmeEmail: 'admin@example.com', renewBeforeLabel: '到期前续期', renewBefore: '到期前天数', days: '天', acmeTermsLabel: '我同意证书颁发机构的服务条款', saveAcme: '保存 ACME 设置', acmeSaved: 'ACME 设置已保存。', acmeAccountReady: 'ACME 账户已注册', acmeAccountPending: 'ACME 账户尚未注册', acmeDisabledStatus: 'ACME 自动化已停用',
+          certificate: '证书', certificateDisabled: '已停用', certificatePending: '等待签发', certificateIssuing: '签发中', certificateActive: '有效', certificateRenewing: '续期中', certificateError: '错误', certificateExpired: '已过期', httpsReady: 'HTTPS 可用', httpsUnavailable: 'HTTPS 不可用', issuer: '签发者', expires: '到期时间', remaining: '剩余', nextRenewal: '下次续期', lastAttempt: '上次尝试', lastSuccess: '上次成功', failureCount: '失败次数', never: '无', unknown: '未知', redirectEnabled: '已启用 HTTP 跳转', redirectDisabled: '未启用 HTTP 跳转',
+          enabled: '已启用', disabled: '已停用', online: '在线', offline: '离线', enable: '启用', disable: '停用', delete: '删除', confirmDeleteTcp: '确定删除这条 TCP 隧道策略吗？', confirmDeleteHttp: '确定删除这条 HTTP/HTTPS 路由及其托管证书吗？', activeConnections: 'TCP 活跃连接', pendingPairs: '待配对连接', traffic: 'TCP 入站 / 出站流量', httpTraffic: 'Web 入站 / 出站流量', httpActivity: 'HTTP 活跃 / 请求 / 失败', httpsActivity: 'HTTPS 活跃 / 请求 / 握手失败', reconnects: '隧道重连次数', authFailures: '认证失败次数', uptime: '服务运行时间', seconds: '秒', unlimited: '不限速', active: '活跃', rejected: '拒绝', failed: '失败', requests: '请求', pairingTimeouts: '配对超时', limitBreakdown: '策略/全局/待配对限制', errorBreakdown: '配对/传输/生存期错误', bandwidth: '带宽', certificates: '托管 / 有效证书', certificatesExpiring: '30 天内到期证书', certificatesExpiredMetric: '已过期证书', nearestExpiry: '最近证书到期时间', acmeOrders: 'ACME 订单 / 失败', acmeRenewals: 'ACME 续期 / 失败', acmeChallenges: 'HTTP-01 挑战',
+          auditLogin: '管理员已登录', auditLoginFailed: '管理员登录失败', auditPasswordChanged: '管理员密码已修改', auditLogout: '管理员已退出', auditClientEnrolled: '客户端已注册', auditTunnelRegistered: 'TCP 隧道已注册', auditTcpCreated: 'TCP 隧道策略已创建', auditTcpUpdated: 'TCP 隧道策略已更新', auditTcpDeleted: 'TCP 隧道策略已删除', auditHttpRegistered: 'HTTP 路由已注册', auditHttpCreated: 'HTTP 路由已创建', auditHttpUpdated: 'HTTP 路由已更新', auditHttpDeleted: 'HTTP 路由已删除', auditAcmeUpdated: 'ACME 设置已更新', auditCertificateIssueStarted: '证书签发已开始', auditCertificateIssueSucceeded: '证书签发成功', auditCertificateIssueFailed: '证书签发失败', auditCertificateRenewStarted: '证书续期已开始', auditCertificateRenewSucceeded: '证书续期成功', auditCertificateRenewFailed: '证书续期失败', auditSessionCreated: '会话已创建', auditPasswordUpdated: '密码已更新', auditEnabled: '已启用', auditDisabled: '已停用', auditPolicyDeleted: '策略已删除',
+          errorUnknownClient: '所选客户端不存在。', errorInvalidName: '路由名称长度必须为 1 到 80 个字符。', errorInvalidHostname: '域名格式无效。', errorDuplicateHostname: '该域名已分配给其他路由。', errorInvalidTarget: '目标地址无效。', errorInvalidConnectionLimit: '最大连接数必须在 1 到 1024 之间。', errorUnknownHttpRoute: 'HTTP 路由不存在。', errorHttpRouteChanged: '证书任务启动时路由已发生变化，请刷新后重试。', errorInvalidAcmeEnvironment: 'ACME 环境无效。', errorInvalidDirectoryUrl: '请输入有效的 HTTPS ACME 目录 URL。', errorDirectoryMismatch: '目录 URL 与所选 ACME 环境不匹配。', errorInvalidContactEmail: 'ACME 联系邮箱无效。', errorTermsNotAccepted: '启用 ACME 前必须同意证书颁发机构条款。', errorInvalidRenewalWindow: '续期提前量必须在 7 到 60 天之间。', errorInvalidRedirectPolicy: '只有启用自动 HTTPS 后才能设置 HTTP 跳转。', errorAcmeDisabled: '签发证书前请先启用并配置 ACME。', errorAcmeAccount: 'ACME 账户注册失败，请检查目录 URL 和服务端日志。', errorTlsNotEnabled: '请先为该路由启用自动 HTTPS。', errorHttpRouteDisabled: '签发或续期证书前，请先启用这条 HTTP 路由。', errorCertificateBusy: '该域名已有证书任务正在运行。', errorCertificateCooldown: '该域名刚执行过证书任务，请等待冷却时间结束后再试。', errorCertificateStorage: '证书存储不可用，请检查 LINKLAKE_DATA_DIR 及其文件权限。', errorCertificateAlreadyValid: '该路由已有有效证书。', errorCertificateUnavailable: '该路由没有可用证书。', errorCertificateIssue: '证书签发失败，请检查 DNS、公网 80 端口和路由错误。', errorCertificateRenew: '证书续期失败，请检查路由错误和 ACME 服务。', errorAcmeRequestFailed: 'ACME 设置请求失败。'
         }
       };
 
       const elements = {
-        loginForm: document.querySelector('#login'), changeForm: document.querySelector('#change-password'), username: document.querySelector('#username'), password: document.querySelector('#password'), newPassword: document.querySelector('#new-password'), confirmPassword: document.querySelector('#confirm-password'), message: document.querySelector('#message'), status: document.querySelector('#status'), metrics: document.querySelector('#metrics'), audit: document.querySelector('#audit'), policyManagement: document.querySelector('#policy-management'), tunnelForm: document.querySelector('#tunnel-form'), tunnelList: document.querySelector('#tunnel-list'), tunnelClient: document.querySelector('#tunnel-client-id'), httpRouteForm: document.querySelector('#http-route-form'), httpRouteList: document.querySelector('#http-route-list'), httpRouteClient: document.querySelector('#http-route-client-id'), languageButton: document.querySelector('#language')
+        loginForm: document.querySelector('#login'), changeForm: document.querySelector('#change-password'), username: document.querySelector('#username'), password: document.querySelector('#password'), newPassword: document.querySelector('#new-password'), confirmPassword: document.querySelector('#confirm-password'), message: document.querySelector('#message'), status: document.querySelector('#status'), metrics: document.querySelector('#metrics'), audit: document.querySelector('#audit'), policyManagement: document.querySelector('#policy-management'), tunnelForm: document.querySelector('#tunnel-form'), tunnelList: document.querySelector('#tunnel-list'), tunnelClient: document.querySelector('#tunnel-client-id'), httpRouteForm: document.querySelector('#http-route-form'), httpRouteList: document.querySelector('#http-route-list'), httpRouteClient: document.querySelector('#http-route-client-id'), httpRouteTlsMode: document.querySelector('#http-route-tls-mode'), httpRouteRedirect: document.querySelector('#http-route-redirect'), acmeForm: document.querySelector('#acme-form'), acmeEnabled: document.querySelector('#acme-enabled'), acmeEnvironment: document.querySelector('#acme-environment'), acmeDirectory: document.querySelector('#acme-directory'), acmeEmail: document.querySelector('#acme-email'), acmeRenewDays: document.querySelector('#acme-renew-days'), acmeTerms: document.querySelector('#acme-terms'), acmeAccountStatus: document.querySelector('#acme-account-status'), languageButton: document.querySelector('#language')
       };
       let language = localStorage.getItem('linklake-language') || (navigator.language.toLowerCase().startsWith('zh') ? 'zh' : 'en');
       let dashboard = null;
       let refreshTimer = null;
+      let acmeFormDirty = false;
+      const acmeDirectories = {
+        production: 'https://acme-v02.api.letsencrypt.org/directory',
+        staging: 'https://acme-staging-v02.api.letsencrypt.org/directory'
+      };
 
       function text(key) { return words[language][key] || key; }
       function setMessage(key, values = {}, error = false) {
         elements.message.className = error ? 'error' : '';
         elements.message.dataset.key = key;
         elements.message.dataset.values = JSON.stringify(values);
-        elements.message.textContent = text(key).replace('{time}', values.time || '');
+        elements.message.textContent = Object.entries(values).reduce((message, [name, value]) => message.replaceAll(`{${name}}`, value), text(key));
       }
       function applyLanguage() {
         document.documentElement.lang = language === 'zh' ? 'zh-CN' : 'en';
@@ -159,9 +188,20 @@
         return `${(value / 1048576).toFixed(1)} MiB`;
       }
       function formatRate(value) { return value ? `${formatBytes(value)}/s` : text('unlimited'); }
+      function formatTimestamp(value) {
+        return value ? new Date(value * 1000).toLocaleString(language) : text('never');
+      }
+      function remainingDays(value) {
+        if (!value) return text('unknown');
+        return `${Math.max(0, Math.ceil((value * 1000 - Date.now()) / 86400000))} ${text('days')}`;
+      }
+      function tlsStatusText(status) {
+        const keys = { disabled: 'certificateDisabled', pending: 'certificatePending', issuing: 'certificateIssuing', active: 'certificateActive', renewing: 'certificateRenewing', error: 'certificateError', expired: 'certificateExpired' };
+        return text(keys[status] || 'unknown');
+      }
       function auditText(event) {
         const actions = {
-          'management.login': 'auditLogin', 'management.login.failed': 'auditLoginFailed', 'management.password.changed': 'auditPasswordChanged', 'management.logout': 'auditLogout', 'client.enrolled': 'auditClientEnrolled', 'tcp_tunnel.registered': 'auditTunnelRegistered', 'tcp_tunnel.policy.created': 'auditTcpCreated', 'tcp_tunnel.policy.updated': 'auditTcpUpdated', 'tcp_tunnel.policy.deleted': 'auditTcpDeleted', 'http_route.registered': 'auditHttpRegistered', 'http_route.policy.created': 'auditHttpCreated', 'http_route.policy.updated': 'auditHttpUpdated', 'http_route.policy.deleted': 'auditHttpDeleted'
+          'management.login': 'auditLogin', 'management.login.failed': 'auditLoginFailed', 'management.password.changed': 'auditPasswordChanged', 'management.logout': 'auditLogout', 'client.enrolled': 'auditClientEnrolled', 'tcp_tunnel.registered': 'auditTunnelRegistered', 'tcp_tunnel.policy.created': 'auditTcpCreated', 'tcp_tunnel.policy.updated': 'auditTcpUpdated', 'tcp_tunnel.policy.deleted': 'auditTcpDeleted', 'http_route.registered': 'auditHttpRegistered', 'http_route.policy.created': 'auditHttpCreated', 'http_route.policy.updated': 'auditHttpUpdated', 'http_route.policy.deleted': 'auditHttpDeleted', 'acme.config.updated': 'auditAcmeUpdated', 'certificate.issue.started': 'auditCertificateIssueStarted', 'certificate.issue.succeeded': 'auditCertificateIssueSucceeded', 'certificate.issue.failed': 'auditCertificateIssueFailed', 'certificate.renew.started': 'auditCertificateRenewStarted', 'certificate.renew.succeeded': 'auditCertificateRenewSucceeded', 'certificate.renew.failed': 'auditCertificateRenewFailed'
         };
         const details = { 'session created': 'auditSessionCreated', 'password updated': 'auditPasswordUpdated', enabled: 'auditEnabled', disabled: 'auditDisabled', 'policy deleted': 'auditPolicyDeleted' };
         return { action: actions[event.action] ? text(actions[event.action]) : event.action, detail: details[event.detail] ? text(details[event.detail]) : event.detail };
@@ -183,7 +223,7 @@
         });
         if (dashboard.clients.some(client => client.client_id === selected)) select.value = selected;
       }
-      function addPolicyCard(container, titleText, detailText, enabled, onToggle, onDelete) {
+      function addPolicyCard(container, titleText, detailText, enabled, onToggle, onDelete, extraActions = [], errorText = '') {
         const article = document.createElement('article');
         const title = document.createElement('strong');
         const detail = document.createElement('span');
@@ -200,9 +240,41 @@
         remove.type = 'button';
         remove.textContent = text('delete');
         remove.onclick = onDelete;
-        actions.append(toggle, remove);
-        article.append(title, detail, actions);
+        actions.append(toggle, ...extraActions, remove);
+        article.append(title, detail);
+        if (errorText) {
+          const error = document.createElement('span');
+          error.className = 'route-error';
+          error.textContent = errorText;
+          article.append(error);
+        }
+        article.append(actions);
         container.append(article);
+      }
+      function actionButton(labelKey, handler, disabled = false) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = text(labelKey);
+        button.disabled = disabled;
+        button.onclick = async () => {
+          button.disabled = true;
+          try { await handler(); }
+          finally { if (button.isConnected) button.disabled = false; }
+        };
+        return button;
+      }
+      function renderAcmeConfig() {
+        const config = dashboard.acme;
+        if (!acmeFormDirty && !elements.acmeForm.contains(document.activeElement)) {
+          elements.acmeEnabled.checked = config.enabled;
+          elements.acmeEnvironment.value = config.environment;
+          elements.acmeDirectory.value = config.directory_url || acmeDirectories[config.environment] || '';
+          elements.acmeEmail.value = config.contact_email || '';
+          elements.acmeRenewDays.value = config.renew_before_days || 30;
+          elements.acmeTerms.checked = config.terms_accepted;
+        }
+        elements.acmeDirectory.readOnly = elements.acmeEnvironment.value !== 'custom';
+        elements.acmeAccountStatus.textContent = !config.enabled ? text('acmeDisabledStatus') : config.account_registered ? text('acmeAccountReady') : text('acmeAccountPending');
       }
       function renderDashboard() {
         elements.status.replaceChildren();
@@ -217,13 +289,24 @@
         addCard(elements.status, String(dashboard.status.clients), text('clients'));
         addCard(elements.status, String(dashboard.tcpPolicies.length), text('tunnels'));
         addCard(elements.status, String(dashboard.httpRoutes.length), text('httpRoutes'));
+        addCard(elements.status, String(dashboard.status.https_routes ?? dashboard.httpRoutes.filter(route => route.tls?.https_online).length), text('httpsRoutes'));
         elements.status.classList.remove('hidden');
 
-        addCard(elements.metrics, String(dashboard.metrics.tcp_active_connections), text('activeConnections'));
-        addCard(elements.metrics, String(dashboard.metrics.tcp_pending_connections), text('pendingPairs'));
-        addCard(elements.metrics, `${formatBytes(dashboard.metrics.tcp_bytes_from_public)} / ${formatBytes(dashboard.metrics.tcp_bytes_to_public)}`, text('traffic'));
-        addCard(elements.metrics, String(dashboard.metrics.tunnel_reconnects_total), text('reconnects'));
-        addCard(elements.metrics, String(dashboard.metrics.authentication_failures_total), text('authFailures'));
+        addCard(elements.metrics, String(dashboard.metrics.tcp_active_connections ?? 0), text('activeConnections'));
+        addCard(elements.metrics, String(dashboard.metrics.tcp_pending_connections ?? 0), text('pendingPairs'));
+        addCard(elements.metrics, `${formatBytes(dashboard.metrics.tcp_bytes_from_public ?? 0)} / ${formatBytes(dashboard.metrics.tcp_bytes_to_public ?? 0)}`, text('traffic'));
+        addCard(elements.metrics, `${dashboard.metrics.http_active_connections ?? 0} / ${dashboard.metrics.http_requests_total ?? 0} / ${dashboard.metrics.http_failed_requests ?? 0}`, text('httpActivity'));
+        addCard(elements.metrics, `${formatBytes(dashboard.metrics.http_bytes_from_public ?? 0)} / ${formatBytes(dashboard.metrics.http_bytes_to_public ?? 0)}`, text('httpTraffic'));
+        addCard(elements.metrics, `${dashboard.metrics.https_active_connections ?? 0} / ${dashboard.metrics.https_requests_total ?? 0} / ${dashboard.metrics.https_handshake_failures_total ?? 0}`, text('httpsActivity'));
+        addCard(elements.metrics, `${dashboard.metrics.certificates_managed ?? 0} / ${dashboard.metrics.certificates_active ?? 0}`, text('certificates'));
+        addCard(elements.metrics, String(dashboard.metrics.certificates_expiring_30d ?? 0), text('certificatesExpiring'));
+        addCard(elements.metrics, String(dashboard.metrics.certificates_expired ?? 0), text('certificatesExpiredMetric'));
+        addCard(elements.metrics, formatTimestamp(dashboard.metrics.certificate_nearest_expiry_unix_seconds), text('nearestExpiry'));
+        addCard(elements.metrics, `${dashboard.metrics.acme_orders_total ?? 0} / ${dashboard.metrics.acme_orders_failed_total ?? 0}`, text('acmeOrders'));
+        addCard(elements.metrics, `${dashboard.metrics.acme_renewals_total ?? 0} / ${dashboard.metrics.acme_renewal_failures_total ?? 0}`, text('acmeRenewals'));
+        addCard(elements.metrics, String(dashboard.metrics.acme_http01_challenges_total ?? 0), text('acmeChallenges'));
+        addCard(elements.metrics, String(dashboard.metrics.tunnel_reconnects_total ?? 0), text('reconnects'));
+        addCard(elements.metrics, String(dashboard.metrics.authentication_failures_total ?? 0), text('authFailures'));
         addCard(elements.metrics, `${dashboard.metrics.uptime_seconds} ${text('seconds')}`, text('uptime'));
         elements.metrics.classList.remove('hidden');
 
@@ -243,16 +326,33 @@
 
         if (dashboard.httpRoutes.length === 0) addCard(elements.httpRouteList, text('noHttpRoutes'), '', text('httpFirstStage'));
         else dashboard.httpRoutes.forEach(route => {
-          const title = `${route.name} · http://${route.hostname} (${route.enabled ? text('enabled') : text('disabled')}, ${route.online ? text('online') : text('offline')})`;
-          const detail = `${route.client_id} -> ${route.target_addr} | ${route.active_connections}/${route.max_connections} ${text('active')} | ${route.requests_total} ${text('requests')} | ${route.failed_requests} ${text('failed')} | ${formatBytes(route.bytes_from_public)} / ${formatBytes(route.bytes_to_public)} | ${route.pairing_timeouts} ${text('pairingTimeouts')}`;
-          addPolicyCard(elements.httpRouteList, title, detail, route.enabled, () => updatePolicy('http-routes', route.id, !route.enabled, 'httpRouteRequestFailed'), () => deletePolicy('http-routes', route.id, 'confirmDeleteHttp', 'httpRouteRequestFailed'));
+          const tls = route.tls || { mode: 'disabled', redirect_http_to_https: false, https_online: false, status: 'disabled' };
+          const endpoints = [`http://${route.hostname}`];
+          if (tls.mode === 'acme') endpoints.push(`https://${route.hostname}`);
+          const title = `${route.name} · ${endpoints.join(' · ')} (${route.enabled ? text('enabled') : text('disabled')}, ${route.online ? text('online') : text('offline')})`;
+          const certificateDetail = tls.mode === 'disabled'
+            ? `${text('certificate')}: ${text('certificateDisabled')}`
+            : `${text('certificate')}: ${tlsStatusText(tls.status)} · ${tls.https_online ? text('httpsReady') : text('httpsUnavailable')} · ${text('issuer')}: ${tls.issuer || text('unknown')} · ${text('expires')}: ${formatTimestamp(tls.not_after_unix_seconds)} (${text('remaining')}: ${remainingDays(tls.not_after_unix_seconds)}) · ${text('nextRenewal')}: ${formatTimestamp(tls.next_renewal_unix_seconds)} · ${text('lastAttempt')}: ${formatTimestamp(tls.last_attempt_unix_seconds)} · ${text('lastSuccess')}: ${formatTimestamp(tls.last_success_unix_seconds)} · ${text('failureCount')}: ${tls.failure_count ?? 0} · ${tls.redirect_http_to_https ? text('redirectEnabled') : text('redirectDisabled')}`;
+          const detail = `${route.client_id} -> ${route.target_addr} | ${route.active_connections}/${route.max_connections} ${text('active')} | ${route.requests_total} ${text('requests')} | ${route.failed_requests} ${text('failed')} | ${formatBytes(route.bytes_from_public)} / ${formatBytes(route.bytes_to_public)} | ${route.pairing_timeouts} ${text('pairingTimeouts')} | ${certificateDetail}`;
+          const busy = tls.status === 'issuing' || tls.status === 'renewing';
+          const actions = [];
+          if (tls.mode === 'disabled') {
+            actions.push(actionButton('enableAutomaticHttps', () => updateRouteTls(route.id, 'acme', false)));
+          } else {
+            actions.push(actionButton('disableHttps', () => updateRouteTls(route.id, 'disabled', false), busy));
+            actions.push(actionButton(tls.redirect_http_to_https ? 'disableRedirect' : 'enableRedirect', () => updateRouteTls(route.id, 'acme', !tls.redirect_http_to_https), busy));
+            if (tls.status === 'active') actions.push(actionButton('renewCertificate', () => runCertificateAction(route.id, 'renew'), busy));
+            else actions.push(actionButton('issueCertificate', () => runCertificateAction(route.id, 'issue'), busy));
+          }
+          addPolicyCard(elements.httpRouteList, title, detail, route.enabled, () => updatePolicy('http-routes', route.id, !route.enabled, 'httpRouteRequestFailed'), () => deletePolicy('http-routes', route.id, 'confirmDeleteHttp', 'httpRouteRequestFailed'), actions, tls.last_error_message || '');
         });
+        renderAcmeConfig();
         elements.policyManagement.classList.remove('hidden');
       }
       async function readApiError(response, fallbackKey) {
         try {
           const error = await response.json();
-          const keys = { unknown_client: 'errorUnknownClient', invalid_name: 'errorInvalidName', invalid_hostname: 'errorInvalidHostname', duplicate_hostname: 'errorDuplicateHostname', invalid_target: 'errorInvalidTarget', invalid_connection_limit: 'errorInvalidConnectionLimit', unknown_http_route: 'errorUnknownHttpRoute' };
+          const keys = { unknown_client: 'errorUnknownClient', invalid_name: 'errorInvalidName', invalid_hostname: 'errorInvalidHostname', duplicate_hostname: 'errorDuplicateHostname', invalid_target: 'errorInvalidTarget', invalid_connection_limit: 'errorInvalidConnectionLimit', unknown_http_route: 'errorUnknownHttpRoute', http_route_changed: 'errorHttpRouteChanged', invalid_acme_environment: 'errorInvalidAcmeEnvironment', invalid_directory_url: 'errorInvalidDirectoryUrl', directory_url_does_not_match_environment: 'errorDirectoryMismatch', invalid_contact_email: 'errorInvalidContactEmail', terms_not_accepted: 'errorTermsNotAccepted', invalid_renewal_window: 'errorInvalidRenewalWindow', invalid_redirect_policy: 'errorInvalidRedirectPolicy', acme_disabled: 'errorAcmeDisabled', acme_account_registration_failed: 'errorAcmeAccount', tls_not_enabled: 'errorTlsNotEnabled', http_route_disabled: 'errorHttpRouteDisabled', certificate_operation_in_progress: 'errorCertificateBusy', certificate_operation_cooldown: 'errorCertificateCooldown', certificate_storage_unavailable: 'errorCertificateStorage', certificate_already_valid: 'errorCertificateAlreadyValid', certificate_not_available: 'errorCertificateUnavailable', certificate_issue_failed: 'errorCertificateIssue', certificate_renew_failed: 'errorCertificateRenew' };
           return keys[error.code] || fallbackKey;
         } catch (_) {
           return fallbackKey;
@@ -270,14 +370,14 @@
         setMessage('sessionExpired', {}, true);
       }
       async function loadManagementData() {
-        const responses = await Promise.all(['/api/v1/status', '/api/v1/metrics', '/api/v1/audit?limit=10', '/api/v1/tcp-tunnels', '/api/v1/http-routes', '/api/v1/clients'].map(url => fetch(url)));
+        const responses = await Promise.all(['/api/v1/status', '/api/v1/metrics', '/api/v1/audit?limit=10', '/api/v1/tcp-tunnels', '/api/v1/http-routes', '/api/v1/clients', '/api/v1/acme/config'].map(url => fetch(url)));
         if (responses.some(response => response.status === 401)) {
           resetForExpiredSession();
           throw new Error(text('sessionExpired'));
         }
         if (responses.some(response => !response.ok)) throw new Error(text('statusFailed'));
-        const [statusData, metricsData, events, tcpPolicies, httpRoutes, clients] = await Promise.all(responses.map(response => response.json()));
-        dashboard = { status: statusData, metrics: metricsData, events, tcpPolicies, httpRoutes, clients };
+        const [statusData, metricsData, events, tcpPolicies, httpRoutes, clients, acme] = await Promise.all(responses.map(response => response.json()));
+        dashboard = { status: statusData, metrics: metricsData, events, tcpPolicies, httpRoutes, clients, acme };
         renderDashboard();
       }
       function startAutoRefresh() {
@@ -296,11 +396,61 @@
         if (!response.ok) return setMessage(await readApiError(response, fallbackKey), {}, true);
         await loadManagementData();
       }
+      async function updateRouteTls(id, mode, redirect) {
+        try {
+          const response = await fetch(`/api/v1/http-routes/${id}/tls`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode, redirect_http_to_https: redirect }) });
+          if (response.status === 401) return resetForExpiredSession();
+          if (!response.ok) return setMessage(await readApiError(response, 'httpRouteRequestFailed'), {}, true);
+          setMessage('tlsUpdated');
+          await loadManagementData();
+        } catch (_) {
+          setMessage('requestFailed', {}, true);
+        }
+      }
+      async function runCertificateAction(id, action) {
+        try {
+          const response = await fetch(`/api/v1/http-routes/${id}/certificate/${action}`, { method: 'POST' });
+          if (response.status === 401) return resetForExpiredSession();
+          if (!response.ok) return setMessage(await readApiError(response, action === 'renew' ? 'errorCertificateRenew' : 'errorCertificateIssue'), {}, true);
+          setMessage('certificateQueued');
+          await loadManagementData();
+        } catch (_) {
+          setMessage('requestFailed', {}, true);
+        }
+      }
 
       elements.languageButton.addEventListener('click', () => {
         language = language === 'zh' ? 'en' : 'zh';
         localStorage.setItem('linklake-language', language);
         applyLanguage();
+      });
+      elements.httpRouteTlsMode.addEventListener('change', () => {
+        elements.httpRouteRedirect.disabled = elements.httpRouteTlsMode.value !== 'acme';
+        if (elements.httpRouteRedirect.disabled) elements.httpRouteRedirect.checked = false;
+      });
+      elements.acmeForm.addEventListener('input', () => { acmeFormDirty = true; });
+      elements.acmeEnvironment.addEventListener('change', () => {
+        const environment = elements.acmeEnvironment.value;
+        elements.acmeDirectory.readOnly = environment !== 'custom';
+        if (environment !== 'custom') elements.acmeDirectory.value = acmeDirectories[environment];
+        else if (Object.values(acmeDirectories).includes(elements.acmeDirectory.value)) elements.acmeDirectory.value = '';
+      });
+      elements.acmeForm.addEventListener('submit', async event => {
+        event.preventDefault();
+        const submit = event.submitter;
+        submit.disabled = true;
+        try {
+          const response = await fetch('/api/v1/acme/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: elements.acmeEnabled.checked, environment: elements.acmeEnvironment.value, directory_url: elements.acmeDirectory.value, contact_email: elements.acmeEmail.value, terms_accepted: elements.acmeTerms.checked, renew_before_days: Number(elements.acmeRenewDays.value) }) });
+          if (response.status === 401) return resetForExpiredSession();
+          if (!response.ok) return setMessage(await readApiError(response, 'errorAcmeRequestFailed'), {}, true);
+          acmeFormDirty = false;
+          setMessage('acmeSaved');
+          await loadManagementData();
+        } catch (_) {
+          setMessage('requestFailed', {}, true);
+        } finally {
+          submit.disabled = false;
+        }
       });
       elements.loginForm.addEventListener('submit', async event => {
         event.preventDefault();
@@ -376,7 +526,17 @@
           const response = await fetch('/api/v1/http-routes', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ client_id: elements.httpRouteClient.value, name: document.querySelector('#http-route-name').value, hostname: document.querySelector('#http-route-hostname').value, target_addr: document.querySelector('#http-route-target').value, max_connections: Number(document.querySelector('#http-route-max').value) }) });
           if (response.status === 401) return resetForExpiredSession();
           if (!response.ok) return setMessage(await readApiError(response, 'httpRouteRequestFailed'), {}, true);
+          const route = await response.json();
+          if (elements.httpRouteTlsMode.value === 'acme') {
+            const tlsResponse = await fetch(`/api/v1/http-routes/${route.id}/tls`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: 'acme', redirect_http_to_https: elements.httpRouteRedirect.checked }) });
+            if (tlsResponse.status === 401) return resetForExpiredSession();
+            if (!tlsResponse.ok) {
+              await loadManagementData();
+              return setMessage(await readApiError(tlsResponse, 'httpRouteRequestFailed'), {}, true);
+            }
+          }
           elements.httpRouteForm.reset();
+          elements.httpRouteRedirect.disabled = true;
           await loadManagementData();
         } catch (_) {
           setMessage('requestFailed', {}, true);

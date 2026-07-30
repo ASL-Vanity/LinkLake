@@ -28,17 +28,19 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{copy_bidirectional, split, ReadHalf, WriteHalf},
-    net::{TcpListener, TcpStream},
+    io::{copy_bidirectional, split, AsyncRead, AsyncWrite, ReadHalf, WriteHalf},
+    net::TcpListener,
     sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore},
     time::{timeout, timeout_at, Instant},
 };
+use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 
 const CONNECTION_PAIR_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(35);
 const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const BACKEND_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HTTP_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_PUBLIC_HTTP_CONNECTIONS: usize = 2048;
 
@@ -47,6 +49,21 @@ static PUBLIC_HTTP_CONNECTION_PERMITS: LazyLock<Arc<Semaphore>> =
 
 type BoxError = Box<dyn Error + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublicScheme {
+    Http,
+    Https,
+}
+
+impl PublicScheme {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Https => "https",
+        }
+    }
+}
 
 pub(crate) struct HttpRouteRegistration {
     registration_id: Uuid,
@@ -91,7 +108,11 @@ struct PendingConnectionGuard {
 
 impl TrackedBody {
     fn plain(status: StatusCode, message: &'static str) -> Response<Self> {
-        let body = Full::new(Bytes::from_static(message.as_bytes()))
+        Self::text(status, message.to_owned())
+    }
+
+    fn text(status: StatusCode, message: String) -> Response<Self> {
+        let body = Full::new(Bytes::from(message))
             .map_err(|never| -> BoxError { match never {} })
             .boxed_unsync();
         Response::builder()
@@ -103,6 +124,24 @@ impl TrackedBody {
                 stop: None,
             })
             .expect("static HTTP error response should build")
+    }
+
+    fn redirect(location: &str) -> Response<Self> {
+        let body = Full::new(Bytes::new())
+            .map_err(|never| -> BoxError { match never {} })
+            .boxed_unsync();
+        match HeaderValue::from_str(location) {
+            Ok(location) => Response::builder()
+                .status(StatusCode::PERMANENT_REDIRECT)
+                .header(header::LOCATION, location)
+                .body(Self {
+                    inner: body,
+                    _activity: None,
+                    stop: None,
+                })
+                .expect("HTTPS redirect response should build"),
+            Err(_) => Self::plain(StatusCode::BAD_REQUEST, "invalid redirect target"),
+        }
     }
 
     fn proxied(
@@ -211,7 +250,7 @@ pub(crate) async fn run_http_listener(
                 let state = state.clone();
                 tokio::spawn(async move {
                     let _connection_permit = connection_permit;
-                    serve_http_connection(state, stream, peer).await;
+                    serve_http_connection(state, stream, peer, PublicScheme::Http, None).await;
                 });
             }
             Err(error) => tracing::error!("HTTP listener accept error: {error}"),
@@ -219,10 +258,101 @@ pub(crate) async fn run_http_listener(
     }
 }
 
-async fn serve_http_connection(state: Arc<AppState>, stream: TcpStream, peer: SocketAddr) {
+pub(crate) async fn run_https_listener(
+    state: Arc<AppState>,
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        let accepted = tokio::select! {
+            _ = shutdown.changed() => break,
+            accepted = listener.accept() => accepted,
+        };
+        match accepted {
+            Ok((stream, peer)) => {
+                let Ok(connection_permit) =
+                    PUBLIC_HTTP_CONNECTION_PERMITS.clone().try_acquire_owned()
+                else {
+                    tracing::warn!("HTTPS public connection limit reached; rejecting {peer}");
+                    drop(stream);
+                    continue;
+                };
+                let state = state.clone();
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let _connection_permit = connection_permit;
+                    let tls_stream =
+                        match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                            Ok(Ok(stream)) => stream,
+                            Ok(Err(error)) => {
+                                state
+                                    .metrics
+                                    .tls_handshake_failures_total
+                                    .fetch_add(1, Ordering::Relaxed);
+                                state
+                                    .metrics
+                                    .https_handshake_failures_total
+                                    .fetch_add(1, Ordering::Relaxed);
+                                tracing::debug!("HTTPS handshake failed for {peer}: {error}");
+                                return;
+                            }
+                            Err(_) => {
+                                state
+                                    .metrics
+                                    .tls_handshake_failures_total
+                                    .fetch_add(1, Ordering::Relaxed);
+                                state
+                                    .metrics
+                                    .https_handshake_failures_total
+                                    .fetch_add(1, Ordering::Relaxed);
+                                tracing::debug!("HTTPS handshake timed out for {peer}");
+                                return;
+                            }
+                        };
+                    let Some(server_name) =
+                        tls_stream.get_ref().1.server_name().map(ToOwned::to_owned)
+                    else {
+                        return;
+                    };
+                    state
+                        .metrics
+                        .https_active_connections
+                        .fetch_add(1, Ordering::Relaxed);
+                    serve_http_connection(
+                        state.clone(),
+                        tls_stream,
+                        peer,
+                        PublicScheme::Https,
+                        Some(server_name),
+                    )
+                    .await;
+                    state
+                        .metrics
+                        .https_active_connections
+                        .fetch_sub(1, Ordering::Relaxed);
+                });
+            }
+            Err(error) => tracing::error!("HTTPS listener accept error: {error}"),
+        }
+    }
+}
+
+async fn serve_http_connection<S>(
+    state: Arc<AppState>,
+    stream: S,
+    peer: SocketAddr,
+    scheme: PublicScheme,
+    tls_hostname: Option<String>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let service = service_fn(move |request| {
         let state = state.clone();
-        async move { Ok::<_, Infallible>(proxy_request(state, peer, request).await) }
+        let tls_hostname = tls_hostname.clone();
+        async move {
+            Ok::<_, Infallible>(proxy_request(state, peer, scheme, tls_hostname, request).await)
+        }
     });
     let mut builder = server_http1::Builder::new();
     builder
@@ -242,8 +372,16 @@ async fn serve_http_connection(state: Arc<AppState>, stream: TcpStream, peer: So
 async fn proxy_request(
     state: Arc<AppState>,
     peer: SocketAddr,
+    scheme: PublicScheme,
+    tls_hostname: Option<String>,
     mut request: Request<Incoming>,
 ) -> Response<TrackedBody> {
+    if scheme == PublicScheme::Https {
+        state
+            .metrics
+            .https_requests_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
     let mut host_values = request.headers().get_all(header::HOST).iter();
     let Some(host) = host_values.next().and_then(|value| value.to_str().ok()) else {
         return TrackedBody::plain(StatusCode::BAD_REQUEST, "missing Host header");
@@ -255,6 +393,35 @@ async fn proxy_request(
     let Ok(hostname) = normalize_hostname(&original_host) else {
         return TrackedBody::plain(StatusCode::BAD_REQUEST, "invalid Host header");
     };
+    if scheme == PublicScheme::Https {
+        let Some(tls_hostname) = tls_hostname
+            .as_deref()
+            .and_then(|value| normalize_hostname(value).ok())
+        else {
+            return TrackedBody::plain(StatusCode::MISDIRECTED_REQUEST, "missing TLS server name");
+        };
+        if tls_hostname != hostname {
+            return TrackedBody::plain(
+                StatusCode::MISDIRECTED_REQUEST,
+                "TLS server name conflicts with Host",
+            );
+        }
+        if !state
+            .certificate_manager
+            .as_ref()
+            .is_some_and(|manager| manager.has_certificate(&hostname))
+        {
+            return TrackedBody::plain(
+                StatusCode::MISDIRECTED_REQUEST,
+                "HTTPS certificate is no longer active",
+            );
+        }
+    }
+    if scheme == PublicScheme::Http {
+        if let Some(response) = acme_challenge_response(&state, &hostname, &request) {
+            return response;
+        }
+    }
     if request.method() == hyper::Method::CONNECT {
         return TrackedBody::plain(StatusCode::METHOD_NOT_ALLOWED, "CONNECT is not supported");
     }
@@ -277,6 +444,23 @@ async fn proxy_request(
         *request.uri_mut() = origin_form;
     } else if request.uri().scheme().is_some() {
         return TrackedBody::plain(StatusCode::BAD_REQUEST, "invalid request target");
+    }
+    if scheme == PublicScheme::Http
+        && state
+            .https_redirect_hosts
+            .lock()
+            .expect("HTTPS redirect registry lock poisoned")
+            .contains(&hostname)
+        && state
+            .certificate_manager
+            .as_ref()
+            .is_some_and(|manager| manager.has_certificate(&hostname))
+    {
+        let path_and_query = request
+            .uri()
+            .path_and_query()
+            .map_or("/", |value| value.as_str());
+        return TrackedBody::redirect(&format!("https://{hostname}{path_and_query}"));
     }
     let context = state
         .http_routes
@@ -314,7 +498,7 @@ async fn proxy_request(
     let activity = ConnectionActivity::new(context.statistics.clone(), route_permit, global_permit);
 
     let client_upgrade = is_upgrade_request(&request).then(|| hyper::upgrade::on(&mut request));
-    prepare_forward_headers(&mut request, peer, &original_host);
+    prepare_forward_headers(&mut request, peer, &original_host, scheme);
     let (parts, body) = request.into_parts();
     let request_statistics = context.statistics.clone();
     let body = body.inspect_frame(move |frame| {
@@ -696,9 +880,59 @@ pub(crate) fn stop_all(state: &AppState) {
     }
 }
 
-fn prepare_forward_headers(request: &mut Request<Incoming>, peer: SocketAddr, original_host: &str) {
-    let client_ip = trusted_client_ip(request, peer);
-    let forwarded_proto = trusted_forwarded_proto(request, peer);
+fn acme_challenge_response(
+    state: &AppState,
+    hostname: &str,
+    request: &Request<Incoming>,
+) -> Option<Response<TrackedBody>> {
+    let token = request
+        .uri()
+        .path()
+        .strip_prefix("/.well-known/acme-challenge/")?;
+    if request.method() != hyper::Method::GET && request.method() != hyper::Method::HEAD {
+        return Some(TrackedBody::plain(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "ACME challenge only supports GET and HEAD",
+        ));
+    }
+    if token.is_empty() || token.contains('/') {
+        return Some(TrackedBody::plain(
+            StatusCode::NOT_FOUND,
+            "unknown ACME challenge",
+        ));
+    }
+    let key_authorization = state
+        .certificate_manager
+        .as_ref()
+        .and_then(|manager| manager.challenges().lookup(hostname, token));
+    match key_authorization {
+        Some(_) if request.method() == hyper::Method::HEAD => {
+            Some(TrackedBody::text(StatusCode::OK, String::new()))
+        }
+        Some(value) => Some(TrackedBody::text(StatusCode::OK, value)),
+        None => Some(TrackedBody::plain(
+            StatusCode::NOT_FOUND,
+            "unknown ACME challenge",
+        )),
+    }
+}
+
+fn prepare_forward_headers(
+    request: &mut Request<Incoming>,
+    peer: SocketAddr,
+    original_host: &str,
+    scheme: PublicScheme,
+) {
+    let client_ip = if scheme == PublicScheme::Http {
+        trusted_client_ip(request, peer)
+    } else {
+        peer.ip()
+    };
+    let forwarded_proto = if scheme == PublicScheme::Http {
+        trusted_forwarded_proto(request, peer)
+    } else {
+        scheme.as_str()
+    };
     let preserve_upgrade = is_upgrade_request(request);
     remove_hop_by_hop_headers(request.headers_mut(), preserve_upgrade);
     for name in [

@@ -4,6 +4,8 @@ param(
     [string]$LogDirectory = "$env:ProgramData\LinkLake\logs",
     [string]$Bind = "127.0.0.1:32100",
     [string]$ControlBind = "127.0.0.1:32101",
+    [string]$HttpBind,
+    [string]$HttpsBind,
     [Parameter(Mandatory)][string]$EnrollmentToken,
     [string]$AdminUsername = "admin",
     [Parameter(Mandatory)][SecureString]$AdminPassword,
@@ -28,6 +30,15 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 }
 
 New-Item -ItemType Directory -Force -Path $InstallDirectory, $DataDirectory, $LogDirectory | Out-Null
+$dataAcl = Get-Acl -LiteralPath $DataDirectory
+$dataAcl.SetAccessRuleProtection($true, $false)
+$dataAcl.SetAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+    'SYSTEM', 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'
+))
+$dataAcl.SetAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+    'BUILTIN\Administrators', 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'
+))
+Set-Acl -LiteralPath $DataDirectory -AclObject $dataAcl
 Copy-Item -LiteralPath $sourceBinary -Destination $destinationBinary -Force
 
 $passwordPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($AdminPassword)
@@ -42,6 +53,8 @@ try {
         "LINKLAKE_ADMIN_USERNAME=$AdminUsername",
         "LINKLAKE_ADMIN_PASSWORD=$plainPassword"
     )
+    if ($HttpBind) { $serviceEnvironment += "LINKLAKE_HTTP_BIND=$HttpBind" }
+    if ($HttpsBind) { $serviceEnvironment += "LINKLAKE_HTTPS_BIND=$HttpsBind" }
     if ($ManagementCertificate) { $serviceEnvironment += "LINKLAKE_MANAGEMENT_CERT_PATH=$ManagementCertificate" }
     if ($ManagementKey) { $serviceEnvironment += "LINKLAKE_MANAGEMENT_KEY_PATH=$ManagementKey" }
     if ($ControlCertificate) { $serviceEnvironment += "LINKLAKE_CONTROL_CERT_PATH=$ControlCertificate" }
@@ -55,7 +68,7 @@ try {
     }
     $binaryPath = "`"$destinationBinary`" --windows-service"
     New-Service -Name $serviceName -BinaryPathName $binaryPath -DisplayName 'LinkLake Server' `
-        -Description 'LinkLake TCP tunnel server' -StartupType Automatic | Out-Null
+        -Description 'LinkLake TCP, HTTP, and HTTPS tunnel server' -StartupType Automatic | Out-Null
     New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$serviceName" `
         -Name Environment -PropertyType MultiString -Value $serviceEnvironment -Force | Out-Null
     & sc.exe failure $serviceName reset= 86400 actions= restart/3000/restart/10000/restart/30000 | Out-Null
@@ -65,10 +78,8 @@ try {
     if ($running.Status -ne 'Running' -or -not (Test-Path -LiteralPath (Join-Path $DataDirectory 'linklake.sqlite3'))) {
         throw "LinkLake Server did not initialize successfully. Check $LogDirectory."
     }
-    # ???????? SQLite ??????????????????????
-    $persistentEnvironment = $serviceEnvironment | Where-Object {
-        $_ -notlike 'LINKLAKE_ADMIN_USERNAME=*' -and $_ -notlike 'LINKLAKE_ADMIN_PASSWORD=*'
-    }
+    # 首次启动后移除明文管理员引导凭据，后续登录使用 SQLite 中的密码哈希。
+    $persistentEnvironment = $serviceEnvironment | Where-Object { ($_ -notlike 'LINKLAKE_ADMIN_USERNAME=*') -and ($_ -notlike 'LINKLAKE_ADMIN_PASSWORD=*') }
     New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$serviceName" `
         -Name Environment -PropertyType MultiString -Value $persistentEnvironment -Force | Out-Null
     Write-Host "LinkLake Server installed and started. Data: $DataDirectory"
