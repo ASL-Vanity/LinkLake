@@ -192,6 +192,24 @@ pub(crate) async fn handle_connection(state: Arc<AppState>, mut stream: BoxedIo)
             )
             .await;
         }
+        ControlFrame::RegisterUdpTunnel {
+            client_id,
+            client_token,
+            name,
+            public_port,
+            target_addr,
+        } => {
+            crate::udp_tunnel::register_tunnel(
+                state,
+                stream,
+                client_id,
+                client_token,
+                name,
+                public_port,
+                target_addr,
+            )
+            .await;
+        }
         ControlFrame::TcpDataConnection {
             client_id,
             client_token,

@@ -43,7 +43,7 @@ jobs:
         run: find packaging scripts -name '*.sh' -print0 | xargs -0 -n1 bash -n
 
   windows-test:
-    name: Windows test and TCP/HTTP E2E
+    name: Windows test and TCP/UDP/HTTP E2E
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
@@ -84,6 +84,9 @@ jobs:
       - name: Run TCP end-to-end tests
         shell: powershell
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\tcp-e2e.ps1
+      - name: Run UDP end-to-end tests
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\udp-e2e.ps1 -SkipBuild
       - name: Run HTTP end-to-end tests
         shell: powershell
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\http-e2e.ps1 -SkipBuild

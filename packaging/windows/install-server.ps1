@@ -6,6 +6,9 @@ param(
     [string]$ControlBind = "127.0.0.1:32101",
     [string]$HttpBind,
     [string]$HttpsBind,
+    [string]$UdpRelayBind,
+    [string]$UdpRelayEndpoint,
+    [string]$UdpRelayServerName,
     [Parameter(Mandatory)][string]$EnrollmentToken,
     [string]$AdminUsername = "admin",
     [Parameter(Mandatory)][SecureString]$AdminPassword,
@@ -55,6 +58,17 @@ try {
     )
     if ($HttpBind) { $serviceEnvironment += "LINKLAKE_HTTP_BIND=$HttpBind" }
     if ($HttpsBind) { $serviceEnvironment += "LINKLAKE_HTTPS_BIND=$HttpsBind" }
+    if ($UdpRelayBind) {
+        if (-not $UdpRelayEndpoint -or -not $UdpRelayServerName) {
+            throw 'UdpRelayEndpoint and UdpRelayServerName are required when UdpRelayBind is set.'
+        }
+        $serviceEnvironment += "LINKLAKE_UDP_RELAY_BIND=$UdpRelayBind"
+        $serviceEnvironment += "LINKLAKE_UDP_RELAY_ENDPOINT=$UdpRelayEndpoint"
+        $serviceEnvironment += "LINKLAKE_UDP_RELAY_SERVER_NAME=$UdpRelayServerName"
+    }
+    elseif ($UdpRelayEndpoint -or $UdpRelayServerName) {
+        throw 'UdpRelayBind is required when a UDP relay endpoint or server name is set.'
+    }
     if ($ManagementCertificate) { $serviceEnvironment += "LINKLAKE_MANAGEMENT_CERT_PATH=$ManagementCertificate" }
     if ($ManagementKey) { $serviceEnvironment += "LINKLAKE_MANAGEMENT_KEY_PATH=$ManagementKey" }
     if ($ControlCertificate) { $serviceEnvironment += "LINKLAKE_CONTROL_CERT_PATH=$ControlCertificate" }
@@ -68,7 +82,7 @@ try {
     }
     $binaryPath = "`"$destinationBinary`" --windows-service"
     New-Service -Name $serviceName -BinaryPathName $binaryPath -DisplayName 'LinkLake Server' `
-        -Description 'LinkLake TCP, HTTP, and HTTPS tunnel server' -StartupType Automatic | Out-Null
+        -Description 'LinkLake TCP, UDP, HTTP, and HTTPS tunnel server' -StartupType Automatic | Out-Null
     New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$serviceName" `
         -Name Environment -PropertyType MultiString -Value $serviceEnvironment -Force | Out-Null
     & sc.exe failure $serviceName reset= 86400 actions= restart/3000/restart/10000/restart/30000 | Out-Null

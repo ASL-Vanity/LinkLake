@@ -8,6 +8,8 @@ mod http_route_catalog;
 mod http_tunnel;
 mod tcp_tunnel;
 mod tunnel_catalog;
+mod udp_data_plane;
+mod udp_tunnel;
 
 use admin_auth::{AdminAuth, BootstrapCredentials};
 use audit_log::{AuditEvent, AuditLog};
@@ -51,12 +53,17 @@ use tokio_rustls::{
     TlsAcceptor,
 };
 use tower_http::trace::TraceLayer;
-use tunnel_catalog::{CreateTcpTunnelPolicy, TcpTunnelPolicy, TunnelCatalog};
+use tunnel_catalog::{
+    CreateTcpTunnelPolicy, CreateUdpTunnelPolicy, TcpTunnelPolicy, TunnelCatalog, UdpPolicyError,
+    UdpTunnelPolicy,
+};
+use udp_data_plane::{UdpDataPlane, UdpDataPlaneConfig};
 use uuid::Uuid;
 
 const MANAGEMENT_UI: &str = include_str!("../web/index.html");
 const GLOBAL_CONNECTION_LIMIT: usize = 1024;
 const PENDING_CONNECTION_LIMIT: usize = 256;
+const GLOBAL_UDP_SESSION_LIMIT: usize = 16_384;
 
 struct AppState {
     started_at: Instant,
@@ -71,6 +78,10 @@ struct AppState {
     tunnels: Mutex<HashMap<u16, tcp_tunnel::TunnelRegistration>>,
     tunnel_statistics: Mutex<HashMap<u16, Arc<tcp_tunnel::TunnelStatistics>>>,
     seen_tunnel_registrations: Mutex<HashSet<(Uuid, u16)>>,
+    udp_data_plane: Option<UdpDataPlane>,
+    udp_tunnels: Mutex<HashMap<u16, udp_tunnel::UdpTunnelRegistration>>,
+    udp_tunnel_statistics: Mutex<HashMap<Uuid, Arc<udp_tunnel::UdpTunnelStatistics>>>,
+    seen_udp_tunnel_registrations: Mutex<HashSet<(Uuid, u16)>>,
     http_route_catalog: Mutex<HttpRouteCatalog>,
     http_routes: Mutex<HashMap<String, http_tunnel::HttpRouteRegistration>>,
     http_route_statistics: Mutex<HashMap<String, Arc<http_tunnel::HttpRouteStatistics>>>,
@@ -82,6 +93,7 @@ struct AppState {
     pending_connections: AsyncMutex<HashMap<Uuid, (Uuid, tokio::sync::oneshot::Sender<BoxedIo>)>>,
     global_connection_permits: Arc<Semaphore>,
     pending_connection_permits: Arc<Semaphore>,
+    global_udp_session_permits: Arc<Semaphore>,
     metrics: ServerCounters,
 }
 
@@ -117,6 +129,7 @@ struct StatusResponse {
     api_version: &'static str,
     instance_id: String,
     tunnels: usize,
+    udp_tunnels: usize,
     http_routes: usize,
     https_routes: usize,
     clients: usize,
@@ -136,6 +149,8 @@ struct MetricsResponse {
     tcp_rejected_policy_limit: u64,
     tcp_rejected_global_limit: u64,
     tcp_rejected_pending_limit: u64,
+    #[serde(flatten)]
+    udp: UdpMetricsResponse,
     control_connections_total: u64,
     control_protocol_errors_total: u64,
     tls_handshake_failures_total: u64,
@@ -162,6 +177,27 @@ struct MetricsResponse {
     acme_renewals_total: u64,
     acme_renewal_failures_total: u64,
     acme_http01_challenges_total: u64,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct UdpMetricsResponse {
+    udp_active_sessions: usize,
+    udp_packets_from_public: u64,
+    udp_packets_to_public: u64,
+    udp_bytes_from_public: u64,
+    udp_bytes_to_public: u64,
+    udp_dropped_packets: u64,
+    udp_dropped_oversized: u64,
+    udp_dropped_malformed: u64,
+    udp_dropped_unknown_session: u64,
+    udp_dropped_queue_full: u64,
+    udp_dropped_policy_session_limit: u64,
+    udp_dropped_global_session_limit: u64,
+    udp_dropped_bandwidth_limit: u64,
+    udp_session_timeouts: u64,
+    udp_reassembly_timeouts: u64,
+    udp_attach_timeouts: u64,
+    udp_transport_errors: u64,
 }
 
 #[derive(Serialize)]
@@ -212,6 +248,30 @@ struct TcpTunnelView {
     pairing_timeouts: u64,
     transfer_errors: u64,
     lifetime_timeouts: u64,
+}
+
+#[derive(Serialize)]
+struct UdpTunnelView {
+    #[serde(flatten)]
+    policy: UdpTunnelPolicy,
+    online: bool,
+    active_sessions: usize,
+    packets_from_public: u64,
+    packets_to_public: u64,
+    bytes_from_public: u64,
+    bytes_to_public: u64,
+    dropped_packets: u64,
+    dropped_bandwidth_limit: u64,
+    dropped_policy_session_limit: u64,
+    dropped_global_session_limit: u64,
+    dropped_oversized: u64,
+    dropped_malformed: u64,
+    dropped_unknown_session: u64,
+    dropped_queue_full: u64,
+    reassembly_timeouts: u64,
+    session_timeouts: u64,
+    attach_timeouts: u64,
+    transport_errors: u64,
 }
 
 #[derive(Serialize)]
@@ -328,6 +388,15 @@ fn coded_http_route_creation_error(error: CreateHttpRouteError) -> CodedApiError
             "could not create HTTP route",
         ),
     }
+}
+
+fn coded_udp_policy_error(error: UdpPolicyError) -> CodedApiError {
+    let status = match error {
+        UdpPolicyError::DuplicatePublicPort => StatusCode::CONFLICT,
+        UdpPolicyError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    CodedApiError(status, error.code(), "UDP tunnel policy is invalid")
 }
 
 fn coded_certificate_catalog_error(error: CertificateCatalogError) -> CodedApiError {
@@ -476,6 +545,17 @@ async fn run_server(
         .filter(|value| !value.trim().is_empty())
         .map(|value| value.parse::<SocketAddr>())
         .transpose()?;
+    let udp_relay_address = std::env::var("LINKLAKE_UDP_RELAY_BIND")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.parse::<SocketAddr>())
+        .transpose()?;
+    let udp_relay_endpoint = std::env::var("LINKLAKE_UDP_RELAY_ENDPOINT")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let udp_relay_server_name = std::env::var("LINKLAKE_UDP_RELAY_SERVER_NAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
     let control_cert = std::env::var("LINKLAKE_CONTROL_CERT_PATH").ok();
     let control_key = std::env::var("LINKLAKE_CONTROL_KEY_PATH").ok();
     let management_cert = std::env::var("LINKLAKE_MANAGEMENT_CERT_PATH").ok();
@@ -501,11 +581,43 @@ async fn run_server(
         (None, None) => anyhow::bail!("LINKLAKE_MANAGEMENT_CERT_PATH and LINKLAKE_MANAGEMENT_KEY_PATH are required for remote management"),
         _ => anyhow::bail!("both TLS certificate and key paths are required for management"),
     };
-    let control_tls = match (control_cert, control_key) {
-        (Some(cert), Some(key)) => Some(load_control_tls(&cert, &key)?),
+    let control_tls = match (&control_cert, &control_key) {
+        (Some(cert), Some(key)) => Some(load_control_tls(cert, key)?),
         (None, None) if control_address.ip().is_loopback() => None,
         (None, None) => anyhow::bail!("LINKLAKE_CONTROL_CERT_PATH and LINKLAKE_CONTROL_KEY_PATH are required for remote TCP control"),
         _ => anyhow::bail!("both TLS certificate and key paths are required for TCP control"),
+    };
+    let udp_data_plane = match udp_relay_address {
+        Some(bind_address) => {
+            let advertised_endpoint = udp_relay_endpoint.ok_or_else(|| {
+                anyhow::anyhow!("LINKLAKE_UDP_RELAY_ENDPOINT is required when UDP relay is enabled")
+            })?;
+            let server_name = udp_relay_server_name.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "LINKLAKE_UDP_RELAY_SERVER_NAME is required when UDP relay is enabled"
+                )
+            })?;
+            let certificate_path = control_cert
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("UDP relay requires LINKLAKE_CONTROL_CERT_PATH"))?;
+            let private_key_path = control_key
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("UDP relay requires LINKLAKE_CONTROL_KEY_PATH"))?;
+            Some(UdpDataPlane::bind(UdpDataPlaneConfig {
+                bind_address,
+                advertised_endpoint,
+                server_name,
+                certificate_path: std::path::Path::new(certificate_path),
+                private_key_path: std::path::Path::new(private_key_path),
+            })?)
+        }
+        None => {
+            anyhow::ensure!(
+                udp_relay_endpoint.is_none() && udp_relay_server_name.is_none(),
+                "LINKLAKE_UDP_RELAY_BIND is required when UDP relay endpoint settings are provided"
+            );
+            None
+        }
     };
     let enrollment_token = configured_token.unwrap_or_else(|| {
         let token = Uuid::new_v4().to_string();
@@ -548,6 +660,10 @@ async fn run_server(
         tunnels: Mutex::new(HashMap::new()),
         tunnel_statistics: Mutex::new(HashMap::new()),
         seen_tunnel_registrations: Mutex::new(HashSet::new()),
+        udp_data_plane,
+        udp_tunnels: Mutex::new(HashMap::new()),
+        udp_tunnel_statistics: Mutex::new(HashMap::new()),
+        seen_udp_tunnel_registrations: Mutex::new(HashSet::new()),
         http_route_catalog: Mutex::new(HttpRouteCatalog::open(data_dir.as_deref())?),
         http_routes: Mutex::new(HashMap::new()),
         http_route_statistics: Mutex::new(HashMap::new()),
@@ -559,6 +675,7 @@ async fn run_server(
         pending_connections: AsyncMutex::new(HashMap::new()),
         global_connection_permits: Arc::new(Semaphore::new(GLOBAL_CONNECTION_LIMIT)),
         pending_connection_permits: Arc::new(Semaphore::new(PENDING_CONNECTION_LIMIT)),
+        global_udp_session_permits: Arc::new(Semaphore::new(GLOBAL_UDP_SESSION_LIMIT)),
         metrics: ServerCounters::default(),
     });
     restore_managed_certificates(&state)?;
@@ -587,6 +704,18 @@ async fn run_server(
         .route(
             "/api/v1/tcp-tunnels/:tunnel_id/enabled",
             post(set_tcp_tunnel_enabled),
+        )
+        .route(
+            "/api/v1/udp-tunnels",
+            get(list_udp_tunnels).post(create_udp_tunnel),
+        )
+        .route(
+            "/api/v1/udp-tunnels/:tunnel_id",
+            axum::routing::delete(delete_udp_tunnel),
+        )
+        .route(
+            "/api/v1/udp-tunnels/:tunnel_id/enabled",
+            post(set_udp_tunnel_enabled),
         )
         .route(
             "/api/v1/http-routes",
@@ -631,6 +760,7 @@ async fn run_server(
             "LinkLake received a shutdown signal; closing tunnels and draining requests."
         );
         tcp_tunnel::stop_all(&shutdown_state);
+        udp_tunnel::stop_all(&shutdown_state);
         http_tunnel::stop_all(&shutdown_state);
         let _ = shutdown_tx.send(true);
     });
@@ -776,6 +906,10 @@ async fn status(
     authorize_management(&state, &headers)?;
     let clients = state.clients.lock().expect("client registry lock poisoned");
     let tunnels = state.tunnels.lock().expect("tunnel registry lock poisoned");
+    let udp_tunnels = state
+        .udp_tunnels
+        .lock()
+        .expect("UDP tunnel registry lock poisoned");
     let http_routes = state
         .http_routes
         .lock()
@@ -785,6 +919,7 @@ async fn status(
         api_version: API_VERSION,
         instance_id: state.instance_id.clone(),
         tunnels: tunnels.len(),
+        udp_tunnels: udp_tunnels.len(),
         http_routes: http_routes.len(),
         https_routes: state
             .certificate_manager
@@ -806,6 +941,14 @@ async fn metrics(
     let sum_u64 = |load: fn(&tcp_tunnel::TunnelStatistics) -> u64| {
         statistics.values().map(|statistics| load(statistics)).sum()
     };
+    let udp_statistics = state
+        .udp_tunnel_statistics
+        .lock()
+        .expect("UDP tunnel statistics lock poisoned");
+    let mut udp_totals = udp_tunnel::UdpTunnelStatisticsSnapshot::default();
+    for statistics in udp_statistics.values() {
+        udp_totals.add_assign(statistics.snapshot());
+    }
     let http_statistics = state
         .http_route_statistics
         .lock()
@@ -879,6 +1022,7 @@ async fn metrics(
         tcp_rejected_pending_limit: sum_u64(|statistics| {
             statistics.rejected_pending_limit.load(Ordering::Relaxed)
         }),
+        udp: udp_metrics_response(udp_totals),
         control_connections_total: state
             .metrics
             .control_connections_total
@@ -958,6 +1102,28 @@ async fn metrics(
             .acme_http01_challenges_total
             .load(Ordering::Relaxed),
     }))
+}
+
+fn udp_metrics_response(statistics: udp_tunnel::UdpTunnelStatisticsSnapshot) -> UdpMetricsResponse {
+    UdpMetricsResponse {
+        udp_active_sessions: statistics.active_sessions,
+        udp_packets_from_public: statistics.packets_from_public,
+        udp_packets_to_public: statistics.packets_to_public,
+        udp_bytes_from_public: statistics.bytes_from_public,
+        udp_bytes_to_public: statistics.bytes_to_public,
+        udp_dropped_packets: statistics.dropped_packets,
+        udp_dropped_oversized: statistics.dropped_oversized,
+        udp_dropped_malformed: statistics.dropped_malformed,
+        udp_dropped_unknown_session: statistics.dropped_unknown_session,
+        udp_dropped_queue_full: statistics.dropped_queue_full,
+        udp_dropped_policy_session_limit: statistics.dropped_policy_limit,
+        udp_dropped_global_session_limit: statistics.dropped_global_limit,
+        udp_dropped_bandwidth_limit: statistics.dropped_bandwidth_limit,
+        udp_session_timeouts: statistics.session_timeouts,
+        udp_reassembly_timeouts: statistics.reassembly_timeouts,
+        udp_attach_timeouts: statistics.attach_timeouts,
+        udp_transport_errors: statistics.transport_errors,
+    }
 }
 
 async fn get_acme_config(
@@ -2139,6 +2305,201 @@ async fn delete_tcp_tunnel(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn list_udp_tunnels(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<UdpTunnelView>>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let policies = state
+        .tunnel_catalog
+        .lock()
+        .expect("tunnel catalog lock poisoned")
+        .list_udp()
+        .map_err(coded_udp_policy_error)?;
+    let online = state
+        .udp_tunnels
+        .lock()
+        .expect("UDP tunnel registry lock poisoned");
+    let statistics = state
+        .udp_tunnel_statistics
+        .lock()
+        .expect("UDP tunnel statistics lock poisoned");
+    Ok(Json(
+        policies
+            .into_iter()
+            .map(|policy| {
+                let tunnel_statistics = statistics
+                    .get(&policy.id)
+                    .map(|value| value.snapshot())
+                    .unwrap_or_default();
+                let is_online = online
+                    .get(&policy.public_port)
+                    .is_some_and(|registration| registration.policy_id == policy.id);
+                UdpTunnelView {
+                    online: is_online,
+                    active_sessions: tunnel_statistics.active_sessions,
+                    packets_from_public: tunnel_statistics.packets_from_public,
+                    packets_to_public: tunnel_statistics.packets_to_public,
+                    bytes_from_public: tunnel_statistics.bytes_from_public,
+                    bytes_to_public: tunnel_statistics.bytes_to_public,
+                    dropped_packets: tunnel_statistics.dropped_packets,
+                    dropped_bandwidth_limit: tunnel_statistics.dropped_bandwidth_limit,
+                    dropped_policy_session_limit: tunnel_statistics.dropped_policy_limit,
+                    dropped_global_session_limit: tunnel_statistics.dropped_global_limit,
+                    dropped_oversized: tunnel_statistics.dropped_oversized,
+                    dropped_malformed: tunnel_statistics.dropped_malformed,
+                    dropped_unknown_session: tunnel_statistics.dropped_unknown_session,
+                    dropped_queue_full: tunnel_statistics.dropped_queue_full,
+                    reassembly_timeouts: tunnel_statistics.reassembly_timeouts,
+                    session_timeouts: tunnel_statistics.session_timeouts,
+                    attach_timeouts: tunnel_statistics.attach_timeouts,
+                    transport_errors: tunnel_statistics.transport_errors,
+                    policy,
+                }
+            })
+            .collect(),
+    ))
+}
+
+async fn create_udp_tunnel(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<CreateUdpTunnelPolicy>,
+) -> Result<(StatusCode, Json<UdpTunnelPolicy>), CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    if state.udp_data_plane.is_none() {
+        return Err(CodedApiError(
+            StatusCode::CONFLICT,
+            "udp_relay_disabled",
+            "UDP relay is not configured on this server",
+        ));
+    }
+    if !state
+        .clients
+        .lock()
+        .expect("client registry lock poisoned")
+        .contains(request.client_id)
+    {
+        return Err(CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "unknown_client",
+            "unknown client for UDP tunnel policy",
+        ));
+    }
+    let policy = state
+        .tunnel_catalog
+        .lock()
+        .expect("tunnel catalog lock poisoned")
+        .create_udp(request)
+        .map_err(coded_udp_policy_error)?;
+    record_audit(
+        &state,
+        "udp_tunnel.policy.created",
+        &policy.id.to_string(),
+        &format!(
+            "client={}; port={}; name={}",
+            policy.client_id, policy.public_port, policy.name
+        ),
+    );
+    Ok((StatusCode::CREATED, Json(policy)))
+}
+
+async fn set_udp_tunnel_enabled(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(tunnel_id): Path<Uuid>,
+    Json(request): Json<EnableTunnelRequest>,
+) -> Result<StatusCode, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let policy = state
+        .tunnel_catalog
+        .lock()
+        .expect("tunnel catalog lock poisoned")
+        .list_udp()
+        .map_err(coded_udp_policy_error)?
+        .into_iter()
+        .find(|policy| policy.id == tunnel_id)
+        .ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_udp_tunnel",
+            "UDP tunnel policy does not exist",
+        ))?;
+    let updated = state
+        .tunnel_catalog
+        .lock()
+        .expect("tunnel catalog lock poisoned")
+        .set_udp_enabled(tunnel_id, request.enabled)
+        .map_err(coded_udp_policy_error)?;
+    if !updated {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_udp_tunnel",
+            "UDP tunnel policy does not exist",
+        ));
+    }
+    if !request.enabled {
+        udp_tunnel::stop_public_port(&state, policy.public_port);
+    }
+    record_audit(
+        &state,
+        "udp_tunnel.policy.updated",
+        &tunnel_id.to_string(),
+        if request.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_udp_tunnel(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(tunnel_id): Path<Uuid>,
+) -> Result<StatusCode, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let policy = state
+        .tunnel_catalog
+        .lock()
+        .expect("tunnel catalog lock poisoned")
+        .list_udp()
+        .map_err(coded_udp_policy_error)?
+        .into_iter()
+        .find(|policy| policy.id == tunnel_id)
+        .ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_udp_tunnel",
+            "UDP tunnel policy does not exist",
+        ))?;
+    if !state
+        .tunnel_catalog
+        .lock()
+        .expect("tunnel catalog lock poisoned")
+        .delete_udp(tunnel_id)
+        .map_err(coded_udp_policy_error)?
+    {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_udp_tunnel",
+            "UDP tunnel policy does not exist",
+        ));
+    }
+    udp_tunnel::stop_public_port(&state, policy.public_port);
+    state
+        .udp_tunnel_statistics
+        .lock()
+        .expect("UDP tunnel statistics lock poisoned")
+        .remove(&policy.id);
+    record_audit(
+        &state,
+        "udp_tunnel.policy.deleted",
+        &tunnel_id.to_string(),
+        "policy deleted",
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn list_http_routes(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -2869,11 +3230,13 @@ mod tests {
     use super::{
         certificate_target_matches, coded_http_route_creation_error, management_session_cookie,
         release_certificate_job_slot, reserve_certificate_job_slot,
-        select_certificate_maintenance_operation, session_cookie_header, CertificateOperation,
+        select_certificate_maintenance_operation, session_cookie_header, udp_metrics_response,
+        CertificateOperation, MANAGEMENT_UI,
     };
     use crate::{
         certificate_catalog::{CertificateState, CertificateStatus, RouteTlsMode, RouteTlsPolicy},
         http_route_catalog::{CreateHttpRouteError, HttpRoutePolicy},
+        udp_tunnel::UdpTunnelStatisticsSnapshot,
     };
     use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
     use std::collections::HashMap;
@@ -2929,6 +3292,54 @@ mod tests {
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("Secure"));
         assert!(cookie.contains("SameSite=Strict"));
+    }
+
+    #[test]
+    fn udp_metrics_api_and_web_ui_share_the_same_fields() {
+        let response = udp_metrics_response(UdpTunnelStatisticsSnapshot {
+            dropped_packets: 11,
+            dropped_oversized: 12,
+            dropped_malformed: 13,
+            dropped_unknown_session: 14,
+            dropped_queue_full: 15,
+            dropped_policy_limit: 16,
+            dropped_global_limit: 17,
+            dropped_bandwidth_limit: 18,
+            attach_timeouts: 19,
+            ..UdpTunnelStatisticsSnapshot::default()
+        });
+        let json = serde_json::to_value(response).expect("UDP metrics should serialize");
+        let expected = [
+            ("udp_dropped_packets", 11),
+            ("udp_dropped_oversized", 12),
+            ("udp_dropped_malformed", 13),
+            ("udp_dropped_unknown_session", 14),
+            ("udp_dropped_queue_full", 15),
+            ("udp_dropped_policy_session_limit", 16),
+            ("udp_dropped_global_session_limit", 17),
+            ("udp_dropped_bandwidth_limit", 18),
+            ("udp_attach_timeouts", 19),
+        ];
+        for (field, value) in expected {
+            assert_eq!(json[field], value);
+            assert!(
+                MANAGEMENT_UI.contains(&format!("dashboard.metrics.{field}")),
+                "Web UI does not consume UDP metric field {field}"
+            );
+        }
+        for field in [
+            "dropped_packets",
+            "dropped_oversized",
+            "dropped_malformed",
+            "dropped_unknown_session",
+            "dropped_queue_full",
+            "attach_timeouts",
+        ] {
+            assert!(
+                MANAGEMENT_UI.contains(&format!("policy.{field}")),
+                "Web UI does not consume per-policy UDP field {field}"
+            );
+        }
     }
 
     #[test]

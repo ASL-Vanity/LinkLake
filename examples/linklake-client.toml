@@ -8,6 +8,16 @@ client_token = "replace-with-the-token-returned-at-enrollment"
 public_port = 32001
 target = "127.0.0.1:2333"
 
+[[udp_tunnels]]
+name = "game-server-udp"
+control = "tunnel.example.com:32101"
+control_ca_cert = "C:\\LinkLake\\control-ca.pem"
+control_server_name = "tunnel.example.com"
+client_id = "00000000-0000-0000-0000-000000000000"
+client_token = "replace-with-the-token-returned-at-enrollment"
+public_port = 32002
+target = "127.0.0.1:2333"
+
 [[http_routes]]
 name = "local-web"
 control = "tunnel.example.com:32101"

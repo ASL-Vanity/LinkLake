@@ -22,6 +22,8 @@ use tokio_rustls::{
 };
 use uuid::Uuid;
 
+mod udp_agent;
+
 const CONTROL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const CONTROL_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
 const TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -98,7 +100,26 @@ enum Command {
         #[arg(long, default_value = "development-http")]
         name: String,
     },
-    /// 运行 TOML 配置文件中声明的全部 TCP 隧道和 HTTP 路由代理。
+    /// 运行开发用 UDP 隧道代理。
+    UdpAgent {
+        #[arg(long, default_value = "127.0.0.1:32101")]
+        control: String,
+        #[arg(long)]
+        control_ca_cert: Option<PathBuf>,
+        #[arg(long)]
+        control_server_name: Option<String>,
+        #[arg(long)]
+        client_id: Uuid,
+        #[arg(long)]
+        token: String,
+        #[arg(long)]
+        public_port: u16,
+        #[arg(long)]
+        target: String,
+        #[arg(long, default_value = "development-udp")]
+        name: String,
+    },
+    /// 运行 TOML 配置文件中声明的全部 TCP、UDP 隧道和 HTTP 路由代理。
     Run {
         #[arg(long, default_value = "linklake-client.toml")]
         config: PathBuf,
@@ -117,11 +138,25 @@ struct ClientConfigFile {
     #[serde(default)]
     tcp_tunnels: Vec<TcpTunnelConfig>,
     #[serde(default)]
+    udp_tunnels: Vec<UdpTunnelConfig>,
+    #[serde(default)]
     http_routes: Vec<HttpRouteConfig>,
 }
 
 #[derive(Deserialize)]
 struct TcpTunnelConfig {
+    control: String,
+    control_ca_cert: Option<PathBuf>,
+    control_server_name: Option<String>,
+    client_id: Uuid,
+    client_token: String,
+    public_port: u16,
+    target: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct UdpTunnelConfig {
     control: String,
     control_ca_cert: Option<PathBuf>,
     control_server_name: Option<String>,
@@ -258,6 +293,29 @@ async fn run_cli() -> anyhow::Result<()> {
             )
             .await?;
         }
+        Command::UdpAgent {
+            control,
+            control_ca_cert,
+            control_server_name,
+            client_id,
+            token,
+            public_port,
+            target,
+            name,
+        } => {
+            udp_agent::run_udp_agent(
+                ControlTransport::new(control, control_ca_cert, control_server_name)?,
+                client_id,
+                token,
+                public_port,
+                target,
+                name,
+                Arc::new(tokio::sync::Semaphore::new(
+                    udp_agent::UDP_QUEUE_BUDGET_BYTES,
+                )),
+            )
+            .await?;
+        }
         Command::Run { config } => run_configured_agents(config, None).await?,
     }
     Ok(())
@@ -269,6 +327,10 @@ async fn run_configured_agents(
 ) -> anyhow::Result<()> {
     let content = read_to_string(&path)?;
     let config = parse_client_config(&content)?;
+    // 同一份配置中的所有 UDP 隧道共享队列字节预算，避免多个策略叠加占满客户端内存。
+    let udp_queue_budget = Arc::new(tokio::sync::Semaphore::new(
+        udp_agent::UDP_QUEUE_BUDGET_BYTES,
+    ));
     for tunnel in config.tcp_tunnels {
         let transport = ControlTransport::new(
             tunnel.control,
@@ -287,6 +349,29 @@ async fn run_configured_agents(
             .await
             {
                 tracing::error!("Configured TCP tunnel failed permanently: {error}");
+            }
+        });
+    }
+    for tunnel in config.udp_tunnels {
+        let transport = ControlTransport::new(
+            tunnel.control,
+            tunnel.control_ca_cert,
+            tunnel.control_server_name,
+        )?;
+        let udp_queue_budget = udp_queue_budget.clone();
+        tokio::spawn(async move {
+            if let Err(error) = udp_agent::run_udp_agent(
+                transport,
+                tunnel.client_id,
+                tunnel.client_token,
+                tunnel.public_port,
+                tunnel.target,
+                tunnel.name,
+                udp_queue_budget,
+            )
+            .await
+            {
+                tracing::error!("Configured UDP tunnel failed permanently: {error}");
             }
         });
     }
@@ -346,8 +431,10 @@ async fn wait_for_os_shutdown() {
 fn parse_client_config(content: &str) -> anyhow::Result<ClientConfigFile> {
     let config: ClientConfigFile = toml::from_str(content)?;
     anyhow::ensure!(
-        !config.tcp_tunnels.is_empty() || !config.http_routes.is_empty(),
-        "the configuration has no tcp_tunnels or http_routes entries"
+        !config.tcp_tunnels.is_empty()
+            || !config.udp_tunnels.is_empty()
+            || !config.http_routes.is_empty(),
+        "the configuration has no tcp_tunnels, udp_tunnels, or http_routes entries"
     );
     Ok(config)
 }
@@ -401,6 +488,29 @@ mod tests {
     }
 
     #[test]
+    fn parses_udp_tunnel_configuration() {
+        let config = parse_client_config(
+            r#"
+                [[udp_tunnels]]
+                name = "game-udp"
+                control = "tunnel.example.com:32101"
+                control_ca_cert = "C:\\LinkLake\\control-ca.pem"
+                control_server_name = "tunnel.example.com"
+                client_id = "00000000-0000-0000-0000-000000000001"
+                client_token = "test-token"
+                public_port = 32002
+                target = "127.0.0.1:2333"
+            "#,
+        )
+        .expect("UDP configuration should parse");
+
+        assert_eq!(config.udp_tunnels.len(), 1);
+        assert_eq!(config.udp_tunnels[0].name, "game-udp");
+        assert_eq!(config.udp_tunnels[0].public_port, 32002);
+        assert_eq!(config.udp_tunnels[0].target, "127.0.0.1:2333");
+    }
+
+    #[test]
     fn rejects_configuration_without_tunnels() {
         assert!(parse_client_config("").is_err());
     }
@@ -410,6 +520,7 @@ mod tests {
 struct ControlTransport {
     endpoint: String,
     tls: Option<ControlTls>,
+    quic: Option<quinn::ClientConfig>,
 }
 
 #[derive(Clone)]
@@ -432,6 +543,7 @@ impl ControlTransport {
             return Ok(Self {
                 endpoint,
                 tls: None,
+                quic: None,
             });
         };
 
@@ -445,6 +557,7 @@ impl ControlTransport {
         for certificate in certificates {
             roots.add(certificate)?;
         }
+        let quic = udp_agent::build_quic_client_config(roots.clone())?;
         let config = ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
@@ -461,6 +574,7 @@ impl ControlTransport {
                 connector: TlsConnector::from(Arc::new(config)),
                 server_name,
             }),
+            quic: Some(quic),
         })
     }
 }
