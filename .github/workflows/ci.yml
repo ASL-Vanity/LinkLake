@@ -86,7 +86,7 @@ jobs:
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\tcp-e2e.ps1
       - name: Run UDP end-to-end tests
         shell: powershell
-        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\udp-e2e.ps1 -SkipBuild
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\udp-e2e.ps1
       - name: Run HTTP end-to-end tests
         shell: powershell
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\http-e2e.ps1 -SkipBuild
