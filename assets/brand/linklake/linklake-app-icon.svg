@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title">
+  <title id="title">LinkLake application icon</title>
+  <rect width="1024" height="1024" rx="224" fill="#07131F"/>
+  <g transform="translate(512 512) scale(11.2941176471) translate(-48 -48)">
+    <path fill="#0896A6" d="M20 14h38v16H38a8 8 0 0 0-8 8v20H14V20a6 6 0 0 1 6-6Z"/>
+    <path fill="#3568E8" d="M76 82H38V66h20a8 8 0 0 0 8-8V38h16v38a6 6 0 0 1-6 6Z"/>
+  </g>
+</svg>

@@ -3,6 +3,7 @@ use argon2::{
     Argon2,
 };
 use rusqlite::{params, Connection, OptionalExtension};
+use sha2::{Digest, Sha256};
 use std::{fs, path::Path};
 use uuid::Uuid;
 
@@ -16,6 +17,7 @@ pub(crate) struct BootstrapCredentials {
 
 pub(crate) struct AdminAuth {
     database: Connection,
+    dummy_password_hash: String,
 }
 
 pub(crate) struct NewSession {
@@ -26,6 +28,7 @@ pub(crate) struct NewSession {
 
 pub(crate) struct SessionIdentity {
     pub(crate) username: String,
+    pub(crate) expires_unix_seconds: u64,
     pub(crate) password_change_required: bool,
 }
 
@@ -105,14 +108,18 @@ impl AdminAuth {
                 "INSERT INTO administrators (username, password_hash, created_unix_seconds, must_change_password) VALUES (?1, ?2, ?3, ?4)",
                 params![
                     bootstrap.username,
-                    hash_secret(&bootstrap.password)?,
+                    hash_password(&bootstrap.password)?,
                     unix_seconds() as i64,
                     bootstrap.force_password_change,
                 ],
             )?;
             tracing::info!("Created initial LinkLake administrator account.");
         }
-        Ok(Self { database })
+        Ok(Self {
+            database,
+            // 未知用户名也执行一次与真实密码相同的 Argon2 校验，降低明显的账户枚举时序差。
+            dummy_password_hash: hash_password("linklake-dummy-password-verification")?,
+        })
     }
 
     pub(crate) fn login(
@@ -128,12 +135,18 @@ impl AdminAuth {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        let Some((password_hash, must_change_password)) = administrator else {
-            return Ok(None);
+        let must_change_password = match administrator {
+            Some((password_hash, must_change_password)) => {
+                if !verify_password(password, &password_hash)? {
+                    return Ok(None);
+                }
+                must_change_password
+            }
+            None => {
+                let _ = verify_password(password, &self.dummy_password_hash)?;
+                return Ok(None);
+            }
         };
-        if !verify_secret(password, &password_hash)? {
-            return Ok(None);
-        }
         let session_id = Uuid::new_v4();
         let session_secret = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
         let expires_unix_seconds = unix_seconds() + SESSION_LIFETIME_SECONDS;
@@ -145,7 +158,7 @@ impl AdminAuth {
             "INSERT INTO admin_sessions (session_id, session_secret_hash, username, expires_unix_seconds) VALUES (?1, ?2, ?3, ?4)",
             params![
                 session_id.to_string(),
-                hash_secret(&session_secret)?,
+                hash_session_secret(&session_secret),
                 username,
                 expires_unix_seconds as i64,
             ],
@@ -183,11 +196,21 @@ impl AdminAuth {
         if expires_unix_seconds <= unix_seconds() as i64 {
             return Ok(None);
         }
-        if !verify_secret(session_secret, &session_secret_hash)? {
+        if !session_secret_hash.starts_with("sha256:") {
+            // 旧版本使用 Argon2 保存会话 secret。升级后明确使其失效，避免高频 API
+            // 鉴权继续承担密码哈希的 CPU 成本。
+            self.database.execute(
+                "DELETE FROM admin_sessions WHERE session_id = ?1",
+                [session_id.to_string()],
+            )?;
+            return Ok(None);
+        }
+        if !verify_session_secret(session_secret, &session_secret_hash) {
             return Ok(None);
         }
         Ok(Some(SessionIdentity {
             username,
+            expires_unix_seconds: expires_unix_seconds as u64,
             password_change_required: must_change_password != 0,
         }))
     }
@@ -211,13 +234,25 @@ impl AdminAuth {
         new_password: &str,
     ) -> anyhow::Result<bool> {
         validate_password(new_password)?;
+        let Some((session_id, _)) = cookie_value.split_once('.') else {
+            return Ok(false);
+        };
+        let Ok(session_id) = Uuid::parse_str(session_id) else {
+            return Ok(false);
+        };
         let Some(identity) = self.authenticate_session(cookie_value)? else {
             return Ok(false);
         };
-        self.database.execute(
+        let transaction = self.database.transaction()?;
+        transaction.execute(
             "UPDATE administrators SET password_hash = ?1, must_change_password = 0 WHERE username = ?2",
-            params![hash_secret(new_password)?, identity.username],
+            params![hash_password(new_password)?, identity.username],
         )?;
+        transaction.execute(
+            "DELETE FROM admin_sessions WHERE username = ?1 AND session_id <> ?2",
+            params![identity.username, session_id.to_string()],
+        )?;
+        transaction.commit()?;
         Ok(true)
     }
 }
@@ -264,21 +299,41 @@ fn validate_password(password: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn hash_secret(secret: &str) -> anyhow::Result<String> {
+fn hash_password(password: &str) -> anyhow::Result<String> {
     let salt = SaltString::encode_b64(Uuid::new_v4().as_bytes())
         .map_err(|error| anyhow::anyhow!("could not create credential salt: {error}"))?;
     Ok(Argon2::default()
-        .hash_password(secret.as_bytes(), &salt)
+        .hash_password(password.as_bytes(), &salt)
         .map_err(|error| anyhow::anyhow!("could not hash credential: {error}"))?
         .to_string())
 }
 
-fn verify_secret(secret: &str, secret_hash: &str) -> anyhow::Result<bool> {
-    let parsed_hash = PasswordHash::new(secret_hash)
+fn verify_password(password: &str, password_hash: &str) -> anyhow::Result<bool> {
+    let parsed_hash = PasswordHash::new(password_hash)
         .map_err(|error| anyhow::anyhow!("stored credential hash is invalid: {error}"))?;
     Ok(Argon2::default()
-        .verify_password(secret.as_bytes(), &parsed_hash)
+        .verify_password(password.as_bytes(), &parsed_hash)
         .is_ok())
+}
+
+fn hash_session_secret(secret: &str) -> String {
+    format!("sha256:{:x}", Sha256::digest(secret.as_bytes()))
+}
+
+fn verify_session_secret(secret: &str, expected_hash: &str) -> bool {
+    constant_time_eq(
+        hash_session_secret(secret).as_bytes(),
+        expected_hash.as_bytes(),
+    )
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    for index in 0..left.len().max(right.len()) {
+        difference |= (left.get(index).copied().unwrap_or(0)
+            ^ right.get(index).copied().unwrap_or(0)) as usize;
+    }
+    difference == 0
 }
 
 fn unix_seconds() -> u64 {
@@ -290,7 +345,11 @@ fn unix_seconds() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{AdminAuth, BootstrapCredentials};
+    use super::{
+        constant_time_eq, hash_password, verify_session_secret, AdminAuth, BootstrapCredentials,
+    };
+    use rusqlite::params;
+    use uuid::Uuid;
 
     #[test]
     fn authenticated_session_is_created_from_a_hashed_password() {
@@ -307,14 +366,37 @@ mod tests {
             .login("admin", "incorrect-password")
             .expect("login should execute")
             .is_none());
+        assert!(auth
+            .login("missing-admin", "incorrect-password")
+            .expect("unknown login should execute dummy verification")
+            .is_none());
         let session = auth
             .login("admin", "correct-horse-battery-staple")
             .expect("login should execute")
             .expect("correct password should create a session");
-        assert!(auth
+        let (session_id, session_secret) = session
+            .cookie_value
+            .split_once('.')
+            .expect("session cookie should contain an id and secret");
+        let stored_hash: String = auth
+            .database
+            .query_row(
+                "SELECT session_secret_hash FROM admin_sessions WHERE session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .expect("session hash should be stored");
+        assert!(stored_hash.starts_with("sha256:"));
+        assert!(!stored_hash.starts_with("$argon2"));
+        assert!(verify_session_secret(session_secret, &stored_hash));
+        assert!(!verify_session_secret("wrong-session-secret", &stored_hash));
+        let identity = auth
             .authenticate_session(&session.cookie_value)
             .expect("session should verify")
-            .is_some());
+            .expect("session should exist");
+        assert_eq!(identity.username, "admin");
+        assert_eq!(identity.expires_unix_seconds, session.expires_unix_seconds);
+        assert!(!identity.password_change_required);
         auth.logout(&session.cookie_value)
             .expect("logout should execute");
         assert!(auth
@@ -338,6 +420,10 @@ mod tests {
             .login("admin", "123456")
             .expect("login should execute")
             .expect("initial password should create a session");
+        let other_session = auth
+            .login("admin", "123456")
+            .expect("second login should execute")
+            .expect("second login should create a session");
         assert!(session.password_change_required);
         assert!(
             auth.authenticate_session(&session.cookie_value)
@@ -356,5 +442,62 @@ mod tests {
                 .expect("session should exist")
                 .password_change_required
         );
+        assert!(auth
+            .authenticate_session(&other_session.cookie_value)
+            .expect("other session should verify")
+            .is_none());
+        assert!(auth
+            .login("admin", "123456")
+            .expect("old password login should execute")
+            .is_none());
+        assert!(auth
+            .login("admin", "a-long-replacement-password")
+            .expect("new password login should execute")
+            .is_some());
+    }
+
+    #[test]
+    fn legacy_argon2_session_hashes_are_explicitly_revoked() {
+        let auth = AdminAuth::open(
+            None,
+            Some(BootstrapCredentials {
+                username: "admin".to_owned(),
+                password: "correct-horse-battery-staple".to_owned(),
+                force_password_change: false,
+            }),
+        )
+        .expect("administrator database should initialize");
+        let session_id = Uuid::new_v4();
+        let session_secret = "legacy-session-secret";
+        auth.database
+            .execute(
+                "INSERT INTO admin_sessions (session_id, session_secret_hash, username, expires_unix_seconds) VALUES (?1, ?2, 'admin', ?3)",
+                params![
+                    session_id.to_string(),
+                    hash_password(session_secret).expect("legacy hash should generate"),
+                    super::unix_seconds() as i64 + 60,
+                ],
+            )
+            .expect("legacy session should insert");
+        assert!(auth
+            .authenticate_session(&format!("{session_id}.{session_secret}"))
+            .expect("legacy session verification should execute")
+            .is_none());
+        let remaining: u64 = auth
+            .database
+            .query_row(
+                "SELECT COUNT(*) FROM admin_sessions WHERE session_id = ?1",
+                [session_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("legacy session count should query");
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn constant_time_comparison_rejects_different_values_and_lengths() {
+        assert!(constant_time_eq(b"same", b"same"));
+        assert!(!constant_time_eq(b"same", b"diff"));
+        assert!(!constant_time_eq(b"same", b"same-longer"));
     }
 }

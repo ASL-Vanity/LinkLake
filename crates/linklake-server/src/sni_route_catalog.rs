@@ -19,6 +19,8 @@ pub(crate) struct CreateSniRoutePolicy {
     pub(crate) bandwidth_limit_bps: Option<u64>,
 }
 
+pub(crate) type UpdateSniRoutePolicy = CreateSniRoutePolicy;
+
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 pub(crate) struct SniRoutePolicy {
     pub(crate) id: Uuid,
@@ -167,6 +169,50 @@ impl SniRouteCatalog {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub(crate) fn update(
+        &mut self,
+        id: Uuid,
+        request: UpdateSniRoutePolicy,
+    ) -> Result<Option<SniRoutePolicy>, SniRoutePolicyError> {
+        let hostname = normalize_hostname(&request.hostname)
+            .map_err(|_| SniRoutePolicyError::InvalidHostname)?;
+        validate_policy(&request)?;
+        let Some(current) = self.policy_by_id(id)? else {
+            return Ok(None);
+        };
+        let duplicate: bool = self.database.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sni_route_policies WHERE hostname = ?1 AND id <> ?2)",
+            params![hostname, id.to_string()],
+            |row| row.get(0),
+        )?;
+        if duplicate {
+            return Err(SniRoutePolicyError::DuplicateHostname);
+        }
+        let policy = SniRoutePolicy {
+            id,
+            client_id: request.client_id,
+            name: request.name.trim().to_owned(),
+            hostname,
+            target_addr: request.target_addr.trim().to_owned(),
+            max_connections: request.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
+            bandwidth_limit_bps: request.bandwidth_limit_bps,
+            enabled: current.enabled,
+        };
+        self.database.execute(
+            "UPDATE sni_route_policies SET client_id = ?1, name = ?2, hostname = ?3, target_addr = ?4, max_connections = ?5, bandwidth_limit_bps = ?6 WHERE id = ?7",
+            params![
+                policy.client_id.to_string(),
+                policy.name,
+                policy.hostname,
+                policy.target_addr,
+                policy.max_connections,
+                policy.bandwidth_limit_bps,
+                policy.id.to_string(),
+            ],
+        )?;
+        Ok(Some(policy))
     }
 
     pub(crate) fn set_enabled(
@@ -353,5 +399,43 @@ mod tests {
             catalog.create(invalid_limit),
             Err(SniRoutePolicyError::InvalidConnectionLimit)
         ));
+    }
+
+    #[test]
+    fn update_preserves_identity_and_enabled_state() {
+        let client_id = Uuid::new_v4();
+        let mut catalog = SniRouteCatalog::open(None).expect("catalog should open");
+        let policy = catalog
+            .create(CreateSniRoutePolicy {
+                client_id,
+                name: "old-mail".to_owned(),
+                hostname: "old-mail.example.test".to_owned(),
+                target_addr: "127.0.0.1:465".to_owned(),
+                max_connections: Some(4),
+                bandwidth_limit_bps: None,
+            })
+            .expect("route should create");
+        catalog
+            .set_enabled(policy.id, false)
+            .expect("route should disable");
+        let updated = catalog
+            .update(
+                policy.id,
+                CreateSniRoutePolicy {
+                    client_id,
+                    name: "new-mail".to_owned(),
+                    hostname: "New-Mail.Example.Test.".to_owned(),
+                    target_addr: "127.0.0.1:8465".to_owned(),
+                    max_connections: Some(10),
+                    bandwidth_limit_bps: Some(2_000_000),
+                },
+            )
+            .expect("route should update")
+            .expect("route should exist");
+        assert_eq!(updated.id, policy.id);
+        assert!(!updated.enabled);
+        assert_eq!(updated.hostname, "new-mail.example.test");
+        assert_eq!(updated.target_addr, "127.0.0.1:8465");
+        assert_eq!(updated.bandwidth_limit_bps, Some(2_000_000));
     }
 }

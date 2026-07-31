@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LinkLake 品牌标志</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; color: #eaf5f8; background: #050b12; font-family: Inter, "Segoe UI", "Microsoft YaHei", sans-serif; }
+      main { width: 1400px; min-height: 1120px; padding: 64px; background: radial-gradient(circle at 10% -5%, #164766, #07131f 42%, #050b12 100%); }
+      header { display: flex; justify-content: space-between; align-items: end; margin-bottom: 34px; }
+      h1 { margin: 8px 0 0; font-size: 52px; letter-spacing: -.045em; }
+      .eyebrow { color: #43d9dd; font-weight: 800; letter-spacing: .16em; }
+      header p { width: 480px; margin: 0; color: #9bb8c5; font-size: 16px; line-height: 1.7; text-align: right; }
+      .hero { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
+      .panel { padding: 30px; border: 1px solid #ffffff18; border-radius: 26px; background: #0b2234d9; }
+      .stage { display: grid; place-items: center; min-height: 310px; border-radius: 22px; }
+      .stage.dark { background: #07131f; }
+      .stage.light { background: #f5fafc; }
+      .stage img { width: 230px; height: 230px; }
+      .panel h2 { margin: 20px 0 4px; font-size: 22px; }
+      .panel p { margin: 0; color: #91adba; font-size: 14px; }
+      .lockups { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; margin-top: 22px; }
+      .lockup-stage { display: grid; place-items: center; height: 180px; border-radius: 22px; }
+      .lockup-stage img { width: 440px; max-width: 88%; }
+      .variants { display: grid; grid-template-columns: 1.2fr .8fr .8fr; gap: 22px; margin-top: 22px; }
+      .icon-stage { display: grid; place-items: center; min-height: 230px; border-radius: 22px; background: #ffffff06; }
+      .icon-stage.app img { width: 180px; height: 180px; }
+      .icon-stage.mono-light { background: #07131f; }
+      .icon-stage.mono-dark { background: #f5fafc; }
+      .icon-stage > img { width: 130px; height: 130px; }
+      .micro-row { display: flex; gap: 20px; align-items: center; justify-content: center; margin-top: 18px; padding: 18px; border-radius: 16px; background: #07131f; }
+      .micro-row span { display: grid; place-items: center; width: 48px; height: 48px; border-radius: 12px; background: #0b2234; }
+      footer { margin-top: 24px; color: #8aa9b7; font-size: 14px; text-align: center; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header><div><div class="eyebrow">LINKLAKE BRAND MARK</div><h1>双岸 · 正式品牌标志</h1></div><p>两枚相向的 L 形几何围出中央连接通道。标准版、小尺寸版、单色版和应用图标均由同一母版派生。</p></header>
+      <section class="hero">
+        <article class="panel"><div class="stage dark"><img src="linklake-mark.svg" /></div><h2>深色背景</h2><p>标准双色透明主标</p></article>
+        <article class="panel"><div class="stage light"><img src="linklake-mark.svg" /></div><h2>浅色背景</h2><p>统一生产色保持可读性</p></article>
+      </section>
+      <section class="lockups">
+        <div class="lockup-stage" style="background:#f5fafc"><img src="linklake-lockup-on-light.svg" /></div>
+        <div class="lockup-stage" style="background:#07131f"><img src="linklake-lockup-on-dark.svg" /></div>
+      </section>
+      <section class="variants">
+        <article class="panel"><div class="icon-stage app"><img src="linklake-app-icon.svg" /></div><h2>应用图标</h2><p>Windows、macOS、移动端和 PWA 母版</p></article>
+        <article class="panel"><div class="icon-stage mono-dark"><img src="linklake-mark-mono-dark.svg" /></div><h2>深色单色版</h2><p>浅色背景与印刷</p></article>
+        <article class="panel"><div class="icon-stage mono-light"><img src="linklake-mark-mono-light.svg" /></div><h2>浅色单色版</h2><p>深色背景与系统托盘</p></article>
+      </section>
+      <div class="micro-row"><strong>小尺寸校验</strong><span><img src="linklake-mark-micro.svg" width="32" height="32" /></span><span><img src="linklake-mark-micro.svg" width="24" height="24" /></span><span><img src="linklake-mark-micro.svg" width="20" height="20" /></span><span><img src="linklake-mark-micro.svg" width="16" height="16" /></span></div>
+      <footer>Lake Cyan #0896A6 · Link Blue #3568E8 · Deep Navy #07131F</footer>
+    </main>
+  </body>
+</html>

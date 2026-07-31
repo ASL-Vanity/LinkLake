@@ -19,6 +19,9 @@ pub(crate) struct CreateSecretTunnelPolicy {
     pub(crate) bandwidth_limit_bps: Option<u64>,
 }
 
+// 更新接口不会重置已有 access key；密钥轮换应使用独立的安全操作。
+pub(crate) type UpdateSecretTunnelPolicy = CreateSecretTunnelPolicy;
+
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 pub(crate) struct SecretTunnelPolicy {
     pub(crate) id: Uuid,
@@ -205,6 +208,52 @@ impl SecretTunnelCatalog {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub(crate) fn update(
+        &mut self,
+        id: Uuid,
+        request: UpdateSecretTunnelPolicy,
+    ) -> Result<Option<SecretTunnelPolicy>, SecretPolicyError> {
+        validate_policy(&request)?;
+        let Some(current) = self.policy_by_id(id)? else {
+            return Ok(None);
+        };
+        let duplicate: bool = self.database.query_row(
+            "SELECT EXISTS(SELECT 1 FROM secret_tunnel_policies WHERE provider_client_id = ?1 AND name = ?2 AND id <> ?3)",
+            params![
+                request.provider_client_id.to_string(),
+                request.name.trim(),
+                id.to_string()
+            ],
+            |row| row.get(0),
+        )?;
+        if duplicate {
+            return Err(SecretPolicyError::DuplicateName);
+        }
+        let policy = SecretTunnelPolicy {
+            id,
+            provider_client_id: request.provider_client_id,
+            allowed_client_id: request.allowed_client_id,
+            name: request.name.trim().to_owned(),
+            target_addr: request.target_addr.trim().to_owned(),
+            max_connections: request.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
+            bandwidth_limit_bps: request.bandwidth_limit_bps,
+            enabled: current.enabled,
+        };
+        self.database.execute(
+            "UPDATE secret_tunnel_policies SET provider_client_id = ?1, allowed_client_id = ?2, name = ?3, target_addr = ?4, max_connections = ?5, bandwidth_limit_bps = ?6 WHERE id = ?7",
+            params![
+                policy.provider_client_id.to_string(),
+                policy.allowed_client_id.map(|value| value.to_string()),
+                policy.name,
+                policy.target_addr,
+                policy.max_connections,
+                policy.bandwidth_limit_bps,
+                policy.id.to_string(),
+            ],
+        )?;
+        Ok(Some(policy))
     }
 
     pub(crate) fn provider_runtime_policy(
@@ -412,5 +461,47 @@ mod tests {
             catalog.create(invalid),
             Err(SecretPolicyError::InvalidTarget)
         ));
+    }
+
+    #[test]
+    fn update_preserves_identity_enabled_state_and_access_key() {
+        let provider = Uuid::new_v4();
+        let new_provider = Uuid::new_v4();
+        let visitor = Uuid::new_v4();
+        let mut catalog = SecretTunnelCatalog::open(None).expect("catalog should open");
+        let created = catalog
+            .create(request(provider))
+            .expect("policy should create");
+        catalog
+            .set_enabled(created.policy.id, false)
+            .expect("policy should disable");
+        let updated = catalog
+            .update(
+                created.policy.id,
+                CreateSecretTunnelPolicy {
+                    provider_client_id: new_provider,
+                    allowed_client_id: Some(visitor),
+                    name: "updated-rdp".to_owned(),
+                    target_addr: "127.0.0.1:3390".to_owned(),
+                    max_connections: Some(9),
+                    bandwidth_limit_bps: Some(2_000_000),
+                },
+            )
+            .expect("policy should update")
+            .expect("policy should exist");
+        assert_eq!(updated.id, created.policy.id);
+        assert!(!updated.enabled);
+        assert_eq!(updated.provider_client_id, new_provider);
+        assert_eq!(updated.allowed_client_id, Some(visitor));
+
+        catalog
+            .set_enabled(updated.id, true)
+            .expect("policy should re-enable");
+        let runtime = catalog
+            .access_runtime_policy(visitor, &created.access_key)
+            .expect("access key should query")
+            .expect("original access key should remain valid");
+        assert_eq!(runtime.policy_id, updated.id);
+        assert_eq!(runtime.provider_client_id, new_provider);
     }
 }

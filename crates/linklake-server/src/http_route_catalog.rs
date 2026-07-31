@@ -14,6 +14,9 @@ pub(crate) struct CreateHttpRoutePolicy {
     pub(crate) max_connections: Option<u16>,
 }
 
+// 更新接口采用完整替换语义，字段格式与创建接口一致。
+pub(crate) type UpdateHttpRoutePolicy = CreateHttpRoutePolicy;
+
 #[derive(Serialize, Clone)]
 pub(crate) struct HttpRoutePolicy {
     pub(crate) id: Uuid,
@@ -149,6 +152,75 @@ impl HttpRouteCatalog {
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub(crate) fn policy_by_id(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<HttpRoutePolicy>, CreateHttpRouteError> {
+        self.database
+            .query_row(
+                "SELECT id, client_id, name, hostname, target_addr, max_connections, enabled FROM http_route_policies WHERE id = ?1",
+                [id.to_string()],
+                |row| {
+                    let id: String = row.get(0)?;
+                    let client_id: String = row.get(1)?;
+                    Ok(HttpRoutePolicy {
+                        id: Uuid::parse_str(&id).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        client_id: Uuid::parse_str(&client_id)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        name: row.get(2)?,
+                        hostname: row.get(3)?,
+                        target_addr: row.get(4)?,
+                        max_connections: row.get(5)?,
+                        enabled: row.get::<_, i64>(6)? != 0,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn update(
+        &mut self,
+        id: Uuid,
+        request: UpdateHttpRoutePolicy,
+    ) -> Result<Option<HttpRoutePolicy>, CreateHttpRouteError> {
+        let hostname = normalize_hostname(&request.hostname)
+            .map_err(|_| CreateHttpRouteError::InvalidHostname)?;
+        validate_policy(&request, &hostname)?;
+        let Some(current) = self.policy_by_id(id)? else {
+            return Ok(None);
+        };
+        let duplicate_count: i64 = self.database.query_row(
+            "SELECT COUNT(*) FROM http_route_policies WHERE hostname = ?1 AND id <> ?2",
+            params![hostname, id.to_string()],
+            |row| row.get(0),
+        )?;
+        if duplicate_count != 0 {
+            return Err(CreateHttpRouteError::DuplicateHostname);
+        }
+        let policy = HttpRoutePolicy {
+            id,
+            client_id: request.client_id,
+            name: request.name.trim().to_owned(),
+            hostname,
+            target_addr: request.target_addr.trim().to_owned(),
+            max_connections: request.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
+            enabled: current.enabled,
+        };
+        self.database.execute(
+            "UPDATE http_route_policies SET client_id = ?1, name = ?2, hostname = ?3, target_addr = ?4, max_connections = ?5 WHERE id = ?6",
+            params![
+                policy.client_id.to_string(),
+                policy.name,
+                policy.hostname,
+                policy.target_addr,
+                policy.max_connections,
+                policy.id.to_string(),
+            ],
+        )?;
+        Ok(Some(policy))
     }
 
     pub(crate) fn set_enabled(&mut self, id: Uuid, enabled: bool) -> anyhow::Result<bool> {
@@ -383,5 +455,41 @@ mod tests {
             catalog.create(request("SITE.EXAMPLE.COM.:80")),
             Err(CreateHttpRouteError::DuplicateHostname)
         ));
+    }
+
+    #[test]
+    fn update_preserves_identity_and_enabled_state() {
+        let client_id = Uuid::new_v4();
+        let mut catalog = HttpRouteCatalog::open(None).expect("catalog should open");
+        let policy = catalog
+            .create(CreateHttpRoutePolicy {
+                client_id,
+                name: "old-site".to_owned(),
+                hostname: "old.example.com".to_owned(),
+                target_addr: "127.0.0.1:8080".to_owned(),
+                max_connections: Some(8),
+            })
+            .expect("route should create");
+        catalog
+            .set_enabled(policy.id, false)
+            .expect("route should disable");
+        let updated = catalog
+            .update(
+                policy.id,
+                CreateHttpRoutePolicy {
+                    client_id,
+                    name: "new-site".to_owned(),
+                    hostname: "New.Example.com.".to_owned(),
+                    target_addr: "127.0.0.1:9090".to_owned(),
+                    max_connections: Some(16),
+                },
+            )
+            .expect("route should update")
+            .expect("route should exist");
+        assert_eq!(updated.id, policy.id);
+        assert!(!updated.enabled);
+        assert_eq!(updated.hostname, "new.example.com");
+        assert_eq!(updated.target_addr, "127.0.0.1:9090");
+        assert_eq!(updated.max_connections, 16);
     }
 }

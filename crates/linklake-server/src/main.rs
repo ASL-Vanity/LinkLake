@@ -20,11 +20,12 @@ mod tunnel_catalog;
 mod udp_data_plane;
 mod udp_tunnel;
 
-use admin_auth::{AdminAuth, BootstrapCredentials};
+use admin_auth::{AdminAuth, BootstrapCredentials, SessionIdentity};
 use audit_log::{AuditEvent, AuditLog};
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::{header, HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post, put},
     Json, Router,
@@ -38,6 +39,7 @@ use certificate_manager::CertificateManager;
 use client_registry::{Authentication, ClientRegistry};
 use http_route_catalog::{
     CreateHttpRouteError, CreateHttpRoutePolicy, HttpRouteCatalog, HttpRoutePolicy,
+    UpdateHttpRoutePolicy,
 };
 use linklake_core::{
     managed_config_revision, BoxedIo, ClientEnrollmentRequest, ClientEnrollmentResponse,
@@ -48,14 +50,15 @@ use linklake_core::{
 use p2p_node_catalog::{P2pNodeCatalog, P2pNodeRecord};
 use secret_tunnel_catalog::{
     CreateSecretTunnelPolicy, CreatedSecretTunnelPolicy, SecretPolicyError, SecretTunnelCatalog,
-    SecretTunnelPolicy,
+    SecretTunnelPolicy, UpdateSecretTunnelPolicy,
 };
 use serde::{Deserialize, Serialize};
 use sni_route_catalog::{
     CreateSniRoutePolicy, SniRouteCatalog, SniRoutePolicy, SniRoutePolicyError,
+    UpdateSniRoutePolicy,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs::File,
     io::BufReader,
     net::SocketAddr,
@@ -78,7 +81,8 @@ use tunnel_catalog::{
     CreateUdpTunnelPolicy, CreatedHttpProxyPolicy, CreatedSocks5ProxyPolicy, HttpProxyPolicy,
     HttpProxyPolicyError, PortGroupMapping, PortGroupPolicy, PortGroupPolicyError,
     PortGroupProtocol, Socks5PolicyError, Socks5ProxyPolicy, TcpTunnelPolicy, TunnelCatalog,
-    UdpPolicyError, UdpTunnelPolicy,
+    UdpPolicyError, UdpTunnelPolicy, UpdateHttpProxyPolicy, UpdatePortGroupPolicy,
+    UpdateSocks5ProxyPolicy, UpdateTcpTunnelPolicy, UpdateUdpTunnelPolicy,
 };
 use udp_data_plane::{UdpDataPlane, UdpDataPlaneConfig};
 use uuid::Uuid;
@@ -87,6 +91,17 @@ const MANAGEMENT_UI: &str = include_str!("../web/index.html");
 const GLOBAL_CONNECTION_LIMIT: usize = 1024;
 const PENDING_CONNECTION_LIMIT: usize = 256;
 const GLOBAL_UDP_SESSION_LIMIT: usize = 16_384;
+const ADMINISTRATOR_ROLE: &str = "administrator";
+const SESSION_AUTHENTICATION_TYPE: &str = "session";
+const METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS: u64 = 5;
+const METRICS_HISTORY_RETENTION_SECONDS: u64 = 24 * 60 * 60;
+const METRICS_HISTORY_CAPACITY: usize =
+    (METRICS_HISTORY_RETENTION_SECONDS / METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS) as usize + 2;
+const METRICS_HISTORY_DEFAULT_MAX_POINTS: u64 = 300;
+const LOGIN_HASH_CONCURRENCY: usize = 1;
+const LOGIN_FAILURE_BASE_DELAY_MILLIS: u64 = 250;
+const LOGIN_FAILURE_MAX_DELAY_SECONDS: u64 = 30;
+const LOGIN_THROTTLE_MAX_IDENTITIES: usize = 1_024;
 
 pub(crate) fn managed_config_for_client(
     state: &AppState,
@@ -254,6 +269,8 @@ struct AppState {
     enrollment_token: String,
     management_token: Option<String>,
     admin_auth: Mutex<AdminAuth>,
+    login_throttle: Mutex<LoginThrottle>,
+    login_hash_permits: Arc<Semaphore>,
     audit: Mutex<AuditLog>,
     management_cookies_secure: bool,
     clients: Mutex<ClientRegistry>,
@@ -290,6 +307,7 @@ struct AppState {
     pending_connection_permits: Arc<Semaphore>,
     global_udp_session_permits: Arc<Semaphore>,
     metrics: ServerCounters,
+    metrics_history: Mutex<MetricsHistory>,
 }
 
 #[derive(Default)]
@@ -314,6 +332,175 @@ struct ServerCounters {
     p2p_session_offers_total: AtomicU64,
     p2p_direct_connections_total: AtomicU64,
     p2p_relay_fallbacks_total: AtomicU64,
+}
+
+#[derive(Clone, Copy)]
+struct LoginThrottleEntry {
+    failures: u32,
+    next_allowed: Instant,
+}
+
+#[derive(Default)]
+struct LoginThrottle {
+    identities: HashMap<String, LoginThrottleEntry>,
+    global_next_allowed: Option<Instant>,
+}
+
+impl LoginThrottle {
+    fn delay(&self, identity: &str, now: Instant) -> Duration {
+        let global = self
+            .global_next_allowed
+            .and_then(|deadline| deadline.checked_duration_since(now))
+            .unwrap_or_default();
+        let identity = self
+            .identities
+            .get(identity)
+            .and_then(|entry| entry.next_allowed.checked_duration_since(now))
+            .unwrap_or_default();
+        global.max(identity)
+    }
+
+    fn record_failure(&mut self, identity: &str, now: Instant) -> Duration {
+        if !self.identities.contains_key(identity)
+            && self.identities.len() >= LOGIN_THROTTLE_MAX_IDENTITIES
+        {
+            self.identities.retain(|_, entry| entry.next_allowed > now);
+        }
+        let identity = if !self.identities.contains_key(identity)
+            && self.identities.len() >= LOGIN_THROTTLE_MAX_IDENTITIES
+        {
+            if !self.identities.contains_key("__overflow__") {
+                if let Some(expiring_first) = self
+                    .identities
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.next_allowed)
+                    .map(|(identity, _)| identity.clone())
+                {
+                    self.identities.remove(&expiring_first);
+                }
+            }
+            "__overflow__"
+        } else {
+            identity
+        };
+        let entry = self
+            .identities
+            .entry(identity.to_owned())
+            .or_insert(LoginThrottleEntry {
+                failures: 0,
+                next_allowed: now,
+            });
+        entry.failures = entry.failures.saturating_add(1);
+        let multiplier = 1_u64 << entry.failures.saturating_sub(1).min(16);
+        let delay = Duration::from_millis(
+            LOGIN_FAILURE_BASE_DELAY_MILLIS
+                .saturating_mul(multiplier)
+                .min(LOGIN_FAILURE_MAX_DELAY_SECONDS * 1_000),
+        );
+        entry.next_allowed = now + delay;
+        let global_delay = Duration::from_millis(LOGIN_FAILURE_BASE_DELAY_MILLIS);
+        let global_deadline = now + global_delay;
+        self.global_next_allowed = Some(
+            self.global_next_allowed
+                .map_or(global_deadline, |current| current.max(global_deadline)),
+        );
+        delay
+    }
+
+    fn record_success(&mut self, identity: &str) {
+        self.identities.remove(identity);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HistoryCounters {
+    bytes_from_public: u64,
+    bytes_to_public: u64,
+    active_connections: u64,
+    active_sessions: u64,
+    requests_total: u64,
+    errors_total: u64,
+}
+
+impl HistoryCounters {
+    fn saturating_add(self, other: Self) -> Self {
+        Self {
+            bytes_from_public: self
+                .bytes_from_public
+                .saturating_add(other.bytes_from_public),
+            bytes_to_public: self.bytes_to_public.saturating_add(other.bytes_to_public),
+            active_connections: self
+                .active_connections
+                .saturating_add(other.active_connections),
+            active_sessions: self.active_sessions.saturating_add(other.active_sessions),
+            requests_total: self.requests_total.saturating_add(other.requests_total),
+            errors_total: self.errors_total.saturating_add(other.errors_total),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MetricsHistorySample {
+    timestamp_unix_seconds: u64,
+    tcp: HistoryCounters,
+    udp: HistoryCounters,
+    web: HistoryCounters,
+    proxy: HistoryCounters,
+    secret: HistoryCounters,
+}
+
+impl MetricsHistorySample {
+    fn counters(&self, protocol: MetricsHistoryProtocol) -> HistoryCounters {
+        match protocol {
+            MetricsHistoryProtocol::Total => self
+                .tcp
+                .saturating_add(self.udp)
+                .saturating_add(self.web)
+                .saturating_add(self.proxy)
+                .saturating_add(self.secret),
+            MetricsHistoryProtocol::Tcp => self.tcp,
+            MetricsHistoryProtocol::Udp => self.udp,
+            MetricsHistoryProtocol::Web => self.web,
+            MetricsHistoryProtocol::Proxy => self.proxy,
+            MetricsHistoryProtocol::Secret => self.secret,
+        }
+    }
+}
+
+struct MetricsHistory {
+    samples: VecDeque<MetricsHistorySample>,
+    capacity: usize,
+}
+
+impl MetricsHistory {
+    fn new(capacity: usize) -> Self {
+        Self {
+            samples: VecDeque::with_capacity(capacity),
+            capacity: capacity.max(2),
+        }
+    }
+
+    fn push(&mut self, sample: MetricsHistorySample) {
+        if self
+            .samples
+            .back()
+            .is_some_and(|last| last.timestamp_unix_seconds > sample.timestamp_unix_seconds)
+        {
+            // 系统时间回拨时开始一条新序列，避免此后的正常样本持续被旧时间基线拒绝。
+            self.samples.clear();
+        }
+        if self
+            .samples
+            .back()
+            .is_some_and(|last| last.timestamp_unix_seconds == sample.timestamp_unix_seconds)
+        {
+            self.samples.pop_back();
+        }
+        self.samples.push_back(sample);
+        while self.samples.len() > self.capacity {
+            self.samples.pop_front();
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -469,6 +656,18 @@ struct LoginRequest {
 
 #[derive(Serialize)]
 struct LoginResponse {
+    username: String,
+    role: &'static str,
+    authentication_type: &'static str,
+    expires_unix_seconds: u64,
+    password_change_required: bool,
+}
+
+#[derive(Serialize)]
+struct AuthMeResponse {
+    username: String,
+    role: &'static str,
+    authentication_type: &'static str,
     expires_unix_seconds: u64,
     password_change_required: bool,
 }
@@ -481,6 +680,51 @@ struct ChangePasswordRequest {
 #[derive(Deserialize)]
 struct AuditQuery {
     limit: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum MetricsHistoryProtocol {
+    #[default]
+    Total,
+    Tcp,
+    Udp,
+    Web,
+    Proxy,
+    Secret,
+}
+
+#[derive(Deserialize)]
+struct MetricsHistoryQuery {
+    range: Option<String>,
+    step: Option<u64>,
+    protocol: Option<MetricsHistoryProtocol>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+struct MetricsHistoryPoint {
+    timestamp_unix_seconds: u64,
+    inbound_bps: f64,
+    outbound_bps: f64,
+    active_connections: u64,
+    active_sessions: u64,
+    requests_per_second: f64,
+    errors_per_second: f64,
+    requests_total: u64,
+    errors_total: u64,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+struct MetricsHistoryResponse {
+    protocol: MetricsHistoryProtocol,
+    range: &'static str,
+    sample_interval_seconds: u64,
+    step_seconds: u64,
+    retention_seconds: u64,
+    series_started_unix_seconds: Option<u64>,
+    from_unix_seconds: u64,
+    to_unix_seconds: u64,
+    points: Vec<MetricsHistoryPoint>,
 }
 
 #[derive(Deserialize)]
@@ -1077,6 +1321,8 @@ async fn run_server(
         enrollment_token,
         management_token: configured_management_token,
         admin_auth: Mutex::new(AdminAuth::open(data_dir.as_deref(), bootstrap_admin)?),
+        login_throttle: Mutex::new(LoginThrottle::default()),
+        login_hash_permits: Arc::new(Semaphore::new(LOGIN_HASH_CONCURRENCY)),
         audit: Mutex::new(AuditLog::open(data_dir.as_deref())?),
         management_cookies_secure,
         clients: Mutex::new(ClientRegistry::open(data_dir.as_deref())?),
@@ -1113,6 +1359,7 @@ async fn run_server(
         pending_connection_permits: Arc::new(Semaphore::new(PENDING_CONNECTION_LIMIT)),
         global_udp_session_permits: Arc::new(Semaphore::new(GLOBAL_UDP_SESSION_LIMIT)),
         metrics: ServerCounters::default(),
+        metrics_history: Mutex::new(MetricsHistory::new(METRICS_HISTORY_CAPACITY)),
     });
     if let Some(plan) = migration_plan {
         plan.finish()?;
@@ -1122,10 +1369,12 @@ async fn run_server(
         .route("/", get(management_ui))
         .route("/api/v1/health", get(health))
         .route("/api/v1/auth/login", post(login))
+        .route("/api/v1/auth/me", get(auth_me))
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/change-password", post(change_password))
         .route("/api/v1/status", get(status))
         .route("/api/v1/metrics", get(metrics))
+        .route("/api/v1/metrics/history", get(metrics_history))
         .route(
             "/api/v1/acme/config",
             get(get_acme_config).put(update_acme_config),
@@ -1138,7 +1387,7 @@ async fn run_server(
         )
         .route(
             "/api/v1/tcp-tunnels/:tunnel_id",
-            axum::routing::delete(delete_tcp_tunnel),
+            axum::routing::delete(delete_tcp_tunnel).put(update_tcp_tunnel),
         )
         .route(
             "/api/v1/tcp-tunnels/:tunnel_id/enabled",
@@ -1150,7 +1399,7 @@ async fn run_server(
         )
         .route(
             "/api/v1/udp-tunnels/:tunnel_id",
-            axum::routing::delete(delete_udp_tunnel),
+            axum::routing::delete(delete_udp_tunnel).put(update_udp_tunnel),
         )
         .route(
             "/api/v1/udp-tunnels/:tunnel_id/enabled",
@@ -1162,7 +1411,7 @@ async fn run_server(
         )
         .route(
             "/api/v1/port-groups/:group_id",
-            axum::routing::delete(delete_port_group),
+            axum::routing::delete(delete_port_group).put(update_port_group),
         )
         .route(
             "/api/v1/port-groups/:group_id/enabled",
@@ -1174,7 +1423,7 @@ async fn run_server(
         )
         .route(
             "/api/v1/http-routes/:route_id",
-            axum::routing::delete(delete_http_route),
+            axum::routing::delete(delete_http_route).put(update_http_route),
         )
         .route(
             "/api/v1/http-routes/:route_id/enabled",
@@ -1186,7 +1435,7 @@ async fn run_server(
         )
         .route(
             "/api/v1/sni-routes/:route_id",
-            axum::routing::delete(delete_sni_route),
+            axum::routing::delete(delete_sni_route).put(update_sni_route),
         )
         .route(
             "/api/v1/sni-routes/:route_id/enabled",
@@ -1208,7 +1457,7 @@ async fn run_server(
         )
         .route(
             "/api/v1/secret-tunnels/:tunnel_id",
-            axum::routing::delete(delete_secret_tunnel),
+            axum::routing::delete(delete_secret_tunnel).put(update_secret_tunnel),
         )
         .route(
             "/api/v1/secret-tunnels/:tunnel_id/enabled",
@@ -1220,7 +1469,7 @@ async fn run_server(
         )
         .route(
             "/api/v1/socks5-proxies/:proxy_id",
-            axum::routing::delete(delete_socks5_proxy),
+            axum::routing::delete(delete_socks5_proxy).put(update_socks5_proxy),
         )
         .route(
             "/api/v1/socks5-proxies/:proxy_id/enabled",
@@ -1232,7 +1481,7 @@ async fn run_server(
         )
         .route(
             "/api/v1/http-proxies/:proxy_id",
-            axum::routing::delete(delete_http_proxy),
+            axum::routing::delete(delete_http_proxy).put(update_http_proxy),
         )
         .route(
             "/api/v1/http-proxies/:proxy_id/enabled",
@@ -1241,9 +1490,15 @@ async fn run_server(
         .route("/api/v1/clients/enroll", post(enroll_client))
         .route("/api/v1/clients/:client_id/heartbeat", post(heartbeat))
         .with_state(state.clone())
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn(cache_control_headers));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    record_metrics_history_sample(&state);
+    tokio::spawn(run_metrics_history_sampler(
+        state.clone(),
+        shutdown_rx.clone(),
+    ));
     tokio::spawn(run_certificate_maintenance(
         state.clone(),
         shutdown_rx.clone(),
@@ -1395,6 +1650,29 @@ fn init_logging() -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard>
         .with_writer(writer)
         .init();
     Ok(guard)
+}
+
+async fn cache_control_headers(request: Request, next: Next) -> Response {
+    let path = request.uri().path().to_owned();
+    let mut response = next.run(request).await;
+    apply_cache_control(&path, response.headers_mut());
+    response
+}
+
+fn apply_cache_control(path: &str, headers: &mut HeaderMap) {
+    let value = if path == "/api/v1" || path.starts_with("/api/v1/") {
+        Some("no-store, private")
+    } else if path == "/" {
+        Some("no-cache")
+    } else {
+        None
+    };
+    if let Some(value) = value {
+        headers.insert(
+            header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static(value),
+        );
+    }
 }
 
 async fn management_ui() -> impl IntoResponse {
@@ -1831,6 +2109,490 @@ async fn metrics(
             .acme_http01_challenges_total
             .load(Ordering::Relaxed),
     }))
+}
+
+async fn metrics_history(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<MetricsHistoryQuery>,
+) -> Result<Json<MetricsHistoryResponse>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let (range_name, range_seconds, default_step_seconds) =
+        parse_metrics_history_range(query.range.as_deref()).ok_or(CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_metrics_range",
+            "metrics history range must be one of 5m, 15m, 1h, 6h, or 24h",
+        ))?;
+    let step_seconds =
+        normalize_metrics_history_step(query.step, range_seconds, default_step_seconds).ok_or(
+            CodedApiError(
+                StatusCode::BAD_REQUEST,
+                "invalid_metrics_step",
+                "metrics history step must be between the sample interval and selected range",
+            ),
+        )?;
+    let protocol = query.protocol.unwrap_or_default();
+    let response = build_metrics_history_response(
+        &state
+            .metrics_history
+            .lock()
+            .expect("metrics history lock poisoned"),
+        unix_seconds(),
+        range_name,
+        range_seconds,
+        step_seconds,
+        protocol,
+    );
+    Ok(Json(response))
+}
+
+fn parse_metrics_history_range(value: Option<&str>) -> Option<(&'static str, u64, u64)> {
+    match value.unwrap_or("1h") {
+        "5m" => Some(("5m", 5 * 60, 5)),
+        "15m" => Some(("15m", 15 * 60, 5)),
+        "1h" => Some(("1h", 60 * 60, 15)),
+        "6h" => Some(("6h", 6 * 60 * 60, 60)),
+        "24h" => Some(("24h", 24 * 60 * 60, 300)),
+        _ => None,
+    }
+}
+
+fn normalize_metrics_history_step(
+    requested: Option<u64>,
+    range_seconds: u64,
+    default_step_seconds: u64,
+) -> Option<u64> {
+    let requested = requested.unwrap_or(default_step_seconds);
+    if requested == 0 || requested > range_seconds {
+        return None;
+    }
+    let minimum_for_payload = range_seconds
+        .div_ceil(METRICS_HISTORY_DEFAULT_MAX_POINTS)
+        .max(METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS);
+    let step = requested
+        .max(minimum_for_payload)
+        .max(METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS);
+    Some(
+        step.div_ceil(METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS)
+            * METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS,
+    )
+}
+
+fn build_metrics_history_response(
+    history: &MetricsHistory,
+    now: u64,
+    range_name: &'static str,
+    range_seconds: u64,
+    step_seconds: u64,
+    protocol: MetricsHistoryProtocol,
+) -> MetricsHistoryResponse {
+    let minimum_step = range_seconds
+        .div_ceil(METRICS_HISTORY_DEFAULT_MAX_POINTS)
+        .max(METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS);
+    let step_seconds = step_seconds
+        .max(minimum_step)
+        .div_ceil(METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS)
+        * METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS;
+    let from = now.saturating_sub(range_seconds);
+    let series_started_unix_seconds = history
+        .samples
+        .front()
+        .map(|sample| sample.timestamp_unix_seconds);
+    let mut points = Vec::new();
+    let mut samples = history.samples.iter().peekable();
+    let mut previous = None;
+    while samples
+        .peek()
+        .is_some_and(|sample| sample.timestamp_unix_seconds <= from)
+    {
+        previous = samples.next();
+    }
+    let mut bucket_start = from;
+    while bucket_start < now {
+        let bucket_end = bucket_start.saturating_add(step_seconds).min(now);
+        let mut first = None;
+        let mut last = None;
+        let mut count = 0_u128;
+        let mut active_connections = 0_u128;
+        let mut active_sessions = 0_u128;
+        while samples
+            .peek()
+            .is_some_and(|sample| sample.timestamp_unix_seconds <= bucket_end)
+        {
+            let sample = samples.next().expect("peeked metrics history sample");
+            first.get_or_insert(sample);
+            last = Some(sample);
+            let counters = sample.counters(protocol);
+            count += 1;
+            active_connections += counters.active_connections as u128;
+            active_sessions += counters.active_sessions as u128;
+        }
+        if let Some(last) = last {
+            let base = previous
+                .or(first)
+                .expect("history bucket has a base sample");
+            let elapsed = last
+                .timestamp_unix_seconds
+                .saturating_sub(base.timestamp_unix_seconds);
+            let base_counters = base.counters(protocol);
+            let last_counters = last.counters(protocol);
+            let divisor = elapsed.max(1) as f64;
+            points.push(MetricsHistoryPoint {
+                timestamp_unix_seconds: last.timestamp_unix_seconds,
+                inbound_bps: last_counters
+                    .bytes_from_public
+                    .saturating_sub(base_counters.bytes_from_public)
+                    as f64
+                    / divisor,
+                outbound_bps: last_counters
+                    .bytes_to_public
+                    .saturating_sub(base_counters.bytes_to_public)
+                    as f64
+                    / divisor,
+                active_connections: (active_connections / count) as u64,
+                active_sessions: (active_sessions / count) as u64,
+                requests_per_second: last_counters
+                    .requests_total
+                    .saturating_sub(base_counters.requests_total)
+                    as f64
+                    / divisor,
+                errors_per_second: last_counters
+                    .errors_total
+                    .saturating_sub(base_counters.errors_total)
+                    as f64
+                    / divisor,
+                requests_total: last_counters.requests_total,
+                errors_total: last_counters.errors_total,
+            });
+            previous = Some(last);
+        }
+        bucket_start = bucket_end;
+    }
+    debug_assert!(points.len() <= METRICS_HISTORY_DEFAULT_MAX_POINTS as usize);
+    MetricsHistoryResponse {
+        protocol,
+        range: range_name,
+        sample_interval_seconds: METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS,
+        step_seconds,
+        retention_seconds: METRICS_HISTORY_RETENTION_SECONDS,
+        series_started_unix_seconds,
+        from_unix_seconds: from,
+        to_unix_seconds: now,
+        points,
+    }
+}
+
+fn record_metrics_history_sample(state: &AppState) {
+    let sample = collect_metrics_history_sample(state, unix_seconds());
+    state
+        .metrics_history
+        .lock()
+        .expect("metrics history lock poisoned")
+        .push(sample);
+}
+
+async fn run_metrics_history_sampler(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
+    let start =
+        tokio::time::Instant::now() + Duration::from_secs(METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS);
+    let mut interval = tokio::time::interval_at(
+        start,
+        Duration::from_secs(METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS),
+    );
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            _ = interval.tick() => record_metrics_history_sample(&state),
+        }
+    }
+}
+
+fn collect_metrics_history_sample(
+    state: &AppState,
+    timestamp_unix_seconds: u64,
+) -> MetricsHistorySample {
+    let tcp_tunnels = {
+        let statistics = state
+            .tunnel_statistics
+            .lock()
+            .expect("tunnel statistics lock poisoned");
+        HistoryCounters {
+            bytes_from_public: statistics
+                .values()
+                .map(|value| value.bytes_from_public.load(Ordering::Relaxed))
+                .sum(),
+            bytes_to_public: statistics
+                .values()
+                .map(|value| value.bytes_to_public.load(Ordering::Relaxed))
+                .sum(),
+            active_connections: statistics
+                .values()
+                .map(|value| value.active_connections.load(Ordering::Relaxed) as u64)
+                .sum(),
+            errors_total: statistics
+                .values()
+                .map(|value| tcp_history_error_total(value))
+                .sum(),
+            ..HistoryCounters::default()
+        }
+    };
+    let secret_tunnels = {
+        let statistics = state
+            .secret_tunnel_statistics
+            .lock()
+            .expect("secret tunnel statistics lock poisoned");
+        HistoryCounters {
+            bytes_from_public: statistics
+                .values()
+                .map(|value| value.bytes_from_visitor.load(Ordering::Relaxed))
+                .sum(),
+            bytes_to_public: statistics
+                .values()
+                .map(|value| value.bytes_to_visitor.load(Ordering::Relaxed))
+                .sum(),
+            active_connections: statistics
+                .values()
+                .map(|value| value.active_connections.load(Ordering::Relaxed) as u64)
+                .sum(),
+            requests_total: statistics
+                .values()
+                .map(|value| value.connections_total.load(Ordering::Relaxed))
+                .sum(),
+            errors_total: statistics
+                .values()
+                .map(|value| {
+                    value
+                        .rejected_connections
+                        .load(Ordering::Relaxed)
+                        .saturating_add(value.pairing_timeouts.load(Ordering::Relaxed))
+                        .saturating_add(value.transfer_errors.load(Ordering::Relaxed))
+                        .saturating_add(value.lifetime_timeouts.load(Ordering::Relaxed))
+                })
+                .sum(),
+            ..HistoryCounters::default()
+        }
+    };
+    let tcp = tcp_tunnels;
+    let secret = secret_tunnels;
+
+    let udp = {
+        let statistics = state
+            .udp_tunnel_statistics
+            .lock()
+            .expect("UDP tunnel statistics lock poisoned");
+        let mut totals = udp_tunnel::UdpTunnelStatisticsSnapshot::default();
+        for value in statistics.values() {
+            totals.add_assign(value.snapshot());
+        }
+        HistoryCounters {
+            bytes_from_public: totals.bytes_from_public,
+            bytes_to_public: totals.bytes_to_public,
+            active_sessions: totals.active_sessions as u64,
+            requests_total: totals.packets_from_public,
+            // dropped_packets 已包含各类 dropped_* 原因计数，这里只加互不重叠的超时和传输错误。
+            errors_total: udp_history_error_total(&totals),
+            ..HistoryCounters::default()
+        }
+    };
+
+    let http = {
+        let statistics = state
+            .http_route_statistics
+            .lock()
+            .expect("HTTP route statistics lock poisoned");
+        HistoryCounters {
+            bytes_from_public: statistics
+                .values()
+                .map(|value| value.bytes_from_public.load(Ordering::Relaxed))
+                .sum(),
+            bytes_to_public: statistics
+                .values()
+                .map(|value| value.bytes_to_public.load(Ordering::Relaxed))
+                .sum(),
+            active_connections: statistics
+                .values()
+                .map(|value| value.active_connections.load(Ordering::Relaxed) as u64)
+                .sum(),
+            requests_total: statistics
+                .values()
+                .map(|value| value.requests_total.load(Ordering::Relaxed))
+                .sum(),
+            errors_total: statistics
+                .values()
+                .map(|value| value.failed_requests.load(Ordering::Relaxed))
+                .sum(),
+            ..HistoryCounters::default()
+        }
+    };
+    let sni = {
+        let statistics = state
+            .sni_route_statistics
+            .lock()
+            .expect("SNI route statistics lock poisoned");
+        HistoryCounters {
+            bytes_from_public: statistics
+                .values()
+                .map(|value| value.bytes_from_public.load(Ordering::Relaxed))
+                .sum(),
+            bytes_to_public: statistics
+                .values()
+                .map(|value| value.bytes_to_public.load(Ordering::Relaxed))
+                .sum(),
+            active_connections: statistics
+                .values()
+                .map(|value| value.active_connections.load(Ordering::Relaxed) as u64)
+                .sum(),
+            requests_total: statistics
+                .values()
+                .map(|value| value.connections_total.load(Ordering::Relaxed))
+                .sum(),
+            errors_total: statistics
+                .values()
+                .map(|value| {
+                    value
+                        .rejected_connections
+                        .load(Ordering::Relaxed)
+                        .saturating_add(value.client_hello_errors.load(Ordering::Relaxed))
+                        .saturating_add(value.unknown_sni.load(Ordering::Relaxed))
+                        .saturating_add(value.transfer_errors.load(Ordering::Relaxed))
+                })
+                .sum::<u64>()
+                .saturating_add(
+                    state
+                        .metrics
+                        .https_handshake_failures_total
+                        .load(Ordering::Relaxed),
+                ),
+            ..HistoryCounters::default()
+        }
+    };
+    let web = http.saturating_add(sni);
+
+    let socks5 = {
+        let statistics = state
+            .socks5_proxy_statistics
+            .lock()
+            .expect("SOCKS5 statistics lock poisoned");
+        HistoryCounters {
+            bytes_from_public: statistics
+                .values()
+                .map(|value| {
+                    value
+                        .bytes_from_public
+                        .load(Ordering::Relaxed)
+                        .saturating_add(value.udp_bytes_from_public.load(Ordering::Relaxed))
+                })
+                .sum(),
+            bytes_to_public: statistics
+                .values()
+                .map(|value| {
+                    value
+                        .bytes_to_public
+                        .load(Ordering::Relaxed)
+                        .saturating_add(value.udp_bytes_to_public.load(Ordering::Relaxed))
+                })
+                .sum(),
+            active_connections: statistics
+                .values()
+                .map(|value| value.active_connections.load(Ordering::Relaxed) as u64)
+                .sum(),
+            active_sessions: statistics
+                .values()
+                .map(|value| value.udp_active_associations.load(Ordering::Relaxed) as u64)
+                .sum(),
+            requests_total: statistics
+                .values()
+                .map(|value| {
+                    value
+                        .requests_total
+                        .load(Ordering::Relaxed)
+                        .saturating_add(value.udp_datagrams_from_public.load(Ordering::Relaxed))
+                })
+                .sum(),
+            errors_total: statistics
+                .values()
+                .map(|value| {
+                    value
+                        .authentication_failures
+                        .load(Ordering::Relaxed)
+                        .saturating_add(value.rejected_connections.load(Ordering::Relaxed))
+                        .saturating_add(value.handshake_errors.load(Ordering::Relaxed))
+                        .saturating_add(value.connect_failures.load(Ordering::Relaxed))
+                        .saturating_add(value.transfer_errors.load(Ordering::Relaxed))
+                        .saturating_add(value.udp_dropped_datagrams.load(Ordering::Relaxed))
+                })
+                .sum(),
+        }
+    };
+    let http_proxy = {
+        let statistics = state
+            .http_proxy_statistics
+            .lock()
+            .expect("HTTP proxy statistics lock poisoned");
+        HistoryCounters {
+            bytes_from_public: statistics
+                .values()
+                .map(|value| value.bytes_from_public.load(Ordering::Relaxed))
+                .sum(),
+            bytes_to_public: statistics
+                .values()
+                .map(|value| value.bytes_to_public.load(Ordering::Relaxed))
+                .sum(),
+            active_connections: statistics
+                .values()
+                .map(|value| value.active_connections.load(Ordering::Relaxed) as u64)
+                .sum(),
+            requests_total: statistics
+                .values()
+                .map(|value| value.requests_total.load(Ordering::Relaxed))
+                .sum(),
+            errors_total: statistics
+                .values()
+                .map(|value| {
+                    value
+                        .authentication_failures
+                        .load(Ordering::Relaxed)
+                        .saturating_add(value.rejected_connections.load(Ordering::Relaxed))
+                        .saturating_add(value.malformed_requests.load(Ordering::Relaxed))
+                        .saturating_add(value.connect_failures.load(Ordering::Relaxed))
+                        .saturating_add(value.transfer_errors.load(Ordering::Relaxed))
+                })
+                .sum(),
+            ..HistoryCounters::default()
+        }
+    };
+    let proxy = socks5.saturating_add(http_proxy);
+
+    MetricsHistorySample {
+        timestamp_unix_seconds,
+        tcp,
+        udp,
+        web,
+        proxy,
+        secret,
+    }
+}
+
+fn tcp_history_error_total(statistics: &tcp_tunnel::TunnelStatistics) -> u64 {
+    // failed_connections 已包含配对、传输和生存期等失败分类，不能再叠加 breakdown。
+    statistics
+        .rejected_connections
+        .load(Ordering::Relaxed)
+        .saturating_add(statistics.failed_connections.load(Ordering::Relaxed))
+}
+
+fn udp_history_error_total(statistics: &udp_tunnel::UdpTunnelStatisticsSnapshot) -> u64 {
+    // dropped_packets 已包含 dropped_oversized 等原因分类，只叠加互不重叠的错误。
+    statistics
+        .dropped_packets
+        .saturating_add(statistics.session_timeouts)
+        .saturating_add(statistics.reassembly_timeouts)
+        .saturating_add(statistics.attach_timeouts)
+        .saturating_add(statistics.transport_errors)
 }
 
 fn udp_metrics_response(statistics: udp_tunnel::UdpTunnelStatisticsSnapshot) -> UdpMetricsResponse {
@@ -2959,6 +3721,56 @@ async fn create_tcp_tunnel(
     Ok(Json(policy))
 }
 
+async fn update_tcp_tunnel(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(tunnel_id): Path<Uuid>,
+    Json(request): Json<UpdateTcpTunnelPolicy>,
+) -> Result<Json<TcpTunnelPolicy>, ApiError> {
+    authorize_management(&state, &headers)?;
+    if !state
+        .clients
+        .lock()
+        .expect("client registry lock poisoned")
+        .contains(request.client_id)
+    {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "unknown client for tunnel policy",
+        ));
+    }
+    let (old_policy, policy) = {
+        let mut catalog = state
+            .tunnel_catalog
+            .lock()
+            .expect("tunnel catalog lock poisoned");
+        let old = catalog.policy_by_id(tunnel_id).map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not read tunnel policy",
+            )
+        })?;
+        let updated = catalog
+            .update(tunnel_id, request)
+            .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "could not update tunnel policy"))?;
+        let old = old.ok_or(ApiError(StatusCode::NOT_FOUND, "unknown tunnel policy"))?;
+        let updated = updated.ok_or(ApiError(StatusCode::NOT_FOUND, "unknown tunnel policy"))?;
+        (old, updated)
+    };
+    // 更新后强制旧注册重新配对，使目标地址、端口和限流参数立即生效。
+    tcp_tunnel::stop_public_port(&state, old_policy.public_port);
+    record_audit(
+        &state,
+        "tcp_tunnel.policy.updated",
+        &tunnel_id.to_string(),
+        &format!(
+            "client={}; port={}; target={}; name={}",
+            policy.client_id, policy.public_port, policy.target_addr, policy.name
+        ),
+    );
+    Ok(Json(policy))
+}
+
 async fn set_tcp_tunnel_enabled(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -3153,6 +3965,68 @@ async fn create_secret_tunnel(
         ),
     );
     Ok((StatusCode::CREATED, Json(created)))
+}
+
+async fn update_secret_tunnel(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(tunnel_id): Path<Uuid>,
+    Json(request): Json<UpdateSecretTunnelPolicy>,
+) -> Result<Json<SecretTunnelPolicy>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let clients = state.clients.lock().expect("client registry lock poisoned");
+    if !clients.contains(request.provider_client_id)
+        || request
+            .allowed_client_id
+            .is_some_and(|client_id| !clients.contains(client_id))
+    {
+        return Err(CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "unknown_client",
+            "unknown provider or allowed visitor client",
+        ));
+    }
+    drop(clients);
+    let (old_policy, policy) = {
+        let mut catalog = state
+            .secret_tunnel_catalog
+            .lock()
+            .expect("secret tunnel catalog lock poisoned");
+        let old = catalog
+            .policy_by_id(tunnel_id)
+            .map_err(coded_secret_policy_error)?;
+        let updated = catalog
+            .update(tunnel_id, request)
+            .map_err(coded_secret_policy_error)?;
+        let old = old.ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_secret_tunnel",
+            "secret tunnel policy does not exist",
+        ))?;
+        let updated = updated.ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_secret_tunnel",
+            "secret tunnel policy does not exist",
+        ))?;
+        (old, updated)
+    };
+    secret_tunnel::stop_policy(&state, old_policy.id);
+    record_audit(
+        &state,
+        "secret_tunnel.policy.updated",
+        &tunnel_id.to_string(),
+        &format!(
+            "provider={}; visitor={}; target={}; name={}",
+            policy.provider_client_id,
+            policy.allowed_client_id.map_or_else(
+                || "any-authenticated-client".to_owned(),
+                |id| id.to_string()
+            ),
+            policy.target_addr,
+            policy.name
+        ),
+    );
+    Ok(Json(policy))
 }
 
 async fn set_secret_tunnel_enabled(
@@ -3350,6 +4224,61 @@ async fn create_socks5_proxy(
     Ok((StatusCode::CREATED, Json(created)))
 }
 
+async fn update_socks5_proxy(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(proxy_id): Path<Uuid>,
+    Json(request): Json<UpdateSocks5ProxyPolicy>,
+) -> Result<Json<Socks5ProxyPolicy>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    if !state
+        .clients
+        .lock()
+        .expect("client registry lock poisoned")
+        .contains(request.client_id)
+    {
+        return Err(CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "unknown_client",
+            "unknown SOCKS5 exit client",
+        ));
+    }
+    let (old_policy, policy) = {
+        let mut catalog = state
+            .tunnel_catalog
+            .lock()
+            .expect("tunnel catalog lock poisoned");
+        let old = catalog
+            .socks5_policy_by_id(proxy_id)
+            .map_err(coded_socks5_policy_error)?;
+        let updated = catalog
+            .update_socks5(proxy_id, request)
+            .map_err(coded_socks5_policy_error)?;
+        let old = old.ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_socks5_proxy",
+            "SOCKS5 proxy policy does not exist",
+        ))?;
+        let updated = updated.ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_socks5_proxy",
+            "SOCKS5 proxy policy does not exist",
+        ))?;
+        (old, updated)
+    };
+    socks5_tunnel::stop_policy(&state, old_policy.id);
+    record_audit(
+        &state,
+        "socks5_proxy.policy.updated",
+        &proxy_id.to_string(),
+        &format!(
+            "client={}; port={}; name={}; username={}",
+            policy.client_id, policy.public_port, policy.name, policy.username
+        ),
+    );
+    Ok(Json(policy))
+}
+
 async fn set_socks5_proxy_enabled(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -3522,6 +4451,61 @@ async fn create_http_proxy(
     Ok((StatusCode::CREATED, Json(created)))
 }
 
+async fn update_http_proxy(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(proxy_id): Path<Uuid>,
+    Json(request): Json<UpdateHttpProxyPolicy>,
+) -> Result<Json<HttpProxyPolicy>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    if !state
+        .clients
+        .lock()
+        .expect("client registry lock poisoned")
+        .contains(request.client_id)
+    {
+        return Err(CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "unknown_client",
+            "unknown HTTP proxy exit client",
+        ));
+    }
+    let (old_policy, policy) = {
+        let mut catalog = state
+            .tunnel_catalog
+            .lock()
+            .expect("tunnel catalog lock poisoned");
+        let old = catalog
+            .http_proxy_policy_by_id(proxy_id)
+            .map_err(coded_http_proxy_policy_error)?;
+        let updated = catalog
+            .update_http_proxy(proxy_id, request)
+            .map_err(coded_http_proxy_policy_error)?;
+        let old = old.ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_http_proxy",
+            "HTTP proxy policy does not exist",
+        ))?;
+        let updated = updated.ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_http_proxy",
+            "HTTP proxy policy does not exist",
+        ))?;
+        (old, updated)
+    };
+    http_proxy_tunnel::stop_policy(&state, old_policy.id);
+    record_audit(
+        &state,
+        "http_proxy.policy.updated",
+        &proxy_id.to_string(),
+        &format!(
+            "client={}; port={}; name={}; username={}",
+            policy.client_id, policy.public_port, policy.name, policy.username
+        ),
+    );
+    Ok(Json(policy))
+}
+
 async fn set_http_proxy_enabled(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -3689,6 +4673,68 @@ async fn create_udp_tunnel(
         ),
     );
     Ok((StatusCode::CREATED, Json(policy)))
+}
+
+async fn update_udp_tunnel(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(tunnel_id): Path<Uuid>,
+    Json(request): Json<UpdateUdpTunnelPolicy>,
+) -> Result<Json<UdpTunnelPolicy>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    if state.udp_data_plane.is_none() {
+        return Err(CodedApiError(
+            StatusCode::CONFLICT,
+            "udp_relay_disabled",
+            "UDP relay is not configured on this server",
+        ));
+    }
+    if !state
+        .clients
+        .lock()
+        .expect("client registry lock poisoned")
+        .contains(request.client_id)
+    {
+        return Err(CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "unknown_client",
+            "unknown client for UDP tunnel policy",
+        ));
+    }
+    let (old_policy, policy) = {
+        let mut catalog = state
+            .tunnel_catalog
+            .lock()
+            .expect("tunnel catalog lock poisoned");
+        let old = catalog
+            .udp_policy_by_id(tunnel_id)
+            .map_err(coded_udp_policy_error)?;
+        let updated = catalog
+            .update_udp(tunnel_id, request)
+            .map_err(coded_udp_policy_error)?;
+        let old = old.ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_udp_tunnel",
+            "UDP tunnel policy does not exist",
+        ))?;
+        let updated = updated.ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_udp_tunnel",
+            "UDP tunnel policy does not exist",
+        ))?;
+        (old, updated)
+    };
+    udp_tunnel::stop_public_port(&state, old_policy.public_port);
+    record_audit(
+        &state,
+        "udp_tunnel.policy.updated",
+        &tunnel_id.to_string(),
+        &format!(
+            "client={}; port={}; target={}; name={}",
+            policy.client_id, policy.public_port, policy.target_addr, policy.name
+        ),
+    );
+    Ok(Json(policy))
 }
 
 async fn set_udp_tunnel_enabled(
@@ -3935,6 +4981,94 @@ async fn create_port_group(
         ),
     );
     Ok((StatusCode::CREATED, Json(policy)))
+}
+
+async fn update_port_group(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(group_id): Path<Uuid>,
+    Json(request): Json<UpdatePortGroupPolicy>,
+) -> Result<Json<PortGroupPolicy>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    if request.protocol == PortGroupProtocol::Udp && state.udp_data_plane.is_none() {
+        return Err(CodedApiError(
+            StatusCode::CONFLICT,
+            "udp_relay_disabled",
+            "UDP relay is not configured on this server",
+        ));
+    }
+    if !state
+        .clients
+        .lock()
+        .expect("client registry lock poisoned")
+        .contains(request.client_id)
+    {
+        return Err(CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "unknown_client",
+            "unknown client for port group policy",
+        ));
+    }
+    let (old_policy, old_mappings, policy) = {
+        let mut catalog = state
+            .tunnel_catalog
+            .lock()
+            .expect("tunnel catalog lock poisoned");
+        let old = catalog
+            .port_group_by_id(group_id)
+            .map_err(coded_port_group_policy_error)?
+            .ok_or(CodedApiError(
+                StatusCode::NOT_FOUND,
+                "unknown_port_group",
+                "port group policy does not exist",
+            ))?;
+        let old_mappings = catalog
+            .port_group_mappings(group_id)
+            .map_err(coded_port_group_policy_error)?;
+        let updated = catalog
+            .update_port_group(group_id, request)
+            .map_err(coded_port_group_policy_error)?
+            .ok_or(CodedApiError(
+                StatusCode::NOT_FOUND,
+                "unknown_port_group",
+                "port group policy does not exist",
+            ))?;
+        (old, old_mappings, updated)
+    };
+    stop_port_group(&state, old_policy.protocol, &old_mappings);
+    match old_policy.protocol {
+        PortGroupProtocol::Tcp => {
+            let mut statistics = state
+                .tunnel_statistics
+                .lock()
+                .expect("tunnel statistics lock poisoned");
+            for mapping in &old_mappings {
+                statistics.remove(&mapping.public_port);
+            }
+        }
+        PortGroupProtocol::Udp => {
+            state
+                .udp_tunnel_statistics
+                .lock()
+                .expect("UDP tunnel statistics lock poisoned")
+                .remove(&group_id);
+        }
+    }
+    record_audit(
+        &state,
+        "port_group.policy.updated",
+        &group_id.to_string(),
+        &format!(
+            "client={}; protocol={:?}; public_ports={}; target={}:{}; name={}",
+            policy.client_id,
+            policy.protocol,
+            policy.public_ports,
+            policy.target_host,
+            policy.target_ports,
+            policy.name
+        ),
+    );
+    Ok(Json(policy))
 }
 
 async fn set_port_group_enabled(
@@ -4198,6 +5332,61 @@ async fn create_sni_route(
     Ok((StatusCode::CREATED, Json(policy)))
 }
 
+async fn update_sni_route(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(route_id): Path<Uuid>,
+    Json(request): Json<UpdateSniRoutePolicy>,
+) -> Result<Json<SniRoutePolicy>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    if !state
+        .clients
+        .lock()
+        .expect("client registry lock poisoned")
+        .contains(request.client_id)
+    {
+        return Err(CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "unknown_client",
+            "unknown client for TLS SNI route",
+        ));
+    }
+    let (old_policy, policy) = {
+        let mut catalog = state
+            .sni_route_catalog
+            .lock()
+            .expect("SNI route catalog lock poisoned");
+        let old = catalog
+            .policy_by_id(route_id)
+            .map_err(coded_sni_route_policy_error)?
+            .ok_or(CodedApiError(
+                StatusCode::NOT_FOUND,
+                "unknown_sni_route",
+                "TLS SNI route does not exist",
+            ))?;
+        let updated = catalog
+            .update(route_id, request)
+            .map_err(coded_sni_route_policy_error)?
+            .ok_or(CodedApiError(
+                StatusCode::NOT_FOUND,
+                "unknown_sni_route",
+                "TLS SNI route does not exist",
+            ))?;
+        (old, updated)
+    };
+    sni_tunnel::stop_hostname(&state, &old_policy.hostname);
+    record_audit(
+        &state,
+        "sni_route.policy.updated",
+        &route_id.to_string(),
+        &format!(
+            "client={}; hostname={}; target={}; name={}",
+            policy.client_id, policy.hostname, policy.target_addr, policy.name
+        ),
+    );
+    Ok(Json(policy))
+}
+
 async fn set_sni_route_enabled(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -4306,6 +5495,120 @@ async fn create_http_route(
         &format!(
             "client={}; hostname={}; name={}",
             policy.client_id, policy.hostname, policy.name
+        ),
+    );
+    Ok(Json(policy))
+}
+
+async fn update_http_route(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(route_id): Path<Uuid>,
+    Json(request): Json<UpdateHttpRoutePolicy>,
+) -> Result<Json<HttpRoutePolicy>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    if !state
+        .clients
+        .lock()
+        .expect("client registry lock poisoned")
+        .contains(request.client_id)
+    {
+        return Err(CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "unknown_client",
+            "unknown client for HTTP route",
+        ));
+    }
+    let certificate_jobs = state
+        .certificate_jobs
+        .lock()
+        .expect("certificate jobs lock poisoned");
+    let (old_policy, tls_policy) = {
+        let catalog = state
+            .http_route_catalog
+            .lock()
+            .expect("HTTP route catalog lock poisoned");
+        let old = catalog
+            .policy_by_id(route_id)
+            .map_err(coded_http_route_creation_error)?
+            .ok_or(CodedApiError(
+                StatusCode::NOT_FOUND,
+                "unknown_http_route",
+                "unknown HTTP route",
+            ))?;
+        if certificate_jobs.contains_key(&old.hostname) {
+            return Err(CodedApiError(
+                StatusCode::CONFLICT,
+                "certificate_operation_in_progress",
+                "certificate operation is already in progress",
+            ));
+        }
+        let tls_policy = state
+            .certificate_catalog
+            .lock()
+            .expect("certificate catalog lock poisoned")
+            .get_route_tls(route_id)
+            .map_err(coded_certificate_catalog_error)?;
+        (old, tls_policy)
+    };
+    let policy = state
+        .http_route_catalog
+        .lock()
+        .expect("HTTP route catalog lock poisoned")
+        .update(route_id, request)
+        .map_err(coded_http_route_creation_error)?
+        .ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_http_route",
+            "unknown HTTP route",
+        ))?;
+    drop(certificate_jobs);
+
+    // 无论是否更换主机名，都停止旧注册以应用新的目标和连接限制。
+    http_tunnel::stop_hostname(&state, &old_policy.hostname);
+    if old_policy.hostname != policy.hostname {
+        state
+            .http_route_statistics
+            .lock()
+            .expect("HTTP route statistics lock poisoned")
+            .remove(&old_policy.hostname);
+        state
+            .https_redirect_hosts
+            .lock()
+            .expect("HTTPS redirect registry lock poisoned")
+            .remove(&old_policy.hostname);
+        if let Some(manager) = &state.certificate_manager {
+            if let Err(error) = manager.delete_certificate(&old_policy.hostname) {
+                tracing::warn!(
+                    "could not delete certificate files for {}: {error}",
+                    old_policy.hostname
+                );
+            }
+        }
+        state
+            .certificate_catalog
+            .lock()
+            .expect("certificate catalog lock poisoned")
+            .delete_certificate_state(route_id)
+            .map_err(coded_certificate_catalog_error)?;
+    }
+    // 主机名未更换时保留现有证书；更换主机名后由证书维护任务重新签发。
+    if old_policy.hostname != policy.hostname
+        && tls_policy.is_some_and(|tls| tls.mode == RouteTlsMode::Disabled)
+    {
+        state
+            .https_redirect_hosts
+            .lock()
+            .expect("HTTPS redirect registry lock poisoned")
+            .remove(&policy.hostname);
+    }
+    record_audit(
+        &state,
+        "http_route.policy.updated",
+        &route_id.to_string(),
+        &format!(
+            "client={}; hostname={}; target={}; name={}",
+            policy.client_id, policy.hostname, policy.target_addr, policy.name
         ),
     );
     Ok(Json(policy))
@@ -4557,18 +5860,57 @@ async fn login(
     State(state): State<Arc<AppState>>,
     Json(request): Json<LoginRequest>,
 ) -> Result<Response, ApiError> {
-    let session = state
-        .admin_auth
-        .lock()
-        .expect("administrator registry lock poisoned")
-        .login(&request.username, &request.password)
+    let LoginRequest { username, password } = request;
+    let throttle_identity = login_throttle_identity(&username);
+    let hash_permit = state
+        .login_hash_permits
+        .clone()
+        .acquire_owned()
+        .await
         .map_err(|_| {
             ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "could not create session",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "administrator login is unavailable",
             )
         })?;
+    // 获取唯一密码哈希许可后重新读取退避时间，避免排队请求绕过前一次失败刚设置的节流。
+    let throttle_delay = state
+        .login_throttle
+        .lock()
+        .expect("login throttle lock poisoned")
+        .delay(&throttle_identity, Instant::now());
+    if !throttle_delay.is_zero() {
+        tokio::time::sleep(throttle_delay).await;
+    }
+    let auth_state = state.clone();
+    let login_username = username.clone();
+    let session = tokio::task::spawn_blocking(move || {
+        let _hash_permit = hash_permit;
+        auth_state
+            .admin_auth
+            .lock()
+            .expect("administrator registry lock poisoned")
+            .login(&login_username, &password)
+    })
+    .await
+    .map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not execute administrator login",
+        )
+    })?
+    .map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not create session",
+        )
+    })?;
     let Some(session) = session else {
+        state
+            .login_throttle
+            .lock()
+            .expect("login throttle lock poisoned")
+            .record_failure(&throttle_identity, Instant::now());
         state
             .metrics
             .authentication_failures_total
@@ -4584,13 +5926,16 @@ async fn login(
             "invalid username or password",
         ));
     };
-    record_audit(
-        &state,
-        "management.login",
-        &request.username,
-        "session created",
-    );
+    state
+        .login_throttle
+        .lock()
+        .expect("login throttle lock poisoned")
+        .record_success(&throttle_identity);
+    record_audit(&state, "management.login", &username, "session created");
     let mut response = Json(LoginResponse {
+        username,
+        role: ADMINISTRATOR_ROLE,
+        authentication_type: SESSION_AUTHENTICATION_TYPE,
         expires_unix_seconds: session.expires_unix_seconds,
         password_change_required: session.password_change_required,
     })
@@ -4604,6 +5949,54 @@ async fn login(
         ),
     );
     Ok(response)
+}
+
+fn login_throttle_identity(username: &str) -> String {
+    if (3..=64).contains(&username.len())
+        && username.bytes().all(|character| {
+            character.is_ascii_alphanumeric() || character == b'_' || character == b'-'
+        })
+    {
+        username.to_ascii_lowercase()
+    } else {
+        "__invalid__".to_owned()
+    }
+}
+
+async fn auth_me(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<AuthMeResponse>, ApiError> {
+    let session = management_session_cookie(&headers).ok_or(ApiError(
+        StatusCode::UNAUTHORIZED,
+        "missing management session",
+    ))?;
+    let identity = state
+        .admin_auth
+        .lock()
+        .expect("administrator registry lock poisoned")
+        .authenticate_session(&session)
+        .map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not verify session",
+            )
+        })?
+        .ok_or(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "invalid management session",
+        ))?;
+    Ok(Json(auth_me_response(identity)))
+}
+
+fn auth_me_response(identity: SessionIdentity) -> AuthMeResponse {
+    AuthMeResponse {
+        username: identity.username,
+        role: ADMINISTRATOR_ROLE,
+        authentication_type: SESSION_AUTHENTICATION_TYPE,
+        expires_unix_seconds: identity.expires_unix_seconds,
+        password_change_required: identity.password_change_required,
+    }
 }
 
 async fn change_password(
@@ -4936,18 +6329,29 @@ mod windows_service_host {
 #[cfg(test)]
 mod tests {
     use super::{
-        certificate_target_matches, coded_http_route_creation_error, management_session_cookie,
+        apply_cache_control, auth_me_response, build_metrics_history_response,
+        certificate_target_matches, coded_http_route_creation_error, login_throttle_identity,
+        management_session_cookie, normalize_metrics_history_step, parse_metrics_history_range,
         release_certificate_job_slot, reserve_certificate_job_slot,
-        select_certificate_maintenance_operation, session_cookie_header, udp_metrics_response,
-        CertificateOperation, MANAGEMENT_UI,
+        select_certificate_maintenance_operation, session_cookie_header, tcp_history_error_total,
+        udp_history_error_total, udp_metrics_response, CertificateOperation, HistoryCounters,
+        LoginResponse, LoginThrottle, MetricsHistory, MetricsHistoryProtocol, MetricsHistorySample,
+        LOGIN_THROTTLE_MAX_IDENTITIES, MANAGEMENT_UI, METRICS_HISTORY_CAPACITY,
+        METRICS_HISTORY_RETENTION_SECONDS, METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS,
     };
     use crate::{
+        admin_auth::SessionIdentity,
         certificate_catalog::{CertificateState, CertificateStatus, RouteTlsMode, RouteTlsPolicy},
         http_route_catalog::{CreateHttpRouteError, HttpRoutePolicy},
+        tcp_tunnel::TunnelStatistics,
         udp_tunnel::UdpTunnelStatisticsSnapshot,
     };
     use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        sync::atomic::Ordering,
+        time::{Duration, Instant},
+    };
     use uuid::Uuid;
 
     fn http_route(id: Uuid, hostname: &str, enabled: bool) -> HttpRoutePolicy {
@@ -4984,6 +6388,21 @@ mod tests {
         }
     }
 
+    fn history_sample(
+        timestamp_unix_seconds: u64,
+        tcp: HistoryCounters,
+        proxy: HistoryCounters,
+    ) -> MetricsHistorySample {
+        MetricsHistorySample {
+            timestamp_unix_seconds,
+            tcp,
+            udp: HistoryCounters::default(),
+            web: HistoryCounters::default(),
+            proxy,
+            secret: HistoryCounters::default(),
+        }
+    }
+
     #[test]
     fn management_session_cookie_is_parsed_without_accepting_other_cookies() {
         let mut headers = HeaderMap::new();
@@ -5000,6 +6419,364 @@ mod tests {
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("Secure"));
         assert!(cookie.contains("SameSite=Strict"));
+    }
+
+    #[test]
+    fn cache_control_contract_covers_management_html_and_all_api_responses() {
+        let mut html_headers = HeaderMap::new();
+        apply_cache_control("/", &mut html_headers);
+        assert_eq!(
+            html_headers
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-cache")
+        );
+
+        for path in [
+            "/api/v1/auth/login",
+            "/api/v1/auth/me",
+            "/api/v1/metrics/history",
+            "/api/v1/unknown",
+        ] {
+            let mut headers = HeaderMap::new();
+            apply_cache_control(path, &mut headers);
+            assert_eq!(
+                headers
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-store, private")
+            );
+        }
+    }
+
+    #[test]
+    fn authenticated_identity_response_has_a_fixed_account_type_without_session_secrets() {
+        let response = auth_me_response(SessionIdentity {
+            username: "admin".to_owned(),
+            expires_unix_seconds: 123_456,
+            password_change_required: false,
+        });
+        let json = serde_json::to_value(response).expect("identity response should serialize");
+        assert_eq!(json["username"], "admin");
+        assert_eq!(json["role"], "administrator");
+        assert_eq!(json["authentication_type"], "session");
+        assert_eq!(json["expires_unix_seconds"], 123_456);
+        assert_eq!(json["password_change_required"], false);
+        assert!(json.get("cookie_value").is_none());
+        assert!(json.get("session_secret").is_none());
+        assert!(json.get("password_hash").is_none());
+
+        let login = serde_json::to_value(LoginResponse {
+            username: "admin".to_owned(),
+            role: "administrator",
+            authentication_type: "session",
+            expires_unix_seconds: 123_456,
+            password_change_required: false,
+        })
+        .expect("login response should serialize");
+        assert_eq!(login["username"], json["username"]);
+        assert_eq!(login["role"], json["role"]);
+        assert_eq!(login["authentication_type"], json["authentication_type"]);
+    }
+
+    #[test]
+    fn login_throttle_applies_global_and_identity_backoff() {
+        let mut throttle = LoginThrottle::default();
+        let identity = login_throttle_identity("Admin");
+        assert_eq!(identity, "admin");
+        assert_eq!(login_throttle_identity("bad name"), "__invalid__");
+        let now = Instant::now();
+        assert_eq!(throttle.delay(&identity, now), Duration::ZERO);
+        assert_eq!(
+            throttle.record_failure(&identity, now),
+            Duration::from_millis(250)
+        );
+        assert_eq!(throttle.delay(&identity, now), Duration::from_millis(250));
+        let second = now + Duration::from_millis(250);
+        assert_eq!(
+            throttle.record_failure(&identity, second),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            throttle.delay(&identity, second),
+            Duration::from_millis(500)
+        );
+        throttle.record_success(&identity);
+        assert_eq!(
+            throttle.delay(&identity, second),
+            Duration::from_millis(250)
+        );
+
+        let mut bounded = LoginThrottle::default();
+        for index in 0..LOGIN_THROTTLE_MAX_IDENTITIES {
+            bounded.record_failure(&format!("user-{index}"), now);
+        }
+        bounded.record_failure("one-more-user", now);
+        assert!(bounded.identities.len() <= LOGIN_THROTTLE_MAX_IDENTITIES);
+        assert!(bounded.identities.contains_key("__overflow__"));
+    }
+
+    #[test]
+    fn history_error_totals_do_not_double_count_breakdowns() {
+        let tcp = TunnelStatistics::default();
+        tcp.rejected_connections.store(2, Ordering::Relaxed);
+        tcp.failed_connections.store(5, Ordering::Relaxed);
+        tcp.pairing_timeouts.store(3, Ordering::Relaxed);
+        tcp.transfer_errors.store(1, Ordering::Relaxed);
+        tcp.lifetime_timeouts.store(1, Ordering::Relaxed);
+        assert_eq!(tcp_history_error_total(&tcp), 7);
+
+        let udp = UdpTunnelStatisticsSnapshot {
+            dropped_packets: 10,
+            dropped_oversized: 2,
+            dropped_malformed: 3,
+            dropped_unknown_session: 4,
+            dropped_queue_full: 1,
+            dropped_policy_limit: 2,
+            dropped_global_limit: 1,
+            dropped_bandwidth_limit: 1,
+            session_timeouts: 2,
+            reassembly_timeouts: 3,
+            attach_timeouts: 4,
+            transport_errors: 5,
+            ..UdpTunnelStatisticsSnapshot::default()
+        };
+        assert_eq!(udp_history_error_total(&udp), 24);
+    }
+
+    #[test]
+    fn metrics_history_range_and_step_contract_is_bounded() {
+        assert_eq!(parse_metrics_history_range(None), Some(("1h", 3_600, 15)));
+        assert_eq!(
+            parse_metrics_history_range(Some("24h")),
+            Some(("24h", 86_400, 300))
+        );
+        assert!(parse_metrics_history_range(Some("7d")).is_none());
+        assert_eq!(normalize_metrics_history_step(Some(1), 300, 5), Some(5));
+        assert_eq!(normalize_metrics_history_step(Some(7), 300, 5), Some(10));
+        assert_eq!(
+            normalize_metrics_history_step(Some(5), 86_400, 300),
+            Some(290)
+        );
+        assert!(normalize_metrics_history_step(Some(0), 300, 5).is_none());
+        assert!(normalize_metrics_history_step(Some(301), 300, 5).is_none());
+        assert!(
+            METRICS_HISTORY_CAPACITY
+                >= (METRICS_HISTORY_RETENTION_SECONDS / METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS)
+                    as usize
+        );
+    }
+
+    #[test]
+    fn metrics_history_ring_replaces_same_timestamp_and_evicts_oldest_sample() {
+        let mut history = MetricsHistory::new(3);
+        for timestamp in [10, 15, 20] {
+            history.push(history_sample(
+                timestamp,
+                HistoryCounters {
+                    bytes_from_public: timestamp,
+                    ..HistoryCounters::default()
+                },
+                HistoryCounters::default(),
+            ));
+        }
+        history.push(history_sample(
+            20,
+            HistoryCounters {
+                bytes_from_public: 200,
+                ..HistoryCounters::default()
+            },
+            HistoryCounters::default(),
+        ));
+        assert_eq!(history.samples.len(), 3);
+        assert_eq!(history.samples.back().unwrap().tcp.bytes_from_public, 200);
+        history.push(history_sample(
+            25,
+            HistoryCounters::default(),
+            HistoryCounters::default(),
+        ));
+        assert_eq!(history.samples.len(), 3);
+        assert_eq!(history.samples.front().unwrap().timestamp_unix_seconds, 15);
+
+        history.push(history_sample(
+            5,
+            HistoryCounters {
+                bytes_from_public: 5,
+                ..HistoryCounters::default()
+            },
+            HistoryCounters::default(),
+        ));
+        assert_eq!(history.samples.len(), 1);
+        assert_eq!(history.samples.front().unwrap().timestamp_unix_seconds, 5);
+    }
+
+    #[test]
+    fn metrics_history_hard_limits_a_full_day_to_three_hundred_points() {
+        let mut history = MetricsHistory::new(METRICS_HISTORY_CAPACITY);
+        for timestamp in (0..=METRICS_HISTORY_RETENTION_SECONDS)
+            .step_by(METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS as usize)
+        {
+            history.push(history_sample(
+                timestamp,
+                HistoryCounters {
+                    bytes_from_public: timestamp * 10,
+                    bytes_to_public: timestamp * 5,
+                    active_connections: timestamp % 7,
+                    requests_total: timestamp,
+                    errors_total: timestamp / 10,
+                    ..HistoryCounters::default()
+                },
+                HistoryCounters::default(),
+            ));
+        }
+        let response = build_metrics_history_response(
+            &history,
+            METRICS_HISTORY_RETENTION_SECONDS,
+            "24h",
+            METRICS_HISTORY_RETENTION_SECONDS,
+            METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS,
+            MetricsHistoryProtocol::Total,
+        );
+        assert!(response.points.len() <= 300);
+        assert!(response.step_seconds >= 288);
+    }
+
+    #[test]
+    fn metrics_history_downsamples_counters_and_keeps_protocols_isolated() {
+        let mut history = MetricsHistory::new(8);
+        history.push(history_sample(
+            100,
+            HistoryCounters {
+                bytes_from_public: 100,
+                bytes_to_public: 100,
+                active_connections: 2,
+                requests_total: 10,
+                errors_total: 1,
+                ..HistoryCounters::default()
+            },
+            HistoryCounters {
+                bytes_from_public: 1_000,
+                bytes_to_public: 2_000,
+                active_connections: 20,
+                requests_total: 100,
+                errors_total: 10,
+                ..HistoryCounters::default()
+            },
+        ));
+        history.push(history_sample(
+            105,
+            HistoryCounters {
+                bytes_from_public: 150,
+                bytes_to_public: 130,
+                active_connections: 4,
+                requests_total: 15,
+                errors_total: 2,
+                ..HistoryCounters::default()
+            },
+            HistoryCounters {
+                bytes_from_public: 2_000,
+                bytes_to_public: 3_000,
+                active_connections: 30,
+                requests_total: 200,
+                errors_total: 20,
+                ..HistoryCounters::default()
+            },
+        ));
+        history.push(history_sample(
+            110,
+            HistoryCounters {
+                bytes_from_public: 200,
+                bytes_to_public: 160,
+                active_connections: 6,
+                requests_total: 25,
+                errors_total: 4,
+                ..HistoryCounters::default()
+            },
+            HistoryCounters {
+                bytes_from_public: 3_000,
+                bytes_to_public: 4_000,
+                active_connections: 40,
+                requests_total: 300,
+                errors_total: 30,
+                ..HistoryCounters::default()
+            },
+        ));
+
+        let response = build_metrics_history_response(
+            &history,
+            120,
+            "test",
+            20,
+            10,
+            MetricsHistoryProtocol::Tcp,
+        );
+        assert_eq!(response.protocol, MetricsHistoryProtocol::Tcp);
+        assert_eq!(response.points.len(), 1);
+        let point = &response.points[0];
+        assert_eq!(point.timestamp_unix_seconds, 110);
+        assert_eq!(point.inbound_bps, 10.0);
+        assert_eq!(point.outbound_bps, 6.0);
+        assert_eq!(point.active_connections, 5);
+        assert_eq!(point.active_sessions, 0);
+        assert_eq!(point.requests_per_second, 1.5);
+        assert_eq!(point.errors_per_second, 0.3);
+        assert_eq!(point.requests_total, 25);
+        assert_eq!(point.errors_total, 4);
+    }
+
+    #[test]
+    fn secret_history_is_separate_from_tcp_and_included_in_total() {
+        let mut history = MetricsHistory::new(4);
+        let mut first = history_sample(100, HistoryCounters::default(), HistoryCounters::default());
+        first.secret = HistoryCounters {
+            bytes_from_public: 100,
+            bytes_to_public: 50,
+            active_connections: 1,
+            requests_total: 10,
+            errors_total: 2,
+            ..HistoryCounters::default()
+        };
+        history.push(first);
+        let mut second =
+            history_sample(105, HistoryCounters::default(), HistoryCounters::default());
+        second.secret = HistoryCounters {
+            bytes_from_public: 200,
+            bytes_to_public: 100,
+            active_connections: 3,
+            requests_total: 20,
+            errors_total: 3,
+            ..HistoryCounters::default()
+        };
+        history.push(second);
+
+        let secret = build_metrics_history_response(
+            &history,
+            110,
+            "test",
+            10,
+            5,
+            MetricsHistoryProtocol::Secret,
+        );
+        let total = build_metrics_history_response(
+            &history,
+            110,
+            "test",
+            10,
+            5,
+            MetricsHistoryProtocol::Total,
+        );
+        let tcp = build_metrics_history_response(
+            &history,
+            110,
+            "test",
+            10,
+            5,
+            MetricsHistoryProtocol::Tcp,
+        );
+        assert_eq!(secret.points[0].inbound_bps, 20.0);
+        assert_eq!(total.points[0].inbound_bps, 20.0);
+        assert_eq!(tcp.points[0].inbound_bps, 0.0);
+        assert_eq!(secret.points[0].active_connections, 3);
     }
 
     #[test]
@@ -5077,6 +6854,32 @@ mod tests {
             );
         }
         assert!(MANAGEMENT_UI.contains("/api/v1/p2p/nodes"));
+    }
+
+    #[test]
+    fn web_ui_supports_editing_every_forwarding_policy() {
+        assert!(
+            MANAGEMENT_UI.contains("savePolicy(elements."),
+            "Web UI does not contain the shared policy save flow"
+        );
+        for resource in [
+            "tcp-tunnels",
+            "udp-tunnels",
+            "port-groups",
+            "http-routes",
+            "sni-routes",
+            "secret-tunnels",
+            "socks5-proxies",
+            "http-proxies",
+        ] {
+            assert!(
+                MANAGEMENT_UI.contains(&format!("'{resource}'")),
+                "Web UI does not expose editing for {resource}"
+            );
+        }
+        assert!(MANAGEMENT_UI.contains("method: editingId ? 'PUT' : 'POST'"));
+        assert!(MANAGEMENT_UI.contains("cancelEdit"));
+        assert!(MANAGEMENT_UI.contains("beginPolicyEdit"));
     }
 
     #[test]

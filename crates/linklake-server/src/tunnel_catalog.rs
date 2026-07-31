@@ -31,6 +31,9 @@ pub(crate) struct CreateTcpTunnelPolicy {
     pub(crate) bandwidth_limit_bps: Option<u64>,
 }
 
+// 更新接口采用完整替换语义，字段格式与创建接口保持一致。
+pub(crate) type UpdateTcpTunnelPolicy = CreateTcpTunnelPolicy;
+
 #[derive(Serialize, Clone)]
 pub(crate) struct TcpTunnelPolicy {
     pub(crate) id: Uuid,
@@ -58,6 +61,9 @@ pub(crate) struct CreateSocks5ProxyPolicy {
     pub(crate) max_connections: Option<u16>,
     pub(crate) bandwidth_limit_bps: Option<u64>,
 }
+
+// 更新代理策略时不会重置一次性生成的密码，只更新公开策略字段。
+pub(crate) type UpdateSocks5ProxyPolicy = CreateSocks5ProxyPolicy;
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 pub(crate) struct Socks5ProxyPolicy {
@@ -96,6 +102,8 @@ pub(crate) struct CreateHttpProxyPolicy {
     pub(crate) max_connections: Option<u16>,
     pub(crate) bandwidth_limit_bps: Option<u64>,
 }
+
+pub(crate) type UpdateHttpProxyPolicy = CreateHttpProxyPolicy;
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 pub(crate) struct HttpProxyPolicy {
@@ -232,6 +240,8 @@ pub(crate) struct CreateUdpTunnelPolicy {
     pub(crate) bandwidth_limit_bps: Option<u64>,
 }
 
+pub(crate) type UpdateUdpTunnelPolicy = CreateUdpTunnelPolicy;
+
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 pub(crate) struct UdpTunnelPolicy {
     pub(crate) id: Uuid,
@@ -290,6 +300,8 @@ pub(crate) struct CreatePortGroupPolicy {
     pub(crate) session_idle_timeout_seconds: Option<u32>,
     pub(crate) bandwidth_limit_bps: Option<u64>,
 }
+
+pub(crate) type UpdatePortGroupPolicy = CreatePortGroupPolicy;
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 pub(crate) struct PortGroupPolicy {
@@ -577,6 +589,71 @@ impl TunnelCatalog {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub(crate) fn policy_by_id(&self, id: Uuid) -> anyhow::Result<Option<TcpTunnelPolicy>> {
+        self.database
+            .query_row(
+                "SELECT id, client_id, name, public_port, target_addr, max_connections, bandwidth_limit_bps, enabled FROM tcp_tunnel_policies WHERE id = ?1",
+                [id.to_string()],
+                |row| {
+                    let id: String = row.get(0)?;
+                    let client_id: String = row.get(1)?;
+                    Ok(TcpTunnelPolicy {
+                        id: Uuid::parse_str(&id).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        client_id: Uuid::parse_str(&client_id)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        name: row.get(2)?,
+                        public_port: row.get(3)?,
+                        target_addr: row.get(4)?,
+                        max_connections: row.get(5)?,
+                        bandwidth_limit_bps: row.get(6)?,
+                        enabled: row.get::<_, i64>(7)? != 0,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn update(
+        &mut self,
+        id: Uuid,
+        request: UpdateTcpTunnelPolicy,
+    ) -> anyhow::Result<Option<TcpTunnelPolicy>> {
+        validate_policy(&request)?;
+        let Some(current) = self.policy_by_id(id)? else {
+            return Ok(None);
+        };
+        let proxy_port_in_use: bool = self.database.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tcp_tunnel_policies WHERE public_port = ?1 AND id <> ?2 UNION ALL SELECT 1 FROM socks5_proxy_policies WHERE public_port = ?1 UNION ALL SELECT 1 FROM http_proxy_policies WHERE public_port = ?1 UNION ALL SELECT 1 FROM port_group_mappings WHERE protocol = 'tcp' AND public_port = ?1 AND policy_id <> ?2)",
+            params![request.public_port, id.to_string()],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(!proxy_port_in_use, "public port is already assigned");
+        let policy = TcpTunnelPolicy {
+            id,
+            client_id: request.client_id,
+            name: request.name.trim().to_owned(),
+            public_port: request.public_port,
+            target_addr: request.target_addr.trim().to_owned(),
+            max_connections: request.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
+            bandwidth_limit_bps: request.bandwidth_limit_bps,
+            enabled: current.enabled,
+        };
+        self.database.execute(
+            "UPDATE tcp_tunnel_policies SET client_id = ?1, name = ?2, public_port = ?3, target_addr = ?4, max_connections = ?5, bandwidth_limit_bps = ?6 WHERE id = ?7",
+            params![
+                policy.client_id.to_string(),
+                policy.name,
+                policy.public_port,
+                policy.target_addr,
+                policy.max_connections,
+                policy.bandwidth_limit_bps,
+                policy.id.to_string(),
+            ],
+        )?;
+        Ok(Some(policy))
+    }
+
     pub(crate) fn set_enabled(&mut self, id: Uuid, enabled: bool) -> anyhow::Result<bool> {
         Ok(self.database.execute(
             "UPDATE tcp_tunnel_policies SET enabled = ?1 WHERE id = ?2",
@@ -725,6 +802,56 @@ impl TunnelCatalog {
             .map_err(Into::into)
     }
 
+    pub(crate) fn update_socks5(
+        &mut self,
+        id: Uuid,
+        request: UpdateSocks5ProxyPolicy,
+    ) -> Result<Option<Socks5ProxyPolicy>, Socks5PolicyError> {
+        validate_socks5_policy(&request)?;
+        let Some(current) = self.socks5_policy_by_id(id)? else {
+            return Ok(None);
+        };
+        let duplicate_name: bool = self.database.query_row(
+            "SELECT EXISTS(SELECT 1 FROM socks5_proxy_policies WHERE client_id = ?1 AND name = ?2 AND id <> ?3)",
+            params![request.client_id.to_string(), request.name.trim(), id.to_string()],
+            |row| row.get(0),
+        )?;
+        if duplicate_name {
+            return Err(Socks5PolicyError::DuplicateName);
+        }
+        let tcp_port_in_use: bool = self.database.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tcp_tunnel_policies WHERE public_port = ?1 UNION ALL SELECT 1 FROM udp_tunnel_policies WHERE public_port = ?1 UNION ALL SELECT 1 FROM http_proxy_policies WHERE public_port = ?1 UNION ALL SELECT 1 FROM socks5_proxy_policies WHERE public_port = ?1 AND id <> ?2 UNION ALL SELECT 1 FROM port_group_mappings WHERE public_port = ?1 AND policy_id <> ?2)",
+            params![request.public_port, id.to_string()],
+            |row| row.get(0),
+        )?;
+        if tcp_port_in_use {
+            return Err(Socks5PolicyError::DuplicatePublicPort);
+        }
+        let policy = Socks5ProxyPolicy {
+            id,
+            client_id: request.client_id,
+            name: request.name.trim().to_owned(),
+            public_port: request.public_port,
+            username: request.username.trim().to_owned(),
+            max_connections: request.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
+            bandwidth_limit_bps: request.bandwidth_limit_bps,
+            enabled: current.enabled,
+        };
+        self.database.execute(
+            "UPDATE socks5_proxy_policies SET client_id = ?1, name = ?2, public_port = ?3, username = ?4, max_connections = ?5, bandwidth_limit_bps = ?6 WHERE id = ?7",
+            params![
+                policy.client_id.to_string(),
+                policy.name,
+                policy.public_port,
+                policy.username,
+                policy.max_connections,
+                policy.bandwidth_limit_bps,
+                policy.id.to_string(),
+            ],
+        )?;
+        Ok(Some(policy))
+    }
+
     pub(crate) fn socks5_runtime_policy(
         &self,
         client_id: Uuid,
@@ -855,6 +982,56 @@ impl TunnelCatalog {
             .map_err(Into::into)
     }
 
+    pub(crate) fn update_http_proxy(
+        &mut self,
+        id: Uuid,
+        request: UpdateHttpProxyPolicy,
+    ) -> Result<Option<HttpProxyPolicy>, HttpProxyPolicyError> {
+        validate_http_proxy_policy(&request)?;
+        let Some(current) = self.http_proxy_policy_by_id(id)? else {
+            return Ok(None);
+        };
+        let duplicate_name: bool = self.database.query_row(
+            "SELECT EXISTS(SELECT 1 FROM http_proxy_policies WHERE client_id = ?1 AND name = ?2 AND id <> ?3)",
+            params![request.client_id.to_string(), request.name.trim(), id.to_string()],
+            |row| row.get(0),
+        )?;
+        if duplicate_name {
+            return Err(HttpProxyPolicyError::DuplicateName);
+        }
+        let port_in_use: bool = self.database.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tcp_tunnel_policies WHERE public_port = ?1 UNION ALL SELECT 1 FROM socks5_proxy_policies WHERE public_port = ?1 UNION ALL SELECT 1 FROM http_proxy_policies WHERE public_port = ?1 AND id <> ?2 UNION ALL SELECT 1 FROM port_group_mappings WHERE protocol = 'tcp' AND public_port = ?1 AND policy_id <> ?2)",
+            params![request.public_port, id.to_string()],
+            |row| row.get(0),
+        )?;
+        if port_in_use {
+            return Err(HttpProxyPolicyError::DuplicatePublicPort);
+        }
+        let policy = HttpProxyPolicy {
+            id,
+            client_id: request.client_id,
+            name: request.name.trim().to_owned(),
+            public_port: request.public_port,
+            username: request.username.trim().to_owned(),
+            max_connections: request.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
+            bandwidth_limit_bps: request.bandwidth_limit_bps,
+            enabled: current.enabled,
+        };
+        self.database.execute(
+            "UPDATE http_proxy_policies SET client_id = ?1, name = ?2, public_port = ?3, username = ?4, max_connections = ?5, bandwidth_limit_bps = ?6 WHERE id = ?7",
+            params![
+                policy.client_id.to_string(),
+                policy.name,
+                policy.public_port,
+                policy.username,
+                policy.max_connections,
+                policy.bandwidth_limit_bps,
+                policy.id.to_string(),
+            ],
+        )?;
+        Ok(Some(policy))
+    }
+
     pub(crate) fn http_proxy_runtime_policy(
         &self,
         client_id: Uuid,
@@ -952,6 +1129,81 @@ impl TunnelCatalog {
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub(crate) fn udp_policy_by_id(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<UdpTunnelPolicy>, UdpPolicyError> {
+        self.database
+            .query_row(
+                "SELECT id, client_id, name, public_port, target_addr, max_sessions, session_idle_timeout_seconds, bandwidth_limit_bps, enabled FROM udp_tunnel_policies WHERE id = ?1",
+                [id.to_string()],
+                |row| {
+                    let id: String = row.get(0)?;
+                    let client_id: String = row.get(1)?;
+                    Ok(UdpTunnelPolicy {
+                        id: Uuid::parse_str(&id).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        client_id: Uuid::parse_str(&client_id)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        name: row.get(2)?,
+                        public_port: row.get(3)?,
+                        target_addr: row.get(4)?,
+                        max_sessions: row.get(5)?,
+                        session_idle_timeout_seconds: row.get(6)?,
+                        bandwidth_limit_bps: row.get(7)?,
+                        enabled: row.get::<_, i64>(8)? != 0,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn update_udp(
+        &mut self,
+        id: Uuid,
+        request: UpdateUdpTunnelPolicy,
+    ) -> Result<Option<UdpTunnelPolicy>, UdpPolicyError> {
+        validate_udp_policy(&request)?;
+        let Some(current) = self.udp_policy_by_id(id)? else {
+            return Ok(None);
+        };
+        let port_in_use: bool = self.database.query_row(
+            "SELECT EXISTS(SELECT 1 FROM udp_tunnel_policies WHERE public_port = ?1 AND id <> ?2 UNION ALL SELECT 1 FROM socks5_proxy_policies WHERE public_port = ?1 UNION ALL SELECT 1 FROM port_group_mappings WHERE protocol = 'udp' AND public_port = ?1 AND policy_id <> ?2)",
+            params![request.public_port, id.to_string()],
+            |row| row.get(0),
+        )?;
+        if port_in_use {
+            return Err(UdpPolicyError::DuplicatePublicPort);
+        }
+        let policy = UdpTunnelPolicy {
+            id,
+            client_id: request.client_id,
+            name: request.name.trim().to_owned(),
+            public_port: request.public_port,
+            target_addr: request.target_addr.trim().to_owned(),
+            max_sessions: request.max_sessions.unwrap_or(DEFAULT_MAX_SESSIONS),
+            session_idle_timeout_seconds: request
+                .session_idle_timeout_seconds
+                .unwrap_or(DEFAULT_UDP_IDLE_TIMEOUT_SECONDS),
+            bandwidth_limit_bps: request.bandwidth_limit_bps,
+            enabled: current.enabled,
+        };
+        self.database.execute(
+            "UPDATE udp_tunnel_policies SET client_id = ?1, name = ?2, public_port = ?3, target_addr = ?4, max_sessions = ?5, session_idle_timeout_seconds = ?6, bandwidth_limit_bps = ?7 WHERE id = ?8",
+            params![
+                policy.client_id.to_string(),
+                policy.name,
+                policy.public_port,
+                policy.target_addr,
+                policy.max_sessions,
+                policy.session_idle_timeout_seconds,
+                policy.bandwidth_limit_bps,
+                policy.id.to_string(),
+            ],
+        )?;
+        Ok(Some(policy))
     }
 
     pub(crate) fn set_udp_enabled(
@@ -1129,6 +1381,109 @@ impl TunnelCatalog {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub(crate) fn update_port_group(
+        &mut self,
+        id: Uuid,
+        request: UpdatePortGroupPolicy,
+    ) -> Result<Option<PortGroupPolicy>, PortGroupPolicyError> {
+        let parsed = validate_port_group_policy(&request)?;
+        let Some(current) = self.port_group_by_id(id)? else {
+            return Ok(None);
+        };
+        let target_host = request.target_host.trim().to_owned();
+        let duplicate_name: bool = self.database.query_row(
+            "SELECT EXISTS(SELECT 1 FROM port_group_policies WHERE client_id = ?1 AND protocol = ?2 AND name = ?3 AND id <> ?4)",
+            params![
+                request.client_id.to_string(),
+                request.protocol.as_str(),
+                request.name.trim(),
+                id.to_string()
+            ],
+            |row| row.get(0),
+        )?;
+        if duplicate_name {
+            return Err(PortGroupPolicyError::DuplicateName);
+        }
+        let policy = PortGroupPolicy {
+            id,
+            client_id: request.client_id,
+            name: request.name.trim().to_owned(),
+            protocol: request.protocol,
+            public_ports: parsed.public_ports.clone(),
+            target_host: target_host.clone(),
+            target_ports: parsed.target_ports.clone(),
+            mapping_count: parsed.pairs.len(),
+            max_connections: request.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
+            max_sessions: request.max_sessions.unwrap_or(DEFAULT_MAX_SESSIONS),
+            session_idle_timeout_seconds: request
+                .session_idle_timeout_seconds
+                .unwrap_or(DEFAULT_UDP_IDLE_TIMEOUT_SECONDS),
+            bandwidth_limit_bps: request.bandwidth_limit_bps,
+            enabled: current.enabled,
+        };
+
+        let transaction = self.database.transaction()?;
+        for pair in &parsed.pairs {
+            let conflict: bool = match request.protocol {
+                PortGroupProtocol::Tcp => transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM tcp_tunnel_policies WHERE public_port = ?1 UNION ALL SELECT 1 FROM socks5_proxy_policies WHERE public_port = ?1 UNION ALL SELECT 1 FROM http_proxy_policies WHERE public_port = ?1 UNION ALL SELECT 1 FROM port_group_mappings WHERE protocol = 'tcp' AND public_port = ?1 AND policy_id <> ?2)",
+                    params![pair.public_port, id.to_string()],
+                    |row| row.get(0),
+                )?,
+                PortGroupProtocol::Udp => transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM udp_tunnel_policies WHERE public_port = ?1 UNION ALL SELECT 1 FROM socks5_proxy_policies WHERE public_port = ?1 UNION ALL SELECT 1 FROM port_group_mappings WHERE protocol = 'udp' AND public_port = ?1 AND policy_id <> ?2)",
+                    params![pair.public_port, id.to_string()],
+                    |row| row.get(0),
+                )?,
+            };
+            if conflict {
+                return Err(PortGroupPolicyError::DuplicatePublicPort);
+            }
+        }
+
+        let insertion = transaction.execute(
+            "UPDATE port_group_policies SET client_id = ?1, name = ?2, protocol = ?3, public_ports = ?4, target_host = ?5, target_ports = ?6, mapping_count = ?7, max_connections = ?8, max_sessions = ?9, session_idle_timeout_seconds = ?10, bandwidth_limit_bps = ?11 WHERE id = ?12",
+            params![
+                policy.client_id.to_string(),
+                policy.name,
+                policy.protocol.as_str(),
+                policy.public_ports,
+                policy.target_host,
+                policy.target_ports,
+                policy.mapping_count,
+                policy.max_connections,
+                policy.max_sessions,
+                policy.session_idle_timeout_seconds,
+                policy.bandwidth_limit_bps,
+                policy.id.to_string(),
+            ],
+        );
+        if let Err(error) = insertion {
+            if is_constraint_violation(&error) {
+                return Err(PortGroupPolicyError::DuplicateName);
+            }
+            return Err(PortGroupPolicyError::Database(error));
+        }
+        transaction.execute(
+            "DELETE FROM port_group_mappings WHERE policy_id = ?1",
+            [id.to_string()],
+        )?;
+        for pair in parsed.pairs {
+            transaction.execute(
+                "INSERT INTO port_group_mappings (policy_id, protocol, public_port, target_port, target_addr) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    policy.id.to_string(),
+                    policy.protocol.as_str(),
+                    pair.public_port,
+                    pair.target_port,
+                    target_addr(&target_host, pair.target_port),
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(Some(policy))
     }
 
     pub(crate) fn port_group_mappings(
@@ -1898,6 +2253,143 @@ mod tests {
                 .expect("authorization should work"),
             None
         );
+    }
+
+    #[test]
+    fn updates_preserve_policy_identity_state_and_proxy_credentials() {
+        let client_id = Uuid::new_v4();
+        let mut catalog = TunnelCatalog::open(None).expect("catalog should open");
+
+        let tcp = catalog
+            .create(CreateTcpTunnelPolicy {
+                client_id,
+                name: "old-tcp".to_owned(),
+                public_port: 32060,
+                target_addr: "127.0.0.1:6000".to_owned(),
+                max_connections: Some(4),
+                bandwidth_limit_bps: None,
+            })
+            .expect("TCP policy should create");
+        catalog
+            .set_enabled(tcp.id, false)
+            .expect("TCP policy should disable");
+        let tcp_updated = catalog
+            .update(
+                tcp.id,
+                CreateTcpTunnelPolicy {
+                    client_id,
+                    name: "new-tcp".to_owned(),
+                    public_port: 32061,
+                    target_addr: "127.0.0.1:6100".to_owned(),
+                    max_connections: Some(9),
+                    bandwidth_limit_bps: Some(2_000_000),
+                },
+            )
+            .expect("TCP policy should update")
+            .expect("TCP policy should exist");
+        assert_eq!(tcp_updated.id, tcp.id);
+        assert!(!tcp_updated.enabled);
+        assert_eq!(tcp_updated.name, "new-tcp");
+        assert_eq!(tcp_updated.public_port, 32061);
+
+        let udp = catalog
+            .create_udp(udp_request(client_id, 32066))
+            .expect("UDP policy should create");
+        catalog
+            .set_udp_enabled(udp.id, false)
+            .expect("UDP policy should disable");
+        let mut udp_update = udp_request(client_id, 32067);
+        udp_update.name = "updated-udp".to_owned();
+        udp_update.target_addr = "127.0.0.1:6700".to_owned();
+        udp_update.max_sessions = Some(33);
+        let udp_updated = catalog
+            .update_udp(udp.id, udp_update)
+            .expect("UDP policy should update")
+            .expect("UDP policy should exist");
+        assert_eq!(udp_updated.id, udp.id);
+        assert!(!udp_updated.enabled);
+        assert_eq!(udp_updated.public_port, 32067);
+        assert_eq!(udp_updated.max_sessions, 33);
+
+        let socks = catalog
+            .create_socks5(socks5_request(client_id, 32062))
+            .expect("SOCKS5 policy should create");
+        let mut socks_update = socks5_request(client_id, 32063);
+        socks_update.name = "updated-exit".to_owned();
+        socks_update.username = "updated-user".to_owned();
+        let socks_updated = catalog
+            .update_socks5(socks.policy.id, socks_update)
+            .expect("SOCKS5 policy should update")
+            .expect("SOCKS5 policy should exist");
+        assert_eq!(socks_updated.id, socks.policy.id);
+        let runtime = catalog
+            .socks5_runtime_policy(client_id, "updated-exit", 32063)
+            .expect("SOCKS5 runtime should query")
+            .expect("updated SOCKS5 runtime should match");
+        assert_eq!(runtime.username, "updated-user");
+        assert!(socks5_password_matches(
+            socks.password.as_bytes(),
+            &runtime.password_hash
+        ));
+        assert!(catalog
+            .socks5_runtime_policy(client_id, "office-exit", 32062)
+            .expect("old SOCKS5 runtime should query")
+            .is_none());
+
+        let http = catalog
+            .create_http_proxy(http_proxy_request(client_id, 32064))
+            .expect("HTTP proxy policy should create");
+        let mut http_update = http_proxy_request(client_id, 32065);
+        http_update.name = "updated-web-exit".to_owned();
+        http_update.username = "updated-proxy-user".to_owned();
+        let http_updated = catalog
+            .update_http_proxy(http.policy.id, http_update)
+            .expect("HTTP proxy policy should update")
+            .expect("HTTP proxy policy should exist");
+        assert_eq!(http_updated.id, http.policy.id);
+        let runtime = catalog
+            .http_proxy_runtime_policy(client_id, "updated-web-exit", 32065)
+            .expect("HTTP proxy runtime should query")
+            .expect("updated HTTP proxy runtime should match");
+        assert_eq!(runtime.username, "updated-proxy-user");
+        assert!(http_proxy_password_matches(
+            http.password.as_bytes(),
+            &runtime.password_hash
+        ));
+    }
+
+    #[test]
+    fn port_group_update_replaces_mappings_and_preserves_enabled_state() {
+        let client_id = Uuid::new_v4();
+        let mut catalog = TunnelCatalog::open(None).expect("catalog should open");
+        let policy = catalog
+            .create_port_group(port_group_request(
+                client_id,
+                PortGroupProtocol::Tcp,
+                "32070-32073",
+            ))
+            .expect("port group should create");
+        catalog
+            .set_port_group_enabled(policy.id, false)
+            .expect("port group should disable");
+        let mut update = port_group_request(client_id, PortGroupProtocol::Udp, "32074-32077");
+        update.name = "updated-game-range".to_owned();
+        update.target_host = "127.0.0.2".to_owned();
+        let updated = catalog
+            .update_port_group(policy.id, update)
+            .expect("port group should update")
+            .expect("port group should exist");
+        assert_eq!(updated.id, policy.id);
+        assert!(!updated.enabled);
+        assert_eq!(updated.protocol, PortGroupProtocol::Udp);
+        assert_eq!(updated.public_ports, "32074-32077");
+        let mappings = catalog
+            .port_group_mappings(policy.id)
+            .expect("updated mappings should list");
+        assert_eq!(mappings.len(), 4);
+        assert_eq!(mappings[0].public_port, 32074);
+        assert_eq!(mappings[0].target_addr, "127.0.0.2:2333");
+        assert!(mappings.iter().all(|mapping| mapping.public_port >= 32074));
     }
 
     #[test]
