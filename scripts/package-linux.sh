@@ -37,7 +37,7 @@ install -m 0644 packaging/iroh-relay/nginx-location.conf.example "$stage/iroh-re
 install -m 0644 packaging/iroh-relay/nginx-server.conf.example "$stage/iroh-relay/"
 install -m 0755 packaging/iroh-relay/install.sh "$stage/iroh-relay/"
 cp examples/* "$stage/examples/"
-cp README.md README.en.md CHANGELOG.md LICENSE NOTICE "$stage/"
+cp README.md README.en.md CHANGELOG.md LICENSE NOTICE THIRD_PARTY_NOTICES.md THIRD_PARTY_LICENSES.html TRADEMARKS.md "$stage/"
 cat >"$stage/release.json" <<EOF
 {"product":"LinkLake","version":"$version","target":"linux-x86_64","built_unix_seconds":$source_date_epoch}
 EOF

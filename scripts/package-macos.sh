@@ -22,7 +22,7 @@ install -m 0644 packaging/launchd/com.linklake.client.plist "$stage/launchd/"
 install -m 0644 packaging/systemd/server.env.example "$stage/launchd/server.env.example"
 install -m 0755 packaging/launchd/install-macos.sh "$stage/launchd/"
 cp examples/* "$stage/examples/"
-cp README.md README.en.md CHANGELOG.md LICENSE NOTICE "$stage/"
+cp README.md README.en.md CHANGELOG.md LICENSE NOTICE THIRD_PARTY_NOTICES.md THIRD_PARTY_LICENSES.html TRADEMARKS.md "$stage/"
 printf '{"product":"LinkLake","version":"%s","target":"macos-%s","built_unix_seconds":%s}\n' \
   "$version" "$architecture" "$source_date_epoch" >"$stage/release.json"
 find "$stage" -exec touch -t "$(date -r "$source_date_epoch" +%Y%m%d%H%M.%S)" {} +

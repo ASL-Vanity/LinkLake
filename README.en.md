@@ -355,4 +355,10 @@ Packaging scripts honor `SOURCE_DATE_EPOCH`. With the same timestamp, source, to
 
 ## License
 
-LinkLake is licensed under the Apache License 2.0. Copyright belongs to ASL-Vanity and LinkLake contributors; see `LICENSE` and `NOTICE` for the complete terms and attribution notice.
+LinkLake is licensed under the Apache License 2.0. Copyright belongs to ASL-Vanity and LinkLake contributors; see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE) for the complete terms and attribution notice.
+
+- Third-party components and licenses: [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) and [`THIRD_PARTY_LICENSES.html`](THIRD_PARTY_LICENSES.html)
+- LinkLake name, Twin Shores logo, and brand assets: [`TRADEMARKS.md`](TRADEMARKS.md)
+- Contribution, provenance, and DCO sign-off requirements: [`CONTRIBUTING.md`](CONTRIBUTING.md)
+
+The Apache License 2.0 does not grant rights to LinkLake branding or trademarks. Modified distributions, forks, and hosted services may accurately describe themselves as based on LinkLake, but must not imply official maintenance or endorsement.

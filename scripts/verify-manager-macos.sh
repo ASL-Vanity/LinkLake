@@ -10,7 +10,7 @@ test -n "$archive"
 entries="$(tar -tzf "$archive" | sed 's#^[^/]*/##')"
 printf '%s\n' "$entries" | grep -E '\.app/Contents/Info\.plist$' >/dev/null
 printf '%s\n' "$entries" | grep -E '\.app/Contents/MacOS/[^/]+$' >/dev/null
-for entry in README.md README.en.md MANAGER_README.md LICENSE NOTICE release.json; do
+for entry in README.md README.en.md MANAGER_README.md LICENSE NOTICE THIRD_PARTY_NOTICES.md THIRD_PARTY_LICENSES.html TRADEMARKS.md release.json; do
   printf '%s\n' "$entries" | grep -Fx "$entry" >/dev/null || { echo "Missing archive entry: $entry" >&2; exit 1; }
 done
 echo "Verified $archive"

@@ -363,4 +363,10 @@ macOS 使用 `scripts/package-macos.sh`、`scripts/verify-macos-package.sh`、`s
 
 ## 许可证
 
-LinkLake 采用 Apache License 2.0。版权归 ASL-Vanity 与 LinkLake contributors 所有；完整条款与归属说明见 `LICENSE` 和 `NOTICE`。
+LinkLake 采用 Apache License 2.0。版权归 ASL-Vanity 与 LinkLake contributors 所有；完整条款与归属说明见 [`LICENSE`](LICENSE) 和 [`NOTICE`](NOTICE)。
+
+- 第三方组件及许可证：[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) 与 [`THIRD_PARTY_LICENSES.html`](THIRD_PARTY_LICENSES.html)
+- LinkLake 名称、双岸 Logo 和品牌资产：[`TRADEMARKS.md`](TRADEMARKS.md)
+- 贡献、原创性与 DCO 签署要求：[`CONTRIBUTING.md`](CONTRIBUTING.md)
+
+Apache License 2.0 不授予 LinkLake 品牌和商标使用权。修改版、分支和托管服务可以准确说明其基于 LinkLake，但不得暗示由 LinkLake 官方维护或背书。

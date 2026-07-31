@@ -46,7 +46,9 @@ New-Item -ItemType Directory -Force -Path $stage | Out-Null
 Copy-Item -Path (Join-Path $bundle '*') -Destination $stage -Recurse -Force
 Copy-Item -LiteralPath (Join-Path $projectRoot 'README.md'), `
     (Join-Path $projectRoot 'README.en.md'), (Join-Path $projectRoot 'LICENSE'), `
-    (Join-Path $projectRoot 'NOTICE') -Destination $stage
+    (Join-Path $projectRoot 'NOTICE'), (Join-Path $projectRoot 'THIRD_PARTY_NOTICES.md'), `
+    (Join-Path $projectRoot 'THIRD_PARTY_LICENSES.html'), (Join-Path $projectRoot 'TRADEMARKS.md') `
+    -Destination $stage
 Copy-Item -LiteralPath (Join-Path $managerRoot 'README.md') `
     -Destination (Join-Path $stage 'MANAGER_README.md')
 

@@ -36,7 +36,9 @@ Copy-Item -Path (Join-Path $projectRoot 'packaging\windows\*.ps1') -Destination 
 Copy-Item -Path (Join-Path $projectRoot 'examples\*') -Destination (Join-Path $stage 'examples')
 Copy-Item -LiteralPath (Join-Path $projectRoot 'README.md'), (Join-Path $projectRoot 'README.en.md'), `
     (Join-Path $projectRoot 'CHANGELOG.md'), (Join-Path $projectRoot 'LICENSE'), `
-    (Join-Path $projectRoot 'NOTICE') -Destination $stage
+    (Join-Path $projectRoot 'NOTICE'), (Join-Path $projectRoot 'THIRD_PARTY_NOTICES.md'), `
+    (Join-Path $projectRoot 'THIRD_PARTY_LICENSES.html'), (Join-Path $projectRoot 'TRADEMARKS.md') `
+    -Destination $stage
 
 $manifestData = [ordered]@{
     product = 'LinkLake'

@@ -33,6 +33,9 @@ try {
         'CHANGELOG.md',
         'LICENSE',
         'NOTICE',
+        'THIRD_PARTY_NOTICES.md',
+        'THIRD_PARTY_LICENSES.html',
+        'TRADEMARKS.md',
         'release.json'
     )
     foreach ($entry in $required) {

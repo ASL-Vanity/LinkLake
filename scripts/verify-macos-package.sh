@@ -8,7 +8,7 @@ archive="$(find "$output_directory" -maxdepth 1 -name "linklake-$version-macos-*
 test -n "$archive"
 (cd "$output_directory" && shasum -a 256 -c "$(basename "$archive").sha256")
 entries="$(tar -tzf "$archive" | sed 's#^[^/]*/##')"
-for entry in bin/linklake-server bin/linklake-client launchd/com.linklake.server.plist launchd/com.linklake.client.plist launchd/install-macos.sh README.md README.en.md CHANGELOG.md LICENSE NOTICE release.json; do
+for entry in bin/linklake-server bin/linklake-client launchd/com.linklake.server.plist launchd/com.linklake.client.plist launchd/install-macos.sh README.md README.en.md CHANGELOG.md LICENSE NOTICE THIRD_PARTY_NOTICES.md THIRD_PARTY_LICENSES.html TRADEMARKS.md release.json; do
   printf '%s\n' "$entries" | grep -Fx "$entry" >/dev/null || { echo "Missing archive entry: $entry" >&2; exit 1; }
 done
 echo "Verified $archive"

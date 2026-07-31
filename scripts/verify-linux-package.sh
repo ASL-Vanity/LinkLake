@@ -27,6 +27,9 @@ README.en.md
 CHANGELOG.md
 LICENSE
 NOTICE
+THIRD_PARTY_NOTICES.md
+THIRD_PARTY_LICENSES.html
+TRADEMARKS.md
 release.json'
 
 entries="$(tar -tzf "$archive" | sed 's#^[^/]*/##')"

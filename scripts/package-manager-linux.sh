@@ -22,7 +22,9 @@ rm -rf -- "$stage"
 rm -f -- "$archive" "$archive.sha256"
 install -d "$stage"
 cp -a "$bundle/." "$stage/"
-cp "$project_root/README.md" "$project_root/README.en.md" "$project_root/LICENSE" "$project_root/NOTICE" "$stage/"
+cp "$project_root/README.md" "$project_root/README.en.md" "$project_root/LICENSE" "$project_root/NOTICE" \
+  "$project_root/THIRD_PARTY_NOTICES.md" "$project_root/THIRD_PARTY_LICENSES.html" \
+  "$project_root/TRADEMARKS.md" "$stage/"
 cp "$manager_root/README.md" "$stage/MANAGER_README.md"
 printf '{"product":"LinkLake Manager","component":"manager","version":"%s","target":"linux-x86_64","built_unix_seconds":%s}\n' \
   "$version" "$source_date_epoch" >"$stage/release.json"

@@ -16,6 +16,30 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  license-compliance:
+    name: License compliance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Select pinned Rust toolchain
+        run: rustup default 1.88.0
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-about
+          key: linux-license-cargo-about-0.9.1-${{ hashFiles('Cargo.lock', 'about.toml') }}
+          restore-keys: linux-license-cargo-about-0.9.1-
+      - name: Install cargo-about
+        run: command -v cargo-about >/dev/null || cargo install cargo-about --version 0.9.1 --locked --features cli
+      - name: Generate locked Rust dependency licenses
+        run: node scripts/generate-third-party-licenses.mjs target/THIRD_PARTY_LICENSES.html
+      - name: Verify committed license document
+        run: cmp target/THIRD_PARTY_LICENSES.html THIRD_PARTY_LICENSES.html
+
   linux-quality:
     name: Linux quality
     runs-on: ubuntu-latest

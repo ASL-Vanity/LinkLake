@@ -4,3 +4,11 @@ Copyright 2026 ASL-Vanity and LinkLake contributors.
 LinkLake source code, automated tests, documentation, and release engineering
 were developed with OpenAI GPT-5.6 assistance under the project owner's
 requirements, review, infrastructure authorization, and acceptance.
+
+Third-party components retain their original copyright and license terms.
+See THIRD_PARTY_NOTICES.md and THIRD_PARTY_LICENSES.html in the source tree
+and release packages for component-level attribution and license texts.
+
+The Apache License 2.0 does not grant rights to the LinkLake name, Twin Shores
+logo, application icons, or visual identity. See TRADEMARKS.md for permitted
+brand use.
