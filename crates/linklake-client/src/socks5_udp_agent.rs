@@ -26,7 +26,9 @@ use uuid::Uuid;
 
 use crate::udp_agent::EstablishedDataPlane;
 
-const SESSION_QUEUE_CAPACITY: usize = 16;
+// SOCKS5 UDP 与普通 UDP 共用同类的数据通路，也需要吸收 QUIC/系统调度产生的小突发。
+// 队列中的有效载荷仍受客户端全局 UDP 字节预算约束。
+const SESSION_QUEUE_CAPACITY: usize = 256;
 const MAX_TARGETS_PER_ASSOCIATION: usize = 256;
 
 struct TargetSession {

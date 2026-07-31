@@ -33,7 +33,9 @@ use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use uuid::Uuid;
 
 pub(super) const UDP_QUEUE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
-const SESSION_QUEUE_CAPACITY: usize = 16;
+// QUIC DATAGRAM 和 Windows 调度都可能把原本均匀的流量成批交付。
+// 每会话需要吸收常见的小突发；总内存仍由 UDP_QUEUE_BUDGET_BYTES 严格限制。
+const SESSION_QUEUE_CAPACITY: usize = 256;
 const SESSION_EVENT_CAPACITY: usize = 256;
 const CONTROL_EVENT_CAPACITY: usize = 64;
 const SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
@@ -691,7 +693,9 @@ fn is_idle(last_activity: &Mutex<Instant>, now: Instant, idle_timeout: Duration)
 
 #[cfg(test)]
 mod tests {
-    use super::{enqueue_datagram, QueueDatagramError, QueuedDatagram, TargetSession};
+    use super::{
+        enqueue_datagram, QueueDatagramError, QueuedDatagram, TargetSession, SESSION_QUEUE_CAPACITY,
+    };
     use std::{
         sync::{Arc, Mutex},
         time::Instant,
@@ -741,6 +745,35 @@ mod tests {
                 .expect("zero-byte datagram should exist"),
         );
         assert_eq!(budget.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn session_queue_absorbs_normal_datagram_burst() {
+        const BURST_PACKETS: usize = 64;
+        const PAYLOAD_BYTES: usize = 512;
+        let budget = Arc::new(Semaphore::new(BURST_PACKETS * PAYLOAD_BYTES));
+        let (sender, mut receiver) = mpsc::channel(SESSION_QUEUE_CAPACITY);
+
+        for sequence in 0..BURST_PACKETS {
+            assert_eq!(
+                enqueue_datagram(
+                    &sender,
+                    vec![u8::try_from(sequence).expect("sequence fits in u8"); PAYLOAD_BYTES],
+                    &budget,
+                ),
+                Ok(())
+            );
+        }
+        assert_eq!(budget.available_permits(), 0);
+
+        for sequence in 0..BURST_PACKETS {
+            let queued = receiver.recv().await.expect("burst datagram should exist");
+            assert_eq!(
+                queued.payload[0],
+                u8::try_from(sequence).expect("sequence fits in u8")
+            );
+        }
+        assert_eq!(budget.available_permits(), BURST_PACKETS * PAYLOAD_BYTES);
     }
 
     #[test]
