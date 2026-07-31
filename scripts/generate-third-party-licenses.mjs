@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -8,6 +8,8 @@ const projectRoot = resolve(scriptDirectory, '..');
 const output = resolve(projectRoot, process.argv[2] ?? 'THIRD_PARTY_LICENSES.html');
 const temporaryOutput = `${output}.tmp`;
 const cargo = process.platform === 'win32' ? 'cargo.exe' : 'cargo';
+
+mkdirSync(dirname(output), { recursive: true });
 
 // 先让 cargo-about 生成完整许可证，再只规范化换行和行尾空白，保证跨平台输出一致。
 const result = spawnSync(
