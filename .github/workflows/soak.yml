@@ -43,8 +43,8 @@ jobs:
         shell: pwsh
         run: |
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\reliability-matrix.ps1 `
-            -Profile soak -DurationMinutes ([int]$env:SOAK_MINUTES) | `
-            Tee-Object -FilePath .\tests\soak-results.json
+            -Profile soak -DurationMinutes ([int]$env:SOAK_MINUTES) `
+            -OutputPath .\tests\soak-results.json
       - name: Upload soak report
         if: always()
         uses: actions/upload-artifact@v7
