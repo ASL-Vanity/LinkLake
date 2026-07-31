@@ -31,12 +31,23 @@ jobs:
             target
           key: windows-release-${{ hashFiles('Cargo.lock') }}
           restore-keys: windows-release-
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.44.8'
+          cache: true
       - name: Build Windows package
         shell: powershell
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\package-windows.ps1
       - name: Verify Windows package
         shell: powershell
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-windows-package.ps1
+      - name: Build Flutter manager Windows package
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\package-manager-windows.ps1
+      - name: Verify Flutter manager Windows package
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-manager-windows.ps1
       - uses: actions/upload-artifact@v7
         with:
           name: linklake-windows-x86_64
@@ -61,10 +72,21 @@ jobs:
             target
           key: linux-release-${{ hashFiles('Cargo.lock') }}
           restore-keys: linux-release-
+      - name: Install Flutter Linux dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.44.8'
+          cache: true
       - name: Build Linux package
         run: bash scripts/package-linux.sh
       - name: Verify Linux package
         run: bash scripts/verify-linux-package.sh
+      - name: Build Flutter manager Linux package
+        run: sh scripts/package-manager-linux.sh
+      - name: Verify Flutter manager Linux package
+        run: sh scripts/verify-manager-linux.sh
       - uses: actions/upload-artifact@v7
         with:
           name: linklake-linux-x86_64
@@ -73,11 +95,49 @@ jobs:
             dist/*.tar.gz.sha256
           if-no-files-found: error
 
+  macos-package:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Select pinned Rust toolchain
+        run: rustup default 1.88.0
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: macos-release-
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.44.8'
+          cache: true
+      - name: Build macOS package
+        run: sh scripts/package-macos.sh
+      - name: Verify macOS package
+        run: sh scripts/verify-macos-package.sh
+      - name: Build Flutter manager macOS package
+        run: sh scripts/package-manager-macos.sh
+      - name: Verify Flutter manager macOS package
+        run: sh scripts/verify-manager-macos.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linklake-macos
+          path: |
+            dist/*-macos-*.tar.gz
+            dist/*-macos-*.tar.gz.sha256
+          if-no-files-found: error
+
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
     needs:
       - windows-package
       - linux-package
+      - macos-package
     runs-on: ubuntu-latest
     permissions:
       contents: write

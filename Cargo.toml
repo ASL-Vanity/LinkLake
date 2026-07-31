@@ -7,9 +7,11 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.4.0-rc.1"
 edition = "2021"
 rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/ASL-Vanity/LinkLake"
 authors = ["LinkLake Contributors"]
 
 [workspace.dependencies]
@@ -18,16 +20,21 @@ argon2 = "0.5"
 arc-swap = "1.7"
 axum = "0.7"
 axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
+base64 = "0.22"
 bytes = "1.12"
+getrandom = "0.4"
 clap = { version = "4.5", features = ["derive"] }
 http-body-util = "0.1"
 hyper = { version = "1.11", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls", "rcgen"] }
+iroh = { version = "0.92.0", default-features = false }
 quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
+snow = "0.10"
 thiserror = "1.0"
 toml = "0.8"
 tokio = { version = "1.38", features = ["io-util", "macros", "rt-multi-thread", "net", "signal", "sync", "time"] }

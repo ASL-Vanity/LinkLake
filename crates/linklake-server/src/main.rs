@@ -3,9 +3,18 @@ mod audit_log;
 mod certificate_catalog;
 mod certificate_manager;
 mod client_registry;
+mod database_migrations;
 mod database_tools;
+mod http_proxy_tunnel;
 mod http_route_catalog;
 mod http_tunnel;
+mod p2p_control;
+mod p2p_node_catalog;
+mod secret_tunnel;
+mod secret_tunnel_catalog;
+mod sni_route_catalog;
+mod sni_tunnel;
+mod socks5_tunnel;
 mod tcp_tunnel;
 mod tunnel_catalog;
 mod udp_data_plane;
@@ -31,9 +40,20 @@ use http_route_catalog::{
     CreateHttpRouteError, CreateHttpRoutePolicy, HttpRouteCatalog, HttpRoutePolicy,
 };
 use linklake_core::{
-    BoxedIo, ClientEnrollmentRequest, ClientEnrollmentResponse, API_VERSION, PRODUCT_NAME,
+    managed_config_revision, BoxedIo, ClientEnrollmentRequest, ClientEnrollmentResponse,
+    ManagedClientConfig, ManagedHttpProxy, ManagedHttpRoute, ManagedSecretTunnel,
+    ManagedSocks5Proxy, ManagedTcpTunnel, ManagedTlsRoute, ManagedUdpTunnel, API_VERSION,
+    PRODUCT_NAME,
+};
+use p2p_node_catalog::{P2pNodeCatalog, P2pNodeRecord};
+use secret_tunnel_catalog::{
+    CreateSecretTunnelPolicy, CreatedSecretTunnelPolicy, SecretPolicyError, SecretTunnelCatalog,
+    SecretTunnelPolicy,
 };
 use serde::{Deserialize, Serialize};
+use sni_route_catalog::{
+    CreateSniRoutePolicy, SniRouteCatalog, SniRoutePolicy, SniRoutePolicyError,
+};
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
@@ -54,8 +74,11 @@ use tokio_rustls::{
 };
 use tower_http::trace::TraceLayer;
 use tunnel_catalog::{
-    CreateTcpTunnelPolicy, CreateUdpTunnelPolicy, TcpTunnelPolicy, TunnelCatalog, UdpPolicyError,
-    UdpTunnelPolicy,
+    CreateHttpProxyPolicy, CreatePortGroupPolicy, CreateSocks5ProxyPolicy, CreateTcpTunnelPolicy,
+    CreateUdpTunnelPolicy, CreatedHttpProxyPolicy, CreatedSocks5ProxyPolicy, HttpProxyPolicy,
+    HttpProxyPolicyError, PortGroupMapping, PortGroupPolicy, PortGroupPolicyError,
+    PortGroupProtocol, Socks5PolicyError, Socks5ProxyPolicy, TcpTunnelPolicy, TunnelCatalog,
+    UdpPolicyError, UdpTunnelPolicy,
 };
 use udp_data_plane::{UdpDataPlane, UdpDataPlaneConfig};
 use uuid::Uuid;
@@ -64,6 +87,166 @@ const MANAGEMENT_UI: &str = include_str!("../web/index.html");
 const GLOBAL_CONNECTION_LIMIT: usize = 1024;
 const PENDING_CONNECTION_LIMIT: usize = 256;
 const GLOBAL_UDP_SESSION_LIMIT: usize = 16_384;
+
+pub(crate) fn managed_config_for_client(
+    state: &AppState,
+    client_id: Uuid,
+) -> anyhow::Result<ManagedClientConfig> {
+    let mut tcp_tunnels = state
+        .tunnel_catalog
+        .lock()
+        .expect("tunnel catalog lock poisoned")
+        .list()?
+        .into_iter()
+        .filter(|policy| policy.client_id == client_id)
+        .map(|policy| ManagedTcpTunnel {
+            name: policy.name,
+            public_port: policy.public_port,
+            target_addr: policy.target_addr,
+            enabled: policy.enabled,
+        })
+        .collect::<Vec<_>>();
+    let mut udp_tunnels = state
+        .tunnel_catalog
+        .lock()
+        .expect("tunnel catalog lock poisoned")
+        .list_udp()
+        .map_err(|error| anyhow::anyhow!(error))?
+        .into_iter()
+        .filter(|policy| policy.client_id == client_id)
+        .map(|policy| ManagedUdpTunnel {
+            name: policy.name,
+            public_port: policy.public_port,
+            target_addr: policy.target_addr,
+            enabled: policy.enabled,
+        })
+        .collect::<Vec<_>>();
+    let port_groups = {
+        let catalog = state
+            .tunnel_catalog
+            .lock()
+            .expect("tunnel catalog lock poisoned");
+        catalog
+            .list_port_groups()
+            .map_err(|error| anyhow::anyhow!(error))?
+            .into_iter()
+            .filter(|policy| policy.client_id == client_id)
+            .map(|policy| {
+                let mappings = catalog
+                    .port_group_mappings(policy.id)
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                Ok((policy, mappings))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?
+    };
+    for (policy, mappings) in port_groups {
+        match policy.protocol {
+            PortGroupProtocol::Tcp => {
+                tcp_tunnels.extend(mappings.into_iter().map(|mapping| ManagedTcpTunnel {
+                    name: policy.name.clone(),
+                    public_port: mapping.public_port,
+                    target_addr: mapping.target_addr,
+                    enabled: policy.enabled,
+                }))
+            }
+            PortGroupProtocol::Udp => {
+                udp_tunnels.extend(mappings.into_iter().map(|mapping| ManagedUdpTunnel {
+                    name: policy.name.clone(),
+                    public_port: mapping.public_port,
+                    target_addr: mapping.target_addr,
+                    enabled: policy.enabled,
+                }))
+            }
+        }
+    }
+    tcp_tunnels.sort_by_key(|tunnel| tunnel.public_port);
+    udp_tunnels.sort_by_key(|tunnel| tunnel.public_port);
+    let http_routes = state
+        .http_route_catalog
+        .lock()
+        .expect("HTTP route catalog lock poisoned")
+        .list()?
+        .into_iter()
+        .filter(|policy| policy.client_id == client_id)
+        .map(|policy| ManagedHttpRoute {
+            name: policy.name,
+            hostname: policy.hostname,
+            target_addr: policy.target_addr,
+            enabled: policy.enabled,
+        })
+        .collect::<Vec<_>>();
+    let tls_routes = state
+        .sni_route_catalog
+        .lock()
+        .expect("SNI route catalog lock poisoned")
+        .list()
+        .map_err(|error| anyhow::anyhow!(error))?
+        .into_iter()
+        .filter(|policy| policy.client_id == client_id)
+        .map(|policy| ManagedTlsRoute {
+            name: policy.name,
+            hostname: policy.hostname,
+            target_addr: policy.target_addr,
+            enabled: policy.enabled,
+        })
+        .collect::<Vec<_>>();
+    let secret_tunnels = state
+        .secret_tunnel_catalog
+        .lock()
+        .expect("secret tunnel catalog lock poisoned")
+        .list()
+        .map_err(|error| anyhow::anyhow!(error))?
+        .into_iter()
+        .filter(|policy| policy.provider_client_id == client_id)
+        .map(|policy| ManagedSecretTunnel {
+            name: policy.name,
+            target_addr: policy.target_addr,
+            enabled: policy.enabled,
+        })
+        .collect::<Vec<_>>();
+    let socks5_proxies = state
+        .tunnel_catalog
+        .lock()
+        .expect("tunnel catalog lock poisoned")
+        .list_socks5()
+        .map_err(|error| anyhow::anyhow!(error))?
+        .into_iter()
+        .filter(|policy| policy.client_id == client_id)
+        .map(|policy| ManagedSocks5Proxy {
+            name: policy.name,
+            public_port: policy.public_port,
+            enabled: policy.enabled,
+        })
+        .collect::<Vec<_>>();
+    let http_proxies = state
+        .tunnel_catalog
+        .lock()
+        .expect("tunnel catalog lock poisoned")
+        .list_http_proxies()
+        .map_err(|error| anyhow::anyhow!(error))?
+        .into_iter()
+        .filter(|policy| policy.client_id == client_id)
+        .map(|policy| ManagedHttpProxy {
+            name: policy.name,
+            public_port: policy.public_port,
+            enabled: policy.enabled,
+        })
+        .collect::<Vec<_>>();
+
+    // 修订号只覆盖客户端需要执行的字段，服务端限流等策略不会造成无意义重启。
+    let mut config = ManagedClientConfig {
+        revision: String::new(),
+        tcp_tunnels,
+        udp_tunnels,
+        http_routes,
+        tls_routes,
+        secret_tunnels,
+        socks5_proxies,
+        http_proxies,
+    };
+    config.revision = managed_config_revision(&config)?;
+    Ok(config)
+}
 
 struct AppState {
     started_at: Instant,
@@ -86,6 +269,18 @@ struct AppState {
     http_routes: Mutex<HashMap<String, http_tunnel::HttpRouteRegistration>>,
     http_route_statistics: Mutex<HashMap<String, Arc<http_tunnel::HttpRouteStatistics>>>,
     seen_http_route_registrations: Mutex<HashSet<(Uuid, String)>>,
+    sni_route_catalog: Mutex<SniRouteCatalog>,
+    sni_routes: Mutex<HashMap<String, sni_tunnel::SniRouteRegistration>>,
+    sni_route_statistics: Mutex<HashMap<String, Arc<sni_tunnel::SniRouteStatistics>>>,
+    p2p_node_catalog: Mutex<P2pNodeCatalog>,
+    p2p_sessions: Mutex<HashMap<Uuid, p2p_control::PendingP2pSession>>,
+    secret_tunnel_catalog: Mutex<SecretTunnelCatalog>,
+    secret_tunnels: Mutex<HashMap<Uuid, secret_tunnel::SecretTunnelRegistration>>,
+    secret_tunnel_statistics: Mutex<HashMap<Uuid, Arc<secret_tunnel::SecretTunnelStatistics>>>,
+    socks5_proxies: Mutex<HashMap<Uuid, socks5_tunnel::Socks5ProxyRegistration>>,
+    socks5_proxy_statistics: Mutex<HashMap<Uuid, Arc<socks5_tunnel::Socks5ProxyStatistics>>>,
+    http_proxies: Mutex<HashMap<Uuid, http_proxy_tunnel::HttpProxyRegistration>>,
+    http_proxy_statistics: Mutex<HashMap<Uuid, Arc<http_proxy_tunnel::HttpProxyStatistics>>>,
     certificate_catalog: Mutex<CertificateCatalog>,
     certificate_manager: Option<CertificateManager>,
     certificate_jobs: Mutex<HashMap<String, Uuid>>,
@@ -114,6 +309,11 @@ struct ServerCounters {
     acme_renewals_total: AtomicU64,
     acme_renewal_failures_total: AtomicU64,
     acme_http01_challenges_total: AtomicU64,
+    sni_client_hello_errors_total: AtomicU64,
+    sni_unknown_hostname_total: AtomicU64,
+    p2p_session_offers_total: AtomicU64,
+    p2p_direct_connections_total: AtomicU64,
+    p2p_relay_fallbacks_total: AtomicU64,
 }
 
 #[derive(Serialize)]
@@ -132,7 +332,22 @@ struct StatusResponse {
     udp_tunnels: usize,
     http_routes: usize,
     https_routes: usize,
+    secret_tunnels: usize,
+    socks5_proxies: usize,
+    http_proxies: usize,
+    port_groups: usize,
+    sni_routes: usize,
+    p2p_nodes: usize,
+    p2p_nodes_total: usize,
     clients: usize,
+}
+
+#[derive(Serialize)]
+struct P2pNodeView {
+    #[serde(flatten)]
+    node: P2pNodeRecord,
+    fresh: bool,
+    age_seconds: u64,
 }
 
 #[derive(Serialize)]
@@ -149,6 +364,35 @@ struct MetricsResponse {
     tcp_rejected_policy_limit: u64,
     tcp_rejected_global_limit: u64,
     tcp_rejected_pending_limit: u64,
+    socks5_active_connections: usize,
+    socks5_requests_total: u64,
+    socks5_authentication_failures: u64,
+    socks5_rejected_connections: u64,
+    socks5_bytes_from_public: u64,
+    socks5_bytes_to_public: u64,
+    socks5_handshake_errors: u64,
+    socks5_handshake_timeouts: u64,
+    socks5_connect_failures: u64,
+    socks5_pairing_timeouts: u64,
+    socks5_transfer_errors: u64,
+    socks5_udp_active_associations: usize,
+    socks5_udp_datagrams_from_public: u64,
+    socks5_udp_datagrams_to_public: u64,
+    socks5_udp_bytes_from_public: u64,
+    socks5_udp_bytes_to_public: u64,
+    socks5_udp_dropped_datagrams: u64,
+    socks5_udp_dropped_bandwidth_limit: u64,
+    http_proxy_active_connections: usize,
+    http_proxy_requests_total: u64,
+    http_proxy_connect_requests: u64,
+    http_proxy_authentication_failures: u64,
+    http_proxy_rejected_connections: u64,
+    http_proxy_malformed_requests: u64,
+    http_proxy_bytes_from_public: u64,
+    http_proxy_bytes_to_public: u64,
+    http_proxy_pairing_timeouts: u64,
+    http_proxy_connect_failures: u64,
+    http_proxy_transfer_errors: u64,
     #[serde(flatten)]
     udp: UdpMetricsResponse,
     control_connections_total: u64,
@@ -164,6 +408,18 @@ struct MetricsResponse {
     http_bytes_from_public: u64,
     http_bytes_to_public: u64,
     http_pairing_timeouts: u64,
+    sni_active_connections: usize,
+    sni_connections_total: u64,
+    sni_rejected_connections: u64,
+    sni_client_hello_errors: u64,
+    sni_unknown_hostname: u64,
+    sni_bytes_from_public: u64,
+    sni_bytes_to_public: u64,
+    sni_pairing_timeouts: u64,
+    sni_transfer_errors: u64,
+    p2p_session_offers_total: u64,
+    p2p_direct_connections_total: u64,
+    p2p_relay_fallbacks_total: u64,
     https_active_connections: u64,
     https_requests_total: u64,
     https_handshake_failures_total: u64,
@@ -275,6 +531,20 @@ struct UdpTunnelView {
 }
 
 #[derive(Serialize)]
+struct PortGroupView {
+    #[serde(flatten)]
+    policy: PortGroupPolicy,
+    mappings: Vec<PortGroupMapping>,
+    online_mappings: usize,
+    active_connections: usize,
+    active_sessions: usize,
+    bytes_from_public: u64,
+    bytes_to_public: u64,
+    packets_from_public: u64,
+    packets_to_public: u64,
+}
+
+#[derive(Serialize)]
 struct HttpRouteView {
     #[serde(flatten)]
     policy: HttpRoutePolicy,
@@ -286,6 +556,86 @@ struct HttpRouteView {
     bytes_to_public: u64,
     pairing_timeouts: u64,
     tls: RouteTlsView,
+}
+
+#[derive(Serialize)]
+struct SniRouteView {
+    #[serde(flatten)]
+    policy: SniRoutePolicy,
+    online: bool,
+    active_connections: usize,
+    connections_total: u64,
+    rejected_connections: u64,
+    client_hello_errors: u64,
+    unknown_sni: u64,
+    bytes_from_public: u64,
+    bytes_to_public: u64,
+    pairing_timeouts: u64,
+    transfer_errors: u64,
+    lifetime_timeouts: u64,
+}
+
+#[derive(Serialize)]
+struct SecretTunnelView {
+    #[serde(flatten)]
+    policy: SecretTunnelPolicy,
+    online: bool,
+    active_connections: usize,
+    connections_total: u64,
+    rejected_connections: u64,
+    bytes_from_visitor: u64,
+    bytes_to_visitor: u64,
+    pairing_timeouts: u64,
+    transfer_errors: u64,
+    lifetime_timeouts: u64,
+}
+
+#[derive(Serialize)]
+struct Socks5ProxyView {
+    #[serde(flatten)]
+    policy: Socks5ProxyPolicy,
+    online: bool,
+    active_connections: usize,
+    connections_total: u64,
+    requests_total: u64,
+    authentication_failures: u64,
+    rejected_connections: u64,
+    unsupported_commands: u64,
+    handshake_errors: u64,
+    handshake_timeouts: u64,
+    bytes_from_public: u64,
+    bytes_to_public: u64,
+    pairing_timeouts: u64,
+    connect_failures: u64,
+    transfer_errors: u64,
+    lifetime_timeouts: u64,
+    udp_active_associations: usize,
+    udp_datagrams_from_public: u64,
+    udp_datagrams_to_public: u64,
+    udp_bytes_from_public: u64,
+    udp_bytes_to_public: u64,
+    udp_dropped_datagrams: u64,
+    udp_dropped_bandwidth_limit: u64,
+}
+
+#[derive(Serialize)]
+struct HttpProxyView {
+    #[serde(flatten)]
+    policy: HttpProxyPolicy,
+    online: bool,
+    active_connections: usize,
+    connections_total: u64,
+    requests_total: u64,
+    connect_requests: u64,
+    authentication_failures: u64,
+    rejected_connections: u64,
+    malformed_requests: u64,
+    bytes_from_public: u64,
+    bytes_to_public: u64,
+    pairing_timeouts: u64,
+    connect_failures: u64,
+    transfer_errors: u64,
+    lifetime_timeouts: u64,
 }
 
 #[derive(Serialize)]
@@ -397,6 +747,57 @@ fn coded_udp_policy_error(error: UdpPolicyError) -> CodedApiError {
         _ => StatusCode::BAD_REQUEST,
     };
     CodedApiError(status, error.code(), "UDP tunnel policy is invalid")
+}
+
+fn coded_secret_policy_error(error: SecretPolicyError) -> CodedApiError {
+    let status = match error {
+        SecretPolicyError::DuplicateName => StatusCode::CONFLICT,
+        SecretPolicyError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    CodedApiError(status, error.code(), "secret tunnel policy is invalid")
+}
+
+fn coded_socks5_policy_error(error: Socks5PolicyError) -> CodedApiError {
+    let status = match error {
+        Socks5PolicyError::DuplicateName | Socks5PolicyError::DuplicatePublicPort => {
+            StatusCode::CONFLICT
+        }
+        Socks5PolicyError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    CodedApiError(status, error.code(), "SOCKS5 proxy policy is invalid")
+}
+
+fn coded_http_proxy_policy_error(error: HttpProxyPolicyError) -> CodedApiError {
+    let status = match error {
+        HttpProxyPolicyError::DuplicateName | HttpProxyPolicyError::DuplicatePublicPort => {
+            StatusCode::CONFLICT
+        }
+        HttpProxyPolicyError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    CodedApiError(status, error.code(), "HTTP proxy policy is invalid")
+}
+
+fn coded_port_group_policy_error(error: PortGroupPolicyError) -> CodedApiError {
+    let status = match error {
+        PortGroupPolicyError::DuplicateName | PortGroupPolicyError::DuplicatePublicPort => {
+            StatusCode::CONFLICT
+        }
+        PortGroupPolicyError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    CodedApiError(status, error.code(), "port group policy is invalid")
+}
+
+fn coded_sni_route_policy_error(error: SniRoutePolicyError) -> CodedApiError {
+    let status = match error {
+        SniRoutePolicyError::DuplicateHostname => StatusCode::CONFLICT,
+        SniRoutePolicyError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    CodedApiError(status, error.code(), "TLS SNI route policy is invalid")
 }
 
 fn coded_certificate_catalog_error(error: CertificateCatalogError) -> CodedApiError {
@@ -545,6 +946,15 @@ async fn run_server(
         .filter(|value| !value.trim().is_empty())
         .map(|value| value.parse::<SocketAddr>())
         .transpose()?;
+    let sni_address = std::env::var("LINKLAKE_TLS_PASSTHROUGH_BIND")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.parse::<SocketAddr>())
+        .transpose()?;
+    anyhow::ensure!(
+        sni_address.is_none() || sni_address != https_address,
+        "LINKLAKE_TLS_PASSTHROUGH_BIND must not equal LINKLAKE_HTTPS_BIND"
+    );
     let udp_relay_address = std::env::var("LINKLAKE_UDP_RELAY_BIND")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -642,6 +1052,20 @@ async fn run_server(
         tracing::warn!("No LINKLAKE_DATA_DIR configured; identities and administrator sessions are in-memory only.");
     }
     let bootstrap_admin = BootstrapCredentials::from_environment(insecure_default_requested)?;
+    let migration_plan = data_dir
+        .as_deref()
+        .map(database_migrations::prepare)
+        .transpose()?;
+    if let Some(plan) = &migration_plan {
+        if let Some(backup) = plan.backup_path() {
+            tracing::info!(
+                from_version = plan.source_version(),
+                to_version = database_migrations::CURRENT_SCHEMA_VERSION,
+                backup = %backup.display(),
+                "Prepared LinkLake database migration backup"
+            );
+        }
+    }
     let certificate_manager = data_dir
         .as_ref()
         .map(|data_dir| CertificateManager::new(data_dir.clone()))
@@ -668,6 +1092,18 @@ async fn run_server(
         http_routes: Mutex::new(HashMap::new()),
         http_route_statistics: Mutex::new(HashMap::new()),
         seen_http_route_registrations: Mutex::new(HashSet::new()),
+        sni_route_catalog: Mutex::new(SniRouteCatalog::open(data_dir.as_deref())?),
+        sni_routes: Mutex::new(HashMap::new()),
+        sni_route_statistics: Mutex::new(HashMap::new()),
+        p2p_node_catalog: Mutex::new(P2pNodeCatalog::open(data_dir.as_deref())?),
+        p2p_sessions: Mutex::new(HashMap::new()),
+        secret_tunnel_catalog: Mutex::new(SecretTunnelCatalog::open(data_dir.as_deref())?),
+        secret_tunnels: Mutex::new(HashMap::new()),
+        secret_tunnel_statistics: Mutex::new(HashMap::new()),
+        socks5_proxies: Mutex::new(HashMap::new()),
+        socks5_proxy_statistics: Mutex::new(HashMap::new()),
+        http_proxies: Mutex::new(HashMap::new()),
+        http_proxy_statistics: Mutex::new(HashMap::new()),
         certificate_catalog: Mutex::new(CertificateCatalog::open(data_dir.as_deref())?),
         certificate_manager,
         certificate_jobs: Mutex::new(HashMap::new()),
@@ -678,6 +1114,9 @@ async fn run_server(
         global_udp_session_permits: Arc::new(Semaphore::new(GLOBAL_UDP_SESSION_LIMIT)),
         metrics: ServerCounters::default(),
     });
+    if let Some(plan) = migration_plan {
+        plan.finish()?;
+    }
     restore_managed_certificates(&state)?;
     let app = Router::new()
         .route("/", get(management_ui))
@@ -718,6 +1157,18 @@ async fn run_server(
             post(set_udp_tunnel_enabled),
         )
         .route(
+            "/api/v1/port-groups",
+            get(list_port_groups).post(create_port_group),
+        )
+        .route(
+            "/api/v1/port-groups/:group_id",
+            axum::routing::delete(delete_port_group),
+        )
+        .route(
+            "/api/v1/port-groups/:group_id/enabled",
+            post(set_port_group_enabled),
+        )
+        .route(
             "/api/v1/http-routes",
             get(list_http_routes).post(create_http_route),
         )
@@ -729,6 +1180,19 @@ async fn run_server(
             "/api/v1/http-routes/:route_id/enabled",
             post(set_http_route_enabled),
         )
+        .route(
+            "/api/v1/sni-routes",
+            get(list_sni_routes).post(create_sni_route),
+        )
+        .route(
+            "/api/v1/sni-routes/:route_id",
+            axum::routing::delete(delete_sni_route),
+        )
+        .route(
+            "/api/v1/sni-routes/:route_id/enabled",
+            post(set_sni_route_enabled),
+        )
+        .route("/api/v1/p2p/nodes", get(list_p2p_nodes))
         .route("/api/v1/http-routes/:route_id/tls", put(set_http_route_tls))
         .route(
             "/api/v1/http-routes/:route_id/certificate/issue",
@@ -737,6 +1201,42 @@ async fn run_server(
         .route(
             "/api/v1/http-routes/:route_id/certificate/renew",
             post(renew_http_route_certificate),
+        )
+        .route(
+            "/api/v1/secret-tunnels",
+            get(list_secret_tunnels).post(create_secret_tunnel),
+        )
+        .route(
+            "/api/v1/secret-tunnels/:tunnel_id",
+            axum::routing::delete(delete_secret_tunnel),
+        )
+        .route(
+            "/api/v1/secret-tunnels/:tunnel_id/enabled",
+            post(set_secret_tunnel_enabled),
+        )
+        .route(
+            "/api/v1/socks5-proxies",
+            get(list_socks5_proxies).post(create_socks5_proxy),
+        )
+        .route(
+            "/api/v1/socks5-proxies/:proxy_id",
+            axum::routing::delete(delete_socks5_proxy),
+        )
+        .route(
+            "/api/v1/socks5-proxies/:proxy_id/enabled",
+            post(set_socks5_proxy_enabled),
+        )
+        .route(
+            "/api/v1/http-proxies",
+            get(list_http_proxies).post(create_http_proxy),
+        )
+        .route(
+            "/api/v1/http-proxies/:proxy_id",
+            axum::routing::delete(delete_http_proxy),
+        )
+        .route(
+            "/api/v1/http-proxies/:proxy_id/enabled",
+            post(set_http_proxy_enabled),
         )
         .route("/api/v1/clients/enroll", post(enroll_client))
         .route("/api/v1/clients/:client_id/heartbeat", post(heartbeat))
@@ -762,6 +1262,10 @@ async fn run_server(
         tcp_tunnel::stop_all(&shutdown_state);
         udp_tunnel::stop_all(&shutdown_state);
         http_tunnel::stop_all(&shutdown_state);
+        sni_tunnel::stop_all(&shutdown_state);
+        secret_tunnel::stop_all(&shutdown_state);
+        socks5_tunnel::stop_all(&shutdown_state);
+        http_proxy_tunnel::stop_all(&shutdown_state);
         let _ = shutdown_tx.send(true);
     });
     let control_listener = TcpListener::bind(control_address).await?;
@@ -801,6 +1305,15 @@ async fn run_server(
             state.clone(),
             https_listener,
             TlsAcceptor::from(certificate_manager.tls_config()),
+            shutdown_rx.clone(),
+        ));
+    }
+    if let Some(sni_address) = sni_address {
+        let sni_listener = TcpListener::bind(sni_address).await?;
+        tracing::info!("{PRODUCT_NAME} TLS SNI pass-through listener active on {sni_address}");
+        tokio::spawn(sni_tunnel::run_listener(
+            state.clone(),
+            sni_listener,
             shutdown_rx.clone(),
         ));
     }
@@ -914,6 +1427,51 @@ async fn status(
         .http_routes
         .lock()
         .expect("HTTP route registry lock poisoned");
+    let secret_tunnels = state
+        .secret_tunnels
+        .lock()
+        .expect("secret tunnel registry lock poisoned");
+    let socks5_proxies = state
+        .socks5_proxies
+        .lock()
+        .expect("SOCKS5 proxy registry lock poisoned");
+    let http_proxies = state
+        .http_proxies
+        .lock()
+        .expect("HTTP proxy registry lock poisoned");
+    let sni_routes = state
+        .sni_routes
+        .lock()
+        .expect("SNI route registry lock poisoned");
+    let port_groups = state
+        .tunnel_catalog
+        .lock()
+        .expect("tunnel catalog lock poisoned")
+        .list_port_groups()
+        .map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not read port groups",
+            )
+        })?
+        .len();
+    let p2p_node_records = state
+        .p2p_node_catalog
+        .lock()
+        .expect("P2P node catalog lock poisoned")
+        .list()
+        .map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not read P2P nodes",
+            )
+        })?;
+    let now = unix_seconds();
+    let p2p_nodes = p2p_node_records
+        .iter()
+        .filter(|node| p2p_control::node_is_fresh(node.updated_unix_seconds, now))
+        .count();
+    let p2p_nodes_total = p2p_node_records.len();
     Ok(Json(StatusResponse {
         product: PRODUCT_NAME,
         api_version: API_VERSION,
@@ -921,6 +1479,13 @@ async fn status(
         tunnels: tunnels.len(),
         udp_tunnels: udp_tunnels.len(),
         http_routes: http_routes.len(),
+        secret_tunnels: secret_tunnels.len(),
+        socks5_proxies: socks5_proxies.len(),
+        http_proxies: http_proxies.len(),
+        port_groups,
+        sni_routes: sni_routes.len(),
+        p2p_nodes,
+        p2p_nodes_total,
         https_routes: state
             .certificate_manager
             .as_ref()
@@ -955,6 +1520,36 @@ async fn metrics(
         .expect("HTTP route statistics lock poisoned");
     let sum_http_u64 = |load: fn(&http_tunnel::HttpRouteStatistics) -> u64| {
         http_statistics
+            .values()
+            .map(|statistics| load(statistics))
+            .sum()
+    };
+    let socks5_statistics = state
+        .socks5_proxy_statistics
+        .lock()
+        .expect("SOCKS5 statistics lock poisoned");
+    let sum_socks5_u64 = |load: fn(&socks5_tunnel::Socks5ProxyStatistics) -> u64| {
+        socks5_statistics
+            .values()
+            .map(|statistics| load(statistics))
+            .sum()
+    };
+    let http_proxy_statistics = state
+        .http_proxy_statistics
+        .lock()
+        .expect("HTTP proxy statistics lock poisoned");
+    let sum_http_proxy_u64 = |load: fn(&http_proxy_tunnel::HttpProxyStatistics) -> u64| {
+        http_proxy_statistics
+            .values()
+            .map(|statistics| load(statistics))
+            .sum()
+    };
+    let sni_statistics = state
+        .sni_route_statistics
+        .lock()
+        .expect("SNI route statistics lock poisoned");
+    let sum_sni_u64 = |load: fn(&sni_tunnel::SniRouteStatistics) -> u64| {
+        sni_statistics
             .values()
             .map(|statistics| load(statistics))
             .sum()
@@ -1021,6 +1616,140 @@ async fn metrics(
         }),
         tcp_rejected_pending_limit: sum_u64(|statistics| {
             statistics.rejected_pending_limit.load(Ordering::Relaxed)
+        }),
+        sni_active_connections: sni_statistics
+            .values()
+            .map(|statistics| statistics.active_connections.load(Ordering::Relaxed))
+            .sum(),
+        sni_connections_total: sum_sni_u64(|statistics| {
+            statistics.connections_total.load(Ordering::Relaxed)
+        }),
+        sni_rejected_connections: sum_sni_u64(|statistics| {
+            statistics.rejected_connections.load(Ordering::Relaxed)
+        }),
+        sni_client_hello_errors: state
+            .metrics
+            .sni_client_hello_errors_total
+            .load(Ordering::Relaxed),
+        sni_unknown_hostname: state
+            .metrics
+            .sni_unknown_hostname_total
+            .load(Ordering::Relaxed),
+        sni_bytes_from_public: sum_sni_u64(|statistics| {
+            statistics.bytes_from_public.load(Ordering::Relaxed)
+        }),
+        sni_bytes_to_public: sum_sni_u64(|statistics| {
+            statistics.bytes_to_public.load(Ordering::Relaxed)
+        }),
+        sni_pairing_timeouts: sum_sni_u64(|statistics| {
+            statistics.pairing_timeouts.load(Ordering::Relaxed)
+        }),
+        sni_transfer_errors: sum_sni_u64(|statistics| {
+            statistics.transfer_errors.load(Ordering::Relaxed)
+        }),
+        p2p_session_offers_total: state
+            .metrics
+            .p2p_session_offers_total
+            .load(Ordering::Relaxed),
+        p2p_direct_connections_total: state
+            .metrics
+            .p2p_direct_connections_total
+            .load(Ordering::Relaxed),
+        p2p_relay_fallbacks_total: state
+            .metrics
+            .p2p_relay_fallbacks_total
+            .load(Ordering::Relaxed),
+        socks5_active_connections: socks5_statistics
+            .values()
+            .map(|statistics| statistics.active_connections.load(Ordering::Relaxed))
+            .sum(),
+        socks5_requests_total: sum_socks5_u64(|statistics| {
+            statistics.requests_total.load(Ordering::Relaxed)
+        }),
+        socks5_authentication_failures: sum_socks5_u64(|statistics| {
+            statistics.authentication_failures.load(Ordering::Relaxed)
+        }),
+        socks5_rejected_connections: sum_socks5_u64(|statistics| {
+            statistics.rejected_connections.load(Ordering::Relaxed)
+        }),
+        socks5_bytes_from_public: sum_socks5_u64(|statistics| {
+            statistics.bytes_from_public.load(Ordering::Relaxed)
+        }),
+        socks5_bytes_to_public: sum_socks5_u64(|statistics| {
+            statistics.bytes_to_public.load(Ordering::Relaxed)
+        }),
+        socks5_handshake_errors: sum_socks5_u64(|statistics| {
+            statistics.handshake_errors.load(Ordering::Relaxed)
+        }),
+        socks5_handshake_timeouts: sum_socks5_u64(|statistics| {
+            statistics.handshake_timeouts.load(Ordering::Relaxed)
+        }),
+        socks5_connect_failures: sum_socks5_u64(|statistics| {
+            statistics.connect_failures.load(Ordering::Relaxed)
+        }),
+        socks5_pairing_timeouts: sum_socks5_u64(|statistics| {
+            statistics.pairing_timeouts.load(Ordering::Relaxed)
+        }),
+        socks5_transfer_errors: sum_socks5_u64(|statistics| {
+            statistics.transfer_errors.load(Ordering::Relaxed)
+        }),
+        socks5_udp_active_associations: socks5_statistics
+            .values()
+            .map(|statistics| statistics.udp_active_associations.load(Ordering::Relaxed))
+            .sum(),
+        socks5_udp_datagrams_from_public: sum_socks5_u64(|statistics| {
+            statistics.udp_datagrams_from_public.load(Ordering::Relaxed)
+        }),
+        socks5_udp_datagrams_to_public: sum_socks5_u64(|statistics| {
+            statistics.udp_datagrams_to_public.load(Ordering::Relaxed)
+        }),
+        socks5_udp_bytes_from_public: sum_socks5_u64(|statistics| {
+            statistics.udp_bytes_from_public.load(Ordering::Relaxed)
+        }),
+        socks5_udp_bytes_to_public: sum_socks5_u64(|statistics| {
+            statistics.udp_bytes_to_public.load(Ordering::Relaxed)
+        }),
+        socks5_udp_dropped_datagrams: sum_socks5_u64(|statistics| {
+            statistics.udp_dropped_datagrams.load(Ordering::Relaxed)
+        }),
+        socks5_udp_dropped_bandwidth_limit: sum_socks5_u64(|statistics| {
+            statistics
+                .udp_dropped_bandwidth_limit
+                .load(Ordering::Relaxed)
+        }),
+        http_proxy_active_connections: http_proxy_statistics
+            .values()
+            .map(|statistics| statistics.active_connections.load(Ordering::Relaxed))
+            .sum(),
+        http_proxy_requests_total: sum_http_proxy_u64(|statistics| {
+            statistics.requests_total.load(Ordering::Relaxed)
+        }),
+        http_proxy_connect_requests: sum_http_proxy_u64(|statistics| {
+            statistics.connect_requests.load(Ordering::Relaxed)
+        }),
+        http_proxy_authentication_failures: sum_http_proxy_u64(|statistics| {
+            statistics.authentication_failures.load(Ordering::Relaxed)
+        }),
+        http_proxy_rejected_connections: sum_http_proxy_u64(|statistics| {
+            statistics.rejected_connections.load(Ordering::Relaxed)
+        }),
+        http_proxy_malformed_requests: sum_http_proxy_u64(|statistics| {
+            statistics.malformed_requests.load(Ordering::Relaxed)
+        }),
+        http_proxy_bytes_from_public: sum_http_proxy_u64(|statistics| {
+            statistics.bytes_from_public.load(Ordering::Relaxed)
+        }),
+        http_proxy_bytes_to_public: sum_http_proxy_u64(|statistics| {
+            statistics.bytes_to_public.load(Ordering::Relaxed)
+        }),
+        http_proxy_pairing_timeouts: sum_http_proxy_u64(|statistics| {
+            statistics.pairing_timeouts.load(Ordering::Relaxed)
+        }),
+        http_proxy_connect_failures: sum_http_proxy_u64(|statistics| {
+            statistics.connect_failures.load(Ordering::Relaxed)
+        }),
+        http_proxy_transfer_errors: sum_http_proxy_u64(|statistics| {
+            statistics.transfer_errors.load(Ordering::Relaxed)
         }),
         udp: udp_metrics_response(udp_totals),
         control_connections_total: state
@@ -2066,6 +2795,35 @@ async fn list_clients(
     Ok(Json(clients.summaries()))
 }
 
+async fn list_p2p_nodes(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<P2pNodeView>>, ApiError> {
+    authorize_management(&state, &headers)?;
+    let nodes = state
+        .p2p_node_catalog
+        .lock()
+        .expect("P2P node catalog lock poisoned")
+        .list()
+        .map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not read P2P nodes",
+            )
+        })?;
+    let now = unix_seconds();
+    Ok(Json(
+        nodes
+            .into_iter()
+            .map(|node| P2pNodeView {
+                fresh: p2p_control::node_is_fresh(node.updated_unix_seconds, now),
+                age_seconds: now.saturating_sub(node.updated_unix_seconds),
+                node,
+            })
+            .collect(),
+    ))
+}
+
 async fn list_audit_events(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -2305,6 +3063,535 @@ async fn delete_tcp_tunnel(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn list_secret_tunnels(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<SecretTunnelView>>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let policies = state
+        .secret_tunnel_catalog
+        .lock()
+        .expect("secret tunnel catalog lock poisoned")
+        .list()
+        .map_err(coded_secret_policy_error)?;
+    let online = state
+        .secret_tunnels
+        .lock()
+        .expect("secret tunnel registry lock poisoned");
+    let statistics = state
+        .secret_tunnel_statistics
+        .lock()
+        .expect("secret tunnel statistics lock poisoned");
+    Ok(Json(
+        policies
+            .into_iter()
+            .map(|policy| {
+                let current = statistics.get(&policy.id);
+                SecretTunnelView {
+                    online: online.contains_key(&policy.id),
+                    active_connections: current
+                        .map_or(0, |value| value.active_connections.load(Ordering::Relaxed)),
+                    connections_total: current
+                        .map_or(0, |value| value.connections_total.load(Ordering::Relaxed)),
+                    rejected_connections: current.map_or(0, |value| {
+                        value.rejected_connections.load(Ordering::Relaxed)
+                    }),
+                    bytes_from_visitor: current
+                        .map_or(0, |value| value.bytes_from_visitor.load(Ordering::Relaxed)),
+                    bytes_to_visitor: current
+                        .map_or(0, |value| value.bytes_to_visitor.load(Ordering::Relaxed)),
+                    pairing_timeouts: current
+                        .map_or(0, |value| value.pairing_timeouts.load(Ordering::Relaxed)),
+                    transfer_errors: current
+                        .map_or(0, |value| value.transfer_errors.load(Ordering::Relaxed)),
+                    lifetime_timeouts: current
+                        .map_or(0, |value| value.lifetime_timeouts.load(Ordering::Relaxed)),
+                    policy,
+                }
+            })
+            .collect(),
+    ))
+}
+
+async fn create_secret_tunnel(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<CreateSecretTunnelPolicy>,
+) -> Result<(StatusCode, Json<CreatedSecretTunnelPolicy>), CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let clients = state.clients.lock().expect("client registry lock poisoned");
+    if !clients.contains(request.provider_client_id)
+        || request
+            .allowed_client_id
+            .is_some_and(|client_id| !clients.contains(client_id))
+    {
+        return Err(CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "unknown_client",
+            "unknown provider or allowed visitor client",
+        ));
+    }
+    drop(clients);
+    let created = state
+        .secret_tunnel_catalog
+        .lock()
+        .expect("secret tunnel catalog lock poisoned")
+        .create(request)
+        .map_err(coded_secret_policy_error)?;
+    record_audit(
+        &state,
+        "secret_tunnel.policy.created",
+        &created.policy.id.to_string(),
+        &format!(
+            "provider={}; visitor={}; name={}",
+            created.policy.provider_client_id,
+            created.policy.allowed_client_id.map_or_else(
+                || "any-authenticated-client".to_owned(),
+                |value| value.to_string()
+            ),
+            created.policy.name
+        ),
+    );
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+async fn set_secret_tunnel_enabled(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(tunnel_id): Path<Uuid>,
+    Json(request): Json<EnableTunnelRequest>,
+) -> Result<StatusCode, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let updated = state
+        .secret_tunnel_catalog
+        .lock()
+        .expect("secret tunnel catalog lock poisoned")
+        .set_enabled(tunnel_id, request.enabled)
+        .map_err(coded_secret_policy_error)?;
+    if !updated {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_secret_tunnel",
+            "secret tunnel policy does not exist",
+        ));
+    }
+    if !request.enabled {
+        secret_tunnel::stop_policy(&state, tunnel_id);
+    }
+    record_audit(
+        &state,
+        "secret_tunnel.policy.updated",
+        &tunnel_id.to_string(),
+        if request.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_secret_tunnel(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(tunnel_id): Path<Uuid>,
+) -> Result<StatusCode, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let deleted = state
+        .secret_tunnel_catalog
+        .lock()
+        .expect("secret tunnel catalog lock poisoned")
+        .delete(tunnel_id)
+        .map_err(coded_secret_policy_error)?;
+    if deleted.is_none() {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_secret_tunnel",
+            "secret tunnel policy does not exist",
+        ));
+    }
+    secret_tunnel::stop_policy(&state, tunnel_id);
+    state
+        .secret_tunnel_statistics
+        .lock()
+        .expect("secret tunnel statistics lock poisoned")
+        .remove(&tunnel_id);
+    record_audit(
+        &state,
+        "secret_tunnel.policy.deleted",
+        &tunnel_id.to_string(),
+        "policy deleted",
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_socks5_proxies(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<Socks5ProxyView>>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let policies = state
+        .tunnel_catalog
+        .lock()
+        .expect("tunnel catalog lock poisoned")
+        .list_socks5()
+        .map_err(coded_socks5_policy_error)?;
+    let online = state
+        .socks5_proxies
+        .lock()
+        .expect("SOCKS5 proxy registry lock poisoned");
+    let statistics = state
+        .socks5_proxy_statistics
+        .lock()
+        .expect("SOCKS5 statistics lock poisoned");
+    Ok(Json(
+        policies
+            .into_iter()
+            .map(|policy| {
+                let current = statistics.get(&policy.id);
+                Socks5ProxyView {
+                    online: online.get(&policy.id).is_some_and(|registration| {
+                        socks5_tunnel::online_public_port(registration) == policy.public_port
+                    }),
+                    active_connections: current
+                        .map_or(0, |value| value.active_connections.load(Ordering::Relaxed)),
+                    connections_total: current
+                        .map_or(0, |value| value.connections_total.load(Ordering::Relaxed)),
+                    requests_total: current
+                        .map_or(0, |value| value.requests_total.load(Ordering::Relaxed)),
+                    authentication_failures: current.map_or(0, |value| {
+                        value.authentication_failures.load(Ordering::Relaxed)
+                    }),
+                    rejected_connections: current.map_or(0, |value| {
+                        value.rejected_connections.load(Ordering::Relaxed)
+                    }),
+                    unsupported_commands: current.map_or(0, |value| {
+                        value.unsupported_commands.load(Ordering::Relaxed)
+                    }),
+                    handshake_errors: current
+                        .map_or(0, |value| value.handshake_errors.load(Ordering::Relaxed)),
+                    handshake_timeouts: current
+                        .map_or(0, |value| value.handshake_timeouts.load(Ordering::Relaxed)),
+                    bytes_from_public: current
+                        .map_or(0, |value| value.bytes_from_public.load(Ordering::Relaxed)),
+                    bytes_to_public: current
+                        .map_or(0, |value| value.bytes_to_public.load(Ordering::Relaxed)),
+                    pairing_timeouts: current
+                        .map_or(0, |value| value.pairing_timeouts.load(Ordering::Relaxed)),
+                    connect_failures: current
+                        .map_or(0, |value| value.connect_failures.load(Ordering::Relaxed)),
+                    transfer_errors: current
+                        .map_or(0, |value| value.transfer_errors.load(Ordering::Relaxed)),
+                    lifetime_timeouts: current
+                        .map_or(0, |value| value.lifetime_timeouts.load(Ordering::Relaxed)),
+                    udp_active_associations: current.map_or(0, |value| {
+                        value.udp_active_associations.load(Ordering::Relaxed)
+                    }),
+                    udp_datagrams_from_public: current.map_or(0, |value| {
+                        value.udp_datagrams_from_public.load(Ordering::Relaxed)
+                    }),
+                    udp_datagrams_to_public: current.map_or(0, |value| {
+                        value.udp_datagrams_to_public.load(Ordering::Relaxed)
+                    }),
+                    udp_bytes_from_public: current.map_or(0, |value| {
+                        value.udp_bytes_from_public.load(Ordering::Relaxed)
+                    }),
+                    udp_bytes_to_public: current
+                        .map_or(0, |value| value.udp_bytes_to_public.load(Ordering::Relaxed)),
+                    udp_dropped_datagrams: current.map_or(0, |value| {
+                        value.udp_dropped_datagrams.load(Ordering::Relaxed)
+                    }),
+                    udp_dropped_bandwidth_limit: current.map_or(0, |value| {
+                        value.udp_dropped_bandwidth_limit.load(Ordering::Relaxed)
+                    }),
+                    policy,
+                }
+            })
+            .collect(),
+    ))
+}
+
+async fn create_socks5_proxy(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<CreateSocks5ProxyPolicy>,
+) -> Result<(StatusCode, Json<CreatedSocks5ProxyPolicy>), CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    if !state
+        .clients
+        .lock()
+        .expect("client registry lock poisoned")
+        .contains(request.client_id)
+    {
+        return Err(CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "unknown_client",
+            "unknown SOCKS5 exit client",
+        ));
+    }
+    let created = state
+        .tunnel_catalog
+        .lock()
+        .expect("tunnel catalog lock poisoned")
+        .create_socks5(request)
+        .map_err(coded_socks5_policy_error)?;
+    record_audit(
+        &state,
+        "socks5_proxy.policy.created",
+        &created.policy.id.to_string(),
+        &format!(
+            "client={}; port={}; name={}; username={}",
+            created.policy.client_id,
+            created.policy.public_port,
+            created.policy.name,
+            created.policy.username
+        ),
+    );
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+async fn set_socks5_proxy_enabled(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(proxy_id): Path<Uuid>,
+    Json(request): Json<EnableTunnelRequest>,
+) -> Result<StatusCode, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let updated = state
+        .tunnel_catalog
+        .lock()
+        .expect("tunnel catalog lock poisoned")
+        .set_socks5_enabled(proxy_id, request.enabled)
+        .map_err(coded_socks5_policy_error)?;
+    if !updated {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_socks5_proxy",
+            "SOCKS5 proxy policy does not exist",
+        ));
+    }
+    if !request.enabled {
+        socks5_tunnel::stop_policy(&state, proxy_id);
+    }
+    record_audit(
+        &state,
+        "socks5_proxy.policy.updated",
+        &proxy_id.to_string(),
+        if request.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_socks5_proxy(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(proxy_id): Path<Uuid>,
+) -> Result<StatusCode, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let deleted = state
+        .tunnel_catalog
+        .lock()
+        .expect("tunnel catalog lock poisoned")
+        .delete_socks5(proxy_id)
+        .map_err(coded_socks5_policy_error)?;
+    if deleted.is_none() {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_socks5_proxy",
+            "SOCKS5 proxy policy does not exist",
+        ));
+    }
+    socks5_tunnel::stop_policy(&state, proxy_id);
+    state
+        .socks5_proxy_statistics
+        .lock()
+        .expect("SOCKS5 statistics lock poisoned")
+        .remove(&proxy_id);
+    record_audit(
+        &state,
+        "socks5_proxy.policy.deleted",
+        &proxy_id.to_string(),
+        "policy deleted",
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_http_proxies(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<HttpProxyView>>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let policies = state
+        .tunnel_catalog
+        .lock()
+        .expect("tunnel catalog lock poisoned")
+        .list_http_proxies()
+        .map_err(coded_http_proxy_policy_error)?;
+    let online = state
+        .http_proxies
+        .lock()
+        .expect("HTTP proxy registry lock poisoned");
+    let statistics = state
+        .http_proxy_statistics
+        .lock()
+        .expect("HTTP proxy statistics lock poisoned");
+    Ok(Json(
+        policies
+            .into_iter()
+            .map(|policy| {
+                let current = statistics.get(&policy.id);
+                HttpProxyView {
+                    online: online.get(&policy.id).is_some_and(|registration| {
+                        http_proxy_tunnel::online_public_port(registration) == policy.public_port
+                    }),
+                    active_connections: current
+                        .map_or(0, |value| value.active_connections.load(Ordering::Relaxed)),
+                    connections_total: current
+                        .map_or(0, |value| value.connections_total.load(Ordering::Relaxed)),
+                    requests_total: current
+                        .map_or(0, |value| value.requests_total.load(Ordering::Relaxed)),
+                    connect_requests: current
+                        .map_or(0, |value| value.connect_requests.load(Ordering::Relaxed)),
+                    authentication_failures: current.map_or(0, |value| {
+                        value.authentication_failures.load(Ordering::Relaxed)
+                    }),
+                    rejected_connections: current.map_or(0, |value| {
+                        value.rejected_connections.load(Ordering::Relaxed)
+                    }),
+                    malformed_requests: current
+                        .map_or(0, |value| value.malformed_requests.load(Ordering::Relaxed)),
+                    bytes_from_public: current
+                        .map_or(0, |value| value.bytes_from_public.load(Ordering::Relaxed)),
+                    bytes_to_public: current
+                        .map_or(0, |value| value.bytes_to_public.load(Ordering::Relaxed)),
+                    pairing_timeouts: current
+                        .map_or(0, |value| value.pairing_timeouts.load(Ordering::Relaxed)),
+                    connect_failures: current
+                        .map_or(0, |value| value.connect_failures.load(Ordering::Relaxed)),
+                    transfer_errors: current
+                        .map_or(0, |value| value.transfer_errors.load(Ordering::Relaxed)),
+                    lifetime_timeouts: current
+                        .map_or(0, |value| value.lifetime_timeouts.load(Ordering::Relaxed)),
+                    policy,
+                }
+            })
+            .collect(),
+    ))
+}
+
+async fn create_http_proxy(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<CreateHttpProxyPolicy>,
+) -> Result<(StatusCode, Json<CreatedHttpProxyPolicy>), CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    if !state
+        .clients
+        .lock()
+        .expect("client registry lock poisoned")
+        .contains(request.client_id)
+    {
+        return Err(CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "unknown_client",
+            "unknown HTTP proxy exit client",
+        ));
+    }
+    let created = state
+        .tunnel_catalog
+        .lock()
+        .expect("tunnel catalog lock poisoned")
+        .create_http_proxy(request)
+        .map_err(coded_http_proxy_policy_error)?;
+    record_audit(
+        &state,
+        "http_proxy.policy.created",
+        &created.policy.id.to_string(),
+        &format!(
+            "client={}; port={}; name={}; username={}",
+            created.policy.client_id,
+            created.policy.public_port,
+            created.policy.name,
+            created.policy.username
+        ),
+    );
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+async fn set_http_proxy_enabled(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(proxy_id): Path<Uuid>,
+    Json(request): Json<EnableTunnelRequest>,
+) -> Result<StatusCode, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let updated = state
+        .tunnel_catalog
+        .lock()
+        .expect("tunnel catalog lock poisoned")
+        .set_http_proxy_enabled(proxy_id, request.enabled)
+        .map_err(coded_http_proxy_policy_error)?;
+    if !updated {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_http_proxy",
+            "HTTP proxy policy does not exist",
+        ));
+    }
+    if !request.enabled {
+        http_proxy_tunnel::stop_policy(&state, proxy_id);
+    }
+    record_audit(
+        &state,
+        "http_proxy.policy.updated",
+        &proxy_id.to_string(),
+        if request.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_http_proxy(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(proxy_id): Path<Uuid>,
+) -> Result<StatusCode, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let deleted = state
+        .tunnel_catalog
+        .lock()
+        .expect("tunnel catalog lock poisoned")
+        .delete_http_proxy(proxy_id)
+        .map_err(coded_http_proxy_policy_error)?;
+    if deleted.is_none() {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_http_proxy",
+            "HTTP proxy policy does not exist",
+        ));
+    }
+    http_proxy_tunnel::stop_policy(&state, proxy_id);
+    state
+        .http_proxy_statistics
+        .lock()
+        .expect("HTTP proxy statistics lock poisoned")
+        .remove(&proxy_id);
+    record_audit(
+        &state,
+        "http_proxy.policy.deleted",
+        &proxy_id.to_string(),
+        "policy deleted",
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn list_udp_tunnels(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -2500,6 +3787,265 @@ async fn delete_udp_tunnel(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn list_port_groups(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<PortGroupView>>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let groups = {
+        let catalog = state
+            .tunnel_catalog
+            .lock()
+            .expect("tunnel catalog lock poisoned");
+        catalog
+            .list_port_groups()
+            .map_err(coded_port_group_policy_error)?
+            .into_iter()
+            .map(|policy| {
+                let mappings = catalog
+                    .port_group_mappings(policy.id)
+                    .map_err(coded_port_group_policy_error)?;
+                Ok((policy, mappings))
+            })
+            .collect::<Result<Vec<_>, CodedApiError>>()?
+    };
+    let tcp_online = state.tunnels.lock().expect("tunnel registry lock poisoned");
+    let tcp_statistics = state
+        .tunnel_statistics
+        .lock()
+        .expect("tunnel statistics lock poisoned");
+    let udp_online = state
+        .udp_tunnels
+        .lock()
+        .expect("UDP tunnel registry lock poisoned");
+    let udp_statistics = state
+        .udp_tunnel_statistics
+        .lock()
+        .expect("UDP tunnel statistics lock poisoned");
+
+    Ok(Json(
+        groups
+            .into_iter()
+            .map(|(policy, mappings)| match policy.protocol {
+                PortGroupProtocol::Tcp => {
+                    let online_mappings = mappings
+                        .iter()
+                        .filter(|mapping| tcp_online.contains_key(&mapping.public_port))
+                        .count();
+                    let active_connections = mappings
+                        .iter()
+                        .filter_map(|mapping| tcp_statistics.get(&mapping.public_port))
+                        .map(|statistics| statistics.active_connections.load(Ordering::Relaxed))
+                        .sum();
+                    let bytes_from_public = mappings
+                        .iter()
+                        .filter_map(|mapping| tcp_statistics.get(&mapping.public_port))
+                        .map(|statistics| statistics.bytes_from_public.load(Ordering::Relaxed))
+                        .sum();
+                    let bytes_to_public = mappings
+                        .iter()
+                        .filter_map(|mapping| tcp_statistics.get(&mapping.public_port))
+                        .map(|statistics| statistics.bytes_to_public.load(Ordering::Relaxed))
+                        .sum();
+                    PortGroupView {
+                        policy,
+                        mappings,
+                        online_mappings,
+                        active_connections,
+                        active_sessions: 0,
+                        bytes_from_public,
+                        bytes_to_public,
+                        packets_from_public: 0,
+                        packets_to_public: 0,
+                    }
+                }
+                PortGroupProtocol::Udp => {
+                    let online_mappings = mappings
+                        .iter()
+                        .filter(|mapping| {
+                            udp_online
+                                .get(&mapping.public_port)
+                                .is_some_and(|registration| registration.policy_id == policy.id)
+                        })
+                        .count();
+                    let statistics = udp_statistics
+                        .get(&policy.id)
+                        .map(|statistics| statistics.snapshot())
+                        .unwrap_or_default();
+                    PortGroupView {
+                        policy,
+                        mappings,
+                        online_mappings,
+                        active_connections: 0,
+                        active_sessions: statistics.active_sessions,
+                        bytes_from_public: statistics.bytes_from_public,
+                        bytes_to_public: statistics.bytes_to_public,
+                        packets_from_public: statistics.packets_from_public,
+                        packets_to_public: statistics.packets_to_public,
+                    }
+                }
+            })
+            .collect(),
+    ))
+}
+
+async fn create_port_group(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<CreatePortGroupPolicy>,
+) -> Result<(StatusCode, Json<PortGroupPolicy>), CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    if request.protocol == PortGroupProtocol::Udp && state.udp_data_plane.is_none() {
+        return Err(CodedApiError(
+            StatusCode::CONFLICT,
+            "udp_relay_disabled",
+            "UDP relay is not configured on this server",
+        ));
+    }
+    if !state
+        .clients
+        .lock()
+        .expect("client registry lock poisoned")
+        .contains(request.client_id)
+    {
+        return Err(CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "unknown_client",
+            "unknown client for port group policy",
+        ));
+    }
+    let policy = state
+        .tunnel_catalog
+        .lock()
+        .expect("tunnel catalog lock poisoned")
+        .create_port_group(request)
+        .map_err(coded_port_group_policy_error)?;
+    record_audit(
+        &state,
+        "port_group.policy.created",
+        &policy.id.to_string(),
+        &format!(
+            "client={}; protocol={:?}; public_ports={}; target={}:{}; name={}",
+            policy.client_id,
+            policy.protocol,
+            policy.public_ports,
+            policy.target_host,
+            policy.target_ports,
+            policy.name
+        ),
+    );
+    Ok((StatusCode::CREATED, Json(policy)))
+}
+
+async fn set_port_group_enabled(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(group_id): Path<Uuid>,
+    Json(request): Json<EnableTunnelRequest>,
+) -> Result<StatusCode, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let (policy, mappings) = {
+        let mut catalog = state
+            .tunnel_catalog
+            .lock()
+            .expect("tunnel catalog lock poisoned");
+        let policy = catalog
+            .port_group_by_id(group_id)
+            .map_err(coded_port_group_policy_error)?
+            .ok_or(CodedApiError(
+                StatusCode::NOT_FOUND,
+                "unknown_port_group",
+                "port group policy does not exist",
+            ))?;
+        let mappings = catalog
+            .port_group_mappings(group_id)
+            .map_err(coded_port_group_policy_error)?;
+        catalog
+            .set_port_group_enabled(group_id, request.enabled)
+            .map_err(coded_port_group_policy_error)?;
+        (policy, mappings)
+    };
+    if !request.enabled {
+        stop_port_group(&state, policy.protocol, &mappings);
+    }
+    record_audit(
+        &state,
+        "port_group.policy.updated",
+        &group_id.to_string(),
+        if request.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_port_group(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(group_id): Path<Uuid>,
+) -> Result<StatusCode, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let (policy, mappings) = {
+        let mut catalog = state
+            .tunnel_catalog
+            .lock()
+            .expect("tunnel catalog lock poisoned");
+        let mappings = catalog
+            .port_group_mappings(group_id)
+            .map_err(coded_port_group_policy_error)?;
+        let policy = catalog
+            .delete_port_group(group_id)
+            .map_err(coded_port_group_policy_error)?
+            .ok_or(CodedApiError(
+                StatusCode::NOT_FOUND,
+                "unknown_port_group",
+                "port group policy does not exist",
+            ))?;
+        (policy, mappings)
+    };
+    stop_port_group(&state, policy.protocol, &mappings);
+    match policy.protocol {
+        PortGroupProtocol::Tcp => {
+            let mut statistics = state
+                .tunnel_statistics
+                .lock()
+                .expect("tunnel statistics lock poisoned");
+            for mapping in &mappings {
+                statistics.remove(&mapping.public_port);
+            }
+        }
+        PortGroupProtocol::Udp => {
+            state
+                .udp_tunnel_statistics
+                .lock()
+                .expect("UDP tunnel statistics lock poisoned")
+                .remove(&group_id);
+        }
+    }
+    record_audit(
+        &state,
+        "port_group.policy.deleted",
+        &group_id.to_string(),
+        "policy deleted",
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn stop_port_group(
+    state: &Arc<AppState>,
+    protocol: PortGroupProtocol,
+    mappings: &[PortGroupMapping],
+) {
+    for mapping in mappings {
+        match protocol {
+            PortGroupProtocol::Tcp => tcp_tunnel::stop_public_port(state, mapping.public_port),
+            PortGroupProtocol::Udp => udp_tunnel::stop_public_port(state, mapping.public_port),
+        }
+    }
+}
+
 async fn list_http_routes(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -2560,6 +4106,168 @@ async fn list_http_routes(
             })
             .collect(),
     ))
+}
+
+async fn list_sni_routes(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<SniRouteView>>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let policies = state
+        .sni_route_catalog
+        .lock()
+        .expect("SNI route catalog lock poisoned")
+        .list()
+        .map_err(coded_sni_route_policy_error)?;
+    let online = state
+        .sni_routes
+        .lock()
+        .expect("SNI route registry lock poisoned");
+    let statistics = state
+        .sni_route_statistics
+        .lock()
+        .expect("SNI route statistics lock poisoned");
+    Ok(Json(
+        policies
+            .into_iter()
+            .map(|policy| {
+                let current = statistics.get(&policy.hostname);
+                SniRouteView {
+                    online: online.contains_key(&policy.hostname),
+                    active_connections: current
+                        .map_or(0, |value| value.active_connections.load(Ordering::Relaxed)),
+                    connections_total: current
+                        .map_or(0, |value| value.connections_total.load(Ordering::Relaxed)),
+                    rejected_connections: current.map_or(0, |value| {
+                        value.rejected_connections.load(Ordering::Relaxed)
+                    }),
+                    client_hello_errors: current
+                        .map_or(0, |value| value.client_hello_errors.load(Ordering::Relaxed)),
+                    unknown_sni: current
+                        .map_or(0, |value| value.unknown_sni.load(Ordering::Relaxed)),
+                    bytes_from_public: current
+                        .map_or(0, |value| value.bytes_from_public.load(Ordering::Relaxed)),
+                    bytes_to_public: current
+                        .map_or(0, |value| value.bytes_to_public.load(Ordering::Relaxed)),
+                    pairing_timeouts: current
+                        .map_or(0, |value| value.pairing_timeouts.load(Ordering::Relaxed)),
+                    transfer_errors: current
+                        .map_or(0, |value| value.transfer_errors.load(Ordering::Relaxed)),
+                    lifetime_timeouts: current
+                        .map_or(0, |value| value.lifetime_timeouts.load(Ordering::Relaxed)),
+                    policy,
+                }
+            })
+            .collect(),
+    ))
+}
+
+async fn create_sni_route(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<CreateSniRoutePolicy>,
+) -> Result<(StatusCode, Json<SniRoutePolicy>), CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    if !state
+        .clients
+        .lock()
+        .expect("client registry lock poisoned")
+        .contains(request.client_id)
+    {
+        return Err(CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "unknown_client",
+            "unknown client for TLS SNI route",
+        ));
+    }
+    let policy = state
+        .sni_route_catalog
+        .lock()
+        .expect("SNI route catalog lock poisoned")
+        .create(request)
+        .map_err(coded_sni_route_policy_error)?;
+    record_audit(
+        &state,
+        "sni_route.policy.created",
+        &policy.id.to_string(),
+        &format!(
+            "client={}; hostname={}; target={}; name={}",
+            policy.client_id, policy.hostname, policy.target_addr, policy.name
+        ),
+    );
+    Ok((StatusCode::CREATED, Json(policy)))
+}
+
+async fn set_sni_route_enabled(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(route_id): Path<Uuid>,
+    Json(request): Json<EnableTunnelRequest>,
+) -> Result<StatusCode, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let policy = state
+        .sni_route_catalog
+        .lock()
+        .expect("SNI route catalog lock poisoned")
+        .policy_by_id(route_id)
+        .map_err(coded_sni_route_policy_error)?
+        .ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_sni_route",
+            "TLS SNI route does not exist",
+        ))?;
+    state
+        .sni_route_catalog
+        .lock()
+        .expect("SNI route catalog lock poisoned")
+        .set_enabled(route_id, request.enabled)
+        .map_err(coded_sni_route_policy_error)?;
+    if !request.enabled {
+        sni_tunnel::stop_hostname(&state, &policy.hostname);
+    }
+    record_audit(
+        &state,
+        "sni_route.policy.updated",
+        &route_id.to_string(),
+        if request.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_sni_route(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(route_id): Path<Uuid>,
+) -> Result<StatusCode, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let policy = state
+        .sni_route_catalog
+        .lock()
+        .expect("SNI route catalog lock poisoned")
+        .delete(route_id)
+        .map_err(coded_sni_route_policy_error)?
+        .ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_sni_route",
+            "TLS SNI route does not exist",
+        ))?;
+    sni_tunnel::stop_hostname(&state, &policy.hostname);
+    state
+        .sni_route_statistics
+        .lock()
+        .expect("SNI route statistics lock poisoned")
+        .remove(&policy.hostname);
+    record_audit(
+        &state,
+        "sni_route.policy.deleted",
+        &route_id.to_string(),
+        "policy deleted",
+    );
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn create_http_route(
@@ -3340,6 +5048,35 @@ mod tests {
                 "Web UI does not consume per-policy UDP field {field}"
             );
         }
+    }
+
+    #[test]
+    fn web_ui_displays_managed_client_configuration_state() {
+        for field in ["config_mode", "config_sync_status", "config_sync_error"] {
+            assert!(
+                MANAGEMENT_UI.contains(field),
+                "Web UI does not consume client configuration field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn web_ui_displays_tls_sni_and_p2p_runtime_state() {
+        for field in [
+            "sni_connections_total",
+            "sni_unknown_hostname",
+            "p2p_session_offers_total",
+            "p2p_direct_connections_total",
+            "p2p_relay_fallbacks_total",
+            "age_seconds",
+            "fresh",
+        ] {
+            assert!(
+                MANAGEMENT_UI.contains(field),
+                "Web UI does not consume SNI/P2P field {field}"
+            );
+        }
+        assert!(MANAGEMENT_UI.contains("/api/v1/p2p/nodes"));
     }
 
     #[test]

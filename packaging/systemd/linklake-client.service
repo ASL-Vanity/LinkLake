@@ -8,6 +8,7 @@ Type=simple
 User=linklake
 Group=linklake
 Environment=LINKLAKE_LOG_DIR=/var/log/linklake-client
+Environment=LINKLAKE_STATE_DIR=/var/lib/linklake-client
 WorkingDirectory=/var/lib/linklake-client
 ExecStart=/usr/local/bin/linklake-client run --config /etc/linklake/client.toml
 Restart=always

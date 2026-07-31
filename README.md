@@ -6,7 +6,7 @@ LinkLake 是一个使用 Rust 从零实现的跨平台安全隧道平台，采�
 
 LinkLake 的代码实现、自动化测试与项目文档由 OpenAI GPT-5.6 完成；项目所有者负责需求定义、基础设施授权与最终验收。
 
-当前版本已完成 TCP 与 UDP 生产化、HTTP 域名路由以及第一阶段原生 HTTPS 与 ACME 证书自动化；P2P 尚未实现。
+当前版本已完成 TCP 与 UDP 生产化、多端口/端口范围、Secret 私密隧道、TLS SNI 原样透传、多节点 P2P 直连与显式服务端中继回退、SOCKS5 TCP/UDP 代理、HTTP 正向代理/CONNECT、HTTP 域名路由以及第一阶段原生 HTTPS 与 ACME 证书自动化。
 
 ## TCP 生产能力
 
@@ -43,6 +43,95 @@ UDP relay 默认不启用。只有设置 `LINKLAKE_UDP_RELAY_BIND` 时才会启�
 
 UDP 和 QUIC DATAGRAM 均为最佳努力传输，LinkLake 不会把 UDP 转换为可靠字节流。自动化本地测试覆盖到 `65507` 字节的数据报，但公网中的 MTU、IP 分片、运营商网络、代理和防火墙可能丢弃较大的原始 UDP 数据报；应用可以控制包长时，建议将 `1200` 字节或更小作为保守的互联网默认值，并在业务层按需实现重试、序号或容错。
 
+## 多端口与端口范围
+
+- TCP、UDP 均可创建端口组，公网端口和目标端口支持单端口、逗号列表、升序闭区间及其混合形式，例如 `32001,32010-32012`
+- 两侧按展开顺序一一映射，例如公网 `32001,32010-32012` 对应目标 `2333,2400-2402`；展开数量必须相同
+- 表达式会在保存前规范化；拒绝降序范围、重复端口、越界端口和歧义语法，每组最多展开 256 个映射
+- 公网端口仍限制为 `32000-32999`，目标端口允许 `1-65535`；目标主机单独填写域名、IPv4 或 IPv6，不包含端口
+- TCP 端口组与普通 TCP、SOCKS5、HTTP 正向代理和其他 TCP 端口组共享端口命名空间；UDP 端口组与普通 UDP、SOCKS5 UDP 和其他 UDP 端口组共享 UDP 命名空间
+- TCP 与 UDP 可使用相同数值的公网端口。创建端口组使用数据库事务，任一映射冲突时整组均不会写入
+- 服务端托管模式会把端口组展开为现有 TCP/UDP 客户端任务；整组启停、删除、在线映射数量、连接/会话和流量统计均可在 Web UI 查看
+
+本地 `local` 或 `report_only` 模式也可声明：
+
+```toml
+[[port_groups]]
+name = "game-range"
+protocol = "tcp"
+public_ports = "32001,32010-32012"
+target_host = "127.0.0.1"
+target_ports = "2333,2400-2402"
+```
+
+## Secret 私密隧道
+
+- 访问端只监听本机地址，通过 LinkLake TLS 控制通道连接目标客户端，不在服务端开放公网业务端口
+- Web UI 指定目标客户端、本地目标地址，并可选限制唯一允许访问的客户端
+- 创建策略时生成 `lls_...` 高熵访问密钥；密钥只在创建响应中显示一次，SQLite 仅保存 SHA-256 哈希
+- 目标端 `[[secret_tunnels]]` 可由服务端托管配置下发；访问端 `[[secret_visitors]]` 和访问密钥始终保存在访问端本地配置中
+- 支持策略启停/删除、目标端自动重连、每策略与全局连接限制、待配对限制、聚合带宽限制
+- Web UI 展示在线状态、活跃/累计/拒绝连接、双向流量、配对超时、传输错误和生命周期超时
+
+典型用途包括不直接暴露公网端口的 RDP、SSH、数据库、内部管理面板和临时 TCP 服务。远程部署必须配置控制通道 TLS；访问密钥不是客户端身份的替代品，访问端仍需使用已注册的客户端 ID 与令牌认证。
+
+## 多节点与 P2P 直连
+
+- 目标客户端通过 `[client]` 中的 `p2p_bind` 同时监听 TCP 与 Iroh QUIC/UDP，并用 `p2p_endpoint` 登记 TCP 可达地址；两项必须成对配置。`p2p_tcp_enabled` 与 `p2p_iroh_enabled` 可分别关闭传输，但至少保留一种
+- Iroh QUIC 候选自动发布本地、STUN/QAD 公网映射和路由器端口映射地址；配置 `p2p_relay_url` 后使用自托管 Iroh 会合服务完成地址发现、NAT 映射检测和 UDP 打洞
+- 服务端持久化节点目录，候选每 30 秒刷新，120 秒内视为新鲜；Web UI 和 `GET /api/v1/p2p/nodes` 同时展示候选、UDP 可用性、映射行为、端口映射、会合服务与更新时间
+- 访问端 `[[secret_visitors]]` 默认使用 `prefer_direct = true`，会先申请绑定目标端、访问端、目标地址和协议版本的 HMAC-SHA256 短期票据；可显式设为 `false` 以始终使用中继
+- 票据有效期 30 秒且只能消费一次；目标端通过已认证控制平面在线验证票据，拒绝过期、重放、签名错误和目标节点身份不匹配的请求
+- 候选缺失、直连超时、拒绝、认证失败或协议错误都会明确记录原因，并回退到现有 Secret 服务端中继；直连成功、中继回退和会话签发均有独立指标与审计
+- 访问端并发竞速所有 Iroh QUIC/UDP 与 TCP 候选，仅把单次票据交给首个成功建立传输层连接的候选；其余尝试立即取消
+- Iroh 连接只在路径成为 `Direct` 或 `Mixed` 后承载业务数据；若只能使用 Iroh relay-only，连接会被关闭并回退到 LinkLake Secret 服务端中继，避免旁路中继策略、指标与限额
+
+TCP 直连在短期票据认证之后使用 `Noise_NNpsk0_25519_ChaChaPoly_SHA256`，每个会话由服务端生成独立 32 字节 PSK，并以 ChaCha20-Poly1305 加密全部业务字节；双方每 `2^20` 条消息同步 rekey。Iroh 路径使用 QUIC/TLS 1.3 端到端加密。PSK 只通过双方已有的认证控制通道下发，不写入公开候选或直连票据。
+
+```toml
+[client]
+p2p_bind = "0.0.0.0:40000"
+p2p_endpoint = "203.0.113.10:40000"
+p2p_relay_url = "https://relay.example.com"
+p2p_tcp_enabled = true
+p2p_iroh_enabled = true
+
+[[secret_visitors]]
+name = "private-rdp-access"
+local_bind = "127.0.0.1:13389"
+access_key = "lls_replace-with-the-one-time-access-key"
+prefer_direct = true
+```
+
+自托管会合服务使用固定的 `iroh-relay 0.92.0`。生产配置、systemd 单元、Nginx WebSocket 反向代理片段和安装脚本位于 `packaging/iroh-relay/`；需为会合域名提供受信 TLS 证书，并开放公网 `443/tcp` 与 `7842/udp`。默认配置让 Relay 监听回环高位端口，避免与 Web UI 的 Nginx 监听冲突。该服务协助发现和打洞，不替代 LinkLake 的受控业务中继。
+
+## SOCKS5 TCP/UDP 代理
+
+- 服务端在同一数值端口监听 SOCKS5 TCP 与 UDP，目标域名解析和出口连接由指定 LinkLake 客户端执行
+- 支持 SOCKS5 `CONNECT` 和 `UDP ASSOCIATE`；`BIND` 明确返回“不支持命令”
+- 强制 RFC 1929 用户名/密码认证，不允许匿名或免认证模式
+- Web UI 创建策略时生成高熵 `llp_...` 密码，密码只显示一次，SQLite 仅保存 SHA-256 哈希
+- 用户名限制为 1 到 64 个 ASCII 字母、数字、点、下划线或连字符
+- TCP 和 UDP 均支持 IPv4、IPv6 和域名目标，域名由出口客户端解析；UDP 每个关联最多记录 256 个已访问目标，只接受这些目标的响应
+- UDP 关联绑定到已认证的 TCP 控制连接、客户端源 IP 和首个 UDP endpoint；控制连接关闭时立即撤销关联
+- SOCKS5 UDP `FRAG` 不受支持，非零 `FRAG` 数据报会被丢弃并计入指标
+- TCP/UDP 共享策略聚合带宽上限，并支持策略/全局/待配对连接限制、握手和配对超时、启停/删除和客户端自动重连
+- Web UI 和指标提供连接、CONNECT 请求、认证失败、握手错误、不支持命令、目标连接失败、TCP/UDP 流量、UDP 关联/数据报/限速丢包和传输错误统计
+
+SOCKS5 TCP 与普通 TCP 隧道共享 TCP 公网端口命名空间；启用 UDP relay 后，SOCKS5 还会占用相同数值的 UDP 端口，因此也不能与普通 UDP 策略使用同一端口。若服务端未配置 UDP relay，SOCKS5 `CONNECT` 仍可用，但 `UDP ASSOCIATE` 会返回“不支持命令”。SOCKS5 UDP 复用上文的 QUIC DATAGRAM relay，属于最佳努力传输并具有相同的公网 MTU 风险。公网 SOCKS5 属于通用网络出口，必须保管好一次性密码、只开放实际需要的来源，并保留云防火墙、主机防火墙和上游滥用防护。
+
+## HTTP 正向代理 / CONNECT
+
+- 服务端监听独立 HTTP 代理公网端口，指定 LinkLake 客户端负责解析目标域名并建立出口 TCP 连接
+- 强制 HTTP Basic `Proxy-Authorization`，不允许匿名代理；Web UI 创建策略时生成一次性高熵 `llh_...` 密码，SQLite 仅保存 SHA-256 哈希
+- 普通 HTTP 请求必须使用 `http://` absolute-form；服务端校验 URI 与 `Host` 一致，改写为 origin-form，并在转发前移除代理凭据和逐跳请求头
+- HTTPS、WebSocket 和任意 TCP 协议通过 `CONNECT host:port` 建立双向隧道；CONNECT 任一方向关闭时立即释放整条连接
+- 拒绝重复 `Host`、重复 `Content-Length`、`Content-Length + Transfer-Encoding`、非 chunked Transfer-Encoding 和其他有请求走私歧义的报文
+- 请求体支持无正文、`Content-Length` 和严格 chunked 定界；响应支持 HEAD、1xx、204/304、`Content-Length`、chunked 与 EOF 定界，不依赖连接关闭猜测消息边界
+- 支持 IPv4、IPv6 和严格 ASCII 域名、策略/全局/待配对连接限制、聚合双向带宽限制、启停/删除、出口自动重连、审计与完整指标
+
+HTTP 正向代理、SOCKS5 和普通 TCP 隧道共享 TCP 公网端口命名空间，三者不能使用相同端口。当前每个普通 HTTP 公网连接只处理一个代理请求并强制源站响应后关闭；需要长连接、协议升级或 HTTPS 时应使用 CONNECT。公网正向代理属于通用网络出口，必须保护凭据、限制来源并保留云防火墙、主机防火墙和上游滥用控制。
+
 ## HTTP/HTTPS 域名路由
 
 - 根据 HTTP Host 和 TLS SNI 将不同域名转发到指定客户端及其本地 HTTP 服务
@@ -58,6 +147,23 @@ UDP 和 QUIC DATAGRAM 均为最佳努力传输，LinkLake 不会把 UDP 转换�
 
 如果前置 Nginx 已在 443 终止业务 TLS，LinkLake 托管的证书不会被使用。应让 LinkLake 直接监听 443，或使用 Nginx `stream` 按 SNI 做 TCP 透传；管理界面可以继续使用独立的管理 TLS 入口。80 端口可以普通反向代理到 LinkLake，但不得重写 Host 或拦截 `/.well-known/acme-challenge/`。
 
+## TLS SNI 原样透传
+
+TLS SNI 原样透传适合由客户端本地服务持有证书并终止 TLS 的 HTTPS、SMTPS、IMAPS、POP3S 和其他 TLS 服务。服务端只在限时、限长读取 TLS ClientHello 后提取并规范化 SNI；不解密、不修改 TLS 内容、不持有业务证书，并把已经读取的原始 ClientHello 与后续字节完整转发到目标客户端。
+
+- 服务端通过 `LINKLAKE_TLS_PASSTHROUGH_BIND` 启用独立监听，例如 `0.0.0.0:443`
+- 路由按精确 SNI 匹配，缺失 SNI、未知 SNI、畸形或超时 ClientHello 会被拒绝并计入指标
+- 支持服务端托管和本地 `[[tls_routes]]`、启停/删除、连接/全局/待配对限制、聚合带宽限制、最长连接寿命、审计和完整指标
+- `LINKLAKE_TLS_PASSTHROUGH_BIND` 不能与原生 HTTPS 的 `LINKLAKE_HTTPS_BIND` 绑定同一个 IP:端口；同一个公网 443 必须在“LinkLake 终止 TLS”和“SNI 原样透传”之间选择，或由前置四层代理按 SNI 分流到不同后端
+- 透传路由不会使用 LinkLake ACME 证书；证书、TLS 版本、ALPN 和应用协议全部由本地目标服务负责
+
+```toml
+[[tls_routes]]
+name = "mail-tls"
+hostname = "mail.example.com"
+target = "127.0.0.1:465"
+```
+
 ## 本地启动
 
 ```powershell
@@ -67,6 +173,7 @@ $env:LINKLAKE_ADMIN_PASSWORD = "自行设置至少12位的强密码"
 $env:LINKLAKE_DATA_DIR = "C:\LinkLake\data"
 $env:LINKLAKE_HTTP_BIND = "127.0.0.1:32102"
 $env:LINKLAKE_HTTPS_BIND = "127.0.0.1:32103"
+$env:LINKLAKE_TLS_PASSTHROUGH_BIND = "127.0.0.1:32105"
 cargo run -p linklake-server
 ```
 
@@ -101,11 +208,21 @@ cargo run -p linklake-client -- agent `
   --name development-tcp
 ```
 
-TCP、UDP 隧道和 HTTP 域名路由的多策略配置见 [examples/linklake-client.toml](examples/linklake-client.toml)。UDP 使用 `[[udp_tunnels]]`，HTTP 路由使用 `[[http_routes]]`；公网端口、名称、目标地址和域名必须与 Web UI 中创建的策略完全匹配：
+生产客户端推荐使用 [examples/linklake-client.toml](examples/linklake-client.toml) 中的服务端托管模式。`[client]` 保存控制地址、CA、客户端 ID/令牌以及可选 P2P 监听与候选地址，Web UI 中的 TCP、UDP、端口组、HTTP、TLS SNI、Secret 目标端、SOCKS5 出口和 HTTP 正向代理出口策略由服务端按客户端生成带 SHA-256 修订号的配置并下发：
 
 ```powershell
 cargo run -p linklake-client -- run --config .\linklake-client.toml
 ```
+
+支持三种 `config_mode`：
+
+- `server_managed`：Web UI 是权威来源。客户端验证配置后写入 `managed.toml`，旧版本保存在 `managed.toml.backup`，并按差异动态启动、停止或重建隧道。
+- `report_only`：继续运行本地 `[[tcp_tunnels]]`、`[[udp_tunnels]]`、`[[port_groups]]`、`[[http_routes]]`、`[[tls_routes]]`、`[[secret_tunnels]]`、`[[socks5_proxies]]` 和 `[[http_proxies]]`，只向 Web UI 报告是否与服务端策略一致。
+- `local`：运行本地条目，不允许服务端覆盖，但仍报告配置冲突状态。
+
+服务端不会下发或修改客户端令牌、CA、控制地址、P2P 监听/候选地址、日志路径、服务设置或 `[[secret_visitors]]` 访问密钥。写入过程先验证临时文件，再保留最后一次有效备份；下发失败、配置损坏或服务端离线时继续运行最后一次有效配置。Web UI 的客户端选择框会显示配置模式、同步状态和应用错误。
+
+Linux systemd 服务默认把托管配置保存到 `/var/lib/linklake-client/managed.toml`；Windows 默认保存在引导配置文件旁边。也可以通过 `managed_config_path` 或 `LINKLAKE_STATE_DIR` 指定位置。
 
 远程控制连接还必须指定 `control_ca_cert` 和 `control_server_name`。当前公网 TCP、UDP 端口范围均为 `32000-32999`，两个协议可以使用相同的数值端口。
 
@@ -117,14 +234,30 @@ cargo run -p linklake-client -- run --config .\linklake-client.toml
 - UDP 策略：`GET/POST /api/v1/udp-tunnels`
 - UDP 策略启停：`POST /api/v1/udp-tunnels/:id/enabled`
 - UDP 策略删除：`DELETE /api/v1/udp-tunnels/:id`
+- 端口组：`GET/POST /api/v1/port-groups`
+- 端口组启停：`POST /api/v1/port-groups/:id/enabled`
+- 端口组删除：`DELETE /api/v1/port-groups/:id`
 - HTTP/HTTPS 路由：`GET/POST /api/v1/http-routes`
+- TLS SNI 透传路由：`GET/POST /api/v1/sni-routes`
+- TLS SNI 路由启停：`POST /api/v1/sni-routes/:id/enabled`
+- TLS SNI 路由删除：`DELETE /api/v1/sni-routes/:id`
+- Secret 私密隧道：`GET/POST /api/v1/secret-tunnels`
+- Secret 策略启停：`POST /api/v1/secret-tunnels/:id/enabled`
+- Secret 策略删除：`DELETE /api/v1/secret-tunnels/:id`
+- SOCKS5 代理：`GET/POST /api/v1/socks5-proxies`
+- SOCKS5 策略启停：`POST /api/v1/socks5-proxies/:id/enabled`
+- SOCKS5 策略删除：`DELETE /api/v1/socks5-proxies/:id`
+- HTTP 正向代理：`GET/POST /api/v1/http-proxies`
+- HTTP 正向代理启停：`POST /api/v1/http-proxies/:id/enabled`
+- HTTP 正向代理删除：`DELETE /api/v1/http-proxies/:id`
 - 路由启停：`POST /api/v1/http-routes/:id/enabled`
 - 路由 TLS 设置：`PUT /api/v1/http-routes/:id/tls`
 - 立即签发/续期：`POST /api/v1/http-routes/:id/certificate/issue|renew`
 - ACME 设置：`GET/PUT /api/v1/acme/config`
 - 路由删除：`DELETE /api/v1/http-routes/:id`
-- Web UI 可配置 TCP 聚合带宽、UDP 聚合带宽/最大会话数/空闲超时、TCP/HTTP 最大连接数、ACME 环境和逐路由 HTTPS
-- 指标包括 UDP 会话、数据包、流量、丢包和超时，以及 HTTP/HTTPS 流量和失败、TLS 握手失败、证书总数、30 天内到期、已过期、ACME 订单、续期和 HTTP-01 挑战
+- P2P 节点目录：`GET /api/v1/p2p/nodes`
+- Web UI 可配置 TCP/TLS SNI/Secret/SOCKS5/HTTP 正向代理聚合带宽、UDP 聚合带宽/最大会话数/空闲超时、TCP/HTTP/TLS SNI/Secret/SOCKS5/HTTP 正向代理最大连接数、Secret 访问客户端限制、代理用户名、ACME 环境和逐路由 HTTPS
+- 指标与策略视图包括 P2P 节点新鲜度、直连与中继回退、TLS SNI ClientHello/未知域名/连接/流量、Secret 连接和流量、SOCKS5 请求/认证/连接/流量、HTTP 正向代理请求/CONNECT/认证/畸形报文/流量、UDP 会话/数据包/流量/丢包/超时、HTTP/HTTPS 路由流量和失败、TLS 握手失败、证书总数、30 天内到期、已过期、ACME 订单、续期和 HTTP-01 挑战
 - `LINKLAKE_MANAGEMENT_TOKEN` 可作为自动化 API Bearer Token，不用于 Web 登录
 
 日志目录通过 `LINKLAKE_LOG_DIR` 设置。服务端未设置时默认使用 `LINKLAKE_DATA_DIR/logs`；客户端未设置时输出到控制台，服务安装器会为其设置轮转日志目录。
@@ -187,8 +320,13 @@ cargo test --workspace --locked
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\tcp-e2e.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\udp-e2e.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\http-e2e.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\sni-e2e.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\secret-e2e.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\package-windows.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-windows-package.ps1
+$env:FLUTTER_BIN = 'F:\Tools\flutter\bin\flutter.bat'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\package-manager-windows.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-manager-windows.ps1
 ```
 
 Linux：
@@ -200,20 +338,29 @@ cargo test --workspace --locked
 pwsh -NoProfile -File ./tests/https-e2e.ps1
 bash scripts/package-linux.sh
 bash scripts/verify-linux-package.sh
+sh scripts/package-manager-linux.sh
+sh scripts/verify-manager-linux.sh
 ```
 
-TCP 端到端测试覆盖真实二进制回显、限速、连接限制、重连、策略生命周期、配对超时和指标。UDP 端到端测试覆盖 `0` 到 `65507` 字节真实数据报回显、多会话、限速丢包、空闲回收、分片重组、策略生命周期、重连、TCP/UDP 同数值端口和指标；生产验收还覆盖独立公网服务器、Linux 服务端和 Windows 客户端。HTTP 端到端测试覆盖 Host 路由、请求与响应传输、连接限制、客户端重连、策略生命周期和指标。HTTPS/ACME 测试在 Linux CI 中使用本地 Pebble 服务，覆盖 HTTP-01、SNI、证书签发与续期、HTTPS 转发、跳转、持久化、失败恢复和证书指标，不访问公网证书机构。
+TCP 端到端测试覆盖真实二进制回显、限速、连接限制、重连、策略生命周期、配对超时和指标。UDP 端到端测试覆盖 `0` 到 `65507` 字节真实数据报回显、多会话、限速丢包、空闲回收、分片重组、策略生命周期、重连、TCP/UDP 同数值端口、TCP/UDP 连续端口组的全部映射及指标；生产验收还覆盖独立公网服务器、Linux 服务端和 Windows 客户端。TLS SNI E2E 使用真实自签名目标和 .NET `SslStream`，覆盖原始 ClientHello 透传、真实 TLS 握手/回显、未知 SNI 拒绝、启停恢复、删除和指标。Secret E2E 覆盖托管目标端、一次性密钥隔离、访问客户端白名单、错误密钥、连接限制、启停恢复、删除失效、统计、两个独立客户端之间的真实 P2P 直连、不可达候选下的显式中继回退，以及服务端无公网业务监听。SOCKS5 E2E 覆盖托管出口、一次性密码隔离、强制认证、错误密码、域名/IPv4 CONNECT、真实 UDP ASSOCIATE 回显、UDP 分片拒绝、TCP 控制连接生命周期、BIND 拒绝、连接限制、策略恢复和指标。HTTP E2E 同时覆盖 Host 路由以及正向代理的一次性密码、强制/错误认证、absolute-form 改写、凭据隔离、GET/POST 请求体、请求走私拒绝、真实 CONNECT 隧道、连接限制、客户端重连、策略生命周期和指标。HTTPS/ACME 测试在 Linux CI 中使用本地 Pebble 服务，覆盖 HTTP-01、SNI、证书签发与续期、HTTPS 转发、跳转、持久化、失败恢复和证书指标，不访问公网证书机构。
 
-打包脚本支持 `SOURCE_DATE_EPOCH`。设置相同时间戳并使用相同源码、工具链、目标平台和锁定依赖时，归档内的文件顺序、时间和发布清单保持稳定。Windows 生成 ZIP 和 SHA-256，Linux 生成 tar.gz 和 SHA-256。
+macOS 使用 `scripts/package-macos.sh`、`scripts/verify-macos-package.sh`、`scripts/package-manager-macos.sh` 和 `scripts/verify-manager-macos.sh` 构建并校验核心服务与 Flutter 管理客户端。
 
-`.github/workflows/ci.yml` 会在推送和拉取请求中执行格式、Clippy、单元测试、脚本语法检查、Windows TCP/UDP/HTTP E2E 以及 Linux Pebble HTTPS/ACME E2E。`.github/workflows/release.yml` 会在手动触发时构建双平台产物；推送 `v*` 标签时还会创建或更新对应 GitHub Release。
+打包脚本支持 `SOURCE_DATE_EPOCH`。设置相同时间戳并使用相同源码、工具链、目标平台和锁定依赖时，归档内的文件顺序、时间和发布清单保持稳定。Windows 生成 ZIP 和 SHA-256，Linux/macOS 生成 tar.gz 和 SHA-256；三个平台均同时生成 LinkLake 核心包和 LinkLake Manager 包。
+
+`.github/workflows/ci.yml` 会在推送和拉取请求中执行格式、Clippy、单元测试、脚本语法检查、Windows TCP/UDP/HTTP/TLS SNI/Secret-P2P/SOCKS5 E2E、Linux Pebble HTTPS/ACME E2E，以及 Flutter Manager 的 Windows/Linux/macOS 分析、测试和 Release 构建。`.github/workflows/soak.yml` 每周或手动运行长稳、弱网、崩溃、重启、并发与吞吐矩阵。`.github/workflows/release.yml` 会构建三个平台的核心包和管理客户端包；推送 `v*` 标签时创建或更新对应 GitHub Release。
 
 ## 后续路线
 
-1. HTTP 域名路由：第一阶段已完成
-2. HTTPS 终止与证书自动化：第一阶段已完成
-3. UDP 隧道生产化：已完成
-4. Flutter 管理客户端
-5. 多节点和显式中继回退的 P2P
+1. Secret 私密隧道：已完成
+2. SOCKS5 TCP：已完成
+3. SOCKS5 UDP Associate：已完成
+4. HTTP Forward Proxy / CONNECT：已完成
+5. 多端口与端口范围：已完成
+6. TLS SNI 透传：已完成
+7. 多节点和显式中继回退的 P2P：已完成
+8. Flutter 管理客户端：已完成首个跨平台版本
 
-许可证将在全部功能开发完成后由项目所有者确定。
+## 许可证
+
+LinkLake 采用 Apache License 2.0。版权归 ASL-Vanity 与 LinkLake contributors 所有；完整条款与归属说明见 `LICENSE` 和 `NOTICE`。

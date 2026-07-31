@@ -43,7 +43,7 @@ jobs:
         run: find packaging scripts -name '*.sh' -print0 | xargs -0 -n1 bash -n
 
   windows-test:
-    name: Windows test and TCP/UDP/HTTP E2E
+    name: Windows test and tunnel E2E
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
@@ -87,9 +87,79 @@ jobs:
       - name: Run UDP end-to-end tests
         shell: powershell
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\udp-e2e.ps1
-      - name: Run HTTP end-to-end tests
+      - name: Run HTTP route and forward proxy end-to-end tests
         shell: powershell
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\http-e2e.ps1 -SkipBuild
+      - name: Run managed configuration end-to-end tests
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\managed-config-e2e.ps1 -SkipBuild
+      - name: Run TLS SNI pass-through end-to-end tests
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\sni-e2e.ps1 -SkipBuild
+      - name: Run secret tunnel end-to-end tests
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\secret-e2e.ps1 -SkipBuild
+      - name: Run SOCKS5 TCP/UDP end-to-end tests
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\socks5-e2e.ps1 -SkipBuild
+
+  macos-test:
+    name: macOS build and unit tests
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Select pinned Rust toolchain
+        run: rustup default 1.88.0
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: macos-cargo-
+      - name: Check all targets
+        run: cargo check --workspace --all-targets --locked
+      - name: Run unit tests
+        run: cargo test --workspace --locked
+
+  flutter-manager:
+    name: Flutter manager (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: windows
+          - os: ubuntu-latest
+            target: linux
+          - os: macos-latest
+            target: macos
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Linux desktop dependencies
+        if: matrix.target == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.44.8'
+          cache: true
+      - name: Resolve Flutter dependencies
+        working-directory: apps/linklake_manager
+        run: flutter pub get
+      - name: Analyze Flutter manager
+        working-directory: apps/linklake_manager
+        run: flutter analyze
+      - name: Test Flutter manager
+        working-directory: apps/linklake_manager
+        run: flutter test
+      - name: Build Flutter manager
+        working-directory: apps/linklake_manager
+        run: flutter build ${{ matrix.target }} --release
 
   linux-https-acme-e2e:
     name: Linux HTTPS/ACME E2E

@@ -22,7 +22,9 @@ pub(crate) fn backup(database_path: &Path, output_path: &Path) -> anyhow::Result
     let temporary = temporary_sibling(output_path, "backup");
     let source = Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     source.backup(DatabaseName::Main, &temporary, None)?;
+    drop(source);
     validate_database(&temporary)?;
+    remove_sidecars(&temporary)?;
     fs::rename(&temporary, output_path)?;
     Ok(())
 }
@@ -42,7 +44,9 @@ pub(crate) fn restore(database_path: &Path, input_path: &Path) -> anyhow::Result
     let staged = temporary_sibling(database_path, "restore");
     let source = Connection::open_with_flags(input_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     source.backup(DatabaseName::Main, &staged, None)?;
+    drop(source);
     validate_database(&staged)?;
+    remove_sidecars(&staged)?;
 
     let previous = if database_path.exists() {
         checkpoint_database(database_path)?;
@@ -87,6 +91,16 @@ fn preserve_sidecar(database: &Path, previous: &Path, suffix: &str) -> anyhow::R
     Ok(())
 }
 
+fn remove_sidecars(database: &Path) -> anyhow::Result<()> {
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = PathBuf::from(format!("{}{suffix}", database.display()));
+        if sidecar.exists() {
+            fs::remove_file(sidecar)?;
+        }
+    }
+    Ok(())
+}
+
 fn temporary_sibling(path: &Path, purpose: &str) -> PathBuf {
     let name = path
         .file_name()
@@ -115,6 +129,10 @@ mod tests {
         drop(connection);
 
         backup(&database, &archive).expect("backup should succeed");
+        assert!(!fs::read_dir(&root)
+            .expect("test directory should list")
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().contains(".tmp-")));
         let connection = Connection::open(&database).expect("database should reopen");
         connection
             .execute("UPDATE sample SET value = 'after'", [])

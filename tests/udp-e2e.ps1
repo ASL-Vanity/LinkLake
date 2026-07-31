@@ -19,11 +19,14 @@ $echoScriptPath = Join-Path $PSScriptRoot 'udp-echo-service.ps1'
 $probeScriptPath = Join-Path $PSScriptRoot 'udp-probe.ps1'
 $runRoot = Join-Path ([IO.Path]::GetTempPath()) ('linklake-udp-e2e-' + [guid]::NewGuid())
 $observationPath = Join-Path $runRoot 'udp-observations.jsonl'
+$observationPath2 = Join-Path $runRoot 'udp-observations-2.jsonl'
 $processSequence = 0
 $serverProcess = $null
 $clientProcess = $null
 $udpEchoProcess = $null
+$udpEchoProcess2 = $null
 $tcpEchoProcess = $null
+$tcpEchoProcess2 = $null
 
 function ConvertTo-ProcessArgument {
     param([AllowEmptyString()][string]$Argument)
@@ -111,7 +114,7 @@ function Stop-LoggedProcess {
 
 function Write-FailureDiagnostics {
     Write-Warning "UDP E2E diagnostics are stored in $runRoot"
-    foreach ($handle in @($serverProcess, $clientProcess, $udpEchoProcess, $tcpEchoProcess)) {
+    foreach ($handle in @($serverProcess, $clientProcess, $udpEchoProcess, $udpEchoProcess2, $tcpEchoProcess, $tcpEchoProcess2)) {
         if ($null -eq $handle) { continue }
         try {
             $handle.Process.Refresh()
@@ -171,6 +174,39 @@ function Get-FreeTunnelPort {
         }
     }
     throw 'No TCP/UDP tunnel port is free in 32000-32999.'
+}
+
+function Get-FreeTunnelRange {
+    param(
+        [Collections.Generic.HashSet[int]]$UsedPorts,
+        [int]$Count
+    )
+    foreach ($start in (32000..(33000 - $Count) | Sort-Object { Get-Random })) {
+        $listeners = [Collections.Generic.List[System.Net.Sockets.TcpListener]]::new()
+        $sockets = [Collections.Generic.List[System.Net.Sockets.UdpClient]]::new()
+        try {
+            $available = $true
+            foreach ($candidate in $start..($start + $Count - 1)) {
+                if ($UsedPorts.Contains($candidate)) { $available = $false; break }
+                $tcp = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, $candidate)
+                $udp = [System.Net.Sockets.UdpClient]::new([System.Net.Sockets.AddressFamily]::InterNetwork)
+                $tcp.Start()
+                $udp.Client.Bind([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, $candidate))
+                $listeners.Add($tcp)
+                $sockets.Add($udp)
+            }
+            if ($available) {
+                foreach ($candidate in $start..($start + $Count - 1)) { $null = $UsedPorts.Add($candidate) }
+                return $start
+            }
+        } catch {
+            # Continue with another contiguous range.
+        } finally {
+            foreach ($listener in $listeners) { $listener.Stop() }
+            foreach ($socket in $sockets) { $socket.Dispose() }
+        }
+    }
+    throw "No contiguous TCP/UDP tunnel range of $Count ports is free in 32000-32999."
 }
 
 function Wait-HttpHealth {
@@ -250,6 +286,42 @@ function Get-TcpTunnel {
         }
     }
     return $current
+}
+
+function Get-PortGroup {
+    param(
+        [string]$BaseUrl,
+        [Microsoft.PowerShell.Commands.WebRequestSession]$Session,
+        [string]$PolicyId
+    )
+    $policies = $null
+    $policies = Invoke-RestMethod -Uri "$BaseUrl/api/v1/port-groups" -WebSession $Session
+    foreach ($policy in $policies) {
+        if ($null -ne $policy -and [string]$policy.id -eq $PolicyId) { return $policy }
+    }
+    return $null
+}
+
+function Wait-PortGroupState {
+    param(
+        [string]$BaseUrl,
+        [Microsoft.PowerShell.Commands.WebRequestSession]$Session,
+        [string]$PolicyId,
+        [int]$OnlineMappings,
+        [bool]$Present = $true,
+        [int]$Seconds = 60
+    )
+    $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $current = Get-PortGroup -BaseUrl $BaseUrl -Session $Session -PolicyId $PolicyId
+        if (-not $Present) {
+            if ($null -eq $current) { return }
+        } elseif ($null -ne $current -and [int]$current.online_mappings -eq $OnlineMappings) {
+            return
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    throw "Port group $PolicyId did not reach present=$Present online_mappings=$OnlineMappings."
 }
 
 function Wait-UdpTunnelState {
@@ -508,10 +580,14 @@ try {
     $controlPort = Get-FreeTcpPort
     $relayPort = Get-FreeUdpPort
     $targetUdpPort = Get-FreeUdpPort
+    $targetUdpPort2 = Get-FreeUdpPort
     $targetTcpPort = Get-FreeTcpPort
+    $targetTcpPort2 = Get-FreeTcpPort
     $usedTunnelPorts = [Collections.Generic.HashSet[int]]::new()
     $sharedPublicPort = Get-FreeTunnelPort -UsedPorts $usedTunnelPorts
     $limitedPublicPort = Get-FreeTunnelPort -UsedPorts $usedTunnelPorts
+    $groupPublicStart = Get-FreeTunnelRange -UsedPorts $usedTunnelPorts -Count 2
+    $groupPublicPort2 = $groupPublicStart + 1
     $baseUrl = "http://127.0.0.1:$managementPort"
     $enrollmentToken = [guid]::NewGuid().ToString()
     $adminPassword = 'LinkLake-UDP-E2E-Password-123!'
@@ -522,6 +598,10 @@ try {
         '-Port', $targetUdpPort, '-ObservationPath', $observationPath
     )
     Wait-EchoReady
+    $udpEchoProcess2 = Start-LoggedProcess -Name 'udp-echo-2' -FilePath $shellPath -Arguments @(
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $echoScriptPath,
+        '-Port', $targetUdpPort2, '-ObservationPath', $observationPath2
+    )
 
     $tcpEchoScript = @"
 `$listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $targetTcpPort)
@@ -545,6 +625,29 @@ try {
         '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $tcpEchoEncoded
     )
     Wait-TcpPort -Port $targetTcpPort
+
+    $tcpEchoScript2 = @"
+`$listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $targetTcpPort2)
+`$listener.Start()
+try {
+    while (`$true) {
+        `$client = `$listener.AcceptTcpClient()
+        try {
+            `$stream = `$client.GetStream()
+            `$buffer = [byte[]]::new(16384)
+            while ((`$read = `$stream.Read(`$buffer, 0, `$buffer.Length)) -gt 0) {
+                `$stream.Write(`$buffer, 0, `$read)
+                `$stream.Flush()
+            }
+        } finally { `$client.Dispose() }
+    }
+} finally { `$listener.Stop() }
+"@
+    $tcpEchoEncoded2 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($tcpEchoScript2))
+    $tcpEchoProcess2 = Start-LoggedProcess -Name 'tcp-echo-2' -FilePath $shellPath -Arguments @(
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $tcpEchoEncoded2
+    )
+    Wait-TcpPort -Port $targetTcpPort2
 
     $serverProcess = Start-LoggedProcess -Name 'server' -FilePath $serverPath -Environment @{
         LINKLAKE_BIND = "127.0.0.1:$managementPort"
@@ -600,38 +703,42 @@ try {
             max_connections = 4
             bandwidth_limit_bps = $null
         } | ConvertTo-Json)
+    $tcpGroup = Invoke-RestMethod -Method Post -Uri "$baseUrl/api/v1/port-groups" `
+        -WebSession $webSession -ContentType 'application/json' -Body (@{
+            client_id = $enrollment.client_id
+            name = 'udp-e2e-tcp-range'
+            protocol = 'tcp'
+            public_ports = "$groupPublicStart-$groupPublicPort2"
+            target_host = '127.0.0.1'
+            target_ports = "$targetTcpPort,$targetTcpPort2"
+            max_connections = 4
+            max_sessions = $null
+            session_idle_timeout_seconds = $null
+            bandwidth_limit_bps = $null
+        } | ConvertTo-Json)
+    $udpGroup = Invoke-RestMethod -Method Post -Uri "$baseUrl/api/v1/port-groups" `
+        -WebSession $webSession -ContentType 'application/json' -Body (@{
+            client_id = $enrollment.client_id
+            name = 'udp-e2e-udp-range'
+            protocol = 'udp'
+            public_ports = "$groupPublicStart-$groupPublicPort2"
+            target_host = '127.0.0.1'
+            target_ports = "$targetUdpPort,$targetUdpPort2"
+            max_connections = $null
+            max_sessions = 8
+            session_idle_timeout_seconds = 30
+            bandwidth_limit_bps = $null
+        } | ConvertTo-Json)
 
     $clientConfigPath = Join-Path $runRoot 'client.toml'
     $clientConfig = @"
-[[udp_tunnels]]
-name = "udp-e2e-main"
+[client]
 control = "127.0.0.1:$controlPort"
 control_ca_cert = "$($certificates.Root.Replace('\', '\\'))"
 control_server_name = "localhost"
 client_id = "$($enrollment.client_id)"
 client_token = "$($enrollment.client_token)"
-public_port = $sharedPublicPort
-target = "127.0.0.1:$targetUdpPort"
-
-[[udp_tunnels]]
-name = "udp-e2e-limit"
-control = "127.0.0.1:$controlPort"
-control_ca_cert = "$($certificates.Root.Replace('\', '\\'))"
-control_server_name = "localhost"
-client_id = "$($enrollment.client_id)"
-client_token = "$($enrollment.client_token)"
-public_port = $limitedPublicPort
-target = "127.0.0.1:$targetUdpPort"
-
-[[tcp_tunnels]]
-name = "udp-e2e-shared-port-tcp"
-control = "127.0.0.1:$controlPort"
-control_ca_cert = "$($certificates.Root.Replace('\', '\\'))"
-control_server_name = "localhost"
-client_id = "$($enrollment.client_id)"
-client_token = "$($enrollment.client_token)"
-public_port = $sharedPublicPort
-target = "127.0.0.1:$targetTcpPort"
+config_mode = "server_managed"
 "@
     [IO.File]::WriteAllText($clientConfigPath, $clientConfig, [Text.UTF8Encoding]::new($false))
     $clientProcess = Start-LoggedProcess -Name 'client' -FilePath $clientPath `
@@ -643,6 +750,8 @@ target = "127.0.0.1:$targetTcpPort"
     Wait-UdpTunnelState -BaseUrl $baseUrl -Session $webSession -PolicyId $mainPolicy.id -Online $true
     Wait-UdpTunnelState -BaseUrl $baseUrl -Session $webSession -PolicyId $limitedPolicy.id -Online $true
     Wait-TcpTunnelOnline -BaseUrl $baseUrl -Session $webSession -PolicyId $tcpPolicy.id -Online $true
+    Wait-PortGroupState -BaseUrl $baseUrl -Session $webSession -PolicyId $tcpGroup.id -OnlineMappings 2
+    Wait-PortGroupState -BaseUrl $baseUrl -Session $webSession -PolicyId $udpGroup.id -OnlineMappings 2
     $baselineMetrics = Invoke-RestMethod -Uri "$baseUrl/api/v1/metrics" -WebSession $webSession
     $limitedPolicyBeforeIdle = Get-UdpTunnel -BaseUrl $baseUrl -Session $webSession -PolicyId $limitedPolicy.id
     if ($null -eq $limitedPolicyBeforeIdle) {
@@ -746,6 +855,31 @@ target = "127.0.0.1:$targetTcpPort"
         Assert-BytesEqual -Expected $tcpPayload -Actual $tcpResponse -Context 'shared-port TCP'
     } finally { $tcp.Dispose() }
 
+    foreach ($port in @($groupPublicStart, $groupPublicPort2)) {
+        $groupTcp = [System.Net.Sockets.TcpClient]::new('127.0.0.1', $port)
+        try {
+            $payload = [Text.Encoding]::UTF8.GetBytes("tcp-port-group-$port")
+            $stream = $groupTcp.GetStream()
+            $stream.ReadTimeout = 10000
+            $stream.Write($payload, 0, $payload.Length)
+            $response = [byte[]]::new($payload.Length)
+            $offset = 0
+            while ($offset -lt $response.Length) {
+                $read = $stream.Read($response, $offset, $response.Length - $offset)
+                if ($read -eq 0) { throw "TCP port group mapping $port closed early." }
+                $offset += $read
+            }
+            Assert-BytesEqual -Expected $payload -Actual $response -Context "TCP port group $port"
+        } finally { $groupTcp.Dispose() }
+
+        $groupUdp = New-UdpSocket
+        try {
+            $payload = [Text.Encoding]::UTF8.GetBytes("udp-port-group-$port")
+            $response = Send-UdpAndReceive -Socket $groupUdp -Port $port -Payload $payload
+            Assert-BytesEqual -Expected $payload -Actual $response -Context "UDP port group $port"
+        } finally { $groupUdp.Dispose() }
+    }
+
     $probeOutput = Join-Path $runRoot 'udp-probe-result.json'
     & $shellPath -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $probeScriptPath `
         -HostName '127.0.0.1' -Port $sharedPublicPort -Count 50 -PacketsPerSecond 100 `
@@ -759,6 +893,8 @@ target = "127.0.0.1:$targetTcpPort"
     Wait-UdpTunnelState -BaseUrl $baseUrl -Session $webSession -PolicyId $mainPolicy.id -Online $false
     Wait-UdpTunnelState -BaseUrl $baseUrl -Session $webSession -PolicyId $limitedPolicy.id -Online $false
     Wait-TcpTunnelOnline -BaseUrl $baseUrl -Session $webSession -PolicyId $tcpPolicy.id -Online $false
+    Wait-PortGroupState -BaseUrl $baseUrl -Session $webSession -PolicyId $tcpGroup.id -OnlineMappings 0
+    Wait-PortGroupState -BaseUrl $baseUrl -Session $webSession -PolicyId $udpGroup.id -OnlineMappings 0
     Assert-NoUdpResponse -Port $sharedPublicPort `
         -Payload ([Text.Encoding]::UTF8.GetBytes('client-stopped'))
 
@@ -770,6 +906,8 @@ target = "127.0.0.1:$targetTcpPort"
     Wait-UdpTunnelState -BaseUrl $baseUrl -Session $webSession -PolicyId $mainPolicy.id -Online $true
     Wait-UdpTunnelState -BaseUrl $baseUrl -Session $webSession -PolicyId $limitedPolicy.id -Online $true
     Wait-TcpTunnelOnline -BaseUrl $baseUrl -Session $webSession -PolicyId $tcpPolicy.id -Online $true
+    Wait-PortGroupState -BaseUrl $baseUrl -Session $webSession -PolicyId $tcpGroup.id -OnlineMappings 2
+    Wait-PortGroupState -BaseUrl $baseUrl -Session $webSession -PolicyId $udpGroup.id -OnlineMappings 2
     $reconnectSocket = New-UdpSocket
     try {
         $payload = [Text.Encoding]::UTF8.GetBytes('client-reconnected')
@@ -794,6 +932,18 @@ target = "127.0.0.1:$targetTcpPort"
         $response = Send-UdpAndReceive -Socket $enabledSocket -Port $sharedPublicPort -Payload $payload
         Assert-BytesEqual -Expected $payload -Actual $response -Context 're-enabled UDP policy'
     } finally { $enabledSocket.Dispose() }
+
+    Invoke-RestMethod -Method Post -Uri "$baseUrl/api/v1/port-groups/$($udpGroup.id)/enabled" `
+        -WebSession $webSession -ContentType 'application/json' -Body '{"enabled":false}'
+    Wait-PortGroupState -BaseUrl $baseUrl -Session $webSession -PolicyId $udpGroup.id -OnlineMappings 0
+    foreach ($port in @($groupPublicStart, $groupPublicPort2)) {
+        Assert-NoUdpResponse -Port $port -Payload ([Text.Encoding]::UTF8.GetBytes('group-disabled'))
+        $tcpStillOnline = [System.Net.Sockets.TcpClient]::new('127.0.0.1', $port)
+        $tcpStillOnline.Dispose()
+    }
+    Invoke-RestMethod -Method Post -Uri "$baseUrl/api/v1/port-groups/$($udpGroup.id)/enabled" `
+        -WebSession $webSession -ContentType 'application/json' -Body '{"enabled":true}'
+    Wait-PortGroupState -BaseUrl $baseUrl -Session $webSession -PolicyId $udpGroup.id -OnlineMappings 2
 
     $metrics = Invoke-RestMethod -Uri "$baseUrl/api/v1/metrics" -WebSession $webSession
     if ([uint64]$metrics.udp_packets_from_public -lt [uint64]$baselineMetrics.udp_packets_from_public + 8 -or
@@ -832,7 +982,11 @@ target = "127.0.0.1:$targetTcpPort"
         -WebSession $webSession
     Wait-UdpTunnelState -BaseUrl $baseUrl -Session $webSession -PolicyId $limitedPolicy.id `
         -Online $false -Present $false
-    Write-Host 'UDP E2E passed: boundaries, multi-session isolation, mapping stability, limits, lifecycle, reconnect, metrics, probe, and shared TCP/UDP port.'
+    Invoke-RestMethod -Method Delete -Uri "$baseUrl/api/v1/port-groups/$($tcpGroup.id)" -WebSession $webSession
+    Invoke-RestMethod -Method Delete -Uri "$baseUrl/api/v1/port-groups/$($udpGroup.id)" -WebSession $webSession
+    Wait-PortGroupState -BaseUrl $baseUrl -Session $webSession -PolicyId $tcpGroup.id -OnlineMappings 0 -Present $false
+    Wait-PortGroupState -BaseUrl $baseUrl -Session $webSession -PolicyId $udpGroup.id -OnlineMappings 0 -Present $false
+    Write-Host 'UDP E2E passed: boundaries, port groups, multi-session isolation, mapping stability, limits, lifecycle, reconnect, metrics, probe, and shared TCP/UDP ports.'
 } catch {
     $testFailed = $true
     Write-FailureDiagnostics
@@ -841,7 +995,9 @@ target = "127.0.0.1:$targetTcpPort"
     Stop-LoggedProcess $clientProcess
     Stop-LoggedProcess $serverProcess
     Stop-LoggedProcess $udpEchoProcess
+    Stop-LoggedProcess $udpEchoProcess2
     Stop-LoggedProcess $tcpEchoProcess
+    Stop-LoggedProcess $tcpEchoProcess2
     if (-not $testFailed) {
         for ($attempt = 0; $attempt -lt 10 -and (Test-Path -LiteralPath $runRoot); $attempt++) {
             try { Remove-Item -LiteralPath $runRoot -Recurse -Force }

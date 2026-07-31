@@ -1,0 +1,24 @@
+# LinkLake P2P 地址发现与打洞辅助服务。
+# 该服务可以帮助双方交换公网映射并尝试 UDP 打洞；LinkLake 不允许业务流量长期停留在 Iroh relay-only 路径。
+enable_relay = true
+# 默认由同机 Nginx 暴露公网 443，避免与 Web UI 共用端口时发生监听冲突。
+http_bind_addr = "127.0.0.1:3340"
+enable_quic_addr_discovery = true
+enable_metrics = true
+metrics_bind_addr = "127.0.0.1:9090"
+access = "everyone"
+
+[tls]
+https_bind_addr = "127.0.0.1:3341"
+quic_bind_addr = "0.0.0.0:7842"
+cert_mode = "Reloading"
+manual_cert_path = "/etc/linklake/iroh-relay/fullchain.pem"
+manual_key_path = "/etc/linklake/iroh-relay/privkey.pem"
+
+[limits]
+accept_conn_limit = 100.0
+accept_conn_burst = 200
+
+[limits.client.rx]
+bytes_per_second = 10485760
+max_burst_bytes = 20971520

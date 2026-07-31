@@ -3,13 +3,17 @@ name = "linklake-server"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+getrandom.workspace = true
 argon2.workspace = true
 arc-swap.workspace = true
 axum.workspace = true
 axum-server.workspace = true
+base64.workspace = true
 bytes.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
@@ -19,6 +23,7 @@ linklake-core = { path = "../linklake-core" }
 quinn.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 tower-http.workspace = true

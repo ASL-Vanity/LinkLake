@@ -34,7 +34,9 @@ Copy-Item -LiteralPath (Join-Path $projectRoot 'target\release\linklake-server.e
 Copy-Item -LiteralPath (Join-Path $projectRoot 'target\release\linklake-client.exe') -Destination (Join-Path $stage 'bin')
 Copy-Item -Path (Join-Path $projectRoot 'packaging\windows\*.ps1') -Destination (Join-Path $stage 'windows')
 Copy-Item -Path (Join-Path $projectRoot 'examples\*') -Destination (Join-Path $stage 'examples')
-Copy-Item -LiteralPath (Join-Path $projectRoot 'README.md'), (Join-Path $projectRoot 'README.en.md') -Destination $stage
+Copy-Item -LiteralPath (Join-Path $projectRoot 'README.md'), (Join-Path $projectRoot 'README.en.md'), `
+    (Join-Path $projectRoot 'CHANGELOG.md'), (Join-Path $projectRoot 'LICENSE'), `
+    (Join-Path $projectRoot 'NOTICE') -Destination $stage
 
 $manifestData = [ordered]@{
     product = 'LinkLake'

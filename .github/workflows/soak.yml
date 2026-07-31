@@ -1,0 +1,54 @@
+name: Reliability soak
+
+on:
+  schedule:
+    - cron: '20 18 * * 6'
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: Soak duration in minutes
+        required: false
+        default: '60'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reliability-soak
+  cancel-in-progress: false
+
+jobs:
+  windows-soak:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    env:
+      SOAK_MINUTES: ${{ github.event.inputs.duration_minutes || '60' }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Select pinned Rust toolchain
+        shell: pwsh
+        run: rustup default 1.88.0
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~\.cargo\registry
+            ~\.cargo\git
+            target
+          key: windows-soak-${{ hashFiles('Cargo.lock') }}
+          restore-keys: windows-soak-
+      - name: Run crash, restart, concurrency, weak-network and throughput soak
+        shell: pwsh
+        run: |
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\reliability-matrix.ps1 `
+            -Profile soak -DurationMinutes ([int]$env:SOAK_MINUTES) | `
+            Tee-Object -FilePath .\tests\soak-results.json
+      - name: Upload soak report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: linklake-soak-report
+          path: tests/soak-results.json
+          if-no-files-found: warn

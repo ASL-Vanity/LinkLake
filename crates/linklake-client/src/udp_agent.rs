@@ -39,21 +39,21 @@ const CONTROL_EVENT_CAPACITY: usize = 64;
 const SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
 const CLOSED_SESSION_RETENTION: Duration = UDP_REASSEMBLY_TIMEOUT;
 
-struct UdpDataPlaneOffer {
-    registration_id: Uuid,
-    ticket: String,
-    endpoint: String,
-    server_name: String,
-    max_datagram_size: usize,
-    session_idle_timeout: Duration,
+pub(crate) struct UdpDataPlaneOffer {
+    pub(crate) registration_id: Uuid,
+    pub(crate) ticket: String,
+    pub(crate) endpoint: String,
+    pub(crate) server_name: String,
+    pub(crate) max_datagram_size: usize,
+    pub(crate) session_idle_timeout: Duration,
 }
 
-struct EstablishedDataPlane {
-    _endpoint: quinn::Endpoint,
-    connection: quinn::Connection,
-    control_send: quinn::SendStream,
-    control_recv: quinn::RecvStream,
-    max_datagram_size: usize,
+pub(crate) struct EstablishedDataPlane {
+    pub(crate) _endpoint: quinn::Endpoint,
+    pub(crate) connection: quinn::Connection,
+    pub(crate) control_send: quinn::SendStream,
+    pub(crate) control_recv: quinn::RecvStream,
+    pub(crate) max_datagram_size: usize,
 }
 
 struct TargetSession {
@@ -233,7 +233,7 @@ async fn run_udp_agent_session(
     result
 }
 
-async fn establish_data_plane(
+pub(crate) async fn establish_data_plane(
     transport: &ControlTransport,
     client_id: Uuid,
     offer: &UdpDataPlaneOffer,

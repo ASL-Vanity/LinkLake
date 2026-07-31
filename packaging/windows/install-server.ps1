@@ -6,6 +6,7 @@ param(
     [string]$ControlBind = "127.0.0.1:32101",
     [string]$HttpBind,
     [string]$HttpsBind,
+    [string]$TlsPassthroughBind,
     [string]$UdpRelayBind,
     [string]$UdpRelayEndpoint,
     [string]$UdpRelayServerName,
@@ -58,6 +59,7 @@ try {
     )
     if ($HttpBind) { $serviceEnvironment += "LINKLAKE_HTTP_BIND=$HttpBind" }
     if ($HttpsBind) { $serviceEnvironment += "LINKLAKE_HTTPS_BIND=$HttpsBind" }
+    if ($TlsPassthroughBind) { $serviceEnvironment += "LINKLAKE_TLS_PASSTHROUGH_BIND=$TlsPassthroughBind" }
     if ($UdpRelayBind) {
         if (-not $UdpRelayEndpoint -or -not $UdpRelayServerName) {
             throw 'UdpRelayEndpoint and UdpRelayServerName are required when UdpRelayBind is set.'
@@ -82,7 +84,7 @@ try {
     }
     $binaryPath = "`"$destinationBinary`" --windows-service"
     New-Service -Name $serviceName -BinaryPathName $binaryPath -DisplayName 'LinkLake Server' `
-        -Description 'LinkLake TCP, UDP, HTTP, and HTTPS tunnel server' -StartupType Automatic | Out-Null
+        -Description 'LinkLake TCP, UDP, HTTP, HTTPS, TLS SNI, and P2P relay server' -StartupType Automatic | Out-Null
     New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$serviceName" `
         -Name Environment -PropertyType MultiString -Value $serviceEnvironment -Force | Out-Null
     & sc.exe failure $serviceName reset= 86400 actions= restart/3000/restart/10000/restart/30000 | Out-Null

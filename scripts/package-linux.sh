@@ -24,15 +24,20 @@ cd "$project_root"
 "$cargo_bin" build --release --workspace --locked
 rm -rf -- "$stage"
 rm -f -- "$archive" "$archive.sha256"
-install -d "$stage/bin" "$stage/systemd" "$stage/examples"
+install -d "$stage/bin" "$stage/systemd" "$stage/iroh-relay" "$stage/examples"
 install -m 0755 target/release/linklake-server "$stage/bin/linklake-server"
 install -m 0755 target/release/linklake-client "$stage/bin/linklake-client"
 install -m 0644 packaging/systemd/linklake-server.service "$stage/systemd/"
 install -m 0644 packaging/systemd/linklake-client.service "$stage/systemd/"
 install -m 0600 packaging/systemd/server.env.example "$stage/systemd/"
 install -m 0755 packaging/systemd/install-linux.sh "$stage/systemd/"
+install -m 0644 packaging/iroh-relay/config.toml.example "$stage/iroh-relay/"
+install -m 0644 packaging/iroh-relay/linklake-iroh-relay.service "$stage/iroh-relay/"
+install -m 0644 packaging/iroh-relay/nginx-location.conf.example "$stage/iroh-relay/"
+install -m 0644 packaging/iroh-relay/nginx-server.conf.example "$stage/iroh-relay/"
+install -m 0755 packaging/iroh-relay/install.sh "$stage/iroh-relay/"
 cp examples/* "$stage/examples/"
-cp README.md README.en.md "$stage/"
+cp README.md README.en.md CHANGELOG.md LICENSE NOTICE "$stage/"
 cat >"$stage/release.json" <<EOF
 {"product":"LinkLake","version":"$version","target":"linux-x86_64","built_unix_seconds":$source_date_epoch}
 EOF

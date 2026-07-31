@@ -30,6 +30,9 @@ try {
         'windows/uninstall.ps1',
         'README.md',
         'README.en.md',
+        'CHANGELOG.md',
+        'LICENSE',
+        'NOTICE',
         'release.json'
     )
     foreach ($entry in $required) {

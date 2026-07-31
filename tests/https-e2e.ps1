@@ -8,7 +8,6 @@ Add-Type -AssemblyName System.Net.Http
 if (Test-Path -LiteralPath 'Variable:PSNativeCommandUseErrorActionPreference') {
     $PSNativeCommandUseErrorActionPreference = $false
 }
-# E2E 全部访问本机端口，避免 curl 或子进程继承系统代理。
 $env:NO_PROXY = '*'
 $env:no_proxy = '*'
 
@@ -98,7 +97,6 @@ function Stop-ChildProcess {
             $null = $Process.WaitForExit(10000)
         }
     } catch {
-        # 清理阶段忽略已经退出或无法再次终止的进程。
     } finally {
         $Process.Dispose()
     }
@@ -153,7 +151,6 @@ function Wait-PebbleDirectory {
 }
 
 function Export-PebbleIssuedRoot {
-    # Pebble 的管理端点会导出本次启动动态生成的签发根证书。
     $curlArguments = @(
         '--silent'
         '--show-error'
@@ -430,7 +427,6 @@ try {
             $stream.Write($payloadBytes, 0, $payloadBytes.Length)
             $stream.Flush()
         } catch {
-            # 单个请求失败不终止测试后端。
         } finally {
             $client.Dispose()
         }
@@ -497,7 +493,6 @@ target = "127.0.0.1:$backendPort"
     $null = Wait-HttpRouteOnline -BaseUrl $baseUrl -Session $webSession -RouteId $route.id -Expected $true
     $baselineMetrics = Invoke-RestMethod -Uri "$baseUrl/api/v1/metrics" -WebSession $webSession
 
-    # 先在 ACME 关闭时保存路由策略，尽量避免后台维护任务先于显式 issue 触发签发。
     $tlsPolicy = Invoke-RestMethod -Method Put -Uri "$baseUrl/api/v1/http-routes/$($route.id)/tls" `
         -WebSession $webSession -ContentType 'application/json' `
         -Body (@{ mode = 'acme'; redirect_http_to_https = $true } | ConvertTo-Json)

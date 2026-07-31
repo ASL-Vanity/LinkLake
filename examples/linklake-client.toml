@@ -1,29 +1,74 @@
-[[tcp_tunnels]]
-name = "game-server"
-control = "tunnel.example.com:32101"
-control_ca_cert = "C:\\LinkLake\\control-ca.pem"
-control_server_name = "tunnel.example.com"
-client_id = "00000000-0000-0000-0000-000000000000"
-client_token = "replace-with-the-token-returned-at-enrollment"
-public_port = 32001
-target = "127.0.0.1:2333"
+config_version = 1
 
-[[udp_tunnels]]
-name = "game-server-udp"
+[client]
 control = "tunnel.example.com:32101"
 control_ca_cert = "C:\\LinkLake\\control-ca.pem"
 control_server_name = "tunnel.example.com"
 client_id = "00000000-0000-0000-0000-000000000000"
 client_token = "replace-with-the-token-returned-at-enrollment"
-public_port = 32002
-target = "127.0.0.1:2333"
 
-[[http_routes]]
-name = "local-web"
-control = "tunnel.example.com:32101"
-control_ca_cert = "C:\\LinkLake\\control-ca.pem"
-control_server_name = "tunnel.example.com"
-client_id = "00000000-0000-0000-0000-000000000000"
-client_token = "replace-with-the-token-returned-at-enrollment"
-hostname = "app.example.com"
-target = "127.0.0.1:8080"
+# server_managed：Web UI 为权威来源，自动写入 managed.toml 并动态应用。
+# report_only：继续运行本地条目，只向 Web UI 报告差异。
+# local：继续运行本地条目，不接受服务端覆盖。
+config_mode = "server_managed"
+managed_config_path = "managed.toml"
+
+# 可选 P2P 直连：同一 bind 同时用于 TCP 与 Iroh QUIC/UDP，endpoint 是 TCP 可达地址。
+# p2p_relay_url 指向自托管 HTTPS 会合服务，协助 STUN/QAD 地址发现、NAT 检测和 UDP 打洞。
+# p2p_bind = "0.0.0.0:40000"
+# p2p_endpoint = "203.0.113.10:40000"
+# p2p_relay_url = "https://relay.example.com"
+# p2p_tcp_enabled = true
+# p2p_iroh_enabled = true
+
+# server_managed 模式无需在此声明隧道。以下条目仅供 local/report_only 模式参考。
+# [[tcp_tunnels]]
+# name = "game-server"
+# public_port = 32001
+# target = "127.0.0.1:2333"
+
+# [[udp_tunnels]]
+# name = "game-server-udp"
+# public_port = 32002
+# target = "127.0.0.1:2333"
+
+# TCP/UDP 端口组会按两侧表达式的展开顺序一一映射，每组最多 256 个端口。
+# [[port_groups]]
+# name = "game-range"
+# protocol = "tcp"
+# public_ports = "32001,32010-32012"
+# target_host = "127.0.0.1"
+# target_ports = "2333,2400-2402"
+
+# [[http_routes]]
+# name = "local-web"
+# hostname = "app.example.com"
+# target = "127.0.0.1:8080"
+
+# TLS SNI 原样透传：证书和 TLS 终止由本地目标服务负责。
+# [[tls_routes]]
+# name = "mail-tls"
+# hostname = "mail.example.com"
+# target = "127.0.0.1:465"
+
+# 私密隧道目标端可由 Web UI 托管下发；仅 local/report_only 模式需要在本地声明。
+# [[secret_tunnels]]
+# name = "private-rdp"
+# target = "127.0.0.1:3389"
+
+# 私密隧道访问端始终保留在本地，不会写入 managed.toml。
+# [[secret_visitors]]
+# name = "private-rdp-access"
+# local_bind = "127.0.0.1:13389"
+# access_key = "lls_replace-with-the-one-time-access-key"
+# prefer_direct = true
+
+# SOCKS5 出口端可由 Web UI 托管下发；用户名和一次性密码只属于服务端公网策略。
+# [[socks5_proxies]]
+# name = "office-exit"
+# public_port = 32020
+
+# HTTP 正向代理出口端可由 Web UI 托管下发；Basic 认证用户名和一次性密码只属于服务端公网策略。
+# [[http_proxies]]
+# name = "web-exit"
+# public_port = 32022

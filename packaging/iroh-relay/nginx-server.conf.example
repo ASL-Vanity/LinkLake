@@ -1,0 +1,25 @@
+server {
+    listen __NGINX_LISTEN__;
+    http2 on;
+    server_name __RELAY_HOSTNAME__;
+
+    ssl_certificate /etc/linklake/iroh-relay/fullchain.pem;
+    ssl_certificate_key /etc/linklake/iroh-relay/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    location = /relay {
+        proxy_pass https://127.0.0.1:3341;
+        proxy_http_version 1.1;
+        proxy_ssl_verify off;
+        proxy_set_header Host $host;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_buffering off;
+        proxy_read_timeout 1d;
+        proxy_send_timeout 1d;
+    }
+
+    location / {
+        return 204;
+    }
+}

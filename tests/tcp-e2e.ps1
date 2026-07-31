@@ -260,7 +260,7 @@ try {
             name = 'e2e-tcp'
             public_port = $publicPort
             target_addr = "127.0.0.1:$targetPort"
-            max_connections = 1
+            max_connections = 8
             bandwidth_limit_bps = 1048576
         } | ConvertTo-Json)
 
@@ -305,15 +305,27 @@ try {
         $tcp.Dispose()
     }
 
+    $loadResult = & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+        -File (Join-Path $PSScriptRoot 'tcp-load-probe.ps1') -Port $publicPort `
+        -Connections 8 -BytesPerConnection 65536 -ChunkBytes 1024 -DelayMilliseconds 1
+    if ($LASTEXITCODE -ne 0) { throw 'The concurrent weak-network TCP load probe failed.' }
+    $loadSummary = $loadResult | ConvertFrom-Json
+    if ($loadSummary.connections -ne 8 -or $loadSummary.round_trip_bytes -ne 1048576) {
+        throw 'The concurrent TCP load probe returned an invalid summary.'
+    }
+
     Start-Sleep -Milliseconds 300
     $metrics = Invoke-RestMethod -Uri "$baseUrl/api/v1/metrics" -WebSession $webSession
     if ($metrics.tcp_bytes_from_public -lt $payload.Length -or $metrics.tcp_bytes_to_public -lt $payload.Length) {
         throw 'TCP traffic metrics were not updated.'
     }
 
-    $heldConnection = [System.Net.Sockets.TcpClient]::new('127.0.0.1', $publicPort)
+    $heldConnections = [System.Collections.Generic.List[System.Net.Sockets.TcpClient]]::new()
     try {
-        Wait-ActiveConnections -BaseUrl $baseUrl -Session $webSession -Expected 1
+        1..8 | ForEach-Object {
+            $heldConnections.Add([System.Net.Sockets.TcpClient]::new('127.0.0.1', $publicPort))
+        }
+        Wait-ActiveConnections -BaseUrl $baseUrl -Session $webSession -Expected 8
         $rejectedConnection = [System.Net.Sockets.TcpClient]::new('127.0.0.1', $publicPort)
         try {
             $rejectedConnection.ReceiveTimeout = 3000
@@ -330,7 +342,7 @@ try {
             $rejectedConnection.Dispose()
         }
     } finally {
-        $heldConnection.Dispose()
+        $heldConnections | ForEach-Object { $_.Dispose() }
     }
     Wait-ActiveConnections -BaseUrl $baseUrl -Session $webSession -Expected 0
     $metrics = Invoke-RestMethod -Uri "$baseUrl/api/v1/metrics" -WebSession $webSession

@@ -1,5 +1,8 @@
 use crate::{client_registry::Authentication, record_audit, AppState};
-use linklake_core::{read_control_frame, write_control_frame, BoxedIo, ControlFrame};
+use linklake_core::{
+    read_control_frame, write_control_frame, write_control_frame_and_shutdown, BoxedIo,
+    ControlFrame, ManagedConfigMode, ManagedConfigStatus,
+};
 use std::{
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -8,10 +11,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{
-        copy_bidirectional, split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf,
-        WriteHalf,
-    },
+    io::{split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf},
     net::{TcpListener, TcpStream},
     sync::{mpsc, oneshot, watch, Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore},
     time::{sleep_until, timeout, Instant},
@@ -45,7 +45,7 @@ pub(crate) struct TunnelStatistics {
     pub(crate) lifetime_timeouts: AtomicU64,
 }
 
-struct BandwidthLimiter {
+pub(crate) struct BandwidthLimiter {
     bytes_per_second: u64,
     next_available: AsyncMutex<Instant>,
 }
@@ -62,14 +62,14 @@ struct PublicConnectionContext {
 }
 
 impl BandwidthLimiter {
-    fn new(bytes_per_second: u64) -> Self {
+    pub(crate) fn new(bytes_per_second: u64) -> Self {
         Self {
             bytes_per_second,
             next_available: AsyncMutex::new(Instant::now()),
         }
     }
 
-    async fn reserve(&self, bytes: usize) {
+    pub(crate) async fn reserve(&self, bytes: usize) {
         let duration = Duration::from_secs_f64(bytes as f64 / self.bytes_per_second as f64);
         let start = {
             let mut next_available = self.next_available.lock().await;
@@ -79,6 +79,19 @@ impl BandwidthLimiter {
             start
         };
         sleep_until(start).await;
+    }
+
+    /// UDP 数据报不能像 TCP 一样等待带宽令牌，否则会在内存中形成排队。
+    /// 这里与 TCP 共用同一个预约时钟：当前策略已有待发送流量时直接拒绝数据报。
+    pub(crate) async fn try_reserve_datagram(&self, bytes: usize) -> bool {
+        let duration = Duration::from_secs_f64(bytes as f64 / self.bytes_per_second as f64);
+        let mut next_available = self.next_available.lock().await;
+        let now = Instant::now();
+        if *next_available > now {
+            return false;
+        }
+        *next_available = now + duration;
+        true
     }
 }
 
@@ -156,6 +169,26 @@ pub(crate) async fn handle_connection(state: Arc<AppState>, mut stream: BoxedIo)
         }
     };
     match frame {
+        ControlFrame::RequestManagedConfig {
+            client_id,
+            client_token,
+            mode,
+            applied_revision,
+            status,
+            error,
+        } => {
+            send_managed_config(
+                state,
+                stream,
+                client_id,
+                client_token,
+                mode,
+                applied_revision,
+                status,
+                error,
+            )
+            .await;
+        }
         ControlFrame::RegisterTcpTunnel {
             client_id,
             client_token,
@@ -171,6 +204,68 @@ pub(crate) async fn handle_connection(state: Arc<AppState>, mut stream: BoxedIo)
                 name,
                 public_port,
                 target_addr,
+            )
+            .await;
+        }
+        ControlFrame::RegisterSecretTunnel {
+            client_id,
+            client_token,
+            name,
+            target_addr,
+        } => {
+            crate::secret_tunnel::register_provider(
+                state,
+                stream,
+                client_id,
+                client_token,
+                name,
+                target_addr,
+            )
+            .await;
+        }
+        ControlFrame::ConnectSecretTunnel {
+            client_id,
+            client_token,
+            access_key,
+        } => {
+            crate::secret_tunnel::connect_visitor(
+                state,
+                stream,
+                client_id,
+                client_token,
+                access_key,
+            )
+            .await;
+        }
+        ControlFrame::RegisterSocks5Proxy {
+            client_id,
+            client_token,
+            name,
+            public_port,
+        } => {
+            crate::socks5_tunnel::register_proxy(
+                state,
+                stream,
+                client_id,
+                client_token,
+                name,
+                public_port,
+            )
+            .await;
+        }
+        ControlFrame::RegisterHttpProxy {
+            client_id,
+            client_token,
+            name,
+            public_port,
+        } => {
+            crate::http_proxy_tunnel::register_proxy(
+                state,
+                stream,
+                client_id,
+                client_token,
+                name,
+                public_port,
             )
             .await;
         }
@@ -192,6 +287,64 @@ pub(crate) async fn handle_connection(state: Arc<AppState>, mut stream: BoxedIo)
             )
             .await;
         }
+        ControlFrame::RegisterTlsRoute {
+            client_id,
+            client_token,
+            name,
+            hostname,
+            target_addr,
+        } => {
+            crate::sni_tunnel::register_route(
+                state,
+                stream,
+                client_id,
+                client_token,
+                name,
+                hostname,
+                target_addr,
+            )
+            .await;
+        }
+        ControlFrame::RegisterP2pNode {
+            client_id,
+            client_token,
+            candidates,
+        } => {
+            crate::p2p_control::register_node(state, stream, client_id, client_token, candidates)
+                .await;
+        }
+        ControlFrame::RequestP2pSession {
+            client_id,
+            client_token,
+            access_key,
+        } => {
+            crate::p2p_control::request_session(state, stream, client_id, client_token, access_key)
+                .await;
+        }
+        ControlFrame::ValidateP2pTicket {
+            client_id,
+            client_token,
+            ticket,
+        } => {
+            crate::p2p_control::validate_ticket(state, stream, client_id, client_token, ticket)
+                .await;
+        }
+        ControlFrame::ReportP2pDirectSuccess {
+            client_id,
+            client_token,
+            session_id,
+            visitor_client_id,
+        } => {
+            crate::p2p_control::report_direct_success(
+                state,
+                stream,
+                client_id,
+                client_token,
+                session_id,
+                visitor_client_id,
+            )
+            .await;
+        }
         ControlFrame::RegisterUdpTunnel {
             client_id,
             client_token,
@@ -209,6 +362,14 @@ pub(crate) async fn handle_connection(state: Arc<AppState>, mut stream: BoxedIo)
                 target_addr,
             )
             .await;
+        }
+        ControlFrame::ReportP2pFallback {
+            client_id,
+            client_token,
+            reason,
+        } => {
+            crate::p2p_control::report_fallback(state, stream, client_id, client_token, reason)
+                .await;
         }
         ControlFrame::TcpDataConnection {
             client_id,
@@ -231,6 +392,72 @@ pub(crate) async fn handle_connection(state: Arc<AppState>, mut stream: BoxedIo)
             .await;
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_managed_config(
+    state: Arc<AppState>,
+    mut stream: BoxedIo,
+    client_id: Uuid,
+    client_token: String,
+    mode: ManagedConfigMode,
+    applied_revision: Option<String>,
+    reported_status: ManagedConfigStatus,
+    error: Option<String>,
+) {
+    let authenticated = {
+        let mut clients = state.clients.lock().expect("client registry lock poisoned");
+        matches!(
+            clients.authenticate_and_touch(client_id, &client_token),
+            Ok(Authentication::Authenticated)
+        )
+    };
+    if !authenticated {
+        state
+            .metrics
+            .authentication_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+        let _ = write_control_frame_and_shutdown(
+            &mut stream,
+            &ControlFrame::Error {
+                message: "invalid client credentials".to_owned(),
+            },
+        )
+        .await;
+        return;
+    }
+
+    let config = match crate::managed_config_for_client(&state, client_id) {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::error!("Could not build managed configuration for {client_id}: {error}");
+            let _ = write_control_frame_and_shutdown(
+                &mut stream,
+                &ControlFrame::Error {
+                    message: "managed configuration is temporarily unavailable".to_owned(),
+                },
+            )
+            .await;
+            return;
+        }
+    };
+    let effective_status = if applied_revision.as_deref() == Some(config.revision.as_str()) {
+        reported_status
+    } else if reported_status == ManagedConfigStatus::ApplyFailed {
+        ManagedConfigStatus::ApplyFailed
+    } else {
+        ManagedConfigStatus::Conflict
+    };
+    if let Err(update_error) = state
+        .clients
+        .lock()
+        .expect("client registry lock poisoned")
+        .update_config_sync(client_id, mode, effective_status, applied_revision, error)
+    {
+        tracing::warn!("Could not persist managed configuration status: {update_error}");
+    }
+    let _ = write_control_frame_and_shutdown(&mut stream, &ControlFrame::ManagedConfig { config })
+        .await;
 }
 
 async fn register_tunnel(
@@ -625,25 +852,32 @@ async fn serve_public_connection(
         .fetch_sub(1, Ordering::Relaxed);
 }
 
-async fn copy_bidirectional_with_limit(
-    external: &mut TcpStream,
-    agent: &mut BoxedIo,
+pub(crate) async fn copy_bidirectional_with_limit<A, B>(
+    external: &mut A,
+    agent: &mut B,
     limiter: Option<Arc<BandwidthLimiter>>,
-) -> std::io::Result<(u64, u64)> {
-    let Some(limiter) = limiter else {
-        return copy_bidirectional(external, agent).await;
-    };
+) -> std::io::Result<(u64, u64)>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
     let (mut external_reader, mut external_writer) = split(external);
     let (mut agent_reader, mut agent_writer) = split(agent);
-    let from_public = copy_limited(&mut external_reader, &mut agent_writer, limiter.clone());
-    let to_public = copy_limited(&mut agent_reader, &mut external_writer, limiter);
+    let from_public = copy_direction(
+        &mut external_reader,
+        &mut agent_writer,
+        limiter.clone(),
+        false,
+    );
+    let to_public = copy_direction(&mut agent_reader, &mut external_writer, limiter, true);
     tokio::try_join!(from_public, to_public)
 }
 
-async fn copy_limited<R, W>(
+async fn copy_direction<R, W>(
     reader: &mut R,
     writer: &mut W,
-    limiter: Arc<BandwidthLimiter>,
+    limiter: Option<Arc<BandwidthLimiter>>,
+    allow_unexpected_eof: bool,
 ) -> std::io::Result<u64>
 where
     R: AsyncRead + Unpin,
@@ -652,13 +886,27 @@ where
     let mut buffer = [0_u8; 16 * 1024];
     let mut transferred = 0_u64;
     loop {
-        let read = reader.read(&mut buffer).await?;
+        let read = match reader.read(&mut buffer).await {
+            Ok(read) => read,
+            Err(error)
+                if allow_unexpected_eof && error.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                // 业务数据通道本身是原始字节流。客户端进程退出或旧版本未发送
+                // TLS close_notify 时，rustls 会把底层 TCP EOF 报为 UnexpectedEof；
+                // 已收到的业务字节仍然有效，应按普通半关闭处理而不是污染失败指标。
+                writer.shutdown().await?;
+                return Ok(transferred);
+            }
+            Err(error) => return Err(error),
+        };
         if read == 0 {
             writer.shutdown().await?;
             return Ok(transferred);
         }
-        // 一个策略的双向连接共享同一个预约时钟，因此限制的是策略总吞吐。
-        limiter.reserve(read).await;
+        if let Some(limiter) = &limiter {
+            // 一个策略的双向连接共享同一个预约时钟，因此限制的是策略总吞吐。
+            limiter.reserve(read).await;
+        }
         writer.write_all(&buffer[..read]).await?;
         transferred = transferred.saturating_add(read as u64);
     }
@@ -741,11 +989,79 @@ pub(crate) fn stop_all(state: &AppState) {
 }
 
 async fn send_error(stream: &mut BoxedIo, message: &str) {
-    let _ = write_control_frame(
+    let _ = write_control_frame_and_shutdown(
         stream,
         &ControlFrame::Error {
             message: message.to_owned(),
         },
     )
     .await;
+}
+
+#[cfg(test)]
+mod bandwidth_limiter_tests {
+    use super::{copy_direction, BandwidthLimiter};
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tokio::io::{duplex, AsyncRead, AsyncReadExt, ReadBuf};
+
+    struct UnexpectedEofReader {
+        bytes: &'static [u8],
+        offset: usize,
+    }
+
+    impl AsyncRead for UnexpectedEofReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.offset < self.bytes.len() {
+                let length = buffer.remaining().min(self.bytes.len() - self.offset);
+                buffer.put_slice(&self.bytes[self.offset..self.offset + length]);
+                self.offset += length;
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "TLS peer omitted close_notify",
+                )))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_datagrams_share_the_tcp_policy_reservation_clock() {
+        let limiter = BandwidthLimiter::new(1_024);
+        limiter.reserve(1_024).await;
+        assert!(!limiter.try_reserve_datagram(1).await);
+    }
+
+    #[tokio::test]
+    async fn first_udp_datagram_is_admitted_without_waiting() {
+        let limiter = BandwidthLimiter::new(1_024);
+        assert!(limiter.try_reserve_datagram(512).await);
+        assert!(!limiter.try_reserve_datagram(512).await);
+    }
+
+    #[tokio::test]
+    async fn data_channel_unexpected_eof_preserves_transferred_bytes() {
+        let mut reader = UnexpectedEofReader {
+            bytes: b"linklake-data",
+            offset: 0,
+        };
+        let (mut writer, mut peer) = duplex(128);
+        let copied = copy_direction(&mut reader, &mut writer, None, true)
+            .await
+            .expect("data-channel EOF should be treated as a half-close");
+        let mut actual = Vec::new();
+        peer.read_to_end(&mut actual)
+            .await
+            .expect("forwarded bytes should remain readable");
+        assert_eq!(copied, actual.len() as u64);
+        assert_eq!(actual, b"linklake-data");
+    }
 }

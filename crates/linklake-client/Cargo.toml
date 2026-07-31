@@ -3,15 +3,21 @@ name = "linklake-client"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
 bytes.workspace = true
 clap.workspace = true
+iroh.workspace = true
 linklake-core = { path = "../linklake-core" }
 quinn.workspace = true
 reqwest.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+snow.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 toml.workspace = true

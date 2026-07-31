@@ -1,10 +1,15 @@
 //! LinkLake 共用的、与传输方式无关的领域类型。
 
+use crate::p2p_protocol::P2pCandidate;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
+pub mod p2p_protocol;
+pub mod port_mapping;
+pub mod socks5_udp;
 pub mod udp_protocol;
 pub mod udp_reassembly;
 
@@ -60,6 +65,111 @@ pub struct ClientSummary {
     pub name: String,
     pub platform: String,
     pub last_seen_unix_seconds: u64,
+    pub config_mode: ManagedConfigMode,
+    pub config_sync_status: ManagedConfigStatus,
+    pub applied_config_revision: Option<String>,
+    pub config_sync_error: Option<String>,
+    pub config_checked_unix_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedConfigMode {
+    #[default]
+    Local,
+    ReportOnly,
+    ServerManaged,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedConfigStatus {
+    #[default]
+    Unknown,
+    Synchronized,
+    Conflict,
+    ApplyFailed,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ManagedTcpTunnel {
+    pub name: String,
+    pub public_port: u16,
+    pub target_addr: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ManagedUdpTunnel {
+    pub name: String,
+    pub public_port: u16,
+    pub target_addr: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ManagedHttpRoute {
+    pub name: String,
+    pub hostname: String,
+    pub target_addr: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ManagedTlsRoute {
+    pub name: String,
+    pub hostname: String,
+    pub target_addr: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ManagedSecretTunnel {
+    pub name: String,
+    pub target_addr: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ManagedSocks5Proxy {
+    pub name: String,
+    pub public_port: u16,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ManagedHttpProxy {
+    pub name: String,
+    pub public_port: u16,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ManagedClientConfig {
+    pub revision: String,
+    pub tcp_tunnels: Vec<ManagedTcpTunnel>,
+    pub udp_tunnels: Vec<ManagedUdpTunnel>,
+    pub http_routes: Vec<ManagedHttpRoute>,
+    #[serde(default)]
+    pub tls_routes: Vec<ManagedTlsRoute>,
+    pub secret_tunnels: Vec<ManagedSecretTunnel>,
+    #[serde(default)]
+    pub socks5_proxies: Vec<ManagedSocks5Proxy>,
+    #[serde(default)]
+    pub http_proxies: Vec<ManagedHttpProxy>,
+}
+
+pub fn managed_config_revision(config: &ManagedClientConfig) -> Result<String, serde_json::Error> {
+    let canonical = serde_json::to_vec(&(
+        config.tcp_tunnels.as_slice(),
+        config.udp_tunnels.as_slice(),
+        config.http_routes.as_slice(),
+        config.tls_routes.as_slice(),
+        config.secret_tunnels.as_slice(),
+        config.socks5_proxies.as_slice(),
+        config.http_proxies.as_slice(),
+    ))?;
+    Ok(format!("sha256:{:x}", Sha256::digest(canonical)))
 }
 
 #[derive(Debug, Error)]
@@ -87,6 +197,76 @@ impl ClientEnrollmentRequest {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ControlFrame {
+    RequestManagedConfig {
+        client_id: Uuid,
+        client_token: String,
+        mode: ManagedConfigMode,
+        applied_revision: Option<String>,
+        status: ManagedConfigStatus,
+        error: Option<String>,
+    },
+    ManagedConfig {
+        config: ManagedClientConfig,
+    },
+    RegisterSecretTunnel {
+        client_id: Uuid,
+        client_token: String,
+        name: String,
+        target_addr: String,
+    },
+    SecretTunnelRegistered {
+        tunnel_id: Uuid,
+    },
+    ConnectSecretTunnel {
+        client_id: Uuid,
+        client_token: String,
+        access_key: String,
+    },
+    SecretTunnelConnected {
+        tunnel_id: Uuid,
+    },
+    OpenSecretConnection {
+        connection_id: Uuid,
+    },
+    RegisterSocks5Proxy {
+        client_id: Uuid,
+        client_token: String,
+        name: String,
+        public_port: u16,
+    },
+    Socks5ProxyRegistered {
+        proxy_id: Uuid,
+        public_port: u16,
+        udp_associate: bool,
+    },
+    Socks5UdpDataPlaneOffer {
+        registration_id: Uuid,
+        ticket: String,
+        endpoint: String,
+        server_name: String,
+        max_datagram_size: u32,
+        session_idle_timeout_seconds: u32,
+    },
+    OpenSocks5Connection {
+        connection_id: Uuid,
+        target_host: String,
+        target_port: u16,
+    },
+    RegisterHttpProxy {
+        client_id: Uuid,
+        client_token: String,
+        name: String,
+        public_port: u16,
+    },
+    HttpProxyRegistered {
+        proxy_id: Uuid,
+        public_port: u16,
+    },
+    OpenHttpProxyConnection {
+        connection_id: Uuid,
+        target_host: String,
+        target_port: u16,
+    },
     RegisterTcpTunnel {
         client_id: Uuid,
         client_token: String,
@@ -95,6 +275,13 @@ pub enum ControlFrame {
         target_addr: String,
     },
     RegisterHttpRoute {
+        client_id: Uuid,
+        client_token: String,
+        name: String,
+        hostname: String,
+        target_addr: String,
+    },
+    RegisterTlsRoute {
         client_id: Uuid,
         client_token: String,
         name: String,
@@ -114,6 +301,50 @@ pub enum ControlFrame {
     HttpRouteRegistered {
         hostname: String,
     },
+    TlsRouteRegistered {
+        hostname: String,
+    },
+    RegisterP2pNode {
+        client_id: Uuid,
+        client_token: String,
+        candidates: Vec<P2pCandidate>,
+    },
+    P2pNodeRegistered,
+    RequestP2pSession {
+        client_id: Uuid,
+        client_token: String,
+        access_key: String,
+    },
+    P2pSessionOffer {
+        ticket: String,
+        noise_psk: [u8; 32],
+        candidates: Vec<P2pCandidate>,
+        relay_available: bool,
+    },
+    ValidateP2pTicket {
+        client_id: Uuid,
+        client_token: String,
+        ticket: String,
+    },
+    P2pTicketValid {
+        session_id: Uuid,
+        visitor_client_id: Uuid,
+        target_addr: String,
+        noise_psk: [u8; 32],
+    },
+    ReportP2pDirectSuccess {
+        client_id: Uuid,
+        client_token: String,
+        session_id: Uuid,
+        visitor_client_id: Uuid,
+    },
+    P2pDirectSuccessRecorded,
+    ReportP2pFallback {
+        client_id: Uuid,
+        client_token: String,
+        reason: crate::p2p_protocol::P2pFallbackReason,
+    },
+    P2pFallbackRecorded,
     UdpDataPlaneOffer {
         registration_id: Uuid,
         ticket: String,
@@ -205,6 +436,16 @@ pub async fn write_control_frame<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// 写入一次性控制响应后执行优雅关闭，确保 TLS close_notify 和尾部记录完整送达。
+pub async fn write_control_frame_and_shutdown<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    frame: &ControlFrame,
+) -> Result<(), ControlFrameError> {
+    write_control_frame(writer, frame).await?;
+    writer.shutdown().await?;
+    Ok(())
+}
+
 pub async fn read_control_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
 ) -> Result<ControlFrame, ControlFrameError> {
@@ -279,6 +520,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_control_response_delivers_frame_before_eof() {
+        let (mut client, mut server) = tokio::io::duplex(4 * 1024);
+        let writer = tokio::spawn(async move {
+            write_control_frame_and_shutdown(&mut server, &ControlFrame::P2pNodeRegistered)
+                .await
+                .expect("terminal response should write and close");
+        });
+        let frame = read_control_frame(&mut client)
+            .await
+            .expect("client should receive the complete terminal frame");
+        assert_eq!(frame, ControlFrame::P2pNodeRegistered);
+        let mut trailing = [0_u8; 1];
+        assert_eq!(
+            client
+                .read(&mut trailing)
+                .await
+                .expect("EOF should be readable"),
+            0
+        );
+        writer.await.expect("writer task should finish");
+    }
+
+    #[tokio::test]
     async fn control_frames_round_trip() {
         let expected = ControlFrame::OpenTcpConnection {
             connection_id: Uuid::new_v4(),
@@ -298,6 +562,117 @@ mod tests {
         let read = read_control_frame(&mut reader);
         let (_, actual) = tokio::join!(write, read);
         assert_eq!(actual.expect("heartbeat frame should decode"), expected);
+    }
+
+    #[tokio::test]
+    async fn socks5_udp_negotiation_frames_round_trip() {
+        let registration_id = Uuid::new_v4();
+        let frames = [
+            ControlFrame::Socks5UdpDataPlaneOffer {
+                registration_id,
+                ticket: "single-use-ticket".to_owned(),
+                endpoint: "127.0.0.1:32001".to_owned(),
+                server_name: "localhost".to_owned(),
+                max_datagram_size: 1200,
+                session_idle_timeout_seconds: 120,
+            },
+            ControlFrame::Socks5ProxyRegistered {
+                proxy_id: registration_id,
+                public_port: 1080,
+                udp_associate: true,
+            },
+        ];
+        for expected in frames {
+            let (mut writer, mut reader) = tokio::io::duplex(2048);
+            let write = write_control_frame(&mut writer, &expected);
+            let read = read_control_frame(&mut reader);
+            let (_, actual) = tokio::join!(write, read);
+            assert_eq!(actual.expect("SOCKS5 UDP frame should decode"), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn http_proxy_control_frames_round_trip() {
+        let proxy_id = Uuid::new_v4();
+        let connection_id = Uuid::new_v4();
+        let frames = [
+            ControlFrame::RegisterHttpProxy {
+                client_id: Uuid::new_v4(),
+                client_token: "token".to_owned(),
+                name: "web-exit".to_owned(),
+                public_port: 32022,
+            },
+            ControlFrame::HttpProxyRegistered {
+                proxy_id,
+                public_port: 32022,
+            },
+            ControlFrame::OpenHttpProxyConnection {
+                connection_id,
+                target_host: "example.com".to_owned(),
+                target_port: 443,
+            },
+        ];
+        for expected in frames {
+            let (mut writer, mut reader) = tokio::io::duplex(2048);
+            let write = write_control_frame(&mut writer, &expected);
+            let read = read_control_frame(&mut reader);
+            let (_, actual) = tokio::join!(write, read);
+            assert_eq!(actual.expect("HTTP proxy frame should decode"), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_configuration_frames_round_trip() {
+        let expected = ControlFrame::ManagedConfig {
+            config: ManagedClientConfig {
+                revision: "sha256:test".to_owned(),
+                tcp_tunnels: vec![ManagedTcpTunnel {
+                    name: "game".to_owned(),
+                    public_port: 32_001,
+                    target_addr: "127.0.0.1:2333".to_owned(),
+                    enabled: true,
+                }],
+                udp_tunnels: Vec::new(),
+                http_routes: Vec::new(),
+                tls_routes: Vec::new(),
+                secret_tunnels: Vec::new(),
+                socks5_proxies: Vec::new(),
+                http_proxies: Vec::new(),
+            },
+        };
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        let write = write_control_frame(&mut writer, &expected);
+        let read = read_control_frame(&mut reader);
+        let (_, actual) = tokio::join!(write, read);
+        assert_eq!(
+            actual.expect("managed config frame should decode"),
+            expected
+        );
+    }
+
+    #[test]
+    fn managed_configuration_revision_detects_policy_changes() {
+        let mut config = ManagedClientConfig {
+            revision: String::new(),
+            tcp_tunnels: vec![ManagedTcpTunnel {
+                name: "game".to_owned(),
+                public_port: 32_001,
+                target_addr: "127.0.0.1:2333".to_owned(),
+                enabled: true,
+            }],
+            udp_tunnels: Vec::new(),
+            http_routes: Vec::new(),
+            tls_routes: Vec::new(),
+            secret_tunnels: Vec::new(),
+            socks5_proxies: Vec::new(),
+            http_proxies: Vec::new(),
+        };
+        let first = managed_config_revision(&config).expect("revision should calculate");
+        config.tcp_tunnels[0].enabled = false;
+        let second = managed_config_revision(&config).expect("revision should calculate");
+        assert_ne!(first, second);
+        assert!(first.starts_with("sha256:"));
+        assert_eq!(first.len(), 71);
     }
 
     #[tokio::test]

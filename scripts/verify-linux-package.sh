@@ -17,8 +17,16 @@ systemd/linklake-server.service
 systemd/linklake-client.service
 systemd/server.env.example
 systemd/install-linux.sh
+iroh-relay/config.toml.example
+iroh-relay/linklake-iroh-relay.service
+iroh-relay/nginx-location.conf.example
+iroh-relay/nginx-server.conf.example
+iroh-relay/install.sh
 README.md
 README.en.md
+CHANGELOG.md
+LICENSE
+NOTICE
 release.json'
 
 entries="$(tar -tzf "$archive" | sed 's#^[^/]*/##')"
