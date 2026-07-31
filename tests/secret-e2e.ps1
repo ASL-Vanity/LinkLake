@@ -282,7 +282,7 @@ access_key = "$($policy.access_key)"
 "@
 
     $providerProcess = Start-Client -ConfigPath $providerConfigPath
-    Start-Client -ConfigPath $visitorConfigPath | Out-Null
+    $visitorProcess = Start-Client -ConfigPath $visitorConfigPath
     Start-Client -ConfigPath $deniedConfigPath | Out-Null
 
     Wait-ForCondition -Failure 'The managed provider did not synchronize its secret target.' -Condition {
@@ -388,18 +388,60 @@ managed_config_path = "$providerManagedTomlPath"
     if ($p2pMetrics.p2p_session_offers_total -lt 3) {
         throw 'P2P session offers were not counted for Iroh, TCP Noise, and fallback attempts.'
     }
+
+    # 已验证自动回退后，后续授权、连接上限和生命周期用例明确走服务端中继。
+    # 服务端会短期保留旧 P2P 候选；若继续优先直连，失效 Iroh 候选的正常拨号超时
+    # 会让这些用例测到候选过期等待，而不是它们真正要验证的中继行为。
+    Stop-Process -Id $visitorProcess.Id -Force
+    $null = $visitorProcess.WaitForExit(5000)
+    Write-Utf8File -Path $visitorConfigPath -Content @"
+[client]
+control = "127.0.0.1:$controlPort"
+client_id = "$($visitor.client_id)"
+client_token = "$($visitor.client_token)"
+
+[[secret_visitors]]
+name = "allowed-access"
+local_bind = "127.0.0.1:$visitorPort"
+access_key = "$($policy.access_key)"
+prefer_direct = false
+
+[[secret_visitors]]
+name = "wrong-key"
+local_bind = "127.0.0.1:$wrongKeyPort"
+access_key = "$wrongAccessKey"
+"@
+    $visitorProcess = Start-Client -ConfigPath $visitorConfigPath
+    Wait-ForCondition -Failure 'The relay-only secret visitor listeners did not restart.' -Condition {
+        $ports = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty LocalPort
+        $ports -contains $visitorPort -and $ports -contains $wrongKeyPort
+    }
+
     Assert-ConnectionRejected -Port $wrongKeyPort -Failure 'A wrong secret key was accepted.'
     Assert-ConnectionRejected -Port $deniedPort -Failure 'A disallowed visitor client was accepted.'
 
     $held = [System.Net.Sockets.TcpClient]::new('127.0.0.1', $visitorPort)
     try {
         $heldStream = $held.GetStream()
-        $heldStream.ReadTimeout = 5000
+        $heldStream.ReadTimeout = 15000
         $heldPayload = [Text.Encoding]::UTF8.GetBytes('held')
         $heldStream.Write($heldPayload, 0, $heldPayload.Length)
         $heldResponse = [byte[]]::new($heldPayload.Length)
-        if ($heldStream.Read($heldResponse, 0, $heldResponse.Length) -ne $heldResponse.Length) {
-            throw 'The held secret tunnel connection did not echo.'
+        $heldOffset = 0
+        while ($heldOffset -lt $heldResponse.Length) {
+            $heldRead = $heldStream.Read(
+                $heldResponse, $heldOffset, $heldResponse.Length - $heldOffset
+            )
+            if ($heldRead -eq 0) {
+                throw 'The held secret tunnel connection closed before echoing all bytes.'
+            }
+            $heldOffset += $heldRead
+        }
+        for ($index = 0; $index -lt $heldPayload.Length; $index++) {
+            if ($heldPayload[$index] -ne $heldResponse[$index]) {
+                throw 'The held secret tunnel connection returned corrupted bytes.'
+            }
         }
         Wait-ForCondition -Failure 'The active secret connection was not reported.' -Condition {
             $current = Invoke-RestMethod -Uri "$baseUrl/api/v1/secret-tunnels" -Headers $headers |
