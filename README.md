@@ -249,6 +249,10 @@ Linux systemd 服务默认把托管配置保存到 `/var/lib/linklake-client/man
 
 - 健康检查：`GET /api/v1/health`
 - 登录后指标：`GET /api/v1/metrics`
+- 历史指标：`GET /api/v1/metrics/history?range=1h|12h|1d|7d|30d`；12 小时内保留 5 秒样本，长期历史按分钟归档并最多保留 30 天
+- 用户管理：`GET/POST /api/v1/users`、`PUT/DELETE /api/v1/users/:username`
+- 密码重置与会话撤销：`POST /api/v1/users/:username/reset-password|revoke-sessions`
+- 活跃会话：`GET /api/v1/sessions`、`DELETE /api/v1/sessions/:session_id`
 - 公网端口策略：`GET /api/v1/public-port-policy`
 - TCP 策略：`GET/POST /api/v1/tcp-tunnels`
 - UDP 策略：`GET/POST /api/v1/udp-tunnels`
@@ -279,6 +283,8 @@ Linux systemd 服务默认把托管配置保存到 `/var/lib/linklake-client/man
 - Web UI 可配置 TCP/TLS SNI/Secret/SOCKS5/HTTP 正向代理聚合带宽、UDP 聚合带宽/最大会话数/空闲超时、TCP/HTTP/TLS SNI/Secret/SOCKS5/HTTP 正向代理最大连接数、Secret 访问客户端限制、代理用户名、ACME 环境和逐路由 HTTPS
 - 指标与策略视图包括 P2P 节点新鲜度、直连与中继回退、TLS SNI ClientHello/未知域名/连接/流量、Secret 连接和流量、SOCKS5 请求/认证/连接/流量、HTTP 正向代理请求/CONNECT/认证/畸形报文/流量、UDP 会话/数据包/流量/丢包/超时、HTTP/HTTPS 路由流量和失败、TLS 握手失败、证书总数、30 天内到期、已过期、ACME 订单、续期和 HTTP-01 挑战
 - `LINKLAKE_MANAGEMENT_TOKEN` 可作为自动化 API Bearer Token，不用于 Web 登录
+- Web UI 支持管理员、运维人员和审计人员三种用户组：管理员拥有全部权限，运维人员可管理客户端与转发策略，审计人员只读；当前用户和最后一个启用的管理员受到保护
+- Web UI 提供湖蓝、海洋、翡翠、紫罗兰四套完整浅色/深色主题，跟随系统只切换明暗，不改变所选配色
 
 日志目录通过 `LINKLAKE_LOG_DIR` 设置。服务端未设置时默认使用 `LINKLAKE_DATA_DIR/logs`；客户端未设置时输出到控制台，服务安装器会为其设置轮转日志目录。
 

@@ -3,7 +3,8 @@
     [int]$ManagementPort = 39210,
     [int]$ControlPort = 39211,
     [int]$UdpRelayPort = 39212,
-    [switch]$KeepData
+    [switch]$KeepData,
+    [switch]$KeepServer
 )
 
 $ErrorActionPreference = 'Stop'
@@ -75,7 +76,13 @@ try {
     $startInfo.EnvironmentVariables['LINKLAKE_ADMIN_PASSWORD'] = $adminPassword
     $startInfo.EnvironmentVariables['LINKLAKE_ENROLLMENT_TOKEN'] = $enrollmentToken
     $startInfo.EnvironmentVariables['LINKLAKE_MANAGEMENT_TOKEN'] = $managementToken
-    $serverProcess = [System.Diagnostics.Process]::Start($startInfo)
+    if ($KeepServer) {
+        $startInfo.RedirectStandardOutput = $false
+        $startInfo.RedirectStandardError = $false
+        $serverProcess = [System.Diagnostics.Process]::Start($startInfo)
+    } else {
+        $serverProcess = [System.Diagnostics.Process]::Start($startInfo)
+    }
 
     $ready = $false
     for ($attempt = 0; $attempt -lt 100; $attempt++) {
@@ -124,13 +131,17 @@ try {
     & $node (Join-Path $PSScriptRoot 'webui-smoke.mjs')
     if ($LASTEXITCODE -ne 0) { throw "WebUI Chrome 冒烟测试失败，退出码 $LASTEXITCODE" }
 } finally {
-    if ($serverProcess -and -not $serverProcess.HasExited) {
+    if (-not $KeepServer -and $serverProcess -and -not $serverProcess.HasExited) {
         $serverProcess.Kill()
         $serverProcess.WaitForExit()
     }
-    if ($serverProcess) {
+    if (-not $KeepServer -and $serverProcess) {
         ($serverProcess.StandardOutput.ReadToEnd() + $serverProcess.StandardError.ReadToEnd()) | Set-Content -LiteralPath $serverLog -Encoding utf8
         $serverProcess.Dispose()
     }
-    if (-not $KeepData) { Remove-SmokeData -Path $dataDir }
+    if ($KeepServer -and $serverProcess) {
+        Write-Host "LinkLake WebUI QA server PID: $($serverProcess.Id)"
+        Write-Host "LinkLake WebUI QA URL: $baseUrl"
+    }
+    if (-not $KeepData -and -not $KeepServer) { Remove-SmokeData -Path $dataDir }
 }

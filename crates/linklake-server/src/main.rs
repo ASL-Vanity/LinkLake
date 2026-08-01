@@ -21,11 +21,14 @@ mod tunnel_catalog;
 mod udp_data_plane;
 mod udp_tunnel;
 
-use admin_auth::{AdminAuth, BootstrapCredentials, SessionIdentity};
+use admin_auth::{
+    AdminAuth, BootstrapCredentials, CreateUser, SessionIdentity, SessionRecord, UpdateUser,
+    UserRecord, UserRole,
+};
 use audit_log::{AuditEvent, AuditLog};
 use axum::{
     extract::{Path, Query, Request, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, Method, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post, put},
@@ -93,12 +96,17 @@ const MANAGEMENT_UI: &str = include_str!("../web/index.html");
 const GLOBAL_CONNECTION_LIMIT: usize = 1024;
 const PENDING_CONNECTION_LIMIT: usize = 256;
 const GLOBAL_UDP_SESSION_LIMIT: usize = 16_384;
-const ADMINISTRATOR_ROLE: &str = "administrator";
 const SESSION_AUTHENTICATION_TYPE: &str = "session";
 const METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS: u64 = 5;
-const METRICS_HISTORY_RETENTION_SECONDS: u64 = 24 * 60 * 60;
-const METRICS_HISTORY_CAPACITY: usize =
-    (METRICS_HISTORY_RETENTION_SECONDS / METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS) as usize + 2;
+const METRICS_HISTORY_RECENT_RETENTION_SECONDS: u64 = 12 * 60 * 60;
+const METRICS_HISTORY_ARCHIVE_SAMPLE_INTERVAL_SECONDS: u64 = 60;
+const METRICS_HISTORY_RETENTION_SECONDS: u64 = 30 * 24 * 60 * 60;
+const METRICS_HISTORY_CAPACITY: usize = (METRICS_HISTORY_RECENT_RETENTION_SECONDS
+    / METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS) as usize
+    + 2;
+const METRICS_HISTORY_ARCHIVE_CAPACITY: usize =
+    (METRICS_HISTORY_RETENTION_SECONDS / METRICS_HISTORY_ARCHIVE_SAMPLE_INTERVAL_SECONDS) as usize
+        + 2;
 const METRICS_HISTORY_DEFAULT_MAX_POINTS: u64 = 300;
 const LOGIN_HASH_CONCURRENCY: usize = 1;
 const LOGIN_FAILURE_BASE_DELAY_MILLIS: u64 = 250;
@@ -472,14 +480,18 @@ impl MetricsHistorySample {
 
 struct MetricsHistory {
     samples: VecDeque<MetricsHistorySample>,
+    archive_samples: VecDeque<MetricsHistorySample>,
     capacity: usize,
+    archive_capacity: usize,
 }
 
 impl MetricsHistory {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, archive_capacity: usize) -> Self {
         Self {
             samples: VecDeque::with_capacity(capacity),
+            archive_samples: VecDeque::with_capacity(archive_capacity),
             capacity: capacity.max(2),
+            archive_capacity: archive_capacity.max(2),
         }
     }
 
@@ -491,6 +503,7 @@ impl MetricsHistory {
         {
             // 系统时间回拨时开始一条新序列，避免此后的正常样本持续被旧时间基线拒绝。
             self.samples.clear();
+            self.archive_samples.clear();
         }
         if self
             .samples
@@ -499,9 +512,32 @@ impl MetricsHistory {
         {
             self.samples.pop_back();
         }
+        let archive_bucket =
+            sample.timestamp_unix_seconds / METRICS_HISTORY_ARCHIVE_SAMPLE_INTERVAL_SECONDS;
+        if self.archive_samples.back().is_some_and(|last| {
+            last.timestamp_unix_seconds / METRICS_HISTORY_ARCHIVE_SAMPLE_INTERVAL_SECONDS
+                == archive_bucket
+        }) {
+            self.archive_samples.pop_back();
+        }
+        self.archive_samples.push_back(sample.clone());
+        while self.archive_samples.len() > self.archive_capacity {
+            self.archive_samples.pop_front();
+        }
         self.samples.push_back(sample);
         while self.samples.len() > self.capacity {
             self.samples.pop_front();
+        }
+    }
+
+    fn tier(&self, range_seconds: u64) -> (&VecDeque<MetricsHistorySample>, u64) {
+        if range_seconds <= METRICS_HISTORY_RECENT_RETENTION_SECONDS {
+            (&self.samples, METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS)
+        } else {
+            (
+                &self.archive_samples,
+                METRICS_HISTORY_ARCHIVE_SAMPLE_INTERVAL_SECONDS,
+            )
         }
     }
 }
@@ -659,8 +695,10 @@ struct LoginRequest {
 
 #[derive(Serialize)]
 struct LoginResponse {
+    session_id: Uuid,
     username: String,
-    role: &'static str,
+    display_name: String,
+    role: UserRole,
     authentication_type: &'static str,
     expires_unix_seconds: u64,
     password_change_required: bool,
@@ -668,8 +706,10 @@ struct LoginResponse {
 
 #[derive(Serialize)]
 struct AuthMeResponse {
+    session_id: Uuid,
     username: String,
-    role: &'static str,
+    display_name: String,
+    role: UserRole,
     authentication_type: &'static str,
     expires_unix_seconds: u64,
     password_change_required: bool,
@@ -678,6 +718,17 @@ struct AuthMeResponse {
 #[derive(Deserialize)]
 struct ChangePasswordRequest {
     new_password: String,
+}
+
+#[derive(Deserialize)]
+struct ResetUserPasswordRequest {
+    new_password: String,
+    #[serde(default = "default_force_password_change")]
+    force_password_change: bool,
+}
+
+fn default_force_password_change() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -1409,7 +1460,10 @@ async fn run_server(
         pending_connection_permits: Arc::new(Semaphore::new(PENDING_CONNECTION_LIMIT)),
         global_udp_session_permits: Arc::new(Semaphore::new(GLOBAL_UDP_SESSION_LIMIT)),
         metrics: ServerCounters::default(),
-        metrics_history: Mutex::new(MetricsHistory::new(METRICS_HISTORY_CAPACITY)),
+        metrics_history: Mutex::new(MetricsHistory::new(
+            METRICS_HISTORY_CAPACITY,
+            METRICS_HISTORY_ARCHIVE_CAPACITY,
+        )),
     });
     if let Some(plan) = migration_plan {
         plan.finish()?;
@@ -1422,6 +1476,24 @@ async fn run_server(
         .route("/api/v1/auth/me", get(auth_me))
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/change-password", post(change_password))
+        .route("/api/v1/users", get(list_users).post(create_user))
+        .route(
+            "/api/v1/users/:username",
+            put(update_user).delete(delete_user),
+        )
+        .route(
+            "/api/v1/users/:username/reset-password",
+            post(reset_user_password),
+        )
+        .route(
+            "/api/v1/users/:username/revoke-sessions",
+            post(revoke_user_sessions),
+        )
+        .route("/api/v1/sessions", get(list_sessions))
+        .route(
+            "/api/v1/sessions/:session_id",
+            axum::routing::delete(revoke_session),
+        )
         .route("/api/v1/status", get(status))
         .route("/api/v1/public-port-policy", get(get_public_port_policy))
         .route("/api/v1/metrics", get(metrics))
@@ -1541,6 +1613,10 @@ async fn run_server(
         .route("/api/v1/clients/enroll", post(enroll_client))
         .route("/api/v1/clients/:client_id/heartbeat", post(heartbeat))
         .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            enforce_management_role,
+        ))
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn(cache_control_headers));
 
@@ -2180,16 +2256,24 @@ async fn metrics_history(
         parse_metrics_history_range(query.range.as_deref()).ok_or(CodedApiError(
             StatusCode::BAD_REQUEST,
             "invalid_metrics_range",
-            "metrics history range must be one of 5m, 15m, 1h, 6h, or 24h",
+            "metrics history range must be one of 1h, 12h, 1d, 7d, or 30d",
         ))?;
-    let step_seconds =
-        normalize_metrics_history_step(query.step, range_seconds, default_step_seconds).ok_or(
-            CodedApiError(
-                StatusCode::BAD_REQUEST,
-                "invalid_metrics_step",
-                "metrics history step must be between the sample interval and selected range",
-            ),
-        )?;
+    let sample_interval_seconds = if range_seconds <= METRICS_HISTORY_RECENT_RETENTION_SECONDS {
+        METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS
+    } else {
+        METRICS_HISTORY_ARCHIVE_SAMPLE_INTERVAL_SECONDS
+    };
+    let step_seconds = normalize_metrics_history_step(
+        query.step,
+        range_seconds,
+        default_step_seconds,
+        sample_interval_seconds,
+    )
+    .ok_or(CodedApiError(
+        StatusCode::BAD_REQUEST,
+        "invalid_metrics_step",
+        "metrics history step must be between the sample interval and selected range",
+    ))?;
     let protocol = query.protocol.unwrap_or_default();
     let response = build_metrics_history_response(
         &state
@@ -2207,11 +2291,11 @@ async fn metrics_history(
 
 fn parse_metrics_history_range(value: Option<&str>) -> Option<(&'static str, u64, u64)> {
     match value.unwrap_or("1h") {
-        "5m" => Some(("5m", 5 * 60, 5)),
-        "15m" => Some(("15m", 15 * 60, 5)),
         "1h" => Some(("1h", 60 * 60, 15)),
-        "6h" => Some(("6h", 6 * 60 * 60, 60)),
-        "24h" => Some(("24h", 24 * 60 * 60, 300)),
+        "12h" => Some(("12h", 12 * 60 * 60, 150)),
+        "1d" => Some(("1d", 24 * 60 * 60, 300)),
+        "7d" => Some(("7d", 7 * 24 * 60 * 60, 2_100)),
+        "30d" => Some(("30d", 30 * 24 * 60 * 60, 9_000)),
         _ => None,
     }
 }
@@ -2220,6 +2304,7 @@ fn normalize_metrics_history_step(
     requested: Option<u64>,
     range_seconds: u64,
     default_step_seconds: u64,
+    sample_interval_seconds: u64,
 ) -> Option<u64> {
     let requested = requested.unwrap_or(default_step_seconds);
     if requested == 0 || requested > range_seconds {
@@ -2227,14 +2312,11 @@ fn normalize_metrics_history_step(
     }
     let minimum_for_payload = range_seconds
         .div_ceil(METRICS_HISTORY_DEFAULT_MAX_POINTS)
-        .max(METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS);
+        .max(sample_interval_seconds);
     let step = requested
         .max(minimum_for_payload)
-        .max(METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS);
-    Some(
-        step.div_ceil(METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS)
-            * METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS,
-    )
+        .max(sample_interval_seconds);
+    Some(step.div_ceil(sample_interval_seconds) * sample_interval_seconds)
 }
 
 fn build_metrics_history_response(
@@ -2245,20 +2327,18 @@ fn build_metrics_history_response(
     step_seconds: u64,
     protocol: MetricsHistoryProtocol,
 ) -> MetricsHistoryResponse {
+    let (tier, sample_interval_seconds) = history.tier(range_seconds);
     let minimum_step = range_seconds
         .div_ceil(METRICS_HISTORY_DEFAULT_MAX_POINTS)
-        .max(METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS);
+        .max(sample_interval_seconds);
     let step_seconds = step_seconds
         .max(minimum_step)
-        .div_ceil(METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS)
-        * METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS;
+        .div_ceil(sample_interval_seconds)
+        * sample_interval_seconds;
     let from = now.saturating_sub(range_seconds);
-    let series_started_unix_seconds = history
-        .samples
-        .front()
-        .map(|sample| sample.timestamp_unix_seconds);
+    let series_started_unix_seconds = tier.front().map(|sample| sample.timestamp_unix_seconds);
     let mut points = Vec::new();
-    let mut samples = history.samples.iter().peekable();
+    let mut samples = tier.iter().peekable();
     let mut previous = None;
     while samples
         .peek()
@@ -2331,7 +2411,7 @@ fn build_metrics_history_response(
     MetricsHistoryResponse {
         protocol,
         range: range_name,
-        sample_interval_seconds: METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS,
+        sample_interval_seconds,
         step_seconds,
         retention_seconds: METRICS_HISTORY_RETENTION_SECONDS,
         series_started_unix_seconds,
@@ -6003,8 +6083,10 @@ async fn login(
         .record_success(&throttle_identity);
     record_audit(&state, "management.login", &username, "session created");
     let mut response = Json(LoginResponse {
+        session_id: session.session_id,
         username,
-        role: ADMINISTRATOR_ROLE,
+        display_name: session.display_name,
+        role: session.role,
         authentication_type: SESSION_AUTHENTICATION_TYPE,
         expires_unix_seconds: session.expires_unix_seconds,
         password_change_required: session.password_change_required,
@@ -6061,12 +6143,214 @@ async fn auth_me(
 
 fn auth_me_response(identity: SessionIdentity) -> AuthMeResponse {
     AuthMeResponse {
+        session_id: identity.session_id,
         username: identity.username,
-        role: ADMINISTRATOR_ROLE,
+        display_name: identity.display_name,
+        role: identity.role,
         authentication_type: SESSION_AUTHENTICATION_TYPE,
         expires_unix_seconds: identity.expires_unix_seconds,
         password_change_required: identity.password_change_required,
     }
+}
+
+async fn list_users(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<UserRecord>>, CodedApiError> {
+    require_administrator(&state, &headers)?;
+    state
+        .admin_auth
+        .lock()
+        .expect("administrator registry lock poisoned")
+        .list_users()
+        .map(Json)
+        .map_err(user_management_error)
+}
+
+async fn create_user(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<CreateUser>,
+) -> Result<(StatusCode, Json<UserRecord>), CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    let username = request.username.clone();
+    let role = request.role;
+    let user = state
+        .admin_auth
+        .lock()
+        .expect("administrator registry lock poisoned")
+        .create_user(request)
+        .map_err(user_management_error)?;
+    record_audit(
+        &state,
+        "management.user.created",
+        &username,
+        &format!("actor={}; role={}", principal.username, role.as_str()),
+    );
+    Ok((StatusCode::CREATED, Json(user)))
+}
+
+async fn update_user(
+    State(state): State<Arc<AppState>>,
+    Path(username): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateUser>,
+) -> Result<Json<UserRecord>, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    let user = state
+        .admin_auth
+        .lock()
+        .expect("administrator registry lock poisoned")
+        .update_user(&principal.username, &username, request)
+        .map_err(user_management_error)?
+        .ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_user",
+            "user does not exist",
+        ))?;
+    record_audit(
+        &state,
+        "management.user.updated",
+        &username,
+        &format!("actor={}", principal.username),
+    );
+    Ok(Json(user))
+}
+
+async fn delete_user(
+    State(state): State<Arc<AppState>>,
+    Path(username): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    let deleted = state
+        .admin_auth
+        .lock()
+        .expect("administrator registry lock poisoned")
+        .delete_user(&principal.username, &username)
+        .map_err(user_management_error)?;
+    if !deleted {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_user",
+            "user does not exist",
+        ));
+    }
+    record_audit(
+        &state,
+        "management.user.deleted",
+        &username,
+        &format!("actor={}", principal.username),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn reset_user_password(
+    State(state): State<Arc<AppState>>,
+    Path(username): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<ResetUserPasswordRequest>,
+) -> Result<StatusCode, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    let reset = state
+        .admin_auth
+        .lock()
+        .expect("administrator registry lock poisoned")
+        .reset_user_password(
+            &username,
+            &request.new_password,
+            request.force_password_change,
+        )
+        .map_err(user_management_error)?;
+    if !reset {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_user",
+            "user does not exist",
+        ));
+    }
+    record_audit(
+        &state,
+        "management.user.password_reset",
+        &username,
+        &format!("actor={}", principal.username),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn revoke_user_sessions(
+    State(state): State<Arc<AppState>>,
+    Path(username): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    let revoked = state
+        .admin_auth
+        .lock()
+        .expect("administrator registry lock poisoned")
+        .revoke_user_sessions(&username)
+        .map_err(user_management_error)?;
+    if !revoked {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_user",
+            "user does not exist",
+        ));
+    }
+    record_audit(
+        &state,
+        "management.user.sessions_revoked",
+        &username,
+        &format!("actor={}", principal.username),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_sessions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<SessionRecord>>, CodedApiError> {
+    require_administrator(&state, &headers)?;
+    state
+        .admin_auth
+        .lock()
+        .expect("administrator registry lock poisoned")
+        .list_sessions()
+        .map(Json)
+        .map_err(user_management_error)
+}
+
+async fn revoke_session(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<StatusCode, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    let current_session_id = principal.session_id.ok_or(CodedApiError(
+        StatusCode::FORBIDDEN,
+        "session_authentication_required",
+        "session management requires an interactive administrator login",
+    ))?;
+    let revoked = state
+        .admin_auth
+        .lock()
+        .expect("administrator registry lock poisoned")
+        .revoke_session(current_session_id, session_id)
+        .map_err(user_management_error)?;
+    if !revoked {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_session",
+            "session does not exist",
+        ));
+    }
+    record_audit(
+        &state,
+        "management.session.revoked",
+        &session_id.to_string(),
+        &format!("actor={}", principal.username),
+    );
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn change_password(
@@ -6201,13 +6485,27 @@ fn authorize(headers: &HeaderMap, expected_token: &str) -> Result<(), ApiError> 
     }
 }
 
-fn authorize_management(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+#[derive(Clone)]
+struct ManagementPrincipal {
+    username: String,
+    role: UserRole,
+    session_id: Option<Uuid>,
+}
+
+fn management_principal(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<ManagementPrincipal, ApiError> {
     if state
         .management_token
         .as_deref()
         .is_some_and(|token| bearer_token(headers) == Some(token))
     {
-        return Ok(());
+        return Ok(ManagementPrincipal {
+            username: "management-token".to_owned(),
+            role: UserRole::Administrator,
+            session_id: None,
+        });
     }
     let identity = management_session_cookie(headers)
         .map(|session| {
@@ -6225,20 +6523,137 @@ fn authorize_management(state: &AppState, headers: &HeaderMap) -> Result<(), Api
             )
         })?
         .flatten();
-    if let Some(identity) = identity {
-        if identity.password_change_required {
-            return Err(ApiError(
-                StatusCode::FORBIDDEN,
-                "password change required before management access",
-            ));
-        }
-        Ok(())
-    } else {
+    let Some(identity) = identity else {
         tracing::warn!("Management API authorization failed");
-        Err(ApiError(
+        return Err(ApiError(
             StatusCode::UNAUTHORIZED,
             "management login required",
-        ))
+        ));
+    };
+    if identity.password_change_required {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "password change required before management access",
+        ));
+    }
+    Ok(ManagementPrincipal {
+        username: identity.username,
+        role: identity.role,
+        session_id: Some(identity.session_id),
+    })
+}
+
+fn require_administrator(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<ManagementPrincipal, CodedApiError> {
+    let principal = management_principal(state, headers).map_err(coded_management_error)?;
+    if principal.role != UserRole::Administrator {
+        return Err(CodedApiError(
+            StatusCode::FORBIDDEN,
+            "administrator_required",
+            "administrator role is required",
+        ));
+    }
+    Ok(principal)
+}
+
+async fn enforce_management_role(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    let public = path == "/"
+        || path == "/api/v1/health"
+        || path == "/api/v1/auth/login"
+        || path == "/api/v1/auth/me"
+        || path == "/api/v1/auth/logout"
+        || path == "/api/v1/auth/change-password"
+        || path == "/api/v1/clients/enroll"
+        || (path.starts_with("/api/v1/clients/") && path.ends_with("/heartbeat"));
+    if public || !path.starts_with("/api/v1/") {
+        return next.run(request).await;
+    }
+
+    let users_or_sessions = path == "/api/v1/users"
+        || path.starts_with("/api/v1/users/")
+        || path == "/api/v1/sessions"
+        || path.starts_with("/api/v1/sessions/");
+    let write = !matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    );
+    if users_or_sessions || write {
+        match management_principal(&state, request.headers()) {
+            Ok(principal)
+                if principal.role == UserRole::Administrator
+                    || (!users_or_sessions && principal.role == UserRole::Operator) => {}
+            Ok(_) => {
+                return CodedApiError(
+                    StatusCode::FORBIDDEN,
+                    "insufficient_role",
+                    "the current role cannot perform this operation",
+                )
+                .into_response();
+            }
+            Err(error) => return coded_management_error(error).into_response(),
+        }
+    }
+    next.run(request).await
+}
+
+fn authorize_management(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    management_principal(state, headers).map(|_| ())
+}
+
+fn user_management_error(error: anyhow::Error) -> CodedApiError {
+    let message = error.to_string();
+    if message.contains("username must")
+        || (message.contains("username") && message.contains("invalid"))
+    {
+        CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_username",
+            "username is invalid",
+        )
+    } else if message.contains("display name") {
+        CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_display_name",
+            "display name is invalid",
+        )
+    } else if message.contains("at least 12 characters") {
+        CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_password",
+            "password must contain at least 12 characters",
+        )
+    } else if message.contains("already exists") {
+        CodedApiError(
+            StatusCode::CONFLICT,
+            "duplicate_username",
+            "username already exists",
+        )
+    } else if message.contains("current user") || message.contains("current session") {
+        CodedApiError(
+            StatusCode::CONFLICT,
+            "current_user_protected",
+            "the current user or session is protected",
+        )
+    } else if message.contains("last administrator") {
+        CodedApiError(
+            StatusCode::CONFLICT,
+            "last_administrator_protected",
+            "the last enabled administrator is protected",
+        )
+    } else {
+        tracing::error!("User registry operation failed: {message}");
+        CodedApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "user_storage_error",
+            "user registry operation failed",
+        )
     }
 }
 
@@ -6406,8 +6821,10 @@ mod tests {
         select_certificate_maintenance_operation, session_cookie_header, tcp_history_error_total,
         udp_history_error_total, udp_metrics_response, CertificateOperation, HistoryCounters,
         LoginResponse, LoginThrottle, MetricsHistory, MetricsHistoryProtocol, MetricsHistorySample,
-        LOGIN_THROTTLE_MAX_IDENTITIES, MANAGEMENT_UI, METRICS_HISTORY_CAPACITY,
-        METRICS_HISTORY_RETENTION_SECONDS, METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS,
+        UserRole, LOGIN_THROTTLE_MAX_IDENTITIES, MANAGEMENT_UI, METRICS_HISTORY_ARCHIVE_CAPACITY,
+        METRICS_HISTORY_ARCHIVE_SAMPLE_INTERVAL_SECONDS, METRICS_HISTORY_CAPACITY,
+        METRICS_HISTORY_RECENT_RETENTION_SECONDS, METRICS_HISTORY_RETENTION_SECONDS,
+        METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS,
     };
     use crate::{
         admin_auth::SessionIdentity,
@@ -6522,7 +6939,10 @@ mod tests {
     #[test]
     fn authenticated_identity_response_has_a_fixed_account_type_without_session_secrets() {
         let response = auth_me_response(SessionIdentity {
+            session_id: Uuid::nil(),
             username: "admin".to_owned(),
+            display_name: "LinkLake Admin".to_owned(),
+            role: UserRole::Administrator,
             expires_unix_seconds: 123_456,
             password_change_required: false,
         });
@@ -6537,8 +6957,10 @@ mod tests {
         assert!(json.get("password_hash").is_none());
 
         let login = serde_json::to_value(LoginResponse {
+            session_id: Uuid::nil(),
             username: "admin".to_owned(),
-            role: "administrator",
+            display_name: "LinkLake Admin".to_owned(),
+            role: UserRole::Administrator,
             authentication_type: "session",
             expires_unix_seconds: 123_456,
             password_change_required: false,
@@ -6618,28 +7040,36 @@ mod tests {
     fn metrics_history_range_and_step_contract_is_bounded() {
         assert_eq!(parse_metrics_history_range(None), Some(("1h", 3_600, 15)));
         assert_eq!(
-            parse_metrics_history_range(Some("24h")),
-            Some(("24h", 86_400, 300))
+            parse_metrics_history_range(Some("30d")),
+            Some(("30d", 2_592_000, 9_000))
         );
-        assert!(parse_metrics_history_range(Some("7d")).is_none());
-        assert_eq!(normalize_metrics_history_step(Some(1), 300, 5), Some(5));
-        assert_eq!(normalize_metrics_history_step(Some(7), 300, 5), Some(10));
         assert_eq!(
-            normalize_metrics_history_step(Some(5), 86_400, 300),
-            Some(290)
+            parse_metrics_history_range(Some("7d")),
+            Some(("7d", 604_800, 2_100))
         );
-        assert!(normalize_metrics_history_step(Some(0), 300, 5).is_none());
-        assert!(normalize_metrics_history_step(Some(301), 300, 5).is_none());
+        assert_eq!(normalize_metrics_history_step(Some(1), 300, 5, 5), Some(5));
+        assert_eq!(normalize_metrics_history_step(Some(7), 300, 5, 5), Some(10));
+        assert_eq!(
+            normalize_metrics_history_step(Some(5), 86_400, 300, 60),
+            Some(300)
+        );
+        assert!(normalize_metrics_history_step(Some(0), 300, 5, 5).is_none());
+        assert!(normalize_metrics_history_step(Some(301), 300, 5, 5).is_none());
         assert!(
             METRICS_HISTORY_CAPACITY
-                >= (METRICS_HISTORY_RETENTION_SECONDS / METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS)
-                    as usize
+                >= (METRICS_HISTORY_RECENT_RETENTION_SECONDS
+                    / METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS) as usize
+        );
+        assert!(
+            METRICS_HISTORY_ARCHIVE_CAPACITY
+                >= (METRICS_HISTORY_RETENTION_SECONDS
+                    / METRICS_HISTORY_ARCHIVE_SAMPLE_INTERVAL_SECONDS) as usize
         );
     }
 
     #[test]
     fn metrics_history_ring_replaces_same_timestamp_and_evicts_oldest_sample() {
-        let mut history = MetricsHistory::new(3);
+        let mut history = MetricsHistory::new(3, 3);
         for timestamp in [10, 15, 20] {
             history.push(history_sample(
                 timestamp,
@@ -6681,10 +7111,11 @@ mod tests {
     }
 
     #[test]
-    fn metrics_history_hard_limits_a_full_day_to_three_hundred_points() {
-        let mut history = MetricsHistory::new(METRICS_HISTORY_CAPACITY);
+    fn metrics_history_hard_limits_thirty_days_to_three_hundred_points() {
+        let mut history =
+            MetricsHistory::new(METRICS_HISTORY_CAPACITY, METRICS_HISTORY_ARCHIVE_CAPACITY);
         for timestamp in (0..=METRICS_HISTORY_RETENTION_SECONDS)
-            .step_by(METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS as usize)
+            .step_by(METRICS_HISTORY_ARCHIVE_SAMPLE_INTERVAL_SECONDS as usize)
         {
             history.push(history_sample(
                 timestamp,
@@ -6702,18 +7133,18 @@ mod tests {
         let response = build_metrics_history_response(
             &history,
             METRICS_HISTORY_RETENTION_SECONDS,
-            "24h",
+            "30d",
             METRICS_HISTORY_RETENTION_SECONDS,
-            METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS,
+            9_000,
             MetricsHistoryProtocol::Total,
         );
         assert!(response.points.len() <= 300);
-        assert!(response.step_seconds >= 288);
+        assert!(response.step_seconds >= 8_640);
     }
 
     #[test]
     fn metrics_history_downsamples_counters_and_keeps_protocols_isolated() {
-        let mut history = MetricsHistory::new(8);
+        let mut history = MetricsHistory::new(8, 8);
         history.push(history_sample(
             100,
             HistoryCounters {
@@ -6796,7 +7227,7 @@ mod tests {
 
     #[test]
     fn secret_history_is_separate_from_tcp_and_included_in_total() {
-        let mut history = MetricsHistory::new(4);
+        let mut history = MetricsHistory::new(4, 4);
         let mut first = history_sample(100, HistoryCounters::default(), HistoryCounters::default());
         first.secret = HistoryCounters {
             bytes_from_public: 100,

@@ -34,48 +34,32 @@
         --radius-md: 15px;
         --radius-lg: 21px;
       }
-      html[data-palette="lake"] { --accent: #0896a6; --accent-soft: #0896a61c; --primary: #3568e8; --primary-soft: #3568e81a; }
-      html[data-palette="ocean"] { --accent: #0284c7; --accent-soft: #0284c71c; --primary: #1d4ed8; --primary-soft: #1d4ed81a; }
-      html[data-palette="jade"] { --accent: #059669; --accent-soft: #0596691c; --primary: #047857; --primary-soft: #0478571a; }
-      html[data-palette="violet"] { --accent: #8b5cf6; --accent-soft: #8b5cf61c; --primary: #6d28d9; --primary-soft: #6d28d91a; }
-      html[data-scheme="dark"] {
+      html[data-scheme="dark"][data-palette="lake"] {
         color-scheme: dark;
-        --bg: #07131f;
-        --bg-elevated: #0a1c2a;
-        --surface: #0b2234;
-        --surface-2: #102d42;
-        --surface-3: #071a28;
-        --surface-hover: #17364a;
+        --brand-a: #16b4bd; --brand-b: #4d7cff;
+        --accent: #16b4bd; --accent-soft: #16b4bd24; --primary: #4d7cff; --primary-soft: #4d7cff22;
+        --bg: #06131d; --bg-elevated: #0a1c28; --surface: #0c2433; --surface-2: #123246; --surface-3: #081b27; --surface-hover: #183d50;
         --text: #e8f2f7;
         --text-strong: #f7fcfe;
-        --muted: #96b2c0;
-        --faint: #6f94a4;
-        --line: #22506b;
-        --line-soft: #ffffff12;
-        --overlay: #02080ed4;
-        --shadow: #0007;
-        --chart-grid: #ffffff12;
-        --chart-label: #83a3b1;
+        --muted: #94b7c4; --faint: #6e97a7; --line: #23546c; --line-soft: #8ddbe318;
+        --overlay: #02080edb; --shadow: #0008; --chart-grid: #8ddbe31c; --chart-label: #8eb1be;
+        --success: #27bd7e; --warning: #e5a832; --danger: #ea6472; --focus-ring: #27c9d2;
       }
-      html[data-scheme="light"] {
+      html[data-scheme="light"][data-palette="lake"] {
         color-scheme: light;
-        --bg: #f4f8fb;
-        --bg-elevated: #ffffff;
-        --surface: #ffffff;
-        --surface-2: #edf4f8;
-        --surface-3: #f7fafc;
-        --surface-hover: #e8f1f6;
-        --text: #173242;
-        --text-strong: #071d2a;
-        --muted: #587382;
-        --faint: #78909d;
-        --line: #bdd1dc;
-        --line-soft: #15384b18;
-        --overlay: #17324266;
-        --shadow: #31526626;
-        --chart-grid: #15384b16;
-        --chart-label: #647f8d;
+        --brand-a: #078d9c; --brand-b: #3568e8;
+        --accent: #078d9c; --accent-soft: #078d9c18; --primary: #3568e8; --primary-soft: #3568e818;
+        --bg: #edf7f8; --bg-elevated: #fbffff; --surface: #ffffff; --surface-2: #e5f3f5; --surface-3: #f3fafb; --surface-hover: #deeff2;
+        --text: #173a45; --text-strong: #062731; --muted: #557681; --faint: #78939c; --line: #afd0d6; --line-soft: #164a5518;
+        --overlay: #173a4566; --shadow: #20556022; --chart-grid: #164a5518; --chart-label: #5b7d88;
+        --success: #11875a; --warning: #b77a08; --danger: #c64454; --focus-ring: #0caab7;
       }
+      html[data-scheme="dark"][data-palette="ocean"] { color-scheme:dark; --brand-a:#20a7ec;--brand-b:#3972ff;--accent:#20a7ec;--accent-soft:#20a7ec24;--primary:#3972ff;--primary-soft:#3972ff22;--bg:#07111f;--bg-elevated:#0b1a2d;--surface:#0d2239;--surface-2:#142f4e;--surface-3:#091a2c;--surface-hover:#193b5e;--text:#eaf3ff;--text-strong:#f8fbff;--muted:#9ab4d1;--faint:#718eaf;--line:#294e77;--line-soft:#8ac7ff18;--overlay:#020711dc;--shadow:#0009;--chart-grid:#8ac7ff1a;--chart-label:#8daaca;--success:#26bd83;--warning:#e9aa35;--danger:#ec6479;--focus-ring:#42b9f5; }
+      html[data-scheme="light"][data-palette="ocean"] { color-scheme:light; --brand-a:#0284c7;--brand-b:#1d4ed8;--accent:#0284c7;--accent-soft:#0284c718;--primary:#1d4ed8;--primary-soft:#1d4ed818;--bg:#eef5fc;--bg-elevated:#fbfdff;--surface:#fff;--surface-2:#e6f0fb;--surface-3:#f5f9fe;--surface-hover:#deebf8;--text:#183752;--text-strong:#08233b;--muted:#58738e;--faint:#7890a9;--line:#b5cbe2;--line-soft:#17436a18;--overlay:#17355266;--shadow:#244d7822;--chart-grid:#17436a18;--chart-label:#607c98;--success:#11875a;--warning:#b87a08;--danger:#c6445b;--focus-ring:#1598dc; }
+      html[data-scheme="dark"][data-palette="jade"] { color-scheme:dark; --brand-a:#25c991;--brand-b:#0a9d73;--accent:#25c991;--accent-soft:#25c99124;--primary:#0a9d73;--primary-soft:#0a9d7322;--bg:#071611;--bg-elevated:#0b2119;--surface:#0d2a20;--surface-2:#143a2d;--surface-3:#091f18;--surface-hover:#194936;--text:#e9f8f1;--text-strong:#f7fffb;--muted:#98c2b0;--faint:#6d9c89;--line:#28634c;--line-soft:#8ce7bd18;--overlay:#020b07dc;--shadow:#0009;--chart-grid:#8ce7bd1a;--chart-label:#8db7a5;--success:#32d296;--warning:#e4a936;--danger:#e96570;--focus-ring:#38d5a0; }
+      html[data-scheme="light"][data-palette="jade"] { color-scheme:light; --brand-a:#059669;--brand-b:#047857;--accent:#059669;--accent-soft:#05966918;--primary:#047857;--primary-soft:#04785718;--bg:#edf8f3;--bg-elevated:#fbfffd;--surface:#fff;--surface-2:#e4f3eb;--surface-3:#f3faf6;--surface-hover:#dcefe5;--text:#193d30;--text-strong:#09291f;--muted:#577b6d;--faint:#78978b;--line:#b4d6c7;--line-soft:#18513c18;--overlay:#173d2e66;--shadow:#245e4622;--chart-grid:#18513c18;--chart-label:#608476;--success:#087d55;--warning:#ae7509;--danger:#c54551;--focus-ring:#0aa874; }
+      html[data-scheme="dark"][data-palette="violet"] { color-scheme:dark; --brand-a:#a47aff;--brand-b:#7651e8;--accent:#a47aff;--accent-soft:#a47aff24;--primary:#7651e8;--primary-soft:#7651e822;--bg:#120d1d;--bg-elevated:#1b142a;--surface:#241a36;--surface-2:#322449;--surface-3:#1a1328;--surface-hover:#3c2b55;--text:#f3edfb;--text-strong:#fffaff;--muted:#c0add5;--faint:#9680ad;--line:#5a4175;--line-soft:#d1b5f418;--overlay:#08040edc;--shadow:#0009;--chart-grid:#d1b5f41a;--chart-label:#b49fca;--success:#35c58a;--warning:#e6aa39;--danger:#ed657d;--focus-ring:#ad83ff; }
+      html[data-scheme="light"][data-palette="violet"] { color-scheme:light; --brand-a:#8b5cf6;--brand-b:#6d28d9;--accent:#8b5cf6;--accent-soft:#8b5cf618;--primary:#6d28d9;--primary-soft:#6d28d918;--bg:#f6f1fc;--bg-elevated:#fffcff;--surface:#fff;--surface-2:#efe7f8;--surface-3:#faf6fd;--surface-hover:#e9dff4;--text:#422f55;--text-strong:#281738;--muted:#765f89;--faint:#9583a5;--line:#d1c0df;--line-soft:#4e2a6918;--overlay:#3c295066;--shadow:#593c7022;--chart-grid:#4e2a6918;--chart-label:#806d91;--success:#13845d;--warning:#ad730a;--danger:#c34559;--focus-ring:#9467f7; }
       * { box-sizing: border-box; }
       html { min-width: 320px; background: var(--bg); }
       body { min-height: 100vh; margin: 0; color: var(--text); background: var(--bg); }
@@ -98,7 +82,8 @@
       .utility-brand, .sidebar-brand, .login-brand { display: flex; align-items: center; gap: 11px; }
       .utility-brand strong, .sidebar-brand strong { color: var(--text-strong); font-size: 15px; letter-spacing: .01em; }
       .utility-brand small, .sidebar-brand small { display: block; margin-top: 2px; color: var(--faint); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
-      .utility-actions, .header-actions, .inline-actions, .drawer-actions, .filter-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+      .utility-actions, .utility-session, .header-actions, .inline-actions, .drawer-actions, .filter-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+      .utility-session { padding-left: 8px; border-left: 1px solid var(--line-soft); }
       .icon-button, .soft-button, .primary-button, .danger-button, .chip-button { min-height: 38px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 10px; font-weight: 700; transition: background .16s, border-color .16s, transform .16s, opacity .16s; }
       .icon-button, .soft-button, .chip-button { color: var(--text); background: var(--surface); }
       .icon-button:hover, .soft-button:hover, .chip-button:hover { border-color: var(--accent); background: var(--surface-hover); }
@@ -114,7 +99,7 @@
       .choice-grid.palette-grid { grid-template-columns: repeat(4, 1fr); margin-bottom: 0; }
       .choice-grid button { min-height: 38px; padding: 7px; color: var(--muted); border: 1px solid var(--line-soft); border-radius: 9px; background: var(--surface-3); }
       .choice-grid button.active { color: var(--text-strong); border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
-      .palette-swatch { display: block; width: 22px; height: 9px; margin: 0 auto 5px; border-radius: 99px; background: linear-gradient(90deg, var(--swatch-a), var(--swatch-b)); }
+      .palette-swatch { display: block; width: 30px; height: 10px; margin: 0 auto 5px; border: 1px solid #ffffff33; border-radius: 99px; background: linear-gradient(90deg, var(--swatch-bg) 0 33%, var(--swatch-surface) 33% 66%, var(--swatch-accent) 66%); }
       .login-shell { display: grid; place-items: center; min-height: calc(100vh - 64px); padding: 34px 18px 72px; }
       .login-card { width: min(470px, 100%); padding: clamp(25px, 5vw, 40px); border: 1px solid var(--line); border-radius: 25px; background: color-mix(in srgb, var(--surface) 94%, transparent); box-shadow: 0 28px 82px var(--shadow); }
       .login-brand { flex-direction: column; gap: 10px; margin-bottom: 28px; text-align: center; }
@@ -131,7 +116,7 @@
       .check-label { display: flex; grid-template-columns: none; align-items: flex-start; gap: 9px; }
       .check-label input { flex: 0 0 auto; width: 18px; min-height: 18px; margin-top: 1px; }
       .login-card form .primary-button { width: 100%; min-height: 46px; margin-top: 3px; }
-      .workspace { display: grid; grid-template-columns: 246px minmax(0, 1fr); gap: 24px; width: min(1640px, 100%); min-width: 0; max-width: 100%; margin: 0 auto; padding: 24px clamp(16px, 3vw, 34px) 50px; }
+      .workspace { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 22px; width: min(2200px, 100%); min-width: 0; max-width: 100%; margin: 0 auto; padding: 24px clamp(16px, 2.4vw, 42px) 50px; }
       .sidebar { position: sticky; top: 88px; min-width: 0; max-width: 100%; max-height: calc(100vh - 112px); overflow: auto; padding: 16px 12px; border: 1px solid var(--line); border-radius: var(--radius-lg); background: color-mix(in srgb, var(--surface) 94%, transparent); box-shadow: 0 18px 45px var(--shadow); }
       .sidebar-brand { padding: 4px 8px 18px; border-bottom: 1px solid var(--line-soft); }
       .sidebar-brand .brand-mark { width: 30px; height: 30px; }
@@ -166,7 +151,7 @@
       .section-heading p { margin-bottom: 0; font-size: 12px; }
       .panel, .chart-panel, .metric-panel, .service-card, .p2p-card, .audit-item { border: 1px solid var(--line-soft); border-radius: var(--radius-md); background: var(--surface); }
       .panel, .chart-panel, .metric-panel { padding: 16px; }
-      .kpi-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 12px; }
+      .kpi-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin-bottom: 12px; }
       .kpi-card { min-width: 0; min-height: 96px; padding: 15px; border: 1px solid var(--line-soft); border-radius: 14px; background: linear-gradient(145deg, var(--surface-2), var(--surface)); }
       .kpi-card strong { display: block; margin-bottom: 7px; color: var(--text-strong); font-size: clamp(20px, 2vw, 27px); overflow-wrap: anywhere; }
       .kpi-card span { display: block; color: var(--muted); font-size: 11px; line-height: 1.4; }
@@ -189,6 +174,12 @@
       .summary-row strong { color: var(--text); font-size: 11px; }
       .summary-row .value { color: var(--text-strong); font-weight: 800; white-space: nowrap; }
       .summary-row .detail { color: var(--faint); white-space: nowrap; }
+      .health-counters { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px; }
+      .health-counter { min-width: 58px; padding: 5px 7px; border-radius: 8px; color: var(--muted); background: var(--surface); text-align: center; }
+      .health-counter strong { display: block; color: var(--text-strong); font-size: 13px; }
+      .health-counter.online strong { color: var(--success); }
+      .health-counter.offline strong { color: var(--warning); }
+      .health-counter.disabled strong { color: var(--faint); }
       .alert-list { display: grid; gap: 7px; }
       .alert-item { padding: 9px 11px; border-left: 3px solid var(--warning); border-radius: 8px; color: var(--text); background: color-mix(in srgb, var(--warning) 12%, var(--surface-3)); font-size: 11px; }
       .normal-state { padding: 10px 11px; border-left: 3px solid var(--success); border-radius: 8px; color: var(--text); background: color-mix(in srgb, var(--success) 11%, var(--surface-3)); font-size: 11px; }
@@ -267,6 +258,18 @@
       .audit-detail dt { color: var(--faint); }
       .audit-detail dd { margin: 0; color: var(--text); }
       .load-more { display: block; min-width: 150px; margin: 14px auto 0; }
+      .data-table-wrap { overflow-x: auto; border: 1px solid var(--line-soft); border-radius: var(--radius-md); background: var(--surface); }
+      .data-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+      .data-table th, .data-table td { padding: 11px 12px; border-bottom: 1px solid var(--line-soft); text-align: left; vertical-align: middle; white-space: nowrap; }
+      .data-table th { color: var(--faint); background: var(--surface-3); font-size: 10px; text-transform: uppercase; letter-spacing: .05em; }
+      .data-table tr:last-child td { border-bottom: 0; }
+      .data-table td:first-child { color: var(--text-strong); font-weight: 800; }
+      .table-actions { display: flex; flex-wrap: wrap; gap: 5px; justify-content: flex-end; }
+      .table-actions button { min-height: 30px; padding: 5px 8px; font-size: 10px; }
+      .access-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 12px; }
+      .role-note { margin: 0; font-size: 11px; }
+      .user-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+      .user-form-grid .full { grid-column: 1 / -1; }
       .modal-backdrop { position: fixed; inset: 0; z-index: 110; display: grid; place-items: center; padding: 20px; background: var(--overlay); }
       .modal { width: min(440px, 100%); padding: 20px; border: 1px solid var(--line); border-radius: var(--radius-lg); background: var(--bg-elevated); box-shadow: 0 28px 70px var(--shadow); }
       .modal-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
@@ -293,6 +296,7 @@
         .workspace { padding-top: 16px; }
         .workspace-header, .section-heading, .service-header, .panel-heading { align-items: flex-start; flex-direction: column; }
         .header-actions { justify-content: flex-start; }
+        .utility-session .time-pill, .utility-session .health-pill { display: none; }
         .range-switch { width: 100%; max-width: 100%; overflow-x: auto; justify-content: flex-start; }
         .range-switch button { flex: 0 0 auto; }
         .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -308,11 +312,15 @@
         .audit-summary { grid-template-columns: 92px minmax(0, 1fr) 20px; }
         .audit-subject { display: none; }
         .audit-detail { padding-left: 12px; }
+        .access-toolbar { align-items: stretch; flex-direction: column; }
+        .user-form-grid { grid-template-columns: 1fr; }
+        .user-form-grid .full { grid-column: auto; }
       }
       @media (max-width: 520px) {
         .utility-bar { min-height: 58px; padding: 10px 12px; }
         .utility-brand .brand-mark { width: 28px; height: 28px; }
         .utility-actions .button-label { display: none; }
+        .utility-session { padding-left: 0; border-left: 0; }
         .login-shell { min-height: calc(100vh - 58px); padding: 22px 12px 55px; }
         .login-card { padding: 24px 19px; }
         .login-brand .brand-mark { width: 58px; height: 58px; }
@@ -329,6 +337,9 @@
         .drawer-actions button { flex: 1; min-width: 0; }
         .bar-row { grid-template-columns: minmax(90px, 1fr) minmax(70px, 1.3fr) auto; }
       }
+      @media (min-width: 1600px) {
+        .metrics-layout .metric-panel { grid-column: span 4; }
+      }
       @media (prefers-reduced-motion: reduce) {
         *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; }
       }
@@ -341,11 +352,26 @@
         <span><strong>LinkLake</strong><small data-i18n="console">Management Console</small></span>
       </a>
       <div class="utility-actions">
+        <div id="utility-session" class="utility-session hidden">
+          <span class="health-pill"><span class="health-dot"></span><span data-i18n="serverOnline">Server online</span></span>
+          <span id="last-refresh" class="time-pill">—</span>
+          <button id="refresh" class="icon-button" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0 2 5M20 4v7h-7"/></svg><span class="button-label" data-i18n="refresh">Refresh</span></button>
+        </div>
         <button id="appearance-button" class="icon-button" type="button" aria-haspopup="dialog" aria-controls="appearance-popover" aria-expanded="false">
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.41M17.66 6.34l1.41-1.41"/></svg>
           <span class="button-label" data-i18n="appearance">Appearance</span>
         </button>
         <button id="language" class="icon-button" type="button" aria-label="Switch language">ZH</button>
+        <div id="account-shell" class="account-wrap hidden">
+          <button id="account-button" class="icon-button account-button" type="button" aria-haspopup="menu" aria-expanded="false"><span id="account-avatar" class="avatar">A</span><span id="account-name" class="button-label">admin</span></button>
+          <div id="account-menu" class="account-menu hidden" role="menu">
+            <div class="account-card"><strong id="account-menu-name">admin</strong><small id="account-menu-role"></small><small id="account-menu-expiry"></small></div>
+            <div class="menu-list">
+              <button id="account-password" type="button" role="menuitem" data-i18n="changePassword">Change password</button>
+              <button id="logout" type="button" role="menuitem" data-i18n="signOut">Sign out</button>
+            </div>
+          </div>
+        </div>
       </div>
     </header>
 
@@ -358,10 +384,10 @@
       </div>
       <h3 data-i18n="palette">Palette</h3>
       <div class="choice-grid palette-grid" aria-label="Color palette">
-        <button type="button" data-palette-choice="lake"><span class="palette-swatch" style="--swatch-a:#0896a6;--swatch-b:#3568e8"></span><span data-i18n="paletteLake">Lake</span></button>
-        <button type="button" data-palette-choice="ocean"><span class="palette-swatch" style="--swatch-a:#0284c7;--swatch-b:#1d4ed8"></span><span data-i18n="paletteOcean">Ocean</span></button>
-        <button type="button" data-palette-choice="jade"><span class="palette-swatch" style="--swatch-a:#059669;--swatch-b:#047857"></span><span data-i18n="paletteJade">Jade</span></button>
-        <button type="button" data-palette-choice="violet"><span class="palette-swatch" style="--swatch-a:#8b5cf6;--swatch-b:#6d28d9"></span><span data-i18n="paletteViolet">Violet</span></button>
+        <button type="button" data-palette-choice="lake"><span class="palette-swatch" style="--swatch-bg:#06131d;--swatch-surface:#0c2433;--swatch-accent:#16b4bd"></span><span data-i18n="paletteLake">Lake</span></button>
+        <button type="button" data-palette-choice="ocean"><span class="palette-swatch" style="--swatch-bg:#07111f;--swatch-surface:#0d2239;--swatch-accent:#20a7ec"></span><span data-i18n="paletteOcean">Ocean</span></button>
+        <button type="button" data-palette-choice="jade"><span class="palette-swatch" style="--swatch-bg:#071611;--swatch-surface:#0d2a20;--swatch-accent:#25c991"></span><span data-i18n="paletteJade">Jade</span></button>
+        <button type="button" data-palette-choice="violet"><span class="palette-swatch" style="--swatch-bg:#120d1d;--swatch-surface:#241a36;--swatch-accent:#a47aff"></span><span data-i18n="paletteViolet">Violet</span></button>
       </div>
     </div>
 
@@ -409,6 +435,9 @@
               <a class="nav-link" href="#/services/acme" data-view="services" data-service-route="acme">ACME</a>
             </div>
             <a class="nav-link" href="#/p2p" data-view="p2p" data-route-prefix="p2p"><span class="nav-icon">◎</span><span data-i18n="p2p">P2P network</span></a>
+            <div class="nav-group-label admin-only" data-i18n="accessControl">Access control</div>
+            <a class="nav-link admin-only" href="#/users" data-view="users" data-route-prefix="users"><span class="nav-icon">♙</span><span data-i18n="userManagement">Users</span></a>
+            <a class="nav-link admin-only" href="#/sessions" data-view="sessions" data-route-prefix="sessions"><span class="nav-icon">◫</span><span data-i18n="securitySessions">Security & sessions</span></a>
             <a class="nav-link" href="#/activity" data-view="activity" data-route-prefix="activity"><span class="nav-icon">◌</span><span data-i18n="activity">Activity</span></a>
           </nav>
         </aside>
@@ -416,29 +445,12 @@
         <section class="workspace-main">
           <header class="workspace-header">
             <div><h1 id="workspace-title">Overview</h1><p id="workspace-subtitle"></p></div>
-            <div class="header-actions">
-              <span class="health-pill"><span class="health-dot"></span><span data-i18n="serverOnline">Server online</span></span>
-              <span id="last-refresh" class="time-pill">—</span>
-              <button id="refresh" class="icon-button" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0 2 5M20 4v7h-7"/></svg><span class="button-label" data-i18n="refresh">Refresh</span></button>
-              <div class="account-wrap">
-                <button id="account-button" class="icon-button account-button" type="button" aria-haspopup="menu" aria-expanded="false"><span id="account-avatar" class="avatar">A</span><span id="account-name" class="button-label">admin</span></button>
-                <div id="account-menu" class="account-menu hidden" role="menu">
-                  <div class="account-card"><strong id="account-menu-name">admin</strong><small id="account-menu-role"></small><small id="account-menu-expiry"></small></div>
-                  <div class="menu-list">
-                    <button id="account-password" type="button" role="menuitem" data-i18n="changePassword">Change password</button>
-                    <button id="account-appearance" type="button" role="menuitem" data-i18n="appearance">Appearance</button>
-                    <button id="account-language" type="button" role="menuitem" data-i18n="language">Language</button>
-                    <button id="logout" type="button" role="menuitem" data-i18n="signOut">Sign out</button>
-                  </div>
-                </div>
-              </div>
-            </div>
           </header>
 
           <section id="overview-view" class="view-panel hidden">
             <div id="overview-kpis" class="kpi-grid"></div>
             <section class="chart-panel">
-              <div class="panel-heading"><div><h3 data-i18n="trafficTrend">Traffic trend</h3><p data-i18n="trafficTrendHelp">Server-side traffic history retained for up to 24 hours and restarted with the service.</p></div><div class="range-switch" aria-label="Traffic range"><button type="button" data-trend-range="5m">5m</button><button type="button" data-trend-range="15m" class="active">15m</button><button type="button" data-trend-range="1h">1h</button><button type="button" data-trend-range="6h">6h</button><button type="button" data-trend-range="24h">24h</button></div></div>
+              <div class="panel-heading"><div><h3 data-i18n="trafficTrend">Traffic trend</h3><p data-i18n="trafficTrendHelp">Server-side traffic history retained for up to 30 days and restarted with the service.</p></div><div class="range-switch" aria-label="Traffic range"><button type="button" data-trend-range="1h" class="active">1h</button><button type="button" data-trend-range="12h">12h</button><button type="button" data-trend-range="1d">1d</button><button type="button" data-trend-range="7d">7d</button><button type="button" data-trend-range="30d">30d</button></div></div>
               <div class="chart-wrap"><canvas id="traffic-chart" role="img" aria-label="Inbound and outbound traffic trend"></canvas><div id="traffic-tooltip" class="chart-tooltip hidden"></div></div>
               <p id="traffic-chart-summary" class="sr-only" aria-live="polite"></p>
             </section>
@@ -469,6 +481,17 @@
 
           <section id="p2p-view" class="view-panel hidden"><div class="section-heading"><div><h2 data-i18n="p2p">P2P network</h2><p data-i18n="p2pSubtitle">Inspect direct candidates, NAT mappings and relay fallback.</p></div></div><div id="p2p-list" class="p2p-list"></div></section>
 
+          <section id="users-view" class="view-panel hidden">
+            <div class="access-toolbar"><div><h2 data-i18n="userManagement">User management</h2><p class="role-note" data-i18n="userManagementHelp">Create accounts, assign roles and control access.</p></div><button id="new-user" class="primary-button" type="button" data-i18n="newUser">New user</button></div>
+            <div class="service-toolbar"><label class="sr-only" for="user-search" data-i18n="search">Search</label><input id="user-search" type="search" data-placeholder="searchUsers" /><label class="sr-only" for="user-role-filter" data-i18n="role">Role</label><select id="user-role-filter"><option value="all" data-i18n="allRoles">All roles</option><option value="administrator" data-i18n="roleAdministrator">Administrator</option><option value="operator" data-i18n="roleOperator">Operator</option><option value="auditor" data-i18n="roleAuditor">Auditor</option></select><span id="user-count" class="time-pill">0</span></div>
+            <div class="data-table-wrap"><table class="data-table"><thead><tr><th data-i18n="username">Username</th><th data-i18n="displayName">Display name</th><th data-i18n="role">Role</th><th data-i18n="status">Status</th><th data-i18n="lastLogin">Last login</th><th data-i18n="activeSessions">Active sessions</th><th data-i18n="actions">Actions</th></tr></thead><tbody id="users-list"></tbody></table></div>
+          </section>
+
+          <section id="sessions-view" class="view-panel hidden">
+            <div class="section-heading"><div><h2 data-i18n="securitySessions">Security & sessions</h2><p data-i18n="securitySessionsHelp">Review active sign-ins and revoke sessions that are no longer trusted.</p></div></div>
+            <div class="data-table-wrap"><table class="data-table"><thead><tr><th data-i18n="username">Username</th><th data-i18n="sessionId">Session ID</th><th data-i18n="createdAt">Created</th><th data-i18n="expiresAt">Expires</th><th data-i18n="actions">Actions</th></tr></thead><tbody id="sessions-list"></tbody></table></div>
+          </section>
+
           <section id="activity-view" class="view-panel hidden">
             <div class="section-heading"><div><h2 data-i18n="activity">Activity</h2><p data-i18n="activitySubtitle">Filter and inspect administrator, policy and tunnel events.</p></div></div>
             <div class="activity-toolbar"><label class="sr-only" for="audit-search" data-i18n="search">Search</label><input id="audit-search" type="search" data-placeholder="searchActivity" /><label class="sr-only" for="audit-category" data-i18n="category">Category</label><select id="audit-category"><option value="all" data-i18n="allCategories">All categories</option><option value="management" data-i18n="categoryManagement">Management</option><option value="policy" data-i18n="categoryPolicy">Policies</option><option value="client" data-i18n="categoryClient">Clients</option><option value="p2p" data-i18n="categoryP2p">P2P</option><option value="certificate" data-i18n="categoryCertificate">Certificates</option></select><span id="audit-count" class="time-pill">0</span></div>
@@ -488,6 +511,14 @@
       <section class="modal" role="dialog" aria-modal="true" aria-labelledby="password-modal-title"><div class="modal-header"><div><h2 id="password-modal-title" data-i18n="changePassword">Change password</h2><p data-i18n="passwordRequirement">Use at least 12 characters.</p></div><button id="password-modal-close" class="icon-button" type="button" aria-label="Close">×</button></div><form id="password-form"><label><span data-i18n="newPassword">New password</span><input id="account-new-password" type="password" autocomplete="new-password" minlength="12" required /></label><label><span data-i18n="confirmPassword">Confirm password</span><input id="account-confirm-password" type="password" autocomplete="new-password" minlength="12" required /></label><div class="drawer-actions" style="position:static;margin:4px 0 0;padding:0;border:0;background:none"><button id="password-cancel" class="soft-button" type="button" data-i18n="cancel">Cancel</button><button class="primary-button" type="submit" data-i18n="changePassword">Change password</button></div></form></section>
     </div>
 
+    <div id="user-modal" class="modal-backdrop hidden" role="presentation">
+      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="user-modal-title"><div class="modal-header"><div><h2 id="user-modal-title" data-i18n="newUser">New user</h2><p id="user-modal-help" data-i18n="userFormHelp">Passwords must contain at least 12 characters.</p></div><button id="user-modal-close" class="icon-button" type="button" aria-label="Close">×</button></div><form id="user-form"><div class="user-form-grid"><label><span data-i18n="username">Username</span><input id="user-username" type="text" minlength="3" maxlength="64" required /></label><label><span data-i18n="displayName">Display name</span><input id="user-display-name" type="text" maxlength="80" required /></label><label><span data-i18n="role">Role</span><select id="user-role"><option value="administrator" data-i18n="roleAdministrator">Administrator</option><option value="operator" data-i18n="roleOperator">Operator</option><option value="auditor" data-i18n="roleAuditor">Auditor</option></select></label><label id="user-password-label"><span data-i18n="password">Password</span><input id="user-password" type="password" minlength="12" /></label><label id="user-enabled-label" class="check-label full hidden"><input id="user-enabled" type="checkbox" checked /><span data-i18n="enabled">Enabled</span></label><label id="user-force-change-label" class="check-label full"><input id="user-force-change" type="checkbox" checked /><span data-i18n="forcePasswordChange">Require password change at next sign-in</span></label></div><div class="drawer-actions" style="position:static;margin:18px 0 0;padding:0;border:0;background:none"><button id="user-cancel" class="soft-button" type="button" data-i18n="cancel">Cancel</button><button class="primary-button" type="submit" data-i18n="save">Save</button></div></form></section>
+    </div>
+
+    <div id="reset-password-modal" class="modal-backdrop hidden" role="presentation">
+      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="reset-password-title"><div class="modal-header"><div><h2 id="reset-password-title" data-i18n="resetPassword">Reset password</h2><p data-i18n="userFormHelp">Passwords must contain at least 12 characters.</p></div><button id="reset-password-close" class="icon-button" type="button" aria-label="Close">×</button></div><form id="reset-password-form"><label><span data-i18n="newPassword">New password</span><input id="reset-password-value" type="password" minlength="12" required /></label><label class="check-label"><input id="reset-force-change" type="checkbox" checked /><span data-i18n="forcePasswordChange">Require password change at next sign-in</span></label><div class="drawer-actions" style="position:static;margin:18px 0 0;padding:0;border:0;background:none"><button id="reset-password-cancel" class="soft-button" type="button" data-i18n="cancel">Cancel</button><button class="primary-button" type="submit" data-i18n="resetPassword">Reset password</button></div></form></section>
+    </div>
+
     <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
 
     <script>
@@ -498,8 +529,8 @@
           title: 'LinkLake Management Console', console: 'Management Console', appearance: 'Appearance', themeSystem: 'System', themeLight: 'Light', themeDark: 'Dark', palette: 'Palette', paletteLake: 'Lake', paletteOcean: 'Ocean', paletteJade: 'Jade', paletteViolet: 'Violet',
           loginTitle: 'Sign in to LinkLake', loginIntro: 'Use an administrator account to manage clients, forwarding services and runtime health.', username: 'Username', password: 'Password', usernamePlaceholder: 'Administrator username', passwordPlaceholder: 'Password', signIn: 'Sign in', newPassword: 'New password', confirmPassword: 'Confirm password', changePassword: 'Change password', passwordRequirement: 'Use at least 12 characters.', passwordsMismatch: 'The passwords do not match.',
           overview: 'Overview', overviewSubtitle: 'Service health, live traffic and active alerts at a glance.', metrics: 'Runtime metrics', metricsSubtitle: 'Protocol activity, failure composition and infrastructure health.', services: 'Services', p2p: 'P2P network', p2pSubtitle: 'Inspect direct candidates, NAT mappings and relay fallback.', activity: 'Activity', activitySubtitle: 'Filter and inspect administrator, policy and tunnel events.', portGroupsShort: 'Ports', secretShort: 'Secret', httpProxyShort: 'Proxy',
-          serverOnline: 'Server online', refresh: 'Refresh', refreshed: 'Updated', language: 'Language', signOut: 'Sign out', roleAdministrator: 'Administrator', sessionExpires: 'Session expires {time}', authenticationSession: 'Cookie session',
-          trafficTrend: 'Traffic trend', trafficTrendHelp: 'Server-side traffic history retained for up to 24 hours and restarted with the service.', inbound: 'Inbound', outbound: 'Outbound', activeSessions: 'Active sessions', noTrendData: 'Waiting for enough samples to calculate throughput.', noTrafficRange: 'No traffic in the selected range.',
+          serverOnline: 'Server online', refresh: 'Refresh', refreshed: 'Updated', language: 'Language', signOut: 'Sign out', roleAdministrator: 'Administrator', roleOperator: 'Operator', roleAuditor: 'Auditor', role: 'Role', sessionExpires: 'Session expires {time}', authenticationSession: 'Cookie session',
+          trafficTrend: 'Traffic trend', trafficTrendHelp: 'Server-side traffic history is retained for up to 30 days and restarts with the service.', inbound: 'Inbound', outbound: 'Outbound', activeSessions: 'Active sessions', noTrendData: 'Waiting for enough samples to calculate throughput.', noTrafficRange: 'No traffic in the selected range.',
           serviceHealth: 'Service health', serviceHealthHelp: 'Online policies by protocol.', certificateSummary: 'Certificates', alerts: 'Alerts', noAlerts: 'No active alerts.', clients: 'Clients', forwardingServices: 'Forwarding services', p2pNodes: 'Fresh / total P2P nodes', totalTraffic: 'Total traffic', configIssues: 'Configuration issues',
           protocolActivity: 'Protocol activity', protocolActivityHelp: 'Current active connections and sessions.', failureOverview: 'Failure overview', failureOverviewHelp: 'Cumulative failures since server startup.', serverUptime: 'Server uptime', requestsTotal: 'Requests', failuresTotal: 'Failures', reconnects: 'Reconnects', authenticationFailures: 'Authentication failures',
           tcpMetrics: 'TCP', udpMetrics: 'UDP', webMetrics: 'Web / TLS', proxyMetrics: 'Forward proxies', p2pMetrics: 'P2P', certificateMetrics: 'Certificates / ACME', systemMetrics: 'System', active: 'Active', pending: 'Pending', sessions: 'Sessions', packets: 'Packets', traffic: 'Traffic in / out', rejected: 'Rejected', failed: 'Failed', timeouts: 'Timeouts', transportErrors: 'Transport errors', drops: 'Drops', connections: 'Connections', direct: 'Direct', relay: 'Relay', managed: 'Managed', valid: 'Valid', expiring: 'Expiring soon', expired: 'Expired', nearestExpiry: 'Nearest expiry', orders: 'Orders', renewals: 'Renewals', challenges: 'HTTP-01 challenges',
@@ -515,14 +546,15 @@
           auditLogin: 'Administrator signed in', auditLoginFailed: 'Administrator sign-in failed', auditPasswordChanged: 'Administrator password changed', auditLogout: 'Administrator signed out', auditClientEnrolled: 'Client enrolled', auditPolicyCreated: 'Policy created', auditPolicyUpdated: 'Policy updated', auditPolicyDeleted: 'Policy deleted', auditRegistered: 'Service registered', auditAcmeUpdated: 'ACME settings updated', auditCertificateStarted: 'Certificate operation started', auditCertificateSucceeded: 'Certificate operation succeeded', auditCertificateFailed: 'Certificate operation failed', auditP2pUpdated: 'P2P candidates updated', auditP2pDirect: 'P2P direct connection established', auditP2pRelay: 'P2P connection fell back to relay',
           signInFailed: 'Sign-in failed. Check the username and password.', signingIn: 'Signing in…', changeRequired: 'Change the initial password before using the management console.', changingPassword: 'Changing password…', passwordChanged: 'Password changed.', passwordChangeFailed: 'Unable to change the password. Use at least 12 characters.', signedOut: 'Signed out.', sessionExpired: 'The administrator session expired. Sign in again.', requestFailed: 'The server did not respond. Check the server and network connection.', statusFailed: 'Unable to load management data.', invalidResponse: 'The server returned an invalid response.',
           configIssueAlert: '{count} client configuration issue(s)', certificateExpiredAlert: '{count} expired certificate(s)', certificateExpiringAlert: '{count} certificate(s) expire within 30 days', authenticationFailureAlert: '{count} authentication failure(s) since startup', transportErrorAlert: '{count} transport or handshake error(s) since startup',
+          accessControl: 'Access control', userManagement: 'User management', userManagementHelp: 'Create accounts, assign roles and control access.', securitySessions: 'Security & sessions', securitySessionsHelp: 'Review active sign-ins and revoke sessions that are no longer trusted.', newUser: 'New user', displayName: 'Display name', lastLogin: 'Last login', actions: 'Actions', sessionId: 'Session ID', createdAt: 'Created', expiresAt: 'Expires', forcePasswordChange: 'Require password change at next sign-in', resetPassword: 'Reset password', revokeSessions: 'Revoke sessions', revoke: 'Revoke', userFormHelp: 'Passwords must contain at least 12 characters.', userCreated: 'User created.', userUpdated: 'User updated.', userDeleted: 'User deleted.', passwordReset: 'Password reset.', sessionsRevoked: 'Sessions revoked.', confirmUserDelete: 'Delete user {username}?', confirmRevokeSessions: 'Revoke every session for {username}?', confirmRevokeSession: 'Revoke this session?', never: 'Never', mustChangePassword: 'Must change password', currentSession: 'Current session', total: 'Total', searchUsers: 'Search username or display name', allRoles: 'All roles', userCount: '{visible} of {total}',
           allowedPorts: 'Allowed: {ports}', reservedPorts: 'reserved: {ports}', errorUnknownClient: 'The selected client does not exist.', errorInvalidName: 'The name must contain 1 to 80 characters.', errorInvalidPort: 'The public port is outside the server policy. {ports}.', errorDuplicatePort: 'This public port is already assigned.', errorInvalidTarget: 'Use a valid host:port target.', errorInvalidHostname: 'The hostname is invalid.', errorDuplicateHostname: 'The hostname is already assigned.', errorInvalidLimit: 'One of the configured limits is invalid.', errorStorage: 'Policy storage is unavailable. Check the data directory and server log.', errorUnknownPolicy: 'The policy does not exist.', errorInvalidUsername: 'The proxy username is invalid.', errorInvalidPortExpression: 'Use single ports, comma-separated lists or ascending ranges.', errorPortCountMismatch: 'Public and target port counts must match.', errorDuplicatePortInGroup: 'A port appears more than once in this group.', errorTooManyMappings: 'A port group can contain at most 256 mappings.', errorAcme: 'The ACME request failed. Check the settings, DNS and server log.'
         },
         zh: {
           title: 'LinkLake 管理控制台', console: '管理控制台', appearance: '外观', themeSystem: '跟随系统', themeLight: '浅色', themeDark: '深色', palette: '配色', paletteLake: '湖蓝', paletteOcean: '海洋', paletteJade: '翡翠', paletteViolet: '紫罗兰',
           loginTitle: '登录 LinkLake', loginIntro: '使用管理员账户登录，管理客户端、转发服务与运行状态。', username: '用户名', password: '密码', usernamePlaceholder: '管理员用户名', passwordPlaceholder: '密码', signIn: '登录', newPassword: '新密码', confirmPassword: '确认密码', changePassword: '修改密码', passwordRequirement: '密码至少需要 12 位。', passwordsMismatch: '两次输入的密码不一致。',
           overview: '总览', overviewSubtitle: '集中查看服务健康、实时流量和活动告警。', metrics: '运行指标', metricsSubtitle: '查看协议活动、故障构成和基础设施健康状态。', services: '服务与转发', p2p: 'P2P 网络', p2pSubtitle: '查看直连候选、NAT 映射和中继回退。', activity: '活动', activitySubtitle: '筛选并检查管理员、策略和隧道事件。', portGroupsShort: '端口组', secretShort: '私密', httpProxyShort: '代理',
-          serverOnline: '服务在线', refresh: '刷新', refreshed: '更新时间', language: '语言', signOut: '退出登录', roleAdministrator: '管理员', sessionExpires: '会话到期时间：{time}', authenticationSession: 'Cookie 会话',
-          trafficTrend: '流量趋势', trafficTrendHelp: '显示服务端最多保留 24 小时的流量历史，服务重启后重新累计。', inbound: '入站', outbound: '出站', activeSessions: '活跃会话', noTrendData: '正在等待足够的样本以计算实时速率。', noTrafficRange: '所选时间范围内没有流量。',
+          serverOnline: '服务在线', refresh: '刷新', refreshed: '更新时间', language: '语言', signOut: '退出登录', roleAdministrator: '管理员', roleOperator: '运维人员', roleAuditor: '审计人员', role: '用户组', sessionExpires: '会话到期时间：{time}', authenticationSession: 'Cookie 会话',
+          trafficTrend: '流量趋势', trafficTrendHelp: '服务端最多保留 30 天流量历史，服务重启后重新累计。', inbound: '入站', outbound: '出站', activeSessions: '活跃会话', noTrendData: '正在等待足够的样本以计算实时速率。', noTrafficRange: '所选时间范围内没有流量。',
           serviceHealth: '服务健康度', serviceHealthHelp: '按协议查看在线策略数量。', certificateSummary: '证书摘要', alerts: '告警', noAlerts: '当前没有活动告警。', clients: '客户端', forwardingServices: '转发服务', p2pNodes: '新鲜 / 全部 P2P 节点', totalTraffic: '累计流量', configIssues: '配置问题',
           protocolActivity: '协议活动', protocolActivityHelp: '当前活跃连接和会话。', failureOverview: '故障概览', failureOverviewHelp: '服务启动以来的累计故障。', serverUptime: '运行时间', requestsTotal: '请求数', failuresTotal: '故障数', reconnects: '重连次数', authenticationFailures: '认证失败',
           tcpMetrics: 'TCP', udpMetrics: 'UDP', webMetrics: '网站 / TLS', proxyMetrics: '正向代理', p2pMetrics: 'P2P', certificateMetrics: '证书 / ACME', systemMetrics: '系统', active: '活跃', pending: '待配对', sessions: '会话', packets: '数据包', traffic: '入站 / 出站流量', rejected: '拒绝', failed: '失败', timeouts: '超时', transportErrors: '传输错误', drops: '丢弃', connections: '连接', direct: '直连', relay: '中继', managed: '托管', valid: '有效', expiring: '即将到期', expired: '已过期', nearestExpiry: '最近到期', orders: '订单', renewals: '续期', challenges: 'HTTP-01 挑战',
@@ -538,6 +570,7 @@
           auditLogin: '管理员已登录', auditLoginFailed: '管理员登录失败', auditPasswordChanged: '管理员密码已修改', auditLogout: '管理员已退出', auditClientEnrolled: '客户端已注册', auditPolicyCreated: '策略已创建', auditPolicyUpdated: '策略已更新', auditPolicyDeleted: '策略已删除', auditRegistered: '服务已注册', auditAcmeUpdated: 'ACME 设置已更新', auditCertificateStarted: '证书任务已开始', auditCertificateSucceeded: '证书任务已成功', auditCertificateFailed: '证书任务失败', auditP2pUpdated: 'P2P 候选地址已更新', auditP2pDirect: 'P2P 直连已建立', auditP2pRelay: 'P2P 连接已回退到中继',
           signInFailed: '登录失败，请检查用户名和密码。', signingIn: '正在登录…', changeRequired: '请先修改初始密码，再使用管理控制台。', changingPassword: '正在修改密码…', passwordChanged: '密码已修改。', passwordChangeFailed: '无法修改密码，请使用至少 12 位的新密码。', signedOut: '已退出登录。', sessionExpired: '管理员会话已过期，请重新登录。', requestFailed: '服务端没有响应，请检查服务和网络连接。', statusFailed: '无法加载管理数据。', invalidResponse: '服务端返回了无效响应。',
           configIssueAlert: '{count} 个客户端配置存在问题', certificateExpiredAlert: '{count} 张证书已过期', certificateExpiringAlert: '{count} 张证书将在 30 天内到期', authenticationFailureAlert: '服务启动以来发生 {count} 次认证失败', transportErrorAlert: '服务启动以来发生 {count} 次传输或握手错误',
+          accessControl: '访问控制', userManagement: '用户管理', userManagementHelp: '创建账户、分配用户组并控制访问权限。', securitySessions: '安全与会话', securitySessionsHelp: '检查当前登录并撤销不再可信的会话。', newUser: '新建用户', displayName: '显示名称', lastLogin: '最后登录', actions: '操作', sessionId: '会话 ID', createdAt: '创建时间', expiresAt: '到期时间', forcePasswordChange: '下次登录时必须修改密码', resetPassword: '重置密码', revokeSessions: '撤销会话', revoke: '撤销', userFormHelp: '密码至少需要 12 位。', userCreated: '用户已创建。', userUpdated: '用户已更新。', userDeleted: '用户已删除。', passwordReset: '密码已重置。', sessionsRevoked: '会话已撤销。', confirmUserDelete: '确定删除用户 {username} 吗？', confirmRevokeSessions: '确定撤销 {username} 的全部会话吗？', confirmRevokeSession: '确定撤销该会话吗？', never: '从未登录', mustChangePassword: '需要修改密码', currentSession: '当前会话', total: '总计', searchUsers: '搜索用户名或显示名称', allRoles: '全部用户组', userCount: '显示 {visible} / {total}',
           allowedPorts: '允许范围：{ports}', reservedPorts: '保留端口：{ports}', errorUnknownClient: '所选客户端不存在。', errorInvalidName: '名称长度必须为 1 到 80 个字符。', errorInvalidPort: '公网端口不符合服务端策略。{ports}。', errorDuplicatePort: '该公网端口已被占用。', errorInvalidTarget: '请使用有效的 host:port 目标地址。', errorInvalidHostname: '域名格式无效。', errorDuplicateHostname: '该域名已被占用。', errorInvalidLimit: '某项限制参数无效。', errorStorage: '策略存储不可用，请检查数据目录和服务端日志。', errorUnknownPolicy: '策略不存在。', errorInvalidUsername: '代理用户名格式无效。', errorInvalidPortExpression: '请使用单端口、逗号列表或升序范围。', errorPortCountMismatch: '公网端口与目标端口数量必须一致。', errorDuplicatePortInGroup: '端口组内存在重复端口。', errorTooManyMappings: '一个端口组最多包含 256 个映射。', errorAcme: 'ACME 请求失败，请检查设置、DNS 和服务端日志。'
         }
       };
@@ -648,7 +681,7 @@
         loading: false,
         pendingLoad: false,
         trafficHistory: [],
-        trendRangeMinutes: 15,
+        trendRange: '1h',
         lastTrafficTotals: null,
         drawer: { open: false, type: null, id: null, dirty: false, values: null },
         serviceSearch: '',
@@ -657,18 +690,26 @@
         auditSearch: '',
         auditCategory: 'all',
         expandedAudit: new Set(),
+        userSearch: '',
+        userRole: 'all',
+        users: [],
+        sessions: [],
+        userEditor: { mode: 'create', username: null },
+        resetUsername: null,
         toastTimer: null,
         activeControllers: new Set()
       };
 
       const elements = Object.fromEntries([
-        'theme-color', 'appearance-button', 'appearance-popover', 'language', 'login-shell', 'login', 'username', 'password', 'initial-password-form', 'initial-new-password', 'initial-confirm-password', 'workspace', 'workspace-title', 'workspace-subtitle', 'last-refresh', 'refresh', 'account-button', 'account-avatar', 'account-name', 'account-menu', 'account-menu-name', 'account-menu-role', 'account-menu-expiry', 'account-password', 'account-appearance', 'account-language', 'logout',
+        'theme-color', 'appearance-button', 'appearance-popover', 'language', 'utility-session', 'account-shell', 'login-shell', 'login', 'username', 'password', 'initial-password-form', 'initial-new-password', 'initial-confirm-password', 'workspace', 'workspace-title', 'workspace-subtitle', 'last-refresh', 'refresh', 'account-button', 'account-avatar', 'account-name', 'account-menu', 'account-menu-name', 'account-menu-role', 'account-menu-expiry', 'account-password', 'logout',
         'overview-view', 'overview-kpis', 'traffic-chart', 'traffic-tooltip', 'traffic-chart-summary', 'service-health-summary', 'overview-alert-panel', 'overview-alerts',
         'metrics-view', 'metrics-kpis', 'activity-chart', 'failure-chart', 'tcp-metric-panel', 'udp-metric-panel', 'proxy-metric-panel', 'web-metric-panel', 'network-health-panel', 'system-metric-panel',
         'services-view', 'service-title', 'service-subtitle', 'new-policy', 'service-toolbar', 'service-search', 'service-status-filter', 'service-count', 'service-list', 'acme-page',
-        'p2p-view', 'p2p-list', 'activity-view', 'audit-search', 'audit-category', 'audit-count', 'audit-list', 'audit-load-more',
+        'p2p-view', 'p2p-list', 'users-view', 'new-user', 'user-search', 'user-role-filter', 'user-count', 'users-list', 'sessions-view', 'sessions-list', 'activity-view', 'audit-search', 'audit-category', 'audit-count', 'audit-list', 'audit-load-more',
         'drawer-backdrop', 'policy-drawer', 'drawer-title', 'drawer-subtitle', 'drawer-close', 'drawer-cancel', 'policy-form', 'policy-fields', 'drawer-submit',
-        'password-modal', 'password-modal-close', 'password-form', 'account-new-password', 'account-confirm-password', 'password-cancel', 'toast'
+        'password-modal', 'password-modal-close', 'password-form', 'account-new-password', 'account-confirm-password', 'password-cancel',
+        'user-modal', 'user-modal-title', 'user-modal-help', 'user-modal-close', 'user-form', 'user-username', 'user-display-name', 'user-role', 'user-password-label', 'user-password', 'user-enabled-label', 'user-enabled', 'user-force-change-label', 'user-force-change', 'user-cancel',
+        'reset-password-modal', 'reset-password-close', 'reset-password-form', 'reset-password-value', 'reset-force-change', 'reset-password-cancel', 'toast'
       ].map(id => [id.replaceAll('-', '_'), document.getElementById(id)]));
 
       const systemTheme = matchMedia('(prefers-color-scheme: dark)');
@@ -702,7 +743,7 @@
         root.dataset.themeMode = mode;
         root.dataset.scheme = resolvedScheme(mode);
         root.dataset.palette = palette;
-        elements.theme_color.content = root.dataset.scheme === 'dark' ? '#07131f' : '#f4f8fb';
+        elements.theme_color.content = getComputedStyle(root).getPropertyValue('--bg').trim();
         if (persist) {
           safeStorageSet('linklake-theme-mode', mode);
           safeStorageSet('linklake-palette', palette);
@@ -816,7 +857,11 @@
           history.replaceState(null, '', '#/overview');
           return { view: 'overview', service: state.route.service || 'tcp' };
         }
-        if (['overview', 'metrics', 'p2p', 'activity'].includes(parts[0])) return { view: parts[0], service: state.route.service || 'tcp' };
+        if (['users', 'sessions'].includes(parts[0]) && state.identity?.role !== 'administrator') {
+          history.replaceState(null, '', '#/overview');
+          return { view: 'overview', service: state.route.service || 'tcp' };
+        }
+        if (['overview', 'metrics', 'p2p', 'users', 'sessions', 'activity'].includes(parts[0])) return { view: parts[0], service: state.route.service || 'tcp' };
         history.replaceState(null, '', '#/overview');
         return { view: 'overview', service: state.route.service || 'tcp' };
       }
@@ -831,6 +876,8 @@
           overview: [t('overview'), t('overviewSubtitle')],
           metrics: [t('metrics'), t('metricsSubtitle')],
           p2p: [t('p2p'), t('p2pSubtitle')],
+          users: [t('userManagement'), t('userManagementHelp')],
+          sessions: [t('securitySessions'), t('securitySessionsHelp')],
           activity: [t('activity'), t('activitySubtitle')]
         };
         return map[route.view] || map.overview;
@@ -841,7 +888,7 @@
         const [title, subtitle] = routeCopy();
         elements.workspace_title.textContent = title;
         elements.workspace_subtitle.textContent = subtitle;
-        const views = { overview: elements.overview_view, metrics: elements.metrics_view, services: elements.services_view, p2p: elements.p2p_view, activity: elements.activity_view };
+        const views = { overview: elements.overview_view, metrics: elements.metrics_view, services: elements.services_view, p2p: elements.p2p_view, users: elements.users_view, sessions: elements.sessions_view, activity: elements.activity_view };
         Object.entries(views).forEach(([name, element]) => element.classList.toggle('hidden', name !== state.route.view));
         document.querySelectorAll('[data-route-prefix]').forEach(link => link.classList.toggle('active', link.dataset.routePrefix === state.route.view));
         document.querySelectorAll('[data-service-route]').forEach(link => link.classList.toggle('active', state.route.view === 'services' && link.dataset.serviceRoute === state.route.service));
@@ -850,17 +897,23 @@
         else if (state.route.view === 'metrics') renderMetrics();
         else if (state.route.view === 'services') renderServices();
         else if (state.route.view === 'p2p') renderP2p();
+        else if (state.route.view === 'users') renderUsers();
+        else if (state.route.view === 'sessions') renderSessions();
         else renderAudit();
       }
 
       function updateIdentityUi() {
         if (!state.identity) return;
         const username = state.identity.username || 'admin';
-        elements.account_name.textContent = username;
-        elements.account_avatar.textContent = username.slice(0, 1).toUpperCase();
-        elements.account_menu_name.textContent = username;
-        elements.account_menu_role.textContent = `${t('roleAdministrator')} · ${t('authenticationSession')}`;
+        const displayName = state.identity.display_name || username;
+        const roleKey = { administrator: 'roleAdministrator', operator: 'roleOperator', auditor: 'roleAuditor' }[state.identity.role] || 'roleAuditor';
+        elements.account_name.textContent = displayName;
+        elements.account_avatar.textContent = displayName.slice(0, 1).toUpperCase();
+        elements.account_menu_name.textContent = `${displayName} (${username})`;
+        elements.account_menu_role.textContent = `${t(roleKey)} · ${t('authenticationSession')}`;
         elements.account_menu_expiry.textContent = t('sessionExpires', { time: formatTimestamp(state.identity.expires_unix_seconds) });
+        document.querySelectorAll('.admin-only').forEach(element => element.classList.toggle('hidden', state.identity.role !== 'administrator'));
+        document.querySelectorAll('[data-action="new-policy"], [data-action="edit-policy"], [data-action="toggle-policy"], [data-action="delete-policy"]').forEach(element => element.classList.toggle('hidden', state.identity.role === 'auditor'));
       }
 
       function createKpi(value, label, detail = '') {
@@ -894,6 +947,30 @@
         return row;
       }
 
+      function createHealthSummary(label, list) {
+        const online = list.filter(isPolicyOnline).length;
+        const enabled = list.filter(policy => policy.enabled).length;
+        const counters = [
+          ['online', online, t('online')],
+          ['offline', Math.max(0, enabled - online), t('offline')],
+          ['disabled', list.length - enabled, t('disabled')],
+          ['total', list.length, t('total')]
+        ];
+        const row = document.createElement('div');
+        row.className = 'summary-row';
+        row.style.gridTemplateColumns = 'minmax(105px, 1fr) auto';
+        const name = document.createElement('strong'); name.textContent = label;
+        const values = document.createElement('div'); values.className = 'health-counters';
+        counters.forEach(([className, value, text]) => {
+          const item = document.createElement('span'); item.className = `health-counter ${className}`;
+          const strong = document.createElement('strong'); strong.textContent = value;
+          const label = document.createElement('span'); label.textContent = text;
+          item.append(strong, label); values.append(item);
+        });
+        row.append(name, values);
+        return row;
+      }
+
       function currentTrafficPoint() {
         return state.trafficHistory.at(-1) || { inbound_bps: 0, outbound_bps: 0, active_connections: 0, active_sessions: 0, requests_per_second: 0, errors_per_second: 0 };
       }
@@ -916,11 +993,13 @@
         const online = policies.filter(isPolicyOnline).length;
         const point = currentTrafficPoint();
         const configIssues = dashboard.clients.filter(client => client.config_sync_status === 'conflict' || client.config_sync_status === 'apply_failed').length;
+        const traffic = aggregateTraffic();
         elements.overview_kpis.replaceChildren(
-          createKpi(`${online}/${policies.length}`, t('forwardingServices'), `${policies.filter(policy => policy.enabled).length} ${t('enabled').toLowerCase()}`),
+          createKpi(String(online), t('forwardingServices'), `${policies.length} ${t('total').toLowerCase()}`),
           createKpi(String(dashboard.clients.length), t('clients'), configIssues ? t('configIssues') : ''),
           createKpi(String(Number(point.active_connections || 0) + Number(point.active_sessions || 0)), t('activeSessions')),
-          createKpi(`${formatRate(point.inbound_bps)} / ${formatRate(point.outbound_bps)}`, `${t('inbound')} / ${t('outbound')}`)
+          createKpi(`${formatRate(point.inbound_bps)} / ${formatRate(point.outbound_bps)}`, `${t('inbound')} / ${t('outbound')}`),
+          createKpi(`${formatBytes(traffic.inbound)} / ${formatBytes(traffic.outbound)}`, t('totalTraffic'))
         );
 
         const protocolGroups = [
@@ -930,10 +1009,7 @@
           [t('proxyMetrics'), [...dashboard.socks5Policies, ...dashboard.httpProxyPolicies]],
           [t('secretTitle'), dashboard.secretPolicies]
         ];
-        elements.service_health_summary.replaceChildren(...protocolGroups.map(([name, list]) => {
-          const active = list.filter(isPolicyOnline).length;
-          return createSummary(name, `${active}/${list.length}`, `${list.filter(policy => policy.enabled).length} ${t('enabled').toLowerCase()}`);
-        }));
+        elements.service_health_summary.replaceChildren(...protocolGroups.map(([name, list]) => createHealthSummary(name, list)));
 
         const alertValues = [];
         if (configIssues) alertValues.push(t('configIssueAlert', { count: configIssues }));
@@ -1055,7 +1131,7 @@
         elements.traffic_chart_summary.textContent = points.length > 1 ? `${t('inbound')}: ${formatRate(latest.inbound_bps)}. ${t('outbound')}: ${formatRate(latest.outbound_bps)}.` : t('noTrendData');
       }
 
-      function drawBarChart(canvas, items, horizontal = false) {
+      function drawBarChart(canvas, items, horizontal = false, semanticFailure = false) {
         const setup = canvasSetup(canvas);
         if (!setup) return;
         const { context, width, height } = setup;
@@ -1063,6 +1139,8 @@
         const gridColor = cssColor('--chart-grid');
         const accent = cssColor('--accent');
         const primary = cssColor('--primary');
+        const danger = cssColor('--danger');
+        const warning = cssColor('--warning');
         context.font = '10px "Segoe UI", sans-serif';
         context.fillStyle = labelColor;
         if (horizontal) {
@@ -1078,7 +1156,7 @@
             context.fillRect(left, y, width - left - right, barHeight);
             const barWidth = (width - left - right) * (Number(item.value) || 0) / maximum;
             const gradient = context.createLinearGradient(left, 0, width - right, 0);
-            gradient.addColorStop(0, accent); gradient.addColorStop(1, primary);
+            gradient.addColorStop(0, semanticFailure ? warning : accent); gradient.addColorStop(1, semanticFailure ? danger : primary);
             context.fillStyle = gradient;
             context.fillRect(left, y, barWidth, barHeight);
             context.fillStyle = labelColor;
@@ -1098,7 +1176,7 @@
           context.fillStyle = gridColor;
           context.fillRect(x, top, barWidth, plotHeight);
           const gradient = context.createLinearGradient(0, top + plotHeight, 0, top);
-          gradient.addColorStop(0, accent); gradient.addColorStop(1, primary);
+          gradient.addColorStop(0, semanticFailure ? warning : accent); gradient.addColorStop(1, semanticFailure ? danger : primary);
           context.fillStyle = gradient;
           context.fillRect(x, top + plotHeight - barHeight, barWidth, barHeight);
           context.fillStyle = labelColor;
@@ -1200,14 +1278,14 @@
           { label: 'SNI', value: metrics.sni_active_connections },
           { label: 'SOCKS5', value: metrics.socks5_active_connections + metrics.socks5_udp_active_associations },
           { label: 'Proxy', value: metrics.http_proxy_active_connections }
-        ]);
+        ], true);
         drawBarChart(elements.failure_chart, [
           { label: 'TCP', value: metrics.tcp_failed_connections + metrics.tcp_rejected_policy_limit + metrics.tcp_rejected_global_limit + metrics.tcp_rejected_pending_limit },
           { label: 'UDP', value: metrics.udp_dropped_packets + metrics.udp_transport_errors },
           { label: 'Web', value: metrics.http_failed_requests + metrics.https_handshake_failures_total + metrics.sni_client_hello_errors + metrics.sni_unknown_hostname },
           { label: 'SOCKS5', value: metrics.socks5_authentication_failures + metrics.socks5_connect_failures + metrics.socks5_handshake_errors },
           { label: 'Proxy', value: metrics.http_proxy_authentication_failures + metrics.http_proxy_malformed_requests + metrics.http_proxy_connect_failures }
-        ], true);
+        ], true, true);
 
         renderMetricPanel(elements.tcp_metric_panel, t('tcpMetrics'), String(metrics.tcp_active_connections), t('active'), [
           { label: t('pending'), value: metrics.tcp_pending_connections },
@@ -1376,12 +1454,14 @@
         }
         const actions = document.createElement('div');
         actions.className = 'service-actions';
-        actions.append(
-          actionButton(t('editPolicy'), () => beginPolicyEdit(type, policy), 'soft-button', 'edit-policy'),
-          actionButton(policy.enabled ? t('disable') : t('enable'), () => setPolicyEnabled(type, policy), 'soft-button', 'toggle-policy')
-        );
-        if (type === 'http') appendHttpCertificateActions(actions, policy);
-        actions.append(actionButton(t('delete'), () => deletePolicy(type, policy), 'danger-button', 'delete-policy'));
+        if (state.identity.role !== 'auditor') {
+          actions.append(
+            actionButton(t('editPolicy'), () => beginPolicyEdit(type, policy), 'soft-button', 'edit-policy'),
+            actionButton(policy.enabled ? t('disable') : t('enable'), () => setPolicyEnabled(type, policy), 'soft-button', 'toggle-policy')
+          );
+          if (type === 'http') appendHttpCertificateActions(actions, policy);
+          actions.append(actionButton(t('delete'), () => deletePolicy(type, policy), 'danger-button', 'delete-policy'));
+        }
         card.append(content, actions);
         return card;
       }
@@ -1402,7 +1482,7 @@
         const isAcme = type === 'acme';
         elements.service_title.textContent = isAcme ? t('acmeTitle') : t(POLICY_TYPES[type].titleKey);
         elements.service_subtitle.textContent = isAcme ? t('acmeSubtitle') : t(POLICY_TYPES[type].subtitleKey);
-        elements.new_policy.classList.toggle('hidden', isAcme);
+        elements.new_policy.classList.toggle('hidden', isAcme || state.identity.role === 'auditor');
         elements.service_toolbar.classList.toggle('hidden', isAcme);
         elements.service_list.classList.toggle('hidden', isAcme);
         elements.acme_page.classList.toggle('hidden', !isAcme);
@@ -1517,6 +1597,165 @@
           });
           card.append(heading, id, age, candidates);
           elements.p2p_list.append(card);
+        });
+      }
+
+      function roleText(role) {
+        return t({ administrator: 'roleAdministrator', operator: 'roleOperator', auditor: 'roleAuditor' }[role] || 'roleAuditor');
+      }
+
+      function openUserModal(user = null) {
+        state.userEditor = { mode: user ? 'edit' : 'create', username: user?.username || null };
+        const enabledAdministrators = (state.dashboard.users || []).filter(item => item.enabled && item.role === 'administrator').length;
+        const protectedAdministrator = Boolean(user && user.enabled && user.role === 'administrator' && enabledAdministrators <= 1);
+        const currentUser = user?.username === state.identity.username;
+        elements.user_modal_title.textContent = user ? t('editPolicy') : t('newUser');
+        elements.user_username.disabled = Boolean(user);
+        elements.user_username.value = user?.username || '';
+        elements.user_display_name.value = user?.display_name || '';
+        elements.user_role.value = user?.role || 'operator';
+        elements.user_role.disabled = currentUser || protectedAdministrator;
+        elements.user_password.value = '';
+        elements.user_password.required = !user;
+        elements.user_password_label.classList.toggle('hidden', Boolean(user));
+        elements.user_enabled_label.classList.toggle('hidden', !user);
+        elements.user_enabled.checked = user?.enabled ?? true;
+        elements.user_enabled.disabled = currentUser || protectedAdministrator;
+        elements.user_force_change_label.classList.toggle('hidden', Boolean(user));
+        elements.user_force_change.checked = true;
+        elements.user_modal.classList.remove('hidden');
+        requestAnimationFrame(() => (user ? elements.user_display_name : elements.user_username).focus());
+      }
+
+      function closeUserModal() {
+        elements.user_modal.classList.add('hidden');
+        elements.user_form.reset();
+      }
+
+      async function submitUser(event) {
+        event.preventDefault();
+        const submit = event.submitter;
+        setBusy(submit, true, 'saving');
+        const editing = state.userEditor.mode === 'edit';
+        const username = state.userEditor.username || elements.user_username.value.trim();
+        const body = editing
+          ? { display_name: elements.user_display_name.value.trim(), role: elements.user_role.value, enabled: elements.user_enabled.checked }
+          : { username, display_name: elements.user_display_name.value.trim(), role: elements.user_role.value, password: elements.user_password.value, force_password_change: elements.user_force_change.checked };
+        try {
+          const response = await apiFetch(editing ? `/api/v1/users/${encodeURIComponent(username)}` : '/api/v1/users', { method: editing ? 'PUT' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+          if (!response.ok) {
+            const payload = await response.json().catch(() => ({}));
+            return showToast(payload.error || t('requestFailed'), true);
+          }
+          closeUserModal();
+          showToast(t(editing ? 'userUpdated' : 'userCreated'));
+          await loadManagementData({ forceHistory: false });
+        } catch (_) { showToast(t('requestFailed'), true); }
+        finally { setBusy(submit, false); }
+      }
+
+      async function deleteUser(user) {
+        if (!confirm(t('confirmUserDelete', { username: user.username }))) return;
+        const response = await apiFetch(`/api/v1/users/${encodeURIComponent(user.username)}`, { method: 'DELETE' });
+        if (!response.ok) {
+          const payload = await response.json().catch(() => ({}));
+          return showToast(payload.error || t('requestFailed'), true);
+        }
+        showToast(t('userDeleted'));
+        await loadManagementData({ forceHistory: false });
+      }
+
+      function openResetPassword(user) {
+        state.resetUsername = user.username;
+        elements.reset_password_value.value = '';
+        elements.reset_force_change.checked = true;
+        elements.reset_password_modal.classList.remove('hidden');
+        requestAnimationFrame(() => elements.reset_password_value.focus());
+      }
+
+      function closeResetPassword() {
+        elements.reset_password_modal.classList.add('hidden');
+        elements.reset_password_form.reset();
+        state.resetUsername = null;
+      }
+
+      async function submitResetPassword(event) {
+        event.preventDefault();
+        const submit = event.submitter;
+        setBusy(submit, true, 'saving');
+        try {
+          const response = await apiFetch(`/api/v1/users/${encodeURIComponent(state.resetUsername)}/reset-password`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ new_password: elements.reset_password_value.value, force_password_change: elements.reset_force_change.checked }) });
+          if (!response.ok) {
+            const payload = await response.json().catch(() => ({}));
+            return showToast(payload.error || t('requestFailed'), true);
+          }
+          closeResetPassword();
+          showToast(t('passwordReset'));
+          await loadManagementData({ forceHistory: false });
+        } catch (_) { showToast(t('requestFailed'), true); }
+        finally { setBusy(submit, false); }
+      }
+
+      async function revokeUserSessions(user) {
+        if (!confirm(t('confirmRevokeSessions', { username: user.username }))) return;
+        const response = await apiFetch(`/api/v1/users/${encodeURIComponent(user.username)}/revoke-sessions`, { method: 'POST' });
+        if (!response.ok) {
+          const payload = await response.json().catch(() => ({}));
+          return showToast(payload.error || t('requestFailed'), true);
+        }
+        showToast(t('sessionsRevoked'));
+        if (user.username === state.identity.username) return resetForExpiredSession();
+        await loadManagementData({ forceHistory: false });
+      }
+
+      function renderUsers() {
+        const users = state.dashboard.users || [];
+        const query = state.userSearch.trim().toLowerCase();
+        const visible = users.filter(user => {
+          if (state.userRole !== 'all' && user.role !== state.userRole) return false;
+          return !query || `${user.username} ${user.display_name}`.toLowerCase().includes(query);
+        });
+        elements.user_count.textContent = t('userCount', { visible: visible.length, total: users.length });
+        elements.users_list.replaceChildren();
+        visible.forEach(user => {
+          const row = document.createElement('tr');
+          const values = [user.username, user.display_name, roleText(user.role), user.enabled ? t('enabled') : t('disabled'), user.last_login_unix_seconds ? formatTimestamp(user.last_login_unix_seconds) : t('never'), `${user.active_sessions}${user.must_change_password ? ` · ${t('mustChangePassword')}` : ''}`];
+          values.forEach(value => { const cell = document.createElement('td'); cell.textContent = value; row.append(cell); });
+          const actions = document.createElement('td'); actions.className = 'table-actions';
+          const edit = actionButton(t('editPolicy'), () => openUserModal(user));
+          const reset = actionButton(t('resetPassword'), () => openResetPassword(user));
+          const sessions = actionButton(t('revokeSessions'), () => revokeUserSessions(user));
+          const remove = actionButton(t('delete'), () => deleteUser(user), 'danger-button');
+          const enabledAdministrators = users.filter(item => item.enabled && item.role === 'administrator').length;
+          remove.disabled = user.username === state.identity.username || (user.enabled && user.role === 'administrator' && enabledAdministrators <= 1);
+          actions.append(edit, reset, sessions, remove);
+          row.append(actions);
+          elements.users_list.append(row);
+        });
+      }
+
+      async function revokeSessionRecord(session) {
+        if (!confirm(t('confirmRevokeSession'))) return;
+        const response = await apiFetch(`/api/v1/sessions/${encodeURIComponent(session.session_id)}`, { method: 'DELETE' });
+        if (!response.ok) {
+          const payload = await response.json().catch(() => ({}));
+          return showToast(payload.error || t('requestFailed'), true);
+        }
+        showToast(t('sessionsRevoked'));
+        await loadManagementData({ forceHistory: false });
+      }
+
+      function renderSessions() {
+        const sessions = state.dashboard.sessions || [];
+        elements.sessions_list.replaceChildren();
+        sessions.forEach(session => {
+          const row = document.createElement('tr');
+          const current = session.session_id === state.identity.session_id;
+          [session.username, `${session.session_id}${current ? ` · ${t('currentSession')}` : ''}`, formatTimestamp(session.created_unix_seconds), formatTimestamp(session.expires_unix_seconds)].forEach(value => { const cell = document.createElement('td'); cell.textContent = value; row.append(cell); });
+          const actions = document.createElement('td'); actions.className = 'table-actions';
+          if (!current) actions.append(actionButton(t('revoke'), () => revokeSessionRecord(session), 'danger-button'));
+          row.append(actions);
+          elements.sessions_list.append(row);
         });
       }
 
@@ -1874,6 +2113,8 @@
 
       function showLogin(messageKey = '') {
         state.identity = null;
+        elements.utility_session.classList.add('hidden');
+        elements.account_shell.classList.add('hidden');
         elements.workspace.classList.add('hidden');
         elements.login_shell.classList.remove('hidden');
         elements.login.classList.remove('hidden');
@@ -1883,6 +2124,8 @@
 
       function showInitialPassword(identity) {
         state.identity = identity;
+        elements.utility_session.classList.add('hidden');
+        elements.account_shell.classList.add('hidden');
         elements.workspace.classList.add('hidden');
         elements.login_shell.classList.remove('hidden');
         elements.login.classList.add('hidden');
@@ -1893,6 +2136,8 @@
 
       function showWorkspace(identity) {
         state.identity = identity;
+        elements.utility_session.classList.remove('hidden');
+        elements.account_shell.classList.remove('hidden');
         elements.login_shell.classList.add('hidden');
         elements.workspace.classList.remove('hidden');
         elements.login.classList.remove('hidden');
@@ -1998,8 +2243,8 @@
 
       function historyQuery() {
         const range = state.trendRange;
-        const steps = { '5m': 5, '15m': 10, '1h': 30, '6h': 120, '24h': 300 };
-        return `/api/v1/metrics/history?range=${encodeURIComponent(range)}&step=${steps[range] || 10}&protocol=total`;
+        const steps = { '1h': 15, '12h': 150, '1d': 300, '7d': 2100, '30d': 9000 };
+        return `/api/v1/metrics/history?range=${encodeURIComponent(range)}&step=${steps[range] || 15}&protocol=total`;
       }
 
       function captureFallbackHistory(metrics, status) {
@@ -2017,7 +2262,7 @@
 
       function emptyDashboard() {
         const metrics = new Proxy({}, { get(target, key) { return key in target ? target[key] : 0; } });
-        return { status: {}, metrics, events: [], tcpPolicies: [], udpPolicies: [], portGroups: [], httpRoutes: [], sniRoutes: [], secretPolicies: [], socks5Policies: [], httpProxyPolicies: [], clients: [], p2pNodes: [], publicPortPolicy: { tcp_allowed: '32000-32999', udp_allowed: '32000-32999', tcp_reserved: '', udp_reserved: '' }, acme: { enabled: false, environment: 'staging', directory_url: acmeDirectories.staging, contact_email: '', terms_accepted: false, renew_before_days: 30, account_registered: false } };
+        return { status: {}, metrics, events: [], users: [], sessions: [], tcpPolicies: [], udpPolicies: [], portGroups: [], httpRoutes: [], sniRoutes: [], secretPolicies: [], socks5Policies: [], httpProxyPolicies: [], clients: [], p2pNodes: [], publicPortPolicy: { tcp_allowed: '32000-32999', udp_allowed: '32000-32999', tcp_reserved: '', udp_reserved: '' }, acme: { enabled: false, environment: 'staging', directory_url: acmeDirectories.staging, contact_email: '', terms_accepted: false, renew_before_days: 30, account_registered: false } };
       }
 
       function managementRequestPlan() {
@@ -2027,6 +2272,8 @@
         ];
         if (state.route.view === 'metrics') return [...common, { key: 'metrics', url: '/api/v1/metrics' }, { key: 'history', url: historyQuery(), optional: true }];
         if (state.route.view === 'p2p') return [...common, { key: 'clients', url: '/api/v1/clients' }, { key: 'p2pNodes', url: '/api/v1/p2p/nodes' }];
+        if (state.route.view === 'users') return [...common, { key: 'users', url: '/api/v1/users' }];
+        if (state.route.view === 'sessions') return [...common, { key: 'sessions', url: '/api/v1/sessions' }];
         if (state.route.view === 'activity') return [...common, { key: 'events', url: `/api/v1/audit?limit=${Math.min(100, state.auditLimit)}` }];
         if (state.route.service === 'acme') return [...common, { key: 'acme', url: '/api/v1/acme/config' }];
         const schema = POLICY_TYPES[state.route.service] || POLICY_TYPES.tcp;
@@ -2123,8 +2370,6 @@
         elements.language.addEventListener('click', () => setLanguage(state.language === 'zh' ? 'en' : 'zh'));
         elements.account_button.addEventListener('click', event => { event.stopPropagation(); togglePopover(elements.account_menu, elements.account_button); });
         elements.account_password.addEventListener('click', () => { togglePopover(elements.account_menu, elements.account_button, false); togglePasswordModal(true); });
-        elements.account_appearance.addEventListener('click', () => { togglePopover(elements.account_menu, elements.account_button, false); togglePopover(elements.appearance_popover, elements.appearance_button, true); });
-        elements.account_language.addEventListener('click', () => { togglePopover(elements.account_menu, elements.account_button, false); setLanguage(state.language === 'zh' ? 'en' : 'zh'); });
         elements.logout.addEventListener('click', logout);
         document.addEventListener('click', event => {
           if (!elements.appearance_popover.contains(event.target) && !elements.appearance_button.contains(event.target)) togglePopover(elements.appearance_popover, elements.appearance_button, false);
@@ -2136,6 +2381,17 @@
         elements.password_modal_close.addEventListener('click', () => togglePasswordModal(false));
         elements.password_cancel.addEventListener('click', () => togglePasswordModal(false));
         elements.password_modal.addEventListener('click', event => { if (event.target === elements.password_modal) togglePasswordModal(false); });
+        elements.new_user.addEventListener('click', () => openUserModal());
+        elements.user_search.addEventListener('input', () => { state.userSearch = elements.user_search.value; renderUsers(); });
+        elements.user_role_filter.addEventListener('change', () => { state.userRole = elements.user_role_filter.value; renderUsers(); });
+        elements.user_form.addEventListener('submit', submitUser);
+        elements.user_modal_close.addEventListener('click', closeUserModal);
+        elements.user_cancel.addEventListener('click', closeUserModal);
+        elements.user_modal.addEventListener('click', event => { if (event.target === elements.user_modal) closeUserModal(); });
+        elements.reset_password_form.addEventListener('submit', submitResetPassword);
+        elements.reset_password_close.addEventListener('click', closeResetPassword);
+        elements.reset_password_cancel.addEventListener('click', closeResetPassword);
+        elements.reset_password_modal.addEventListener('click', event => { if (event.target === elements.reset_password_modal) closeResetPassword(); });
         elements.refresh.addEventListener('click', () => loadManagementData({ forceHistory: true }));
         document.querySelectorAll('a[href^="#/"]').forEach(link => link.addEventListener('click', event => {
           if (!state.drawer.open || !state.drawer.dirty) return;
@@ -2170,6 +2426,8 @@
         elements.audit_load_more.addEventListener('click', () => { state.auditLimit = Math.min(100, state.auditLimit + 20); loadManagementData({ forceHistory: false }); });
         document.addEventListener('keydown', event => {
           if (event.key === 'Escape') {
+            if (!elements.reset_password_modal.classList.contains('hidden')) return closeResetPassword();
+            if (!elements.user_modal.classList.contains('hidden')) return closeUserModal();
             if (!elements.password_modal.classList.contains('hidden')) return togglePasswordModal(false);
             if (state.drawer.open) return cancelEdit();
             togglePopover(elements.appearance_popover, elements.appearance_button, false);
@@ -2198,7 +2456,7 @@
       state.routeGeneration = 0;
       state.loadPromise = null;
       state.historyMeta = null;
-      state.trendRange = '15m';
+      state.trendRange = '1h';
       state.language = safeStorageGet('linklake-language', state.language);
       bindEvents();
       applyTheme(document.documentElement.dataset.themeMode, document.documentElement.dataset.palette, false);

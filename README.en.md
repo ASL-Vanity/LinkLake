@@ -243,6 +243,10 @@ Remote control connections also require `control_ca_cert` and `control_server_na
 
 - Public health endpoint: `GET /api/v1/health`
 - Authenticated metrics endpoint: `GET /api/v1/metrics`
+- Metrics history: `GET /api/v1/metrics/history?range=1h|12h|1d|7d|30d`; 5-second samples are retained for 12 hours and minute archives for up to 30 days
+- User management: `GET/POST /api/v1/users` and `PUT/DELETE /api/v1/users/:username`
+- Password reset and session revocation: `POST /api/v1/users/:username/reset-password|revoke-sessions`
+- Active sessions: `GET /api/v1/sessions` and `DELETE /api/v1/sessions/:session_id`
 - Public port policy: `GET /api/v1/public-port-policy`
 - TCP policies: `GET/POST /api/v1/tcp-tunnels`
 - UDP policies: `GET/POST /api/v1/udp-tunnels`
@@ -273,6 +277,8 @@ Remote control connections also require `control_ca_cert` and `control_server_na
 - The Web UI configures TCP/TLS-SNI/secret/SOCKS5/HTTP-forward-proxy aggregate bandwidth, UDP aggregate bandwidth/session limits/idle timeouts, TCP/HTTP/TLS-SNI/secret/SOCKS5/HTTP-proxy connection limits, secret visitor restrictions, proxy usernames, the ACME environment, and HTTPS per route
 - Metrics and policy views cover P2P freshness/direct/fallback paths, TLS SNI ClientHello/unknown-host/connection/traffic events, secret connections and traffic, SOCKS5 requests/authentication/connections/traffic, HTTP proxy requests/CONNECT/authentication/malformed messages/traffic, UDP sessions/packets/traffic/drops/timeouts, HTTP/HTTPS route traffic and failures, TLS handshake failures, managed/expiring/expired certificates, ACME orders, renewals, and HTTP-01 challenges
 - `LINKLAKE_MANAGEMENT_TOKEN` is an optional automation Bearer token, not a Web login credential
+- The Web UI supports administrator, operator, and auditor roles. Administrators have full access, operators manage clients and forwarding policies, and auditors are read-only. The current user and the last enabled administrator are protected.
+- Lake, ocean, jade, and violet are complete light/dark themes. System mode changes only the light/dark scheme and preserves the selected palette.
 
 Set logs with `LINKLAKE_LOG_DIR`. The server defaults to `LINKLAKE_DATA_DIR/logs`; the client writes to the console when unset, while service installers configure a rotating log directory.
 
