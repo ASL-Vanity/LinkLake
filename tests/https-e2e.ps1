@@ -583,9 +583,19 @@ target = "127.0.0.1:$backendPort"
         throw "HTTP redirect Location is incorrect: $($redirect.Headers)"
     }
 
-    Start-Sleep -Seconds 2
-    $renewResponse = Invoke-WebRequest -Method Post `
-        -Uri "$baseUrl/api/v1/http-routes/$($route.id)/certificate/renew" -WebSession $webSession
+    $renewDeadline = [DateTime]::UtcNow.AddSeconds(15)
+    do {
+        $renewResponse = Invoke-WebRequest -Method Post `
+            -Uri "$baseUrl/api/v1/http-routes/$($route.id)/certificate/renew" `
+            -WebSession $webSession -SkipHttpErrorCheck
+        if ([int]$renewResponse.StatusCode -eq 202) { break }
+        $renewError = $renewResponse.Content | ConvertFrom-Json
+        if ([int]$renewResponse.StatusCode -ne 409 -or
+            $renewError.code -ne 'certificate_operation_cooldown') {
+            throw "Certificate renewal request failed with HTTP $($renewResponse.StatusCode): $($renewResponse.Content)"
+        }
+        Start-Sleep -Seconds 1
+    } while ([DateTime]::UtcNow -lt $renewDeadline)
     if ([int]$renewResponse.StatusCode -ne 202) { throw 'Certificate renewal request was not accepted.' }
     $renewedRoute = Wait-RouteTlsStatus -BaseUrl $baseUrl -Session $webSession `
         -RouteId $route.id -ExpectedStatus 'active' -ExpectedOnline $true
