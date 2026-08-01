@@ -1,5 +1,6 @@
 //! 服务端 UDP 隧道注册、会话映射与 QUIC DATAGRAM 转发。
 
+use crate::traffic_control::TrafficDecision;
 use crate::{
     client_registry::Authentication, record_audit, udp_data_plane::AuthenticatedUdpConnection,
     AppState,
@@ -660,6 +661,7 @@ async fn run_tunnel_loop(
         .expect("the built-in UDP reassembly configuration is valid");
     let mut limiter = policy.bandwidth_limit_bps.map(TokenBucket::new);
     let mut datagram_id = 0_u64;
+    let mut usage_pending = 0_u64;
     let mut public_buffer = vec![0_u8; UDP_RECEIVE_BUFFER_BYTES];
     let mut sweep = interval(SESSION_SWEEP_INTERVAL);
     sweep.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -740,6 +742,15 @@ async fn run_tunnel_loop(
                         session.last_activity = now;
                         (session.session_id, false)
                     } else {
+                        let decision = state.traffic_controls
+                            .lock()
+                            .expect("traffic control catalog lock poisoned")
+                            .authorize(policy.policy_kind, policy.policy_id, external_address.ip(), crate::unix_seconds());
+                        if !matches!(decision, Ok(TrafficDecision::Allowed)) {
+                            record_drop(statistics, &statistics.dropped_policy_limit);
+                            tracing::debug!("UDP traffic control rejected {external_address}: {decision:?}");
+                            continue;
+                        }
                         let Ok(policy_permit) = policy_permits.clone().try_acquire_owned() else {
                             record_drop(statistics, &statistics.dropped_policy_limit);
                             continue;
@@ -819,6 +830,7 @@ async fn run_tunnel_loop(
                     }
                     statistics.packets_from_public.fetch_add(1, Ordering::Relaxed);
                     statistics.bytes_from_public.fetch_add(length as u64, Ordering::Relaxed);
+                    usage_pending = usage_pending.saturating_add(length as u64);
                 }
                 Err(error) => {
                     statistics.transport_errors.fetch_add(1, Ordering::Relaxed);
@@ -860,6 +872,7 @@ async fn run_tunnel_loop(
                                     }
                                     statistics.packets_to_public.fetch_add(1, Ordering::Relaxed);
                                     statistics.bytes_to_public.fetch_add(sent as u64, Ordering::Relaxed);
+                                    usage_pending = usage_pending.saturating_add(sent as u64);
                                 }
                                 Ok(_) | Err(_) => {
                                     statistics.transport_errors.fetch_add(1, Ordering::Relaxed);
@@ -877,6 +890,17 @@ async fn run_tunnel_loop(
             },
             _ = sweep.tick() => {
                 let now = Instant::now();
+                if usage_pending != 0 {
+                    if let Err(error) = state.traffic_controls
+                        .lock()
+                        .expect("traffic control catalog lock poisoned")
+                        .record_bytes(policy.policy_kind, policy.policy_id, usage_pending, crate::unix_seconds())
+                    {
+                        tracing::warn!("Could not persist UDP traffic usage: {error}");
+                    } else {
+                        usage_pending = 0;
+                    }
+                }
                 if now >= control_deadline {
                     statistics.transport_errors.fetch_add(1, Ordering::Relaxed);
                     break RuntimeStop::ControlClosed;
@@ -939,6 +963,21 @@ async fn run_tunnel_loop(
             UdpSessionCloseReason::DataPlaneClosed
         }
     };
+    if usage_pending != 0 {
+        if let Err(error) = state
+            .traffic_controls
+            .lock()
+            .expect("traffic control catalog lock poisoned")
+            .record_bytes(
+                policy.policy_kind,
+                policy.policy_id,
+                usage_pending,
+                crate::unix_seconds(),
+            )
+        {
+            tracing::warn!("Could not persist final UDP traffic usage: {error}");
+        }
+    }
     let session_ids = sessions_by_external
         .values()
         .map(|session| session.session_id)

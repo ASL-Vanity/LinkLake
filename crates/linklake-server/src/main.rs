@@ -21,6 +21,7 @@ mod sni_route_catalog;
 mod sni_tunnel;
 mod socks5_tunnel;
 mod tcp_tunnel;
+mod traffic_control;
 mod tunnel_catalog;
 mod udp_data_plane;
 mod udp_tunnel;
@@ -92,6 +93,7 @@ use tokio_rustls::{
     TlsAcceptor,
 };
 use tower_http::trace::TraceLayer;
+use traffic_control::{TrafficControlCatalog, TrafficPolicyKind, UpsertTrafficControl};
 use tunnel_catalog::{
     CreateHttpProxyPolicy, CreatePortGroupPolicy, CreateSocks5ProxyPolicy, CreateTcpTunnelPolicy,
     CreateUdpTunnelPolicy, CreatedHttpProxyPolicy, CreatedSocks5ProxyPolicy, HttpProxyPolicy,
@@ -297,6 +299,7 @@ struct AppState {
     audit: Mutex<AuditLog>,
     alerts: Mutex<AlertCatalog>,
     fleet: Mutex<FleetCatalog>,
+    traffic_controls: Mutex<TrafficControlCatalog>,
     management_cookies_secure: bool,
     public_port_policy: PublicPortPolicy,
     clients: Mutex<ClientRegistry>,
@@ -1665,6 +1668,7 @@ async fn run_server(
         audit: Mutex::new(AuditLog::open(data_dir.as_deref())?),
         alerts: Mutex::new(AlertCatalog::open(data_dir.as_deref())?),
         fleet: Mutex::new(FleetCatalog::open(data_dir.as_deref())?),
+        traffic_controls: Mutex::new(TrafficControlCatalog::open(data_dir.as_deref())?),
         management_cookies_secure,
         public_port_policy: public_port_policy.clone(),
         clients: Mutex::new(ClientRegistry::open(data_dir.as_deref())?),
@@ -1797,6 +1801,12 @@ async fn run_server(
             put(update_fleet_peer).delete(delete_fleet_peer),
         )
         .route("/api/v1/fleet/overview", get(fleet_overview))
+        .route(
+            "/api/v1/traffic-controls/:kind/:policy_id",
+            get(get_traffic_control)
+                .put(upsert_traffic_control)
+                .delete(delete_traffic_control),
+        )
         .route(
             "/api/v1/tcp-tunnels",
             get(list_tcp_tunnels).post(create_tcp_tunnel),
@@ -5633,6 +5643,79 @@ async fn fleet_overview(
     }))
 }
 
+async fn get_traffic_control(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((kind, policy_id)): Path<(String, Uuid)>,
+) -> Result<Json<traffic_control::TrafficControlRecord>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let kind = TrafficPolicyKind::parse(&kind).map_err(coded_traffic_control_error)?;
+    state
+        .traffic_controls
+        .lock()
+        .expect("traffic control catalog lock poisoned")
+        .get(kind, policy_id, unix_seconds())
+        .map_err(coded_traffic_control_error)?
+        .map(Json)
+        .ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "traffic_control_not_configured",
+            "traffic control is not configured for this policy",
+        ))
+}
+
+async fn upsert_traffic_control(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((kind, policy_id)): Path<(String, Uuid)>,
+    Json(request): Json<UpsertTrafficControl>,
+) -> Result<Json<traffic_control::TrafficControlRecord>, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    let kind = TrafficPolicyKind::parse(&kind).map_err(coded_traffic_control_error)?;
+    let record = state
+        .traffic_controls
+        .lock()
+        .expect("traffic control catalog lock poisoned")
+        .upsert(kind, policy_id, request, unix_seconds())
+        .map_err(coded_traffic_control_error)?;
+    record_audit(
+        &state,
+        "traffic_control.updated",
+        &policy_id.to_string(),
+        &format!("actor={}; kind={}", principal.username, kind.as_str()),
+    );
+    Ok(Json(record))
+}
+
+async fn delete_traffic_control(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((kind, policy_id)): Path<(String, Uuid)>,
+) -> Result<StatusCode, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    let kind = TrafficPolicyKind::parse(&kind).map_err(coded_traffic_control_error)?;
+    if !state
+        .traffic_controls
+        .lock()
+        .expect("traffic control catalog lock poisoned")
+        .delete(kind, policy_id)
+        .map_err(coded_traffic_control_error)?
+    {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "traffic_control_not_configured",
+            "traffic control is not configured for this policy",
+        ));
+    }
+    record_audit(
+        &state,
+        "traffic_control.deleted",
+        &policy_id.to_string(),
+        &format!("actor={}; kind={}", principal.username, kind.as_str()),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn probe_fleet_peer(client: &reqwest::Client, peer: FleetPeer) -> FleetPeerStatus {
     let started = Instant::now();
     if !peer.enabled {
@@ -8943,6 +9026,31 @@ fn coded_fleet_error(error: anyhow::Error) -> CodedApiError {
             StatusCode::INTERNAL_SERVER_ERROR,
             "fleet_storage_error",
             "fleet catalog operation failed",
+        )
+    }
+}
+
+fn coded_traffic_control_error(error: anyhow::Error) -> CodedApiError {
+    let message = error.to_string();
+    if message.contains("invalid")
+        || message.contains("CIDR")
+        || message.contains("schedule")
+        || message.contains("quota")
+        || message.contains("rate")
+        || message.contains("weekday")
+        || message.contains("too many")
+    {
+        CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_traffic_control",
+            "traffic control configuration is invalid",
+        )
+    } else {
+        tracing::error!("Traffic control operation failed: {message}");
+        CodedApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "traffic_control_storage_error",
+            "traffic control operation failed",
         )
     }
 }

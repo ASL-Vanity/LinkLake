@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use linklake_core::port_mapping::{parse_port_mappings, MAX_PORT_MAPPINGS};
+use linklake_core::target_pool::{parse_target_pool, select_weighted_target, WeightedTarget};
 use linklake_core::{
     managed_config_revision, read_control_frame, write_control_frame, BoxedIo,
     ClientEnrollmentRequest, ClientEnrollmentResponse, ControlFrame, ManagedClientConfig,
@@ -15,12 +16,15 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 use tokio::{
     io::{copy_bidirectional, split, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
-    net::{TcpListener, TcpStream},
+    net::{lookup_host, TcpListener, TcpStream, UdpSocket},
     task::{JoinHandle, JoinSet},
     time::{interval, timeout, MissedTickBehavior},
 };
@@ -310,6 +314,16 @@ struct SecretVisitorConfig {
     access_key: String,
     #[serde(default = "default_true")]
     prefer_direct: bool,
+    #[serde(default)]
+    path_policy: Option<P2pPathPolicy>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum P2pPathPolicy {
+    PreferDirect,
+    DirectOnly,
+    RelayOnly,
 }
 
 #[derive(Clone, Deserialize)]
@@ -382,7 +396,7 @@ enum AgentSpec {
         name: String,
         local_bind: String,
         access_key: String,
-        prefer_direct: bool,
+        path_policy: P2pPathPolicy,
     },
     Socks5 {
         name: String,
@@ -1042,7 +1056,7 @@ fn spawn_agent_task(
                 name,
                 local_bind,
                 access_key,
-                prefer_direct,
+                path_policy,
             } => {
                 run_secret_visitor(
                     transport,
@@ -1051,7 +1065,7 @@ fn spawn_agent_task(
                     local_bind,
                     access_key,
                     name,
-                    prefer_direct,
+                    path_policy,
                 )
                 .await
             }
@@ -1140,7 +1154,11 @@ fn agent_specs(
                 name: visitor.name.clone(),
                 local_bind: visitor.local_bind.clone(),
                 access_key: visitor.access_key.clone(),
-                prefer_direct: visitor.prefer_direct,
+                path_policy: visitor.path_policy.unwrap_or(if visitor.prefer_direct {
+                    P2pPathPolicy::PreferDirect
+                } else {
+                    P2pPathPolicy::RelayOnly
+                }),
             },
         );
     }
@@ -1862,22 +1880,78 @@ async fn diagnose_client_config(path: &Path) -> DiagnosticReport {
         .collect::<Vec<_>>();
     targets.sort();
     targets.dedup();
-    for (name, target) in targets {
-        match timeout(Duration::from_secs(3), TcpStream::connect(&target)).await {
-            Ok(Ok(_)) => checks.push(DiagnosticCheck {
-                name: format!("target.{name}"),
-                ok: true,
-                detail: target,
-            }),
-            Ok(Err(error)) => checks.push(DiagnosticCheck {
+    for (name, pool) in targets {
+        match parse_target_pool(&pool) {
+            Ok(targets) => {
+                for target in targets {
+                    match timeout(Duration::from_secs(3), TcpStream::connect(&target.address)).await
+                    {
+                        Ok(Ok(_)) => checks.push(DiagnosticCheck {
+                            name: format!("target.{name}"),
+                            ok: true,
+                            detail: target.address,
+                        }),
+                        Ok(Err(error)) => checks.push(DiagnosticCheck {
+                            name: format!("target.{name}"),
+                            ok: false,
+                            detail: format!("{}: {error}", target.address),
+                        }),
+                        Err(_) => checks.push(DiagnosticCheck {
+                            name: format!("target.{name}"),
+                            ok: false,
+                            detail: format!("{}: connection timed out", target.address),
+                        }),
+                    }
+                }
+            }
+            Err(error) => checks.push(DiagnosticCheck {
                 name: format!("target.{name}"),
                 ok: false,
                 detail: error.to_string(),
             }),
-            Err(_) => checks.push(DiagnosticCheck {
-                name: format!("target.{name}"),
+        }
+    }
+    for tunnel in &config.udp_tunnels {
+        match parse_target_pool(&tunnel.target) {
+            Ok(targets) => {
+                for target in targets {
+                    let result = async {
+                        let address = lookup_host(&target.address)
+                            .await?
+                            .next()
+                            .ok_or_else(|| anyhow::anyhow!("target did not resolve"))?;
+                        let bind = if address.is_ipv4() {
+                            "0.0.0.0:0"
+                        } else {
+                            "[::]:0"
+                        };
+                        let socket = UdpSocket::bind(bind).await?;
+                        socket.connect(address).await?;
+                        Ok::<_, anyhow::Error>(address)
+                    };
+                    match timeout(Duration::from_secs(3), result).await {
+                        Ok(Ok(address)) => checks.push(DiagnosticCheck {
+                            name: format!("udp_target.{}", tunnel.name),
+                            ok: true,
+                            detail: format!("{} -> {address}", target.address),
+                        }),
+                        Ok(Err(error)) => checks.push(DiagnosticCheck {
+                            name: format!("udp_target.{}", tunnel.name),
+                            ok: false,
+                            detail: format!("{}: {error}", target.address),
+                        }),
+                        Err(_) => checks.push(DiagnosticCheck {
+                            name: format!("udp_target.{}", tunnel.name),
+                            ok: false,
+                            detail: format!("{}: resolution timed out", target.address),
+                        }),
+                    }
+                }
+            }
+            Err(error) => checks.push(DiagnosticCheck {
+                name: format!("udp_target.{}", tunnel.name),
                 ok: false,
-                detail: "connection timed out".to_owned(),
+                detail: error.to_string(),
             }),
         }
     }
@@ -3643,7 +3717,7 @@ async fn run_secret_visitor(
     local_bind: String,
     access_key: String,
     name: String,
-    prefer_direct: bool,
+    path_policy: P2pPathPolicy,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&local_bind).await?;
     tracing::info!("Secret visitor {name} listening on {local_bind}.");
@@ -3659,7 +3733,7 @@ async fn run_secret_visitor(
                 token,
                 access_key,
                 local,
-                prefer_direct,
+                path_policy,
             )
             .await
             {
@@ -3675,15 +3749,19 @@ async fn run_secret_visitor_connection(
     token: String,
     access_key: String,
     mut local: TcpStream,
-    prefer_direct: bool,
+    path_policy: P2pPathPolicy,
 ) -> anyhow::Result<()> {
-    let fallback_reason = if prefer_direct {
+    let try_direct = path_policy != P2pPathPolicy::RelayOnly;
+    let fallback_reason = if try_direct {
         try_p2p_direct(&transport, client_id, &token, &access_key, &mut local).await?
     } else {
         None
     };
-    if prefer_direct && fallback_reason.is_none() {
+    if try_direct && fallback_reason.is_none() {
         return Ok(());
+    }
+    if path_policy == P2pPathPolicy::DirectOnly {
+        anyhow::bail!("P2P direct-only policy rejected relay fallback")
     }
     if let Some(reason) = fallback_reason {
         let mut report = connect_control(&transport).await?;
@@ -4247,6 +4325,8 @@ async fn read_registered_control(
     client_id: Uuid,
     token: String,
 ) -> anyhow::Result<()> {
+    let targets = Arc::new(parse_target_pool(&target)?);
+    let target_sequence = Arc::new(AtomicU64::new(0));
     loop {
         let frame = timeout(CONTROL_HEARTBEAT_TIMEOUT, read_control_frame(&mut reader))
             .await
@@ -4255,7 +4335,7 @@ async fn read_registered_control(
             ControlFrame::OpenTcpConnection { connection_id }
             | ControlFrame::OpenSecretConnection { connection_id } => {
                 let transport = transport.clone();
-                let target = target.clone();
+                let target = select_target(&targets, &target_sequence)?;
                 let token = token.clone();
                 tokio::spawn(async move {
                     if let Err(error) =
@@ -4271,6 +4351,13 @@ async fn read_registered_control(
             frame => anyhow::bail!("unexpected control frame: {frame:?}"),
         }
     }
+}
+
+fn select_target(targets: &[WeightedTarget], sequence: &AtomicU64) -> anyhow::Result<String> {
+    let slot = sequence.fetch_add(1, Ordering::Relaxed);
+    select_weighted_target(targets, slot)
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("target pool is empty"))
 }
 
 async fn open_tcp_data_connection(

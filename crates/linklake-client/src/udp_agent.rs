@@ -3,6 +3,7 @@ use super::{
     TARGET_CONNECT_TIMEOUT,
 };
 use bytes::Bytes;
+use linklake_core::target_pool::{parse_target_pool, WeightedTarget};
 use linklake_core::{
     read_control_frame, read_udp_data_plane_control_frame,
     udp_protocol::{fragment_datagram, UdpDirection, UdpFragment, MAX_UDP_DATAGRAM_BYTES},
@@ -62,6 +63,12 @@ struct TargetSession {
     sender: mpsc::Sender<QueuedDatagram>,
     last_activity: Arc<Mutex<Instant>>,
     worker: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Clone, Copy)]
+struct ResolvedTarget {
+    address: SocketAddr,
+    weight: u32,
 }
 
 struct QueuedDatagram {
@@ -211,7 +218,7 @@ async fn run_udp_agent_session(
         frame => anyhow::bail!("unexpected UDP registration response: {frame:?}"),
     }
 
-    let target_address = timeout(TARGET_CONNECT_TIMEOUT, resolve_target(&target))
+    let target_addresses = timeout(TARGET_CONNECT_TIMEOUT, resolve_target_pool(&target))
         .await
         .map_err(|_| anyhow::anyhow!("UDP target address resolution timed out"))??;
     let (tcp_reader, tcp_writer) = split(tcp_control);
@@ -223,7 +230,7 @@ async fn run_udp_agent_session(
         data_plane.control_recv,
         data_plane.max_datagram_size,
         offer.session_idle_timeout,
-        target_address,
+        target_addresses,
         queue_budget,
         tcp_monitor,
     )
@@ -311,7 +318,7 @@ async fn run_data_plane(
     control_recv: quinn::RecvStream,
     max_datagram_size: usize,
     session_idle_timeout: Duration,
-    target_address: SocketAddr,
+    target_addresses: Vec<ResolvedTarget>,
     queue_budget: Arc<Semaphore>,
     mut tcp_monitor: tokio::task::JoinHandle<anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
@@ -322,6 +329,7 @@ async fn run_data_plane(
     let mut reassembler = UdpReassembler::new(UdpReassemblyConfig::default())?;
     let next_datagram_id = Arc::new(AtomicU64::new(1));
     let mut sessions = HashMap::<Uuid, TargetSession>::new();
+    let mut target_sequence = 0_u64;
     let mut closed_sessions = HashMap::<Uuid, Instant>::new();
     let (session_event_tx, mut session_event_rx) = mpsc::channel(SESSION_EVENT_CAPACITY);
     let (control_event_tx, mut control_event_rx) = mpsc::channel(CONTROL_EVENT_CAPACITY);
@@ -396,6 +404,9 @@ async fn run_data_plane(
                 if let std::collections::hash_map::Entry::Vacant(entry) =
                     sessions.entry(session_id)
                 {
+                    let target_address = select_resolved_target(&target_addresses, target_sequence)
+                        .ok_or_else(|| anyhow::anyhow!("UDP target pool is empty"))?;
+                    target_sequence = target_sequence.wrapping_add(1);
                     match create_target_session(
                         session_id,
                         target_address,
@@ -485,6 +496,37 @@ async fn run_data_plane(
         tcp_monitor.abort();
     }
     result
+}
+
+async fn resolve_target_pool(value: &str) -> anyhow::Result<Vec<ResolvedTarget>> {
+    let parsed = parse_target_pool(value)?;
+    let mut resolved = Vec::with_capacity(parsed.len());
+    for WeightedTarget { address, weight } in parsed {
+        resolved.push(ResolvedTarget {
+            address: resolve_target(&address).await?,
+            weight,
+        });
+    }
+    Ok(resolved)
+}
+
+fn select_resolved_target(targets: &[ResolvedTarget], sequence: u64) -> Option<SocketAddr> {
+    let total = targets
+        .iter()
+        .map(|target| u64::from(target.weight))
+        .sum::<u64>();
+    if total == 0 {
+        return None;
+    }
+    let mut slot = sequence % total;
+    for target in targets {
+        let weight = u64::from(target.weight);
+        if slot < weight {
+            return Some(target.address);
+        }
+        slot -= weight;
+    }
+    None
 }
 
 fn enqueue_datagram(

@@ -1,3 +1,4 @@
+use crate::traffic_control::{TrafficDecision, TrafficPolicyKind};
 use crate::{client_registry::Authentication, record_audit, AppState};
 use linklake_core::{
     read_control_frame, write_control_frame, write_control_frame_and_shutdown, BoxedIo,
@@ -53,6 +54,8 @@ struct PublicConnectionContext {
     state: Arc<AppState>,
     command_tx: mpsc::Sender<ControlFrame>,
     client_id: Uuid,
+    policy_id: Uuid,
+    policy_kind: TrafficPolicyKind,
     permits: Arc<Semaphore>,
     statistics: Arc<TunnelStatistics>,
     bandwidth_limiter: Option<Arc<BandwidthLimiter>>,
@@ -577,6 +580,8 @@ async fn register_tunnel(
         state: state.clone(),
         command_tx,
         client_id,
+        policy_id: runtime_policy.policy_id,
+        policy_kind: runtime_policy.policy_kind,
         permits: Arc::new(Semaphore::new(runtime_policy.max_connections)),
         statistics,
         bandwidth_limiter,
@@ -681,7 +686,16 @@ async fn accept_public_connections(
         tokio::select! {
             _ = stop.changed() => break,
             accepted = listener.accept() => match accepted {
-                Ok((external, _)) => {
+                Ok((external, source)) => {
+                    let decision = context.state.traffic_controls
+                        .lock()
+                        .expect("traffic control catalog lock poisoned")
+                        .authorize(context.policy_kind, context.policy_id, source.ip(), crate::unix_seconds());
+                    if !matches!(decision, Ok(TrafficDecision::Allowed)) {
+                        context.statistics.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!("TCP traffic control rejected {source}: {decision:?}");
+                        continue;
+                    }
                     let Ok(permit) = context.permits.clone().try_acquire_owned() else {
                         context.statistics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                         context.statistics.rejected_policy_limit.fetch_add(1, Ordering::Relaxed);
@@ -727,6 +741,8 @@ async fn serve_public_connection(
         state,
         command_tx,
         client_id,
+        policy_id,
+        policy_kind,
         statistics,
         bandwidth_limiter,
         ..
@@ -799,6 +815,19 @@ async fn serve_public_connection(
                     statistics
                         .bytes_to_public
                         .fetch_add(to_public, Ordering::Relaxed);
+                    if let Err(error) = state
+                        .traffic_controls
+                        .lock()
+                        .expect("traffic control catalog lock poisoned")
+                        .record_bytes(
+                            policy_kind,
+                            policy_id,
+                            from_public.saturating_add(to_public),
+                            crate::unix_seconds(),
+                        )
+                    {
+                        tracing::warn!("Could not persist TCP traffic usage: {error}");
+                    }
                 }
                 Ok(Err(error)) => {
                     statistics

@@ -1,3 +1,4 @@
+use linklake_core::target_pool::parse_target_pool;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt, fs, net::IpAddr, path::Path};
@@ -30,6 +31,7 @@ pub(crate) struct HttpRoutePolicy {
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct HttpRouteRuntimePolicy {
+    pub(crate) policy_id: Uuid,
     pub(crate) max_connections: usize,
 }
 
@@ -266,17 +268,22 @@ impl HttpRouteCatalog {
         target_addr: &str,
     ) -> anyhow::Result<Option<HttpRouteRuntimePolicy>> {
         let hostname = normalize_hostname(hostname)?;
-        let value: Option<i64> = self
+        let value: Option<(String, i64)> = self
             .database
             .query_row(
-                "SELECT max_connections FROM http_route_policies WHERE client_id = ?1 AND name = ?2 AND hostname = ?3 AND target_addr = ?4 AND enabled = 1",
+                "SELECT id, max_connections FROM http_route_policies WHERE client_id = ?1 AND name = ?2 AND hostname = ?3 AND target_addr = ?4 AND enabled = 1",
                 params![client_id.to_string(), name, hostname, target_addr],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        Ok(value.map(|max_connections| HttpRouteRuntimePolicy {
-            max_connections: max_connections as usize,
-        }))
+        value
+            .map(|(policy_id, max_connections)| {
+                Ok(HttpRouteRuntimePolicy {
+                    policy_id: Uuid::parse_str(&policy_id)?,
+                    max_connections: max_connections as usize,
+                })
+            })
+            .transpose()
     }
 }
 
@@ -328,25 +335,13 @@ fn validate_policy(
     if hostname.is_empty() {
         return Err(CreateHttpRouteError::InvalidHostname);
     }
-    if !valid_target_address(request.target_addr.trim()) || request.target_addr.len() > 255 {
+    if parse_target_pool(request.target_addr.trim()).is_err() || request.target_addr.len() > 4096 {
         return Err(CreateHttpRouteError::InvalidTarget);
     }
     if !(1..=1024).contains(&request.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS)) {
         return Err(CreateHttpRouteError::InvalidConnectionLimit);
     }
     Ok(())
-}
-
-fn valid_target_address(value: &str) -> bool {
-    if value.parse::<std::net::SocketAddr>().is_ok() {
-        return true;
-    }
-    let Some((host, port)) = value.rsplit_once(':') else {
-        return false;
-    };
-    !host.is_empty()
-        && !host.chars().any(char::is_whitespace)
-        && port.parse::<u16>().is_ok_and(|port| port != 0)
 }
 
 #[cfg(test)]
@@ -386,6 +381,7 @@ mod tests {
                 .runtime_policy(client_id, "site", "SITE.EXAMPLE.COM:80", "127.0.0.1:8080")
                 .expect("authorization should work"),
             Some(super::HttpRouteRuntimePolicy {
+                policy_id: policy.id,
                 max_connections: 12,
             })
         );

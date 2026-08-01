@@ -5,10 +5,12 @@ use std::{fmt, fs, net::Ipv6Addr, path::Path};
 use uuid::Uuid;
 
 use crate::public_port_policy::PublicPortPolicy;
+use crate::traffic_control::TrafficPolicyKind;
 
 use linklake_core::port_mapping::{
     parse_port_mappings, ParsedPortMappings, PortMappingError, MAX_PORT_MAPPINGS,
 };
+use linklake_core::target_pool::parse_target_pool;
 
 const DEFAULT_MAX_CONNECTIONS: u16 = 64;
 const DEFAULT_MAX_SESSIONS: u16 = 256;
@@ -46,6 +48,8 @@ pub(crate) struct TcpTunnelPolicy {
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct TcpTunnelRuntimePolicy {
+    pub(crate) policy_id: Uuid,
+    pub(crate) policy_kind: TrafficPolicyKind,
     pub(crate) max_connections: usize,
     pub(crate) bandwidth_limit_bps: Option<u64>,
 }
@@ -256,6 +260,7 @@ pub(crate) struct UdpTunnelPolicy {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct UdpTunnelRuntimePolicy {
     pub(crate) policy_id: Uuid,
+    pub(crate) policy_kind: TrafficPolicyKind,
     pub(crate) max_sessions: usize,
     pub(crate) session_idle_timeout_seconds: u64,
     pub(crate) bandwidth_limit_bps: Option<u64>,
@@ -687,29 +692,37 @@ impl TunnelCatalog {
         public_port: u16,
         target_addr: &str,
     ) -> anyhow::Result<Option<TcpTunnelRuntimePolicy>> {
-        let value: Option<(i64, Option<i64>)> = self.database.query_row(
-            "SELECT max_connections, bandwidth_limit_bps FROM tcp_tunnel_policies WHERE client_id = ?1 AND name = ?2 AND public_port = ?3 AND target_addr = ?4 AND enabled = 1",
+        let value: Option<(String, i64, Option<i64>)> = self.database.query_row(
+            "SELECT id, max_connections, bandwidth_limit_bps FROM tcp_tunnel_policies WHERE client_id = ?1 AND name = ?2 AND public_port = ?3 AND target_addr = ?4 AND enabled = 1",
             params![client_id.to_string(), name, public_port, target_addr],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).optional()?;
         if let Some(value) = value {
-            let (max_connections, bandwidth_limit_bps) = value;
+            let (policy_id, max_connections, bandwidth_limit_bps) = value;
             return Ok(Some(TcpTunnelRuntimePolicy {
+                policy_id: Uuid::parse_str(&policy_id)?,
+                policy_kind: TrafficPolicyKind::Tcp,
                 max_connections: max_connections as usize,
                 bandwidth_limit_bps: bandwidth_limit_bps.map(|value| value as u64),
             }));
         }
-        let value: Option<(i64, Option<i64>)> = self.database.query_row(
-            "SELECT p.max_connections, p.bandwidth_limit_bps FROM port_group_policies p JOIN port_group_mappings m ON m.policy_id = p.id WHERE p.client_id = ?1 AND p.protocol = 'tcp' AND p.name = ?2 AND m.public_port = ?3 AND m.target_addr = ?4 AND p.enabled = 1",
+        let value: Option<(String, i64, Option<i64>)> = self.database.query_row(
+            "SELECT p.id, p.max_connections, p.bandwidth_limit_bps FROM port_group_policies p JOIN port_group_mappings m ON m.policy_id = p.id WHERE p.client_id = ?1 AND p.protocol = 'tcp' AND p.name = ?2 AND m.public_port = ?3 AND m.target_addr = ?4 AND p.enabled = 1",
             params![client_id.to_string(), name, public_port, target_addr],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).optional()?;
-        Ok(value.map(
-            |(max_connections, bandwidth_limit_bps)| TcpTunnelRuntimePolicy {
-                max_connections: max_connections as usize,
-                bandwidth_limit_bps: bandwidth_limit_bps.map(|value| value as u64),
-            },
-        ))
+        value
+            .map(
+                |(policy_id, max_connections, bandwidth_limit_bps)| -> anyhow::Result<_> {
+                    Ok(TcpTunnelRuntimePolicy {
+                        policy_id: Uuid::parse_str(&policy_id)?,
+                        policy_kind: TrafficPolicyKind::PortGroup,
+                        max_connections: max_connections as usize,
+                        bandwidth_limit_bps: bandwidth_limit_bps.map(|value| value as u64),
+                    })
+                },
+            )
+            .transpose()
     }
 
     pub(crate) fn create_socks5(
@@ -1261,6 +1274,7 @@ impl TunnelCatalog {
                         Ok(UdpTunnelRuntimePolicy {
                             policy_id: Uuid::parse_str(&policy_id)
                                 .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                            policy_kind: TrafficPolicyKind::Udp,
                             max_sessions: max_sessions as usize,
                             session_idle_timeout_seconds: session_idle_timeout_seconds as u64,
                             bandwidth_limit_bps: bandwidth_limit_bps.map(|value| value as u64),
@@ -1281,6 +1295,7 @@ impl TunnelCatalog {
                     Ok(UdpTunnelRuntimePolicy {
                         policy_id: Uuid::parse_str(&policy_id)
                             .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        policy_kind: TrafficPolicyKind::PortGroup,
                         max_sessions: max_sessions as usize,
                         session_idle_timeout_seconds: session_idle_timeout_seconds as u64,
                         bandwidth_limit_bps: bandwidth_limit_bps.map(|value| value as u64),
@@ -1850,7 +1865,7 @@ fn validate_policy(
         "public port is outside the permitted range"
     );
     anyhow::ensure!(
-        valid_target_address(request.target_addr.trim()) && request.target_addr.len() <= 255,
+        request.target_addr.len() <= 4096 && parse_target_pool(request.target_addr.trim()).is_ok(),
         "target address is invalid"
     );
     anyhow::ensure!(
@@ -1867,18 +1882,6 @@ fn validate_policy(
     Ok(())
 }
 
-fn valid_target_address(value: &str) -> bool {
-    if value.parse::<std::net::SocketAddr>().is_ok() {
-        return true;
-    }
-    let Some((host, port)) = value.rsplit_once(':') else {
-        return false;
-    };
-    !host.is_empty()
-        && !host.chars().any(char::is_whitespace)
-        && port.parse::<u16>().is_ok_and(|port| port != 0)
-}
-
 fn validate_udp_policy(
     public_port_policy: &PublicPortPolicy,
     request: &CreateUdpTunnelPolicy,
@@ -1891,7 +1894,7 @@ fn validate_udp_policy(
         return Err(UdpPolicyError::InvalidPublicPort);
     }
     let target = request.target_addr.trim();
-    if target != request.target_addr || target.len() > 255 || !valid_udp_target_address(target) {
+    if target != request.target_addr || target.len() > 4096 || parse_target_pool(target).is_err() {
         return Err(UdpPolicyError::InvalidTarget);
     }
     if !(1..=MAX_UDP_SESSIONS).contains(&request.max_sessions.unwrap_or(DEFAULT_MAX_SESSIONS)) {
@@ -1911,42 +1914,6 @@ fn validate_udp_policy(
         return Err(UdpPolicyError::InvalidBandwidthLimit);
     }
     Ok(())
-}
-
-// UDP 目标只接受 IP socket 地址或严格的 ASCII DNS 主机名加端口。
-fn valid_udp_target_address(value: &str) -> bool {
-    if value.is_empty()
-        || value.chars().any(|character| {
-            character.is_whitespace()
-                || character.is_control()
-                || matches!(character, '/' | '\\' | '?' | '#' | '@')
-        })
-        || value.contains("://")
-    {
-        return false;
-    }
-    if let Ok(address) = value.parse::<std::net::SocketAddr>() {
-        return address.port() != 0;
-    }
-    let Some((host, port)) = value.rsplit_once(':') else {
-        return false;
-    };
-    if host.is_empty()
-        || host.len() > 253
-        || host.contains(':')
-        || !port.parse::<u16>().is_ok_and(|port| port != 0)
-    {
-        return false;
-    }
-    host.split('.').all(|label| {
-        !label.is_empty()
-            && label.len() <= 63
-            && !label.starts_with('-')
-            && !label.ends_with('-')
-            && label
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-    })
 }
 
 fn is_constraint_violation(error: &rusqlite::Error) -> bool {
@@ -2067,6 +2034,8 @@ mod tests {
                 .runtime_policy(client_id, "game-range", 32011, "127.0.0.1:2401")
                 .expect("runtime policy should query"),
             Some(super::TcpTunnelRuntimePolicy {
+                policy_id: policy.id,
+                policy_kind: crate::traffic_control::TrafficPolicyKind::PortGroup,
                 max_connections: 12,
                 bandwidth_limit_bps: Some(1_000_000),
             })
@@ -2339,6 +2308,8 @@ mod tests {
                 .runtime_policy(client_id, "game", 32001, "127.0.0.1:2333")
                 .expect("authorization should work"),
             Some(super::TcpTunnelRuntimePolicy {
+                policy_id: policy.id,
+                policy_kind: crate::traffic_control::TrafficPolicyKind::Tcp,
                 max_connections: 12,
                 bandwidth_limit_bps: Some(1_000_000),
             })
@@ -2663,6 +2634,7 @@ mod tests {
                 .expect("authorization should work"),
             Some(UdpTunnelRuntimePolicy {
                 policy_id: policy.id,
+                policy_kind: crate::traffic_control::TrafficPolicyKind::Udp,
                 max_sessions: 12,
                 session_idle_timeout_seconds: 90,
                 bandwidth_limit_bps: Some(1_000_000),

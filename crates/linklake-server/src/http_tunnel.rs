@@ -1,3 +1,4 @@
+use crate::traffic_control::{TrafficDecision, TrafficPolicyKind};
 use crate::{
     client_registry::Authentication, http_route_catalog::normalize_hostname, record_audit, AppState,
 };
@@ -83,6 +84,7 @@ pub(crate) struct HttpRouteStatistics {
 
 struct HttpRouteContext {
     client_id: Uuid,
+    policy_id: Uuid,
     command_tx: mpsc::Sender<ControlFrame>,
     stop: watch::Receiver<()>,
     permits: Arc<Semaphore>,
@@ -96,6 +98,9 @@ struct TrackedBody {
 }
 
 struct ConnectionActivity {
+    state: Arc<AppState>,
+    policy_id: Uuid,
+    usage: Arc<AtomicU64>,
     statistics: Arc<HttpRouteStatistics>,
     _route_permit: OwnedSemaphorePermit,
     _global_permit: OwnedSemaphorePermit,
@@ -164,11 +169,17 @@ impl TrackedBody {
 
 impl ConnectionActivity {
     fn new(
+        state: Arc<AppState>,
+        policy_id: Uuid,
+        usage: Arc<AtomicU64>,
         statistics: Arc<HttpRouteStatistics>,
         route_permit: OwnedSemaphorePermit,
         global_permit: OwnedSemaphorePermit,
     ) -> Self {
         Self {
+            state,
+            policy_id,
+            usage,
             statistics,
             _route_permit: route_permit,
             _global_permit: global_permit,
@@ -207,6 +218,21 @@ impl Drop for ConnectionActivity {
         self.statistics
             .active_connections
             .fetch_sub(1, Ordering::Relaxed);
+        let bytes = self.usage.load(Ordering::Relaxed);
+        if let Err(error) = self
+            .state
+            .traffic_controls
+            .lock()
+            .expect("traffic control catalog lock poisoned")
+            .record_bytes(
+                TrafficPolicyKind::Http,
+                self.policy_id,
+                bytes,
+                crate::unix_seconds(),
+            )
+        {
+            tracing::warn!("Could not persist HTTP traffic usage: {error}");
+        }
     }
 }
 
@@ -481,6 +507,22 @@ async fn proxy_request(
             TrackedBody::plain(StatusCode::NOT_FOUND, "unknown HTTP route")
         };
     };
+    let decision = state
+        .traffic_controls
+        .lock()
+        .expect("traffic control catalog lock poisoned")
+        .authorize(
+            TrafficPolicyKind::Http,
+            context.policy_id,
+            peer.ip(),
+            crate::unix_seconds(),
+        );
+    if !matches!(decision, Ok(TrafficDecision::Allowed)) {
+        return TrackedBody::plain(
+            StatusCode::FORBIDDEN,
+            "HTTP traffic control rejected request",
+        );
+    }
     let Ok(route_permit) = context.permits.clone().try_acquire_owned() else {
         return TrackedBody::plain(StatusCode::SERVICE_UNAVAILABLE, "HTTP route is busy");
     };
@@ -495,17 +537,27 @@ async fn proxy_request(
         .statistics
         .requests_total
         .fetch_add(1, Ordering::Relaxed);
-    let activity = ConnectionActivity::new(context.statistics.clone(), route_permit, global_permit);
+    let usage = Arc::new(AtomicU64::new(0));
+    let activity = ConnectionActivity::new(
+        state.clone(),
+        context.policy_id,
+        usage.clone(),
+        context.statistics.clone(),
+        route_permit,
+        global_permit,
+    );
 
     let client_upgrade = is_upgrade_request(&request).then(|| hyper::upgrade::on(&mut request));
     prepare_forward_headers(&mut request, peer, &original_host, scheme);
     let (parts, body) = request.into_parts();
     let request_statistics = context.statistics.clone();
+    let request_usage = usage.clone();
     let body = body.inspect_frame(move |frame| {
         if let Some(data) = frame.data_ref() {
             request_statistics
                 .bytes_from_public
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
+            request_usage.fetch_add(data.len() as u64, Ordering::Relaxed);
         }
     });
     let request = Request::from_parts(parts, body);
@@ -598,12 +650,14 @@ async fn proxy_request(
         }
     }
     let response_statistics = context.statistics.clone();
+    let response_usage = usage;
     let response = response.map(|body| {
         body.inspect_frame(move |frame| {
             if let Some(data) = frame.data_ref() {
                 response_statistics
                     .bytes_to_public
                     .fetch_add(data.len() as u64, Ordering::Relaxed);
+                response_usage.fetch_add(data.len() as u64, Ordering::Relaxed);
             }
         })
         .map_err(|error| -> BoxError { Box::new(error) })
@@ -714,6 +768,7 @@ pub(crate) async fn register_route(
     };
     let context = Arc::new(HttpRouteContext {
         client_id,
+        policy_id: runtime_policy.policy_id,
         command_tx,
         stop: stop_rx.clone(),
         permits: Arc::new(Semaphore::new(runtime_policy.max_connections)),

@@ -1,3 +1,4 @@
+use linklake_core::target_pool::parse_target_pool;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt, fs, path::Path};
@@ -290,7 +291,7 @@ fn validate_policy(request: &CreateSniRoutePolicy) -> Result<(), SniRoutePolicyE
         return Err(SniRoutePolicyError::InvalidName);
     }
     let target = request.target_addr.trim();
-    if target != request.target_addr || target.len() > 255 || !valid_target_address(target) {
+    if target != request.target_addr || target.len() > 4096 || parse_target_pool(target).is_err() {
         return Err(SniRoutePolicyError::InvalidTarget);
     }
     if !(1..=1_024).contains(&request.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS)) {
@@ -303,20 +304,6 @@ fn validate_policy(request: &CreateSniRoutePolicy) -> Result<(), SniRoutePolicyE
         return Err(SniRoutePolicyError::InvalidBandwidthLimit);
     }
     Ok(())
-}
-
-fn valid_target_address(value: &str) -> bool {
-    if value.parse::<std::net::SocketAddr>().is_ok() {
-        return true;
-    }
-    let Some((host, port)) = value.rsplit_once(':') else {
-        return false;
-    };
-    !host.is_empty()
-        && !host.chars().any(char::is_whitespace)
-        && !host.contains('/')
-        && !host.contains('@')
-        && port.parse::<u16>().is_ok_and(|port| port != 0)
 }
 
 #[cfg(test)]

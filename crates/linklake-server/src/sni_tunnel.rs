@@ -1,3 +1,4 @@
+use crate::traffic_control::{TrafficDecision, TrafficPolicyKind};
 use crate::{
     client_registry::Authentication,
     http_route_catalog::normalize_hostname,
@@ -50,6 +51,7 @@ pub(crate) struct SniRouteStatistics {
 
 struct SniRouteContext {
     client_id: Uuid,
+    policy_id: Uuid,
     command_tx: mpsc::Sender<ControlFrame>,
     stop: watch::Receiver<()>,
     permits: Arc<Semaphore>,
@@ -108,7 +110,7 @@ pub(crate) async fn run_listener(
             Ok((stream, peer)) => {
                 let state = state.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = serve_connection(state, stream).await {
+                    if let Err(error) = serve_connection(state, stream, peer).await {
                         tracing::debug!("TLS SNI connection from {peer} ended: {error}");
                     }
                 });
@@ -118,7 +120,11 @@ pub(crate) async fn run_listener(
     }
 }
 
-async fn serve_connection(state: Arc<AppState>, mut public: TcpStream) -> anyhow::Result<()> {
+async fn serve_connection(
+    state: Arc<AppState>,
+    mut public: TcpStream,
+    peer: std::net::SocketAddr,
+) -> anyhow::Result<()> {
     let (hostname, client_hello) =
         match timeout(CLIENT_HELLO_TIMEOUT, read_client_hello_sni(&mut public)).await {
             Ok(Ok(value)) => value,
@@ -151,6 +157,23 @@ async fn serve_connection(state: Arc<AppState>, mut public: TcpStream) -> anyhow
         }
         anyhow::bail!("unknown or offline TLS SNI hostname")
     };
+    let decision = state
+        .traffic_controls
+        .lock()
+        .expect("traffic control catalog lock poisoned")
+        .authorize(
+            TrafficPolicyKind::Sni,
+            context.policy_id,
+            peer.ip(),
+            crate::unix_seconds(),
+        )?;
+    if decision != TrafficDecision::Allowed {
+        context
+            .statistics
+            .rejected_connections
+            .fetch_add(1, Ordering::Relaxed);
+        anyhow::bail!("TLS SNI traffic control rejected connection: {decision:?}")
+    }
     let Ok(route_permit) = context.permits.clone().try_acquire_owned() else {
         context
             .statistics
@@ -213,6 +236,18 @@ async fn serve_connection(state: Arc<AppState>, mut public: TcpStream) -> anyhow
                 .statistics
                 .bytes_to_public
                 .fetch_add(to_public, Ordering::Relaxed);
+            state
+                .traffic_controls
+                .lock()
+                .expect("traffic control catalog lock poisoned")
+                .record_bytes(
+                    TrafficPolicyKind::Sni,
+                    context.policy_id,
+                    from_public
+                        .saturating_add(to_public)
+                        .saturating_add(client_hello.len() as u64),
+                    crate::unix_seconds(),
+                )?;
             Ok(())
         }
         Ok(Err(error)) => {
@@ -315,6 +350,7 @@ pub(crate) async fn register_route(
     };
     let context = Arc::new(SniRouteContext {
         client_id,
+        policy_id: runtime.policy_id,
         command_tx,
         stop: stop_rx.clone(),
         permits: Arc::new(Semaphore::new(runtime.max_connections)),

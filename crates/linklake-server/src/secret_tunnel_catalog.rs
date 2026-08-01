@@ -1,7 +1,8 @@
+use linklake_core::target_pool::parse_target_pool;
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{fmt, fs, net::SocketAddr, path::Path};
+use std::{fmt, fs, path::Path};
 use uuid::Uuid;
 
 const DEFAULT_MAX_CONNECTIONS: u16 = 32;
@@ -329,7 +330,7 @@ fn validate_policy(request: &CreateSecretTunnelPolicy) -> Result<(), SecretPolic
         return Err(SecretPolicyError::InvalidName);
     }
     let target = request.target_addr.trim();
-    if target != request.target_addr || target.len() > 255 || !valid_target(target) {
+    if target != request.target_addr || target.len() > 4096 || parse_target_pool(target).is_err() {
         return Err(SecretPolicyError::InvalidTarget);
     }
     if !(1..=MAX_CONNECTIONS).contains(&request.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS))
@@ -343,20 +344,6 @@ fn validate_policy(request: &CreateSecretTunnelPolicy) -> Result<(), SecretPolic
         return Err(SecretPolicyError::InvalidBandwidthLimit);
     }
     Ok(())
-}
-
-fn valid_target(value: &str) -> bool {
-    if value.parse::<SocketAddr>().is_ok() {
-        return true;
-    }
-    let Some((host, port)) = value.rsplit_once(':') else {
-        return false;
-    };
-    !host.is_empty()
-        && !host.chars().any(char::is_whitespace)
-        && !host.contains('/')
-        && !host.contains('@')
-        && port.parse::<u16>().is_ok_and(|port| port != 0)
 }
 
 fn valid_access_key(value: &str) -> bool {
