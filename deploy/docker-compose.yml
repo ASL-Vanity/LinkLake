@@ -1,0 +1,63 @@
+services:
+  linklake:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: linklake/server:${LINKLAKE_VERSION:-latest}
+    restart: unless-stopped
+    env_file: linklake.env
+    volumes:
+      - linklake-data:/var/lib/linklake
+      - linklake-logs:/var/log/linklake
+      - ./certs:/etc/linklake/certs:ro
+    ports:
+      - "32100:32100/tcp"
+      - "32101:32101/tcp"
+      - "32102:32102/tcp"
+      - "32103:32103/tcp"
+      - "32104:32104/udp"
+      - "32105:32105/tcp"
+      # 避开 32100-32105 管理、控制和内置数据面端口，防止重复发布同一宿主机端口。
+      - "32000-32099:32000-32099/tcp"
+      - "32106-32999:32106-32999/tcp"
+      - "32000-32103:32000-32103/udp"
+      - "32105-32999:32105-32999/udp"
+    healthcheck:
+      test: ["CMD-SHELL", "/usr/local/bin/linklake-client check --server \"$${LINKLAKE_HEALTH_URL}\" --ca-cert /etc/linklake/certs/management-cert.pem"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    restart: unless-stopped
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=30d"]
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    secrets: [linklake_metrics_token]
+    depends_on: [linklake]
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD}
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports: ["127.0.0.1:33000:3000"]
+    depends_on: [prometheus]
+
+volumes:
+  linklake-data:
+  linklake-logs:
+  prometheus-data:
+  grafana-data:
+
+secrets:
+  linklake_metrics_token:
+    file: ./secrets/linklake_metrics_token

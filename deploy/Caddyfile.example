@@ -1,0 +1,7 @@
+management.example.com {
+    reverse_proxy https://127.0.0.1:32100 {
+        transport http {
+            tls_server_name management.example.com
+        }
+    }
+}

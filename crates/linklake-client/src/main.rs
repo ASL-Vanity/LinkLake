@@ -62,6 +62,9 @@ enum Command {
     Check {
         #[arg(long, default_value = "http://127.0.0.1:32100")]
         server: String,
+        /// 管理 API 使用私有 CA 或自签证书时，显式指定受信 PEM 证书。
+        #[arg(long)]
+        ca_cert: Option<PathBuf>,
     },
     /// 注册本机，并且仅输出一次客户端凭据。
     Enroll {
@@ -433,9 +436,17 @@ fn main() -> anyhow::Result<()> {
 
 async fn run_cli() -> anyhow::Result<()> {
     match Cli::parse().command {
-        Command::Check { server } => {
+        Command::Check { server, ca_cert } => {
             let endpoint = format!("{}/api/v1/health", server.trim_end_matches('/'));
-            let health: HealthResponse = reqwest::get(endpoint)
+            let mut builder = reqwest::Client::builder();
+            if let Some(path) = ca_cert {
+                let certificate = reqwest::Certificate::from_pem(&std::fs::read(path)?)?;
+                builder = builder.add_root_certificate(certificate);
+            }
+            let health: HealthResponse = builder
+                .build()?
+                .get(endpoint)
+                .send()
                 .await?
                 .error_for_status()?
                 .json()

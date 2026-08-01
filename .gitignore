@@ -11,3 +11,6 @@
 !.env.example
 /.tmp-tls-test/
 /linklake-client.toml
+/deploy/linklake.env
+/deploy/secrets/
+/deploy/certs/

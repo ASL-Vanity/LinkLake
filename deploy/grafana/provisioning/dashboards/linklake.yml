@@ -1,0 +1,7 @@
+apiVersion: 1
+providers:
+  - name: LinkLake
+    folder: LinkLake
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards

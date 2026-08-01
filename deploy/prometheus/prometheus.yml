@@ -1,0 +1,13 @@
+global:
+  scrape_interval: 15s
+scrape_configs:
+  - job_name: linklake
+    scheme: https
+    metrics_path: /api/v1/metrics/prometheus
+    authorization:
+      credentials_file: /run/secrets/linklake_metrics_token
+    # Compose 私有网络内仍使用 TLS。若已部署内部 CA，生产环境应改为 ca_file + server_name 严格校验。
+    tls_config:
+      insecure_skip_verify: true
+    static_configs:
+      - targets: ["linklake:32100"]

@@ -1,0 +1,11 @@
+.git
+.idea
+target
+dist
+data
+logs
+.tmp-*
+apps/linklake_manager/build
+deploy/linklake.env
+deploy/secrets
+deploy/certs

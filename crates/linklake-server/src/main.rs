@@ -76,6 +76,7 @@ use sni_route_catalog::{
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    fmt::Write as _,
     fs::File,
     io::BufReader,
     net::SocketAddr,
@@ -1757,6 +1758,7 @@ async fn run_server(
         .route("/api/v1/status", get(status))
         .route("/api/v1/public-port-policy", get(get_public_port_policy))
         .route("/api/v1/metrics", get(metrics))
+        .route("/api/v1/metrics/prometheus", get(prometheus_metrics))
         .route("/api/v1/metrics/history", get(metrics_history))
         .route(
             "/api/v1/metrics/history/export",
@@ -2580,6 +2582,44 @@ async fn metrics(
             .acme_http01_challenges_total
             .load(Ordering::Relaxed),
     }))
+}
+
+async fn prometheus_metrics(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let Json(metrics) = metrics(State(state), headers).await?;
+    let value = serde_json::to_value(metrics).map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not encode Prometheus metrics",
+        )
+    })?;
+    let output = render_prometheus_metrics(&value);
+    Ok((
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        output,
+    )
+        .into_response())
+}
+
+fn render_prometheus_metrics(value: &serde_json::Value) -> String {
+    let mut output = String::new();
+    if let Some(fields) = value.as_object() {
+        for (name, value) in fields {
+            if !value.is_number() {
+                continue;
+            }
+            let metric = format!("linklake_{}", name.replace('-', "_"));
+            // 保留 JSON 数字的原始十进制表示，避免大流量计数转换为 f64 后丢失精度。
+            let _ = writeln!(output, "# TYPE {metric} gauge");
+            let _ = writeln!(output, "{metric} {value}");
+        }
+    }
+    output
 }
 
 async fn metrics_history(
@@ -9269,11 +9309,12 @@ mod tests {
         apply_cache_control, auth_me_response, build_metrics_history_response,
         certificate_target_matches, coded_http_route_creation_error, coded_tcp_policy_error,
         login_throttle_identity, management_session_cookie, normalize_metrics_history_step,
-        parse_metrics_history_range, release_certificate_job_slot, reserve_certificate_job_slot,
-        select_certificate_maintenance_operation, session_cookie_header, tcp_history_error_total,
-        udp_history_error_total, udp_metrics_response, CertificateOperation, HistoryCounters,
-        LoginResponse, LoginThrottle, MetricsHistory, MetricsHistoryProtocol, MetricsHistorySample,
-        UserRole, LOGIN_THROTTLE_MAX_IDENTITIES, MANAGEMENT_UI, METRICS_HISTORY_ARCHIVE_CAPACITY,
+        parse_metrics_history_range, release_certificate_job_slot, render_prometheus_metrics,
+        reserve_certificate_job_slot, select_certificate_maintenance_operation,
+        session_cookie_header, tcp_history_error_total, udp_history_error_total,
+        udp_metrics_response, CertificateOperation, HistoryCounters, LoginResponse, LoginThrottle,
+        MetricsHistory, MetricsHistoryProtocol, MetricsHistorySample, UserRole,
+        LOGIN_THROTTLE_MAX_IDENTITIES, MANAGEMENT_UI, METRICS_HISTORY_ARCHIVE_CAPACITY,
         METRICS_HISTORY_ARCHIVE_SAMPLE_INTERVAL_SECONDS, METRICS_HISTORY_CAPACITY,
         METRICS_HISTORY_RECENT_RETENTION_SECONDS, METRICS_HISTORY_RETENTION_SECONDS,
         METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS,
@@ -9389,6 +9430,21 @@ mod tests {
                 Some("no-store, private")
             );
         }
+    }
+
+    #[test]
+    fn prometheus_metrics_preserve_integer_precision_and_skip_non_numbers() {
+        let output = render_prometheus_metrics(&serde_json::json!({
+            "large-counter": u64::MAX,
+            "active_connections": 3,
+            "optional": null,
+            "label": "ignored"
+        }));
+        assert!(output.contains("# TYPE linklake_large_counter gauge\n"));
+        assert!(output.contains("linklake_large_counter 18446744073709551615\n"));
+        assert!(output.contains("linklake_active_connections 3\n"));
+        assert!(!output.contains("optional"));
+        assert!(!output.contains("label"));
     }
 
     #[test]

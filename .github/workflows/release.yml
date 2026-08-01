@@ -73,7 +73,7 @@ jobs:
           key: linux-release-${{ hashFiles('Cargo.lock') }}
           restore-keys: linux-release-
       - name: Install Flutter Linux dependencies
-        run: sudo apt-get update && sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev
+        run: sudo apt-get update && sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev rpm
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
@@ -83,6 +83,12 @@ jobs:
         run: bash scripts/package-linux.sh
       - name: Verify Linux package
         run: bash scripts/verify-linux-package.sh
+      - name: Build DEB and RPM packages
+        run: sh scripts/package-native-linux.sh
+      - name: Verify DEB and RPM packages
+        run: sh scripts/verify-native-linux-packages.sh
+      - name: Verify container image builds
+        run: docker build -t linklake:${{ github.ref_name }} .
       - name: Build Flutter manager Linux package
         run: sh scripts/package-manager-linux.sh
       - name: Verify Flutter manager Linux package
@@ -93,6 +99,10 @@ jobs:
           path: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
+            dist/*.deb
+            dist/*.deb.sha256
+            dist/*.rpm
+            dist/*.rpm.sha256
           if-no-files-found: error
 
   macos-package:
