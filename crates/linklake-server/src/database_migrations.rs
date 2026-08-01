@@ -3,7 +3,7 @@
 use rusqlite::Connection;
 use std::{fs, path::Path};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 pub(crate) struct MigrationPlan {
     database_path: std::path::PathBuf,

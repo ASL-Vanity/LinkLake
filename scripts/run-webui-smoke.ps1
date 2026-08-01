@@ -106,6 +106,7 @@ try {
     }
     $client = Invoke-LinkLakeJson -Method Post -Path '/api/v1/clients/enroll' -Headers $enrollmentHeaders -Body @{ name = 'smoke-client'; platform = 'windows' }
     $clientId = [string]$client.client_id
+    Invoke-LinkLakeJson -Method Post -Path '/api/v1/clients/enroll' -Headers $enrollmentHeaders -Body @{ name = 'unused-client'; platform = 'linux' } | Out-Null
 
     $policies = @(
         @{ Path = '/api/v1/tcp-tunnels'; Body = @{ client_id = $clientId; name = 'smoke-tcp'; public_port = 18080; target_addr = '127.0.0.1:18001'; max_connections = 64; bandwidth_limit_bps = $null } },

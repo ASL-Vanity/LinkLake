@@ -40,7 +40,7 @@ use certificate_catalog::{
     RouteTlsMode, RouteTlsPolicy, UpdateAcmeConfig, UpdateRouteTlsPolicy,
 };
 use certificate_manager::CertificateManager;
-use client_registry::{Authentication, ClientRegistry};
+use client_registry::{Authentication, ClientRegistry, UpdateClient};
 use http_route_catalog::{
     CreateHttpRouteError, CreateHttpRoutePolicy, HttpRouteCatalog, HttpRoutePolicy,
     UpdateHttpRoutePolicy,
@@ -734,6 +734,20 @@ fn default_force_password_change() -> bool {
 #[derive(Deserialize)]
 struct AuditQuery {
     limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct SearchQuery {
+    q: String,
+}
+
+#[derive(Serialize)]
+struct SearchResult {
+    kind: &'static str,
+    id: String,
+    title: String,
+    subtitle: String,
+    href: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -1503,6 +1517,15 @@ async fn run_server(
             get(get_acme_config).put(update_acme_config),
         )
         .route("/api/v1/clients", get(list_clients))
+        .route("/api/v1/search", get(global_search))
+        .route(
+            "/api/v1/clients/:client_id",
+            put(update_client).delete(delete_client),
+        )
+        .route(
+            "/api/v1/clients/:client_id/rotate-token",
+            post(rotate_client_token),
+        )
         .route("/api/v1/audit", get(list_audit_events))
         .route(
             "/api/v1/tcp-tunnels",
@@ -3694,6 +3717,351 @@ async fn list_clients(
     authorize_management(&state, &headers)?;
     let clients = state.clients.lock().expect("client registry lock poisoned");
     Ok(Json(clients.summaries()))
+}
+
+async fn global_search(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<SearchQuery>,
+) -> Result<Json<Vec<SearchResult>>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let query = query.q.trim().to_lowercase();
+    if query.len() < 2 {
+        return Ok(Json(Vec::new()));
+    }
+    let mut results = Vec::new();
+    let mut add =
+        |kind: &'static str, id: String, title: String, subtitle: String, href: &'static str| {
+            if results.len() >= 50 {
+                return;
+            }
+            let haystack = format!("{id} {title} {subtitle}").to_lowercase();
+            if haystack.contains(&query) {
+                results.push(SearchResult {
+                    kind,
+                    id,
+                    title,
+                    subtitle,
+                    href: href.to_owned(),
+                });
+            }
+        };
+    for client in state
+        .clients
+        .lock()
+        .expect("client registry lock poisoned")
+        .summaries()
+    {
+        add(
+            "client",
+            client.client_id.to_string(),
+            client.name,
+            format!(
+                "{} · {} · {}",
+                client.platform,
+                client.group_name.unwrap_or_default(),
+                client.tags.join(",")
+            ),
+            "#/clients",
+        );
+    }
+    let catalog = state
+        .tunnel_catalog
+        .lock()
+        .expect("tunnel catalog lock poisoned");
+    for policy in catalog.list().map_err(coded_client_management_error)? {
+        add(
+            "tcp",
+            policy.id.to_string(),
+            policy.name,
+            format!("{} → {}", policy.public_port, policy.target_addr),
+            "#/services/tcp",
+        );
+    }
+    for policy in catalog
+        .list_udp()
+        .map_err(|error| coded_client_management_error(error.into()))?
+    {
+        add(
+            "udp",
+            policy.id.to_string(),
+            policy.name,
+            format!("{} → {}", policy.public_port, policy.target_addr),
+            "#/services/udp",
+        );
+    }
+    for policy in catalog
+        .list_port_groups()
+        .map_err(|error| coded_client_management_error(error.into()))?
+    {
+        add(
+            "ports",
+            policy.id.to_string(),
+            policy.name,
+            format!(
+                "{} → {}:{}",
+                policy.public_ports, policy.target_host, policy.target_ports
+            ),
+            "#/services/ports",
+        );
+    }
+    for policy in catalog
+        .list_socks5()
+        .map_err(|error| coded_client_management_error(error.into()))?
+    {
+        add(
+            "socks5",
+            policy.id.to_string(),
+            policy.name,
+            format!("{} · {}", policy.public_port, policy.username),
+            "#/services/socks5",
+        );
+    }
+    for policy in catalog
+        .list_http_proxies()
+        .map_err(|error| coded_client_management_error(error.into()))?
+    {
+        add(
+            "http_proxy",
+            policy.id.to_string(),
+            policy.name,
+            format!("{} · {}", policy.public_port, policy.username),
+            "#/services/http-proxy",
+        );
+    }
+    drop(catalog);
+    for policy in state
+        .http_route_catalog
+        .lock()
+        .expect("HTTP route catalog lock poisoned")
+        .list()
+        .map_err(coded_client_management_error)?
+    {
+        add(
+            "http",
+            policy.id.to_string(),
+            policy.name,
+            format!("{} → {}", policy.hostname, policy.target_addr),
+            "#/services/http",
+        );
+    }
+    for policy in state
+        .sni_route_catalog
+        .lock()
+        .expect("SNI route catalog lock poisoned")
+        .list()
+        .map_err(|error| coded_client_management_error(error.into()))?
+    {
+        add(
+            "sni",
+            policy.id.to_string(),
+            policy.name,
+            format!("{} → {}", policy.hostname, policy.target_addr),
+            "#/services/sni",
+        );
+    }
+    for policy in state
+        .secret_tunnel_catalog
+        .lock()
+        .expect("secret tunnel catalog lock poisoned")
+        .list()
+        .map_err(|error| coded_client_management_error(error.into()))?
+    {
+        add(
+            "secret",
+            policy.id.to_string(),
+            policy.name,
+            policy.target_addr,
+            "#/services/secret",
+        );
+    }
+    Ok(Json(results))
+}
+
+async fn update_client(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(client_id): Path<Uuid>,
+    Json(request): Json<UpdateClient>,
+) -> Result<Json<linklake_core::ClientSummary>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let client = state
+        .clients
+        .lock()
+        .expect("client registry lock poisoned")
+        .update(client_id, request)
+        .map_err(coded_client_management_error)?
+        .ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_client",
+            "client does not exist",
+        ))?;
+    record_audit(
+        &state,
+        "client.updated",
+        &client_id.to_string(),
+        &format!(
+            "name={}; group={}; enabled={}; tags={}",
+            client.name,
+            client.group_name.as_deref().unwrap_or(""),
+            client.enabled,
+            client.tags.join(",")
+        ),
+    );
+    Ok(Json(client))
+}
+
+async fn rotate_client_token(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(client_id): Path<Uuid>,
+) -> Result<Json<ClientEnrollmentResponse>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let client_token = state
+        .clients
+        .lock()
+        .expect("client registry lock poisoned")
+        .rotate_token(client_id)
+        .map_err(coded_client_management_error)?
+        .ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_client",
+            "client does not exist",
+        ))?;
+    record_audit(
+        &state,
+        "client.token.rotated",
+        &client_id.to_string(),
+        "client token rotated; existing control sessions will fail on their next authentication",
+    );
+    Ok(Json(ClientEnrollmentResponse {
+        client_id,
+        client_token,
+    }))
+}
+
+async fn delete_client(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(client_id): Path<Uuid>,
+) -> Result<StatusCode, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let client = state
+        .clients
+        .lock()
+        .expect("client registry lock poisoned")
+        .summary_by_id(client_id)
+        .ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_client",
+            "client does not exist",
+        ))?;
+    if client.enabled && unix_seconds().saturating_sub(client.last_seen_unix_seconds) <= 120 {
+        return Err(CodedApiError(
+            StatusCode::CONFLICT,
+            "client_is_online",
+            "disable the client identity and wait for it to disconnect before deletion",
+        ));
+    }
+    let references = client_policy_reference_count(&state, client_id)?;
+    if references > 0 {
+        return Err(CodedApiError(
+            StatusCode::CONFLICT,
+            "client_has_policies",
+            "delete or migrate policies that reference this client first",
+        ));
+    }
+    let deleted = state
+        .clients
+        .lock()
+        .expect("client registry lock poisoned")
+        .delete(client_id)
+        .map_err(coded_client_management_error)?;
+    if !deleted {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_client",
+            "client does not exist",
+        ));
+    }
+    record_audit(
+        &state,
+        "client.deleted",
+        &client_id.to_string(),
+        "client identity deleted",
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn client_policy_reference_count(
+    state: &AppState,
+    client_id: Uuid,
+) -> Result<usize, CodedApiError> {
+    let tunnel_catalog = state
+        .tunnel_catalog
+        .lock()
+        .expect("tunnel catalog lock poisoned");
+    let mut count = tunnel_catalog
+        .list()
+        .map_err(coded_client_management_error)?
+        .into_iter()
+        .filter(|policy| policy.client_id == client_id)
+        .count();
+    count += tunnel_catalog
+        .list_udp()
+        .map_err(|error| coded_client_management_error(error.into()))?
+        .into_iter()
+        .filter(|policy| policy.client_id == client_id)
+        .count();
+    count += tunnel_catalog
+        .list_port_groups()
+        .map_err(|error| coded_client_management_error(error.into()))?
+        .into_iter()
+        .filter(|policy| policy.client_id == client_id)
+        .count();
+    count += tunnel_catalog
+        .list_socks5()
+        .map_err(|error| coded_client_management_error(error.into()))?
+        .into_iter()
+        .filter(|policy| policy.client_id == client_id)
+        .count();
+    count += tunnel_catalog
+        .list_http_proxies()
+        .map_err(|error| coded_client_management_error(error.into()))?
+        .into_iter()
+        .filter(|policy| policy.client_id == client_id)
+        .count();
+    drop(tunnel_catalog);
+    count += state
+        .http_route_catalog
+        .lock()
+        .expect("HTTP route catalog lock poisoned")
+        .list()
+        .map_err(coded_client_management_error)?
+        .into_iter()
+        .filter(|policy| policy.client_id == client_id)
+        .count();
+    count += state
+        .sni_route_catalog
+        .lock()
+        .expect("SNI route catalog lock poisoned")
+        .list()
+        .map_err(|error| coded_client_management_error(error.into()))?
+        .into_iter()
+        .filter(|policy| policy.client_id == client_id)
+        .count();
+    count += state
+        .secret_tunnel_catalog
+        .lock()
+        .expect("secret tunnel catalog lock poisoned")
+        .list()
+        .map_err(|error| coded_client_management_error(error.into()))?
+        .into_iter()
+        .filter(|policy| {
+            policy.provider_client_id == client_id || policy.allowed_client_id == Some(client_id)
+        })
+        .count();
+    Ok(count)
 }
 
 async fn list_p2p_nodes(
@@ -6459,6 +6827,16 @@ async fn heartbeat(
                 .fetch_add(1, Ordering::Relaxed);
             return Err(ApiError(StatusCode::NOT_FOUND, "unknown client"));
         }
+        Authentication::DisabledClient => {
+            state
+                .metrics
+                .authentication_failures_total
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(ApiError(
+                StatusCode::FORBIDDEN,
+                "client identity is disabled",
+            ));
+        }
         Authentication::InvalidToken => {
             state
                 .metrics
@@ -6653,6 +7031,42 @@ fn user_management_error(error: anyhow::Error) -> CodedApiError {
             StatusCode::INTERNAL_SERVER_ERROR,
             "user_storage_error",
             "user registry operation failed",
+        )
+    }
+}
+
+fn coded_client_management_error(error: anyhow::Error) -> CodedApiError {
+    let message = error.to_string();
+    if message.contains("client name") {
+        CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_client_name",
+            "client name is invalid",
+        )
+    } else if message.contains("client group") {
+        CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_client_group",
+            "client group is invalid",
+        )
+    } else if message.contains("client notes") {
+        CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_client_notes",
+            "client notes are invalid",
+        )
+    } else if message.contains("client tag") {
+        CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_client_tags",
+            "client tags are invalid",
+        )
+    } else {
+        tracing::error!("Client registry operation failed: {message}");
+        CodedApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "client_storage_error",
+            "client registry operation failed",
         )
     }
 }

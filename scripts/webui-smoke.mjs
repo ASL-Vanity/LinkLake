@@ -85,6 +85,33 @@ try {
   await waitForWorkspace();
   assert((await page.locator('#account-name').textContent())?.trim() === username, '刷新后未恢复当前账户');
 
+  await page.locator('#global-search').fill('smoke-tcp');
+  await page.locator('#global-search-results button').first().waitFor({ timeout: 15_000 });
+  assert((await page.locator('#global-search-results').textContent()).includes('smoke-tcp'), '全局搜索没有返回策略');
+  await page.locator('#global-search').fill('');
+
+  await openRoute('#/clients');
+  const managedClientRow = page.locator('#clients-list tr').filter({ hasText: 'smoke-client' });
+  await managedClientRow.waitFor({ timeout: 15_000 });
+  await managedClientRow.getByRole('button', { name: /Edit client|编辑客户端/ }).click();
+  await page.locator('#client-group').fill('QA');
+  await page.locator('#client-tags').fill('windows, smoke');
+  await page.locator('#client-notes').fill('Web UI smoke client');
+  await page.locator('#client-form button[type="submit"]').click();
+  await page.waitForFunction(() => document.querySelector('#clients-list')?.textContent?.includes('QA'));
+  page.once('dialog', dialog => dialog.accept());
+  await page.locator('#clients-list tr').filter({ hasText: 'smoke-client' }).getByRole('button', { name: /Rotate token|轮换令牌/ }).click();
+  await page.locator('#client-token-modal:not(.hidden)').waitFor();
+  assert((await page.locator('#client-token-value').inputValue()).startsWith('llc_'), '轮换后的客户端令牌格式错误');
+  await page.locator('#client-token-done').click();
+
+  const unusedClientRow = page.locator('#clients-list tr').filter({ hasText: 'unused-client' });
+  await unusedClientRow.getByRole('button', { name: /Revoke|撤销/ }).click();
+  await page.waitForFunction(() => document.querySelector('#clients-list')?.textContent?.includes('unused-client'));
+  page.once('dialog', dialog => dialog.accept());
+  await page.locator('#clients-list tr').filter({ hasText: 'unused-client' }).getByRole('button', { name: /Delete|删除/ }).click();
+  await page.waitForFunction(() => !document.querySelector('#clients-list')?.textContent?.includes('unused-client'));
+
   // 验证主题模式与配色持久化。
   await page.locator('#appearance-button').click();
   await page.locator('[data-theme-choice="light"]').click();
@@ -130,6 +157,14 @@ try {
     ['http-proxy', 'smoke-http-proxy-edited'],
   ];
   for (const [route, editedName] of policies) await editPolicy(route, editedName);
+
+  await openRoute('#/services/tcp');
+  await page.locator('#service-list .policy-select input').first().check();
+  assert(!(await page.locator('#bulk-disable-policies').isDisabled()), '选择策略后批量操作仍被禁用');
+  await page.locator('#bulk-disable-policies').click();
+  await page.waitForFunction(() => document.querySelector('#service-list')?.textContent?.includes('Disabled') || document.querySelector('#service-list')?.textContent?.includes('已停用'));
+  assert(await page.locator('#export-policies').isVisible(), '策略导出入口不可见');
+  assert(await page.locator('#import-policies').isVisible(), '策略导入入口不可见');
 
   // 管理员通过真实界面创建、编辑、重置和撤销用户会话。
   await openRoute('#/users');
