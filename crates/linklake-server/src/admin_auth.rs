@@ -2,8 +2,11 @@ use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
+use getrandom::fill as random_fill;
+use hmac::{Hmac, Mac};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::{fs, path::Path};
 use uuid::Uuid;
@@ -28,7 +31,16 @@ pub(crate) struct NewSession {
     pub(crate) expires_unix_seconds: u64,
     pub(crate) password_change_required: bool,
     pub(crate) role: UserRole,
+    pub(crate) totp_enabled: bool,
 }
+
+pub(crate) enum LoginAttempt {
+    Success(NewSession),
+    InvalidCredentials,
+    TotpRequired,
+}
+
+type AdministratorLoginRow = (String, i64, i64, String, String, Option<String>, i64);
 
 #[derive(Debug, Clone)]
 pub(crate) struct SessionIdentity {
@@ -38,6 +50,7 @@ pub(crate) struct SessionIdentity {
     pub(crate) role: UserRole,
     pub(crate) expires_unix_seconds: u64,
     pub(crate) password_change_required: bool,
+    pub(crate) totp_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -77,6 +90,7 @@ pub(crate) struct UserRecord {
     pub(crate) created_unix_seconds: u64,
     pub(crate) last_login_unix_seconds: Option<u64>,
     pub(crate) active_sessions: u64,
+    pub(crate) totp_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -85,6 +99,8 @@ pub(crate) struct SessionRecord {
     pub(crate) username: String,
     pub(crate) created_unix_seconds: u64,
     pub(crate) expires_unix_seconds: u64,
+    pub(crate) remote_addr: Option<String>,
+    pub(crate) user_agent: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,14 +180,18 @@ impl AdminAuth {
                 display_name TEXT NOT NULL DEFAULT '',
                 role TEXT NOT NULL DEFAULT 'administrator',
                 enabled INTEGER NOT NULL DEFAULT 1,
-                last_login_unix_seconds INTEGER
+                last_login_unix_seconds INTEGER,
+                totp_secret TEXT,
+                totp_enabled INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS admin_sessions (
                 session_id TEXT PRIMARY KEY NOT NULL,
                 session_secret_hash TEXT NOT NULL,
                 username TEXT NOT NULL,
                 created_unix_seconds INTEGER NOT NULL DEFAULT 0,
-                expires_unix_seconds INTEGER NOT NULL
+                expires_unix_seconds INTEGER NOT NULL,
+                remote_addr TEXT,
+                user_agent TEXT
             );
             CREATE INDEX IF NOT EXISTS admin_sessions_expiry ON admin_sessions(expires_unix_seconds);
             ",
@@ -204,15 +224,40 @@ impl AdminAuth {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn login(
         &mut self,
         username: &str,
         password: &str,
     ) -> anyhow::Result<Option<NewSession>> {
-        let administrator: Option<(String, i64, i64, String, String)> = self
+        match self.login_with_totp(username, password, None)? {
+            LoginAttempt::Success(session) => Ok(Some(session)),
+            LoginAttempt::InvalidCredentials | LoginAttempt::TotpRequired => Ok(None),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn login_with_totp(
+        &mut self,
+        username: &str,
+        password: &str,
+        totp_code: Option<&str>,
+    ) -> anyhow::Result<LoginAttempt> {
+        self.login_with_context(username, password, totp_code, None, None)
+    }
+
+    pub(crate) fn login_with_context(
+        &mut self,
+        username: &str,
+        password: &str,
+        totp_code: Option<&str>,
+        remote_addr: Option<&str>,
+        user_agent: Option<&str>,
+    ) -> anyhow::Result<LoginAttempt> {
+        let administrator: Option<AdministratorLoginRow> = self
             .database
             .query_row(
-                "SELECT password_hash, must_change_password, enabled, role, display_name FROM administrators WHERE username = ?1",
+                "SELECT password_hash, must_change_password, enabled, role, display_name, totp_secret, totp_enabled FROM administrators WHERE username = ?1",
                 [username],
                 |row| {
                     Ok((
@@ -221,22 +266,50 @@ impl AdminAuth {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
                     ))
                 },
             )
             .optional()?;
-        let (must_change_password, role, display_name) = match administrator {
-            Some((password_hash, must_change_password, enabled, role, display_name)) => {
-                if enabled == 0 || !verify_password(password, &password_hash)? {
-                    return Ok(None);
+        let (must_change_password, role, display_name, totp_secret, totp_enabled) =
+            match administrator {
+                Some((
+                    password_hash,
+                    must_change_password,
+                    enabled,
+                    role,
+                    display_name,
+                    totp_secret,
+                    totp_enabled,
+                )) => {
+                    if enabled == 0 || !verify_password(password, &password_hash)? {
+                        return Ok(LoginAttempt::InvalidCredentials);
+                    }
+                    (
+                        must_change_password,
+                        UserRole::parse(&role)?,
+                        display_name,
+                        totp_secret,
+                        totp_enabled != 0,
+                    )
                 }
-                (must_change_password, UserRole::parse(&role)?, display_name)
+                None => {
+                    let _ = verify_password(password, &self.dummy_password_hash)?;
+                    return Ok(LoginAttempt::InvalidCredentials);
+                }
+            };
+        if totp_enabled {
+            let Some(code) = totp_code.filter(|value| !value.trim().is_empty()) else {
+                return Ok(LoginAttempt::TotpRequired);
+            };
+            let Some(secret) = totp_secret.as_deref() else {
+                return Ok(LoginAttempt::InvalidCredentials);
+            };
+            if !verify_totp(secret, code, unix_seconds()) {
+                return Ok(LoginAttempt::InvalidCredentials);
             }
-            None => {
-                let _ = verify_password(password, &self.dummy_password_hash)?;
-                return Ok(None);
-            }
-        };
+        }
         let session_id = Uuid::new_v4();
         let session_secret = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
         let expires_unix_seconds = unix_seconds() + SESSION_LIFETIME_SECONDS;
@@ -245,26 +318,29 @@ impl AdminAuth {
             [unix_seconds() as i64],
         )?;
         self.database.execute(
-            "INSERT INTO admin_sessions (session_id, session_secret_hash, username, created_unix_seconds, expires_unix_seconds) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO admin_sessions (session_id, session_secret_hash, username, created_unix_seconds, expires_unix_seconds, remote_addr, user_agent) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 session_id.to_string(),
                 hash_session_secret(&session_secret),
                 username,
                 unix_seconds() as i64,
                 expires_unix_seconds as i64,
+                remote_addr.map(|value| value.chars().take(128).collect::<String>()),
+                user_agent.map(|value| value.chars().take(512).collect::<String>()),
             ],
         )?;
         self.database.execute(
             "UPDATE administrators SET last_login_unix_seconds = ?1 WHERE username = ?2",
             params![unix_seconds() as i64, username],
         )?;
-        Ok(Some(NewSession {
+        Ok(LoginAttempt::Success(NewSession {
             session_id,
             cookie_value: format!("{session_id}.{session_secret}"),
             display_name,
             expires_unix_seconds,
             password_change_required: must_change_password != 0,
             role,
+            totp_enabled,
         }))
     }
 
@@ -278,12 +354,22 @@ impl AdminAuth {
         let Ok(session_id) = Uuid::parse_str(session_id) else {
             return Ok(None);
         };
-        let session: Option<(String, i64, String, String, String, i64)> = self
+        let session: Option<(String, i64, String, String, String, i64, i64)> = self
             .database
             .query_row(
-                "SELECT s.session_secret_hash, s.expires_unix_seconds, a.username, a.display_name, a.role, a.must_change_password FROM admin_sessions s JOIN administrators a ON a.username = s.username WHERE s.session_id = ?1 AND a.enabled = 1",
+                "SELECT s.session_secret_hash, s.expires_unix_seconds, a.username, a.display_name, a.role, a.must_change_password, a.totp_enabled FROM admin_sessions s JOIN administrators a ON a.username = s.username WHERE s.session_id = ?1 AND a.enabled = 1",
                 [session_id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
             )
             .optional()?;
         let Some((
@@ -293,6 +379,7 @@ impl AdminAuth {
             display_name,
             role,
             must_change_password,
+            totp_enabled,
         )) = session
         else {
             return Ok(None);
@@ -319,6 +406,7 @@ impl AdminAuth {
             role: UserRole::parse(&role)?,
             expires_unix_seconds: expires_unix_seconds as u64,
             password_change_required: must_change_password != 0,
+            totp_enabled: totp_enabled != 0,
         }))
     }
 
@@ -369,7 +457,7 @@ impl AdminAuth {
             [unix_seconds() as i64],
         )?;
         let mut statement = self.database.prepare(
-            "SELECT a.username, a.display_name, a.role, a.enabled, a.must_change_password, a.created_unix_seconds, a.last_login_unix_seconds, COUNT(s.session_id) FROM administrators a LEFT JOIN admin_sessions s ON s.username = a.username GROUP BY a.username ORDER BY a.username",
+            "SELECT a.username, a.display_name, a.role, a.enabled, a.must_change_password, a.created_unix_seconds, a.last_login_unix_seconds, COUNT(s.session_id), a.totp_enabled FROM administrators a LEFT JOIN admin_sessions s ON s.username = a.username GROUP BY a.username ORDER BY a.username",
         )?;
         let rows = statement.query_map([], |row| {
             let role: String = row.get(2)?;
@@ -382,6 +470,7 @@ impl AdminAuth {
                 row.get::<_, i64>(5)? as u64,
                 row.get::<_, Option<i64>>(6)?.map(|value| value as u64),
                 row.get::<_, i64>(7)? as u64,
+                row.get::<_, i64>(8)? != 0,
             ))
         })?;
         rows.map(|row| {
@@ -394,6 +483,7 @@ impl AdminAuth {
                 created_unix_seconds,
                 last_login_unix_seconds,
                 active_sessions,
+                totp_enabled,
             ) = row?;
             Ok(UserRecord {
                 username,
@@ -404,6 +494,7 @@ impl AdminAuth {
                 created_unix_seconds,
                 last_login_unix_seconds,
                 active_sessions,
+                totp_enabled,
             })
         })
         .collect()
@@ -520,13 +611,85 @@ impl AdminAuth {
         Ok(true)
     }
 
+    /// 生成新的 TOTP 密钥，但在校验首个验证码前不启用双因素认证。
+    pub(crate) fn begin_totp(&mut self, username: &str) -> anyhow::Result<Option<String>> {
+        if self.user(username)?.is_none() {
+            return Ok(None);
+        }
+        let mut secret = [0_u8; 20];
+        random_fill(&mut secret)?;
+        let encoded = base32_encode(&secret);
+        self.database.execute(
+            "UPDATE administrators SET totp_secret = ?1, totp_enabled = 0 WHERE username = ?2",
+            params![encoded, username],
+        )?;
+        Ok(Some(encoded))
+    }
+
+    /// 验证设置阶段的首个验证码并启用 TOTP，同时撤销除当前会话外的其他会话。
+    pub(crate) fn enable_totp(
+        &mut self,
+        username: &str,
+        current_session_id: Uuid,
+        code: &str,
+    ) -> anyhow::Result<bool> {
+        let secret: Option<Option<String>> = self
+            .database
+            .query_row(
+                "SELECT totp_secret FROM administrators WHERE username = ?1",
+                [username],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(Some(secret)) = secret else {
+            return Ok(false);
+        };
+        if !verify_totp(&secret, code, unix_seconds()) {
+            return Ok(false);
+        }
+        let transaction = self.database.transaction()?;
+        transaction.execute(
+            "UPDATE administrators SET totp_enabled = 1 WHERE username = ?1",
+            [username],
+        )?;
+        transaction.execute(
+            "DELETE FROM admin_sessions WHERE username = ?1 AND session_id <> ?2",
+            params![username, current_session_id.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    /// 使用当前有效的 TOTP 验证码关闭双因素认证，并清除密钥。
+    pub(crate) fn disable_totp(&mut self, username: &str, code: &str) -> anyhow::Result<bool> {
+        let secret: Option<Option<String>> = self
+            .database
+            .query_row(
+                "SELECT CASE WHEN totp_enabled = 1 THEN totp_secret ELSE NULL END FROM administrators WHERE username = ?1",
+                [username],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(Some(secret)) = secret else {
+            return Ok(false);
+        };
+        if !verify_totp(&secret, code, unix_seconds()) {
+            return Ok(false);
+        }
+        self.database.execute(
+            "UPDATE administrators SET totp_secret = NULL, totp_enabled = 0 WHERE username = ?1",
+            [username],
+        )?;
+        Ok(true)
+    }
+
     pub(crate) fn list_sessions(&self) -> anyhow::Result<Vec<SessionRecord>> {
         self.database.execute(
             "DELETE FROM admin_sessions WHERE expires_unix_seconds <= ?1",
             [unix_seconds() as i64],
         )?;
         let mut statement = self.database.prepare(
-            "SELECT session_id, username, created_unix_seconds, expires_unix_seconds FROM admin_sessions ORDER BY created_unix_seconds DESC",
+            "SELECT session_id, username, created_unix_seconds, expires_unix_seconds, remote_addr, user_agent FROM admin_sessions ORDER BY created_unix_seconds DESC",
         )?;
         let rows = statement.query_map([], |row| {
             let session_id: String = row.get(0)?;
@@ -536,6 +699,8 @@ impl AdminAuth {
                 username: row.get(1)?,
                 created_unix_seconds: row.get::<_, i64>(2)? as u64,
                 expires_unix_seconds: row.get::<_, i64>(3)? as u64,
+                remote_addr: row.get(4)?,
+                user_agent: row.get(5)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -559,7 +724,7 @@ impl AdminAuth {
     fn user(&self, username: &str) -> anyhow::Result<Option<UserRecord>> {
         self.database
             .query_row(
-                "SELECT a.username, a.display_name, a.role, a.enabled, a.must_change_password, a.created_unix_seconds, a.last_login_unix_seconds, (SELECT COUNT(*) FROM admin_sessions s WHERE s.username = a.username AND s.expires_unix_seconds > ?1) FROM administrators a WHERE a.username = ?2",
+                "SELECT a.username, a.display_name, a.role, a.enabled, a.must_change_password, a.created_unix_seconds, a.last_login_unix_seconds, (SELECT COUNT(*) FROM admin_sessions s WHERE s.username = a.username AND s.expires_unix_seconds > ?1), a.totp_enabled FROM administrators a WHERE a.username = ?2",
                 params![unix_seconds() as i64, username],
                 |row| {
                     let role: String = row.get(2)?;
@@ -572,11 +737,12 @@ impl AdminAuth {
                         row.get::<_, i64>(5)? as u64,
                         row.get::<_, Option<i64>>(6)?.map(|value| value as u64),
                         row.get::<_, i64>(7)? as u64,
+                        row.get::<_, i64>(8)? != 0,
                     ))
                 },
             )
             .optional()?
-            .map(|(username, display_name, role, enabled, must_change_password, created_unix_seconds, last_login_unix_seconds, active_sessions)| {
+            .map(|(username, display_name, role, enabled, must_change_password, created_unix_seconds, last_login_unix_seconds, active_sessions, totp_enabled)| {
                 Ok(UserRecord {
                     username,
                     display_name,
@@ -586,6 +752,7 @@ impl AdminAuth {
                     created_unix_seconds,
                     last_login_unix_seconds,
                     active_sessions,
+                    totp_enabled,
                 })
             })
             .transpose()
@@ -613,6 +780,8 @@ fn ensure_auth_columns(database: &Connection) -> anyhow::Result<()> {
         ("role", "TEXT NOT NULL DEFAULT 'administrator'"),
         ("enabled", "INTEGER NOT NULL DEFAULT 1"),
         ("last_login_unix_seconds", "INTEGER"),
+        ("totp_secret", "TEXT"),
+        ("totp_enabled", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         if !names.iter().any(|column| column == name) {
             database.execute(
@@ -637,6 +806,14 @@ fn ensure_auth_columns(database: &Connection) -> anyhow::Result<()> {
             "ALTER TABLE admin_sessions ADD COLUMN created_unix_seconds INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
+    }
+    for (name, definition) in [("remote_addr", "TEXT"), ("user_agent", "TEXT")] {
+        if !session_columns.iter().any(|column| column == name) {
+            database.execute(
+                &format!("ALTER TABLE admin_sessions ADD COLUMN {name} {definition}"),
+                [],
+            )?;
+        }
     }
     Ok(())
 }
@@ -711,6 +888,73 @@ fn verify_session_secret(secret: &str, expected_hash: &str) -> bool {
     )
 }
 
+fn base32_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut output = String::with_capacity((input.len() * 8).div_ceil(5));
+    let mut buffer = 0_u32;
+    let mut bits = 0_u8;
+    for byte in input {
+        buffer = (buffer << 8) | u32::from(*byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            output.push(ALPHABET[((buffer >> bits) & 0x1f) as usize] as char);
+        }
+    }
+    if bits > 0 {
+        output.push(ALPHABET[((buffer << (5 - bits)) & 0x1f) as usize] as char);
+    }
+    output
+}
+
+fn base32_decode(input: &str) -> Option<Vec<u8>> {
+    let mut output = Vec::with_capacity(input.len() * 5 / 8);
+    let mut buffer = 0_u32;
+    let mut bits = 0_u8;
+    for character in input.bytes().filter(|value| !value.is_ascii_whitespace()) {
+        let value = match character.to_ascii_uppercase() {
+            b'A'..=b'Z' => character.to_ascii_uppercase() - b'A',
+            b'2'..=b'7' => character - b'2' + 26,
+            _ => return None,
+        };
+        buffer = (buffer << 5) | u32::from(value);
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            output.push(((buffer >> bits) & 0xff) as u8);
+        }
+    }
+    (!output.is_empty()).then_some(output)
+}
+
+fn totp_code(secret: &[u8], unix_seconds: u64) -> Option<String> {
+    let counter = unix_seconds / 30;
+    let mut mac = Hmac::<Sha1>::new_from_slice(secret).ok()?;
+    mac.update(&counter.to_be_bytes());
+    let digest = mac.finalize().into_bytes();
+    let offset = usize::from(digest[19] & 0x0f);
+    let binary = (u32::from(digest[offset] & 0x7f) << 24)
+        | (u32::from(digest[offset + 1]) << 16)
+        | (u32::from(digest[offset + 2]) << 8)
+        | u32::from(digest[offset + 3]);
+    Some(format!("{:06}", binary % 1_000_000))
+}
+
+fn verify_totp(encoded_secret: &str, code: &str, unix_seconds: u64) -> bool {
+    let code = code.trim();
+    if code.len() != 6 || !code.bytes().all(|value| value.is_ascii_digit()) {
+        return false;
+    }
+    let Some(secret) = base32_decode(encoded_secret) else {
+        return false;
+    };
+    [-30_i64, 0, 30].into_iter().any(|offset| {
+        let candidate_time = unix_seconds.saturating_add_signed(offset);
+        totp_code(&secret, candidate_time)
+            .is_some_and(|candidate| constant_time_eq(candidate.as_bytes(), code.as_bytes()))
+    })
+}
+
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     let mut difference = left.len() ^ right.len();
     for index in 0..left.len().max(right.len()) {
@@ -730,8 +974,9 @@ fn unix_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        constant_time_eq, hash_password, verify_session_secret, AdminAuth, BootstrapCredentials,
-        CreateUser, UpdateUser, UserRole,
+        base32_decode, base32_encode, constant_time_eq, hash_password, totp_code,
+        verify_session_secret, verify_totp, AdminAuth, BootstrapCredentials, CreateUser,
+        LoginAttempt, UpdateUser, UserRole,
     };
     use rusqlite::params;
     use uuid::Uuid;
@@ -967,5 +1212,61 @@ mod tests {
         assert!(constant_time_eq(b"same", b"same"));
         assert!(!constant_time_eq(b"same", b"diff"));
         assert!(!constant_time_eq(b"same", b"same-longer"));
+    }
+
+    #[test]
+    fn base32_and_totp_match_rfc_vectors() {
+        let secret = b"12345678901234567890";
+        let encoded = base32_encode(secret);
+        assert_eq!(base32_decode(&encoded).as_deref(), Some(secret.as_slice()));
+        assert_eq!(totp_code(secret, 59).as_deref(), Some("287082"));
+        assert!(verify_totp(&encoded, "287082", 59));
+        assert!(!verify_totp(&encoded, "287083", 59));
+    }
+
+    #[test]
+    fn totp_setup_is_required_after_enable_and_can_be_disabled() {
+        let mut auth = AdminAuth::open(
+            None,
+            Some(BootstrapCredentials {
+                username: "admin".to_owned(),
+                password: "correct-horse-battery-staple".to_owned(),
+                force_password_change: false,
+            }),
+        )
+        .expect("administrator database should initialize");
+        let session = auth
+            .login("admin", "correct-horse-battery-staple")
+            .expect("login should execute")
+            .expect("login should succeed");
+        let secret = auth
+            .begin_totp("admin")
+            .expect("setup should execute")
+            .expect("user should exist");
+        let code = totp_code(
+            &base32_decode(&secret).expect("secret should decode"),
+            super::unix_seconds(),
+        )
+        .expect("code should generate");
+        assert!(auth
+            .enable_totp("admin", session.session_id, &code)
+            .expect("enable should execute"));
+        assert!(matches!(
+            auth.login_with_totp("admin", "correct-horse-battery-staple", None)
+                .expect("login should execute"),
+            LoginAttempt::TotpRequired
+        ));
+        assert!(matches!(
+            auth.login_with_totp("admin", "correct-horse-battery-staple", Some(&code))
+                .expect("login should execute"),
+            LoginAttempt::Success(_)
+        ));
+        assert!(auth
+            .disable_totp("admin", &code)
+            .expect("disable should execute"));
+        assert!(auth
+            .login("admin", "correct-horse-battery-staple")
+            .expect("login should execute")
+            .is_some());
     }
 }

@@ -1,11 +1,13 @@
 mod admin_auth;
 mod alerting;
+mod api_tokens;
 mod audit_log;
 mod certificate_catalog;
 mod certificate_manager;
 mod client_registry;
 mod database_migrations;
 mod database_tools;
+mod fleet;
 mod http_proxy_tunnel;
 mod http_route_catalog;
 mod http_tunnel;
@@ -24,16 +26,17 @@ mod udp_data_plane;
 mod udp_tunnel;
 
 use admin_auth::{
-    AdminAuth, BootstrapCredentials, CreateUser, SessionIdentity, SessionRecord, UpdateUser,
-    UserRecord, UserRole,
+    AdminAuth, BootstrapCredentials, CreateUser, LoginAttempt, SessionIdentity, SessionRecord,
+    UpdateUser, UserRecord, UserRole,
 };
 use alerting::{
     AlertCatalog, AlertEvent, AlertMetric, AlertNotification, AlertRule, AlertSignal,
     CreateAlertRule, UpdateAlertRule,
 };
+use api_tokens::{ApiTokenCatalog, ApiTokenScope, CreateApiToken, CreatedApiToken};
 use audit_log::{AuditEvent, AuditLog};
 use axum::{
-    extract::{Path, Query, Request, State},
+    extract::{ConnectInfo, Path, Query, Request, State},
     http::{header, HeaderMap, Method, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
@@ -47,6 +50,7 @@ use certificate_catalog::{
 };
 use certificate_manager::CertificateManager;
 use client_registry::{Authentication, ClientRegistry, UpdateClient};
+use fleet::{FleetCatalog, FleetPeer, UpsertFleetPeer};
 use http_route_catalog::{
     CreateHttpRouteError, CreateHttpRoutePolicy, HttpRouteCatalog, HttpRoutePolicy,
     UpdateHttpRoutePolicy,
@@ -287,10 +291,12 @@ struct AppState {
     enrollment_token: String,
     management_token: Option<String>,
     admin_auth: Mutex<AdminAuth>,
+    api_tokens: Mutex<ApiTokenCatalog>,
     login_throttle: Mutex<LoginThrottle>,
     login_hash_permits: Arc<Semaphore>,
     audit: Mutex<AuditLog>,
     alerts: Mutex<AlertCatalog>,
+    fleet: Mutex<FleetCatalog>,
     management_cookies_secure: bool,
     public_port_policy: PublicPortPolicy,
     clients: Mutex<ClientRegistry>,
@@ -840,6 +846,8 @@ struct HeartbeatResponse {
 struct LoginRequest {
     username: String,
     password: String,
+    #[serde(default)]
+    totp_code: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -851,6 +859,7 @@ struct LoginResponse {
     authentication_type: &'static str,
     expires_unix_seconds: u64,
     password_change_required: bool,
+    totp_enabled: bool,
 }
 
 #[derive(Serialize)]
@@ -862,6 +871,18 @@ struct AuthMeResponse {
     authentication_type: &'static str,
     expires_unix_seconds: u64,
     password_change_required: bool,
+    totp_enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct TotpCodeRequest {
+    code: String,
+}
+
+#[derive(Serialize)]
+struct TotpSetupResponse {
+    secret: String,
+    provisioning_uri: String,
 }
 
 #[derive(Deserialize)]
@@ -903,6 +924,27 @@ struct SearchResult {
     title: String,
     subtitle: String,
     href: String,
+}
+
+#[derive(Debug, Serialize)]
+struct FleetPeerStatus {
+    #[serde(flatten)]
+    peer: FleetPeer,
+    online: bool,
+    latency_millis: Option<u64>,
+    error: Option<String>,
+    active_connections: u64,
+    bytes_total: u64,
+    clients: u64,
+    policies: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct FleetOverview {
+    preferred_peer_id: Option<Uuid>,
+    failover_order: Vec<Uuid>,
+    conflicts: Vec<String>,
+    peers: Vec<FleetPeerStatus>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -1617,10 +1659,12 @@ async fn run_server(
         enrollment_token,
         management_token: configured_management_token,
         admin_auth: Mutex::new(AdminAuth::open(data_dir.as_deref(), bootstrap_admin)?),
+        api_tokens: Mutex::new(ApiTokenCatalog::open(data_dir.as_deref())?),
         login_throttle: Mutex::new(LoginThrottle::default()),
         login_hash_permits: Arc::new(Semaphore::new(LOGIN_HASH_CONCURRENCY)),
         audit: Mutex::new(AuditLog::open(data_dir.as_deref())?),
         alerts: Mutex::new(AlertCatalog::open(data_dir.as_deref())?),
+        fleet: Mutex::new(FleetCatalog::open(data_dir.as_deref())?),
         management_cookies_secure,
         public_port_policy: public_port_policy.clone(),
         clients: Mutex::new(ClientRegistry::open(data_dir.as_deref())?),
@@ -1677,6 +1721,9 @@ async fn run_server(
         .route("/api/v1/auth/me", get(auth_me))
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/change-password", post(change_password))
+        .route("/api/v1/auth/totp/setup", post(setup_totp))
+        .route("/api/v1/auth/totp/enable", post(enable_totp))
+        .route("/api/v1/auth/totp/disable", post(disable_totp))
         .route("/api/v1/users", get(list_users).post(create_user))
         .route(
             "/api/v1/users/:username",
@@ -1691,6 +1738,14 @@ async fn run_server(
             post(revoke_user_sessions),
         )
         .route("/api/v1/sessions", get(list_sessions))
+        .route(
+            "/api/v1/api-tokens",
+            get(list_api_tokens).post(create_api_token),
+        )
+        .route(
+            "/api/v1/api-tokens/:token_id",
+            axum::routing::delete(revoke_api_token),
+        )
         .route(
             "/api/v1/sessions/:session_id",
             axum::routing::delete(revoke_session),
@@ -1733,6 +1788,15 @@ async fn run_server(
         )
         .route("/api/v1/alerts/events", get(list_alert_events))
         .route("/api/v1/alerts/channels", get(alert_notification_channels))
+        .route(
+            "/api/v1/fleet/peers",
+            get(list_fleet_peers).post(create_fleet_peer),
+        )
+        .route(
+            "/api/v1/fleet/peers/:peer_id",
+            put(update_fleet_peer).delete(delete_fleet_peer),
+        )
+        .route("/api/v1/fleet/overview", get(fleet_overview))
         .route(
             "/api/v1/tcp-tunnels",
             get(list_tcp_tunnels).post(create_tcp_tunnel),
@@ -1847,7 +1911,8 @@ async fn run_server(
             enforce_management_role,
         ))
         .layer(TraceLayer::new_for_http())
-        .layer(middleware::from_fn(cache_control_headers));
+        .layer(middleware::from_fn(cache_control_headers))
+        .layer(middleware::from_fn(security_headers));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     record_metrics_history_sample(&state);
@@ -1940,14 +2005,17 @@ async fn run_server(
         });
         axum_server::bind_rustls(address, config)
             .handle(handle)
-            .serve(app.into_make_service())
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await?;
     } else {
         let listener = TcpListener::bind(address).await?;
         tracing::info!("{PRODUCT_NAME} development HTTP management listening on http://{address}");
-        axum::serve(listener, app)
-            .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
-            .await?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
+        .await?;
     }
     Ok(())
 }
@@ -2013,6 +2081,34 @@ async fn cache_control_headers(request: Request, next: Next) -> Response {
     let path = request.uri().path().to_owned();
     let mut response = next.run(request).await;
     apply_cache_control(&path, response.headers_mut());
+    response
+}
+
+async fn security_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        axum::http::HeaderValue::from_static(
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+        ),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::X_FRAME_OPTIONS,
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        axum::http::HeaderName::from_static("permissions-policy"),
+        axum::http::HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+    );
     response
 }
 
@@ -5395,6 +5491,255 @@ async fn alert_notification_channels(
     Ok(Json(notifications::channel_view()))
 }
 
+async fn list_fleet_peers(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<FleetPeer>>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    Ok(Json(
+        state
+            .fleet
+            .lock()
+            .expect("fleet catalog lock poisoned")
+            .list()
+            .map_err(coded_fleet_error)?,
+    ))
+}
+
+async fn create_fleet_peer(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<UpsertFleetPeer>,
+) -> Result<(StatusCode, Json<FleetPeer>), CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let peer = state
+        .fleet
+        .lock()
+        .expect("fleet catalog lock poisoned")
+        .create(request, unix_seconds())
+        .map_err(coded_fleet_error)?;
+    record_audit(
+        &state,
+        "fleet.peer.created",
+        &peer.id.to_string(),
+        &peer.name,
+    );
+    Ok((StatusCode::CREATED, Json(peer)))
+}
+
+async fn update_fleet_peer(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(peer_id): Path<Uuid>,
+    Json(request): Json<UpsertFleetPeer>,
+) -> Result<Json<FleetPeer>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let peer = state
+        .fleet
+        .lock()
+        .expect("fleet catalog lock poisoned")
+        .update(peer_id, request, unix_seconds())
+        .map_err(coded_fleet_error)?
+        .ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_fleet_peer",
+            "fleet peer does not exist",
+        ))?;
+    record_audit(
+        &state,
+        "fleet.peer.updated",
+        &peer_id.to_string(),
+        &peer.name,
+    );
+    Ok(Json(peer))
+}
+
+async fn delete_fleet_peer(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(peer_id): Path<Uuid>,
+) -> Result<StatusCode, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    if !state
+        .fleet
+        .lock()
+        .expect("fleet catalog lock poisoned")
+        .delete(peer_id)
+        .map_err(coded_fleet_error)?
+    {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_fleet_peer",
+            "fleet peer does not exist",
+        ));
+    }
+    record_audit(
+        &state,
+        "fleet.peer.deleted",
+        &peer_id.to_string(),
+        "peer deleted",
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn fleet_overview(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<FleetOverview>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let peers = state
+        .fleet
+        .lock()
+        .expect("fleet catalog lock poisoned")
+        .list()
+        .map_err(coded_fleet_error)?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(|error| coded_fleet_error(error.into()))?;
+    let mut statuses = Vec::with_capacity(peers.len());
+    for peer in peers {
+        statuses.push(probe_fleet_peer(&client, peer).await);
+    }
+    let mut available = statuses
+        .iter()
+        .filter(|status| status.peer.enabled && status.online)
+        .collect::<Vec<_>>();
+    available.sort_by_key(|status| (status.peer.priority, std::cmp::Reverse(status.peer.weight)));
+    let failover_order = available
+        .iter()
+        .map(|status| status.peer.id)
+        .collect::<Vec<_>>();
+    let preferred_peer_id = failover_order.first().copied();
+    let mut conflicts = Vec::new();
+    let mut placement = HashMap::<(String, u16), Vec<String>>::new();
+    for status in statuses.iter().filter(|status| status.peer.enabled) {
+        placement
+            .entry((status.peer.region.clone(), status.peer.priority))
+            .or_default()
+            .push(status.peer.name.clone());
+    }
+    for ((region, priority), names) in placement.into_iter().filter(|(_, names)| names.len() > 1) {
+        conflicts.push(format!(
+            "region {region} has multiple peers at priority {priority}: {}",
+            names.join(", ")
+        ));
+    }
+    Ok(Json(FleetOverview {
+        preferred_peer_id,
+        failover_order,
+        conflicts,
+        peers: statuses,
+    }))
+}
+
+async fn probe_fleet_peer(client: &reqwest::Client, peer: FleetPeer) -> FleetPeerStatus {
+    let started = Instant::now();
+    if !peer.enabled {
+        return FleetPeerStatus {
+            peer,
+            online: false,
+            latency_millis: None,
+            error: Some("peer disabled".to_owned()),
+            active_connections: 0,
+            bytes_total: 0,
+            clients: 0,
+            policies: 0,
+        };
+    }
+    let Some(token) = std::env::var_os(&peer.token_env).and_then(|value| value.into_string().ok())
+    else {
+        return FleetPeerStatus {
+            peer,
+            online: false,
+            latency_millis: None,
+            error: Some("management token environment variable is not configured".to_owned()),
+            active_connections: 0,
+            bytes_total: 0,
+            clients: 0,
+            policies: 0,
+        };
+    };
+    let status_request = client
+        .get(format!("{}/api/v1/status", peer.url))
+        .bearer_auth(&token)
+        .send();
+    let metrics_request = client
+        .get(format!("{}/api/v1/metrics", peer.url))
+        .bearer_auth(&token)
+        .send();
+    let (status, metrics) = tokio::join!(status_request, metrics_request);
+    let result = async {
+        let status = status?
+            .error_for_status()?
+            .json::<serde_json::Value>()
+            .await?;
+        let metrics = metrics?
+            .error_for_status()?
+            .json::<serde_json::Value>()
+            .await?;
+        Ok::<_, reqwest::Error>((status, metrics))
+    }
+    .await;
+    match result {
+        Ok((status, metrics)) => {
+            let active_connections = [
+                "tcp_active_connections",
+                "udp_active_sessions",
+                "http_active_connections",
+                "sni_active_connections",
+                "socks5_active_connections",
+                "http_proxy_active_connections",
+            ]
+            .iter()
+            .map(|key| metrics[*key].as_u64().unwrap_or(0))
+            .sum();
+            let bytes_total = metrics
+                .as_object()
+                .into_iter()
+                .flat_map(|value| value.iter())
+                .filter(|(key, _)| {
+                    key.contains("bytes_from_public") || key.contains("bytes_to_public")
+                })
+                .map(|(_, value)| value.as_u64().unwrap_or(0))
+                .sum();
+            let policies = [
+                "tunnels",
+                "udp_tunnels",
+                "http_routes",
+                "secret_tunnels",
+                "socks5_proxies",
+                "http_proxies",
+                "port_groups",
+                "sni_routes",
+            ]
+            .iter()
+            .map(|key| status[*key].as_u64().unwrap_or(0))
+            .sum();
+            FleetPeerStatus {
+                clients: status["clients"].as_u64().unwrap_or(0),
+                peer,
+                online: true,
+                latency_millis: Some(started.elapsed().as_millis() as u64),
+                error: None,
+                active_connections,
+                bytes_total,
+                policies,
+            }
+        }
+        Err(error) => FleetPeerStatus {
+            peer,
+            online: false,
+            latency_millis: Some(started.elapsed().as_millis() as u64),
+            error: Some(error.to_string()),
+            active_connections: 0,
+            bytes_total: 0,
+            clients: 0,
+            policies: 0,
+        },
+    }
+}
+
 async fn list_tcp_tunnels(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -7658,9 +8003,15 @@ async fn enroll_client(
 
 async fn login(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<LoginRequest>,
-) -> Result<Response, ApiError> {
-    let LoginRequest { username, password } = request;
+) -> Result<Response, CodedApiError> {
+    let LoginRequest {
+        username,
+        password,
+        totp_code,
+    } = request;
     let throttle_identity = login_throttle_identity(&username);
     let hash_permit = state
         .login_hash_permits
@@ -7668,8 +8019,9 @@ async fn login(
         .acquire_owned()
         .await
         .map_err(|_| {
-            ApiError(
+            CodedApiError(
                 StatusCode::SERVICE_UNAVAILABLE,
+                "login_unavailable",
                 "administrator login is unavailable",
             )
         })?;
@@ -7684,47 +8036,71 @@ async fn login(
     }
     let auth_state = state.clone();
     let login_username = username.clone();
+    let login_remote_addr = remote_addr.ip().to_string();
+    let login_user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let session = tokio::task::spawn_blocking(move || {
         let _hash_permit = hash_permit;
         auth_state
             .admin_auth
             .lock()
             .expect("administrator registry lock poisoned")
-            .login(&login_username, &password)
+            .login_with_context(
+                &login_username,
+                &password,
+                totp_code.as_deref(),
+                Some(&login_remote_addr),
+                login_user_agent.as_deref(),
+            )
     })
     .await
     .map_err(|_| {
-        ApiError(
+        CodedApiError(
             StatusCode::INTERNAL_SERVER_ERROR,
+            "login_execution_failed",
             "could not execute administrator login",
         )
     })?
     .map_err(|_| {
-        ApiError(
+        CodedApiError(
             StatusCode::INTERNAL_SERVER_ERROR,
+            "session_creation_failed",
             "could not create session",
         )
     })?;
-    let Some(session) = session else {
-        state
-            .login_throttle
-            .lock()
-            .expect("login throttle lock poisoned")
-            .record_failure(&throttle_identity, Instant::now());
-        state
-            .metrics
-            .authentication_failures_total
-            .fetch_add(1, Ordering::Relaxed);
-        record_audit(
-            &state,
-            "management.login.failed",
-            "unknown",
-            "invalid credentials",
-        );
-        return Err(ApiError(
-            StatusCode::UNAUTHORIZED,
-            "invalid username or password",
-        ));
+    let session = match session {
+        LoginAttempt::Success(session) => session,
+        LoginAttempt::TotpRequired => {
+            return Err(CodedApiError(
+                StatusCode::UNAUTHORIZED,
+                "totp_required",
+                "a TOTP verification code is required",
+            ));
+        }
+        LoginAttempt::InvalidCredentials => {
+            state
+                .login_throttle
+                .lock()
+                .expect("login throttle lock poisoned")
+                .record_failure(&throttle_identity, Instant::now());
+            state
+                .metrics
+                .authentication_failures_total
+                .fetch_add(1, Ordering::Relaxed);
+            record_audit(
+                &state,
+                "management.login.failed",
+                "unknown",
+                "invalid credentials",
+            );
+            return Err(CodedApiError(
+                StatusCode::UNAUTHORIZED,
+                "invalid_credentials",
+                "invalid username or password",
+            ));
+        }
     };
     state
         .login_throttle
@@ -7740,6 +8116,7 @@ async fn login(
         authentication_type: SESSION_AUTHENTICATION_TYPE,
         expires_unix_seconds: session.expires_unix_seconds,
         password_change_required: session.password_change_required,
+        totp_enabled: session.totp_enabled,
     })
     .into_response();
     response.headers_mut().insert(
@@ -7800,7 +8177,97 @@ fn auth_me_response(identity: SessionIdentity) -> AuthMeResponse {
         authentication_type: SESSION_AUTHENTICATION_TYPE,
         expires_unix_seconds: identity.expires_unix_seconds,
         password_change_required: identity.password_change_required,
+        totp_enabled: identity.totp_enabled,
     }
+}
+
+async fn setup_totp(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<TotpSetupResponse>, CodedApiError> {
+    let principal = require_interactive_session(&state, &headers)?;
+    let secret = state
+        .admin_auth
+        .lock()
+        .expect("administrator registry lock poisoned")
+        .begin_totp(&principal.username)
+        .map_err(user_management_error)?
+        .ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_user",
+            "user does not exist",
+        ))?;
+    let provisioning_uri = format!(
+        "otpauth://totp/LinkLake:{}?secret={}&issuer=LinkLake&algorithm=SHA1&digits=6&period=30",
+        principal.username, secret
+    );
+    record_audit(
+        &state,
+        "management.totp.setup_started",
+        &principal.username,
+        "TOTP setup secret generated",
+    );
+    Ok(Json(TotpSetupResponse {
+        secret,
+        provisioning_uri,
+    }))
+}
+
+async fn enable_totp(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<TotpCodeRequest>,
+) -> Result<StatusCode, CodedApiError> {
+    let principal = require_interactive_session(&state, &headers)?;
+    let session_id = principal.session_id.expect("interactive session has an id");
+    let enabled = state
+        .admin_auth
+        .lock()
+        .expect("administrator registry lock poisoned")
+        .enable_totp(&principal.username, session_id, &request.code)
+        .map_err(user_management_error)?;
+    if !enabled {
+        return Err(CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_totp_code",
+            "the TOTP verification code is invalid",
+        ));
+    }
+    record_audit(
+        &state,
+        "management.totp.enabled",
+        &principal.username,
+        "TOTP enabled",
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn disable_totp(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<TotpCodeRequest>,
+) -> Result<StatusCode, CodedApiError> {
+    let principal = require_interactive_session(&state, &headers)?;
+    let disabled = state
+        .admin_auth
+        .lock()
+        .expect("administrator registry lock poisoned")
+        .disable_totp(&principal.username, &request.code)
+        .map_err(user_management_error)?;
+    if !disabled {
+        return Err(CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_totp_code",
+            "the TOTP verification code is invalid or TOTP is not enabled",
+        ));
+    }
+    record_audit(
+        &state,
+        "management.totp.disabled",
+        &principal.username,
+        "TOTP disabled",
+    );
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn list_users(
@@ -7968,6 +8435,72 @@ async fn list_sessions(
         .list_sessions()
         .map(Json)
         .map_err(user_management_error)
+}
+
+async fn list_api_tokens(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<api_tokens::ApiTokenRecord>>, CodedApiError> {
+    require_administrator(&state, &headers)?;
+    state
+        .api_tokens
+        .lock()
+        .expect("API token catalog lock poisoned")
+        .list()
+        .map(Json)
+        .map_err(coded_api_token_error)
+}
+
+async fn create_api_token(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<CreateApiToken>,
+) -> Result<(StatusCode, Json<CreatedApiToken>), CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    let created = state
+        .api_tokens
+        .lock()
+        .expect("API token catalog lock poisoned")
+        .create(request, unix_seconds())
+        .map_err(coded_api_token_error)?;
+    record_audit(
+        &state,
+        "management.api_token.created",
+        &created.record.id.to_string(),
+        &format!(
+            "actor={}; scope={}",
+            principal.username, created.record.scope
+        ),
+    );
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+async fn revoke_api_token(
+    State(state): State<Arc<AppState>>,
+    Path(token_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<StatusCode, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    if !state
+        .api_tokens
+        .lock()
+        .expect("API token catalog lock poisoned")
+        .revoke(token_id)
+        .map_err(coded_api_token_error)?
+    {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_api_token",
+            "API token does not exist",
+        ));
+    }
+    record_audit(
+        &state,
+        "management.api_token.revoked",
+        &token_id.to_string(),
+        &format!("actor={}", principal.username),
+    );
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn revoke_session(
@@ -8167,6 +8700,31 @@ fn management_principal(
             session_id: None,
         });
     }
+    if let Some(token) = bearer_token(headers) {
+        let record = state
+            .api_tokens
+            .lock()
+            .expect("API token catalog lock poisoned")
+            .authenticate(token, unix_seconds())
+            .map_err(|_| {
+                ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not verify API token",
+                )
+            })?;
+        if let Some(record) = record {
+            let role = match record.scope {
+                ApiTokenScope::Read => UserRole::Auditor,
+                ApiTokenScope::Write => UserRole::Operator,
+                ApiTokenScope::Administrator => UserRole::Administrator,
+            };
+            return Ok(ManagementPrincipal {
+                username: format!("api-token:{}", record.name),
+                role,
+                session_id: None,
+            });
+        }
+    }
     let identity = management_session_cookie(headers)
         .map(|session| {
             state
@@ -8218,6 +8776,21 @@ fn require_administrator(
     Ok(principal)
 }
 
+fn require_interactive_session(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<ManagementPrincipal, CodedApiError> {
+    let principal = management_principal(state, headers).map_err(coded_management_error)?;
+    if principal.session_id.is_none() {
+        return Err(CodedApiError(
+            StatusCode::FORBIDDEN,
+            "session_authentication_required",
+            "this operation requires an interactive login",
+        ));
+    }
+    Ok(principal)
+}
+
 async fn enforce_management_role(
     State(state): State<Arc<AppState>>,
     request: Request,
@@ -8244,6 +8817,22 @@ async fn enforce_management_role(
         *request.method(),
         Method::GET | Method::HEAD | Method::OPTIONS
     );
+    if write
+        && management_session_cookie(request.headers()).is_some()
+        && bearer_token(request.headers()).is_none()
+        && request
+            .headers()
+            .get("x-linklake-csrf")
+            .and_then(|value| value.to_str().ok())
+            != Some("1")
+    {
+        return CodedApiError(
+            StatusCode::FORBIDDEN,
+            "csrf_check_failed",
+            "state-changing session requests require the LinkLake CSRF header",
+        )
+        .into_response();
+    }
     if users_or_sessions || write {
         match management_principal(&state, request.headers()) {
             Ok(principal)
@@ -8336,6 +8925,42 @@ fn coded_alert_error(error: anyhow::Error) -> CodedApiError {
             StatusCode::INTERNAL_SERVER_ERROR,
             "alert_storage_error",
             "alert catalog operation failed",
+        )
+    }
+}
+
+fn coded_fleet_error(error: anyhow::Error) -> CodedApiError {
+    let message = error.to_string();
+    if message.contains("fleet peer") || message.contains("UNIQUE constraint") {
+        CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_fleet_peer",
+            "fleet peer configuration is invalid or duplicated",
+        )
+    } else {
+        tracing::error!("Fleet catalog operation failed: {message}");
+        CodedApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "fleet_storage_error",
+            "fleet catalog operation failed",
+        )
+    }
+}
+
+fn coded_api_token_error(error: anyhow::Error) -> CodedApiError {
+    let message = error.to_string();
+    if message.contains("API token") || message.contains("UNIQUE constraint") {
+        CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_api_token",
+            "API token configuration is invalid or duplicated",
+        )
+    } else {
+        tracing::error!("API token catalog operation failed: {message}");
+        CodedApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_token_storage_error",
+            "API token catalog operation failed",
         )
     }
 }
@@ -8667,6 +9292,7 @@ mod tests {
             role: UserRole::Administrator,
             expires_unix_seconds: 123_456,
             password_change_required: false,
+            totp_enabled: false,
         });
         let json = serde_json::to_value(response).expect("identity response should serialize");
         assert_eq!(json["username"], "admin");
@@ -8686,6 +9312,7 @@ mod tests {
             authentication_type: "session",
             expires_unix_seconds: 123_456,
             password_change_required: false,
+            totp_enabled: false,
         })
         .expect("login response should serialize");
         assert_eq!(login["username"], json["username"]);

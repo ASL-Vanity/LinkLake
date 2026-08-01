@@ -4,7 +4,7 @@ import 'dart:io';
 /// LinkLake 管理 API 的桌面端会话客户端。
 class LinkLakeApiClient {
   LinkLakeApiClient(String baseUrl)
-      : baseUri = Uri.parse(baseUrl.replaceAll(RegExp(r'/+$'), ''));
+    : baseUri = Uri.parse(baseUrl.replaceAll(RegExp(r'/+$'), ''));
 
   final Uri baseUri;
   final HttpClient _client = HttpClient()
@@ -14,16 +14,28 @@ class LinkLakeApiClient {
 
   bool get authenticated => _cookie != null;
 
-  Future<Map<String, dynamic>> login(String username, String password) async {
+  Future<Map<String, dynamic>> login(
+    String username,
+    String password, {
+    String? totpCode,
+  }) async {
     final response = await _request(
       'POST',
       '/api/v1/auth/login',
-      body: {'username': username, 'password': password},
+      body: {
+        'username': username,
+        'password': password,
+        'totp_code': totpCode?.trim().isEmpty == true ? null : totpCode,
+      },
       includeCookie: false,
     );
     final cookie = response.headers.value(HttpHeaders.setCookieHeader);
     if (cookie == null || cookie.isEmpty) {
-      throw const LinkLakeApiException(500, 'server did not return a session');
+      throw const LinkLakeApiException(
+        500,
+        'server did not return a session',
+        code: 'missing_session',
+      );
     }
     _cookie = cookie.split(';').first;
     return _decodeObject(response.body);
@@ -52,9 +64,15 @@ class LinkLakeApiClient {
 
   Future<List<dynamic>> getList(String path) async {
     final response = await _request('GET', path);
-    final decoded = response.body.isEmpty ? <dynamic>[] : jsonDecode(response.body);
+    final decoded = response.body.isEmpty
+        ? <dynamic>[]
+        : jsonDecode(response.body);
     if (decoded is! List) {
-      throw const LinkLakeApiException(500, 'server returned an invalid list');
+      throw const LinkLakeApiException(
+        500,
+        'server returned an invalid list',
+        code: 'invalid_response',
+      );
     }
     return decoded;
   }
@@ -98,6 +116,9 @@ class LinkLakeApiClient {
   }) async {
     final request = await _client.openUrl(method, baseUri.resolve(path));
     request.headers.set(HttpHeaders.acceptHeader, 'application/json');
+    if (!const ['GET', 'HEAD', 'OPTIONS'].contains(method.toUpperCase())) {
+      request.headers.set('X-LinkLake-CSRF', '1');
+    }
     if (includeCookie && _cookie != null) {
       request.headers.set(HttpHeaders.cookieHeader, _cookie!);
     }
@@ -109,13 +130,15 @@ class LinkLakeApiClient {
     final text = await utf8.decoder.bind(response).join();
     if (response.statusCode < 200 || response.statusCode >= 300) {
       var message = text;
+      String? code;
       try {
         final decoded = jsonDecode(text);
         if (decoded is Map && decoded['error'] != null) {
           message = decoded['error'].toString();
+          code = decoded['code']?.toString();
         }
       } catch (_) {}
-      throw LinkLakeApiException(response.statusCode, message);
+      throw LinkLakeApiException(response.statusCode, message, code: code);
     }
     return _ApiResponse(response.headers, text);
   }
@@ -123,7 +146,11 @@ class LinkLakeApiClient {
   Map<String, dynamic> _decodeObject(String value) {
     final decoded = value.isEmpty ? <String, dynamic>{} : jsonDecode(value);
     if (decoded is! Map<String, dynamic>) {
-      throw const LinkLakeApiException(500, 'server returned an invalid object');
+      throw const LinkLakeApiException(
+        500,
+        'server returned an invalid object',
+        code: 'invalid_response',
+      );
     }
     return decoded;
   }
@@ -132,10 +159,11 @@ class LinkLakeApiClient {
 }
 
 class LinkLakeApiException implements Exception {
-  const LinkLakeApiException(this.statusCode, this.message);
+  const LinkLakeApiException(this.statusCode, this.message, {this.code});
 
   final int statusCode;
   final String message;
+  final String? code;
 
   @override
   String toString() => 'HTTP $statusCode: $message';

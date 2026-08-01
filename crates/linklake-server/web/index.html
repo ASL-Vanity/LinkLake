@@ -380,6 +380,7 @@
             <div class="account-card"><strong id="account-menu-name">admin</strong><small id="account-menu-role"></small><small id="account-menu-expiry"></small></div>
             <div class="menu-list">
               <button id="account-password" type="button" role="menuitem" data-i18n="changePassword">Change password</button>
+              <button id="account-security" type="button" role="menuitem" data-i18n="securitySessions">Security &amp; sessions</button>
               <button id="logout" type="button" role="menuitem" data-i18n="signOut">Sign out</button>
             </div>
           </div>
@@ -415,6 +416,7 @@
           <form id="login" autocomplete="on">
             <label><span data-i18n="username">Username</span><input id="username" name="username" type="text" autocomplete="username" data-placeholder="usernamePlaceholder" required /></label>
             <label><span data-i18n="password">Password</span><input id="password" name="password" type="password" autocomplete="current-password" data-placeholder="passwordPlaceholder" required /></label>
+            <label id="login-totp-label" class="hidden"><span data-i18n="totpCode">Verification code</span><input id="login-totp" name="totp" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" data-placeholder="totpPlaceholder" /></label>
             <button class="primary-button" type="submit" data-i18n="signIn">Sign in</button>
           </form>
           <form id="initial-password-form" class="hidden" autocomplete="off">
@@ -448,6 +450,7 @@
               <a class="nav-link" href="#/services/acme" data-view="services" data-service-route="acme">ACME</a>
             </div>
             <a class="nav-link" href="#/p2p" data-view="p2p" data-route-prefix="p2p"><span class="nav-icon">◎</span><span data-i18n="p2p">P2P network</span></a>
+            <a class="nav-link admin-only" href="#/fleet" data-view="fleet" data-route-prefix="fleet"><span class="nav-icon">⌘</span><span data-i18n="fleet">Multi-cloud</span></a>
             <div class="nav-group-label admin-only" data-i18n="accessControl">Access control</div>
             <a class="nav-link admin-only" href="#/users" data-view="users" data-route-prefix="users"><span class="nav-icon">♙</span><span data-i18n="userManagement">Users</span></a>
             <a class="nav-link admin-only" href="#/sessions" data-view="sessions" data-route-prefix="sessions"><span class="nav-icon">◫</span><span data-i18n="securitySessions">Security & sessions</span></a>
@@ -496,6 +499,13 @@
 
           <section id="p2p-view" class="view-panel hidden"><div class="section-heading"><div><h2 data-i18n="p2p">P2P network</h2><p data-i18n="p2pSubtitle">Inspect direct candidates, NAT mappings and relay fallback.</p></div></div><div id="p2p-list" class="p2p-list"></div></section>
 
+          <section id="fleet-view" class="view-panel hidden">
+            <div class="access-toolbar"><div><h2 data-i18n="fleet">Multi-cloud</h2><p class="role-note" data-i18n="fleetHelp">Monitor LinkLake servers and define preferred and failover entry points.</p></div><button id="new-fleet-peer" class="primary-button" type="button" data-i18n="newFleetPeer">Add server</button></div>
+            <div id="fleet-summary" class="kpi-grid" style="margin-bottom:12px"></div>
+            <div id="fleet-conflicts" class="alert-list" style="margin-bottom:12px"></div>
+            <div class="data-table-wrap"><table class="data-table"><thead><tr><th data-i18n="name">Name</th><th data-i18n="region">Region</th><th data-i18n="status">Status</th><th data-i18n="latency">Latency</th><th data-i18n="priority">Priority</th><th data-i18n="weight">Weight</th><th data-i18n="traffic">Traffic</th><th data-i18n="actions">Actions</th></tr></thead><tbody id="fleet-list"></tbody></table></div>
+          </section>
+
           <section id="clients-view" class="view-panel hidden">
             <div class="section-heading"><div><h2 data-i18n="clientManagement">Client management</h2><p data-i18n="clientManagementHelp">Organize client identities, revoke access and rotate credentials.</p></div></div>
             <div class="service-toolbar"><label class="sr-only" for="client-search" data-i18n="search">Search</label><input id="client-search" type="search" data-placeholder="searchClients" /><label class="sr-only" for="client-status-filter" data-i18n="status">Status</label><select id="client-status-filter"><option value="all" data-i18n="allStatuses">All statuses</option><option value="online" data-i18n="online">Online</option><option value="offline" data-i18n="offline">Offline</option><option value="enabled" data-i18n="enabled">Enabled</option><option value="disabled" data-i18n="disabled">Disabled</option></select><span id="client-count" class="time-pill">0</span></div>
@@ -510,7 +520,13 @@
 
           <section id="sessions-view" class="view-panel hidden">
             <div class="section-heading"><div><h2 data-i18n="securitySessions">Security & sessions</h2><p data-i18n="securitySessionsHelp">Review active sign-ins and revoke sessions that are no longer trusted.</p></div></div>
-            <div class="data-table-wrap"><table class="data-table"><thead><tr><th data-i18n="username">Username</th><th data-i18n="sessionId">Session ID</th><th data-i18n="createdAt">Created</th><th data-i18n="expiresAt">Expires</th><th data-i18n="actions">Actions</th></tr></thead><tbody id="sessions-list"></tbody></table></div>
+            <div class="overview-grid" style="margin-bottom:12px">
+              <section class="panel"><div class="panel-heading"><div><h3 data-i18n="twoFactorAuth">Two-factor authentication</h3><p id="totp-status" class="role-note"></p></div><button id="totp-action" class="soft-button" type="button"></button></div></section>
+              <section class="panel"><div class="panel-heading"><div><h3 data-i18n="apiTokens">API tokens</h3><p data-i18n="apiTokensHelp">Create scoped tokens for automation and integrations.</p></div><button id="new-api-token" class="primary-button" type="button" data-i18n="newApiToken">New token</button></div></section>
+            </div>
+            <div class="data-table-wrap" style="margin-bottom:12px"><table class="data-table"><thead><tr><th data-i18n="name">Name</th><th data-i18n="scope">Scope</th><th data-i18n="createdAt">Created</th><th data-i18n="expiresAt">Expires</th><th data-i18n="lastUsed">Last used</th><th data-i18n="actions">Actions</th></tr></thead><tbody id="api-tokens-list"></tbody></table></div>
+            <h3 style="margin:18px 0 10px" data-i18n="activeSignIns">Active sign-ins</h3>
+            <div class="data-table-wrap"><table class="data-table"><thead><tr><th data-i18n="username">Username</th><th data-i18n="sessionId">Session ID</th><th>IP</th><th data-i18n="device">Device</th><th data-i18n="createdAt">Created</th><th data-i18n="expiresAt">Expires</th><th data-i18n="actions">Actions</th></tr></thead><tbody id="sessions-list"></tbody></table></div>
           </section>
 
           <section id="alerts-view" class="view-panel hidden">
@@ -547,6 +563,18 @@
       <section class="modal" role="dialog" aria-modal="true" aria-labelledby="reset-password-title"><div class="modal-header"><div><h2 id="reset-password-title" data-i18n="resetPassword">Reset password</h2><p data-i18n="userFormHelp">Passwords must contain at least 12 characters.</p></div><button id="reset-password-close" class="icon-button" type="button" aria-label="Close">×</button></div><form id="reset-password-form"><label><span data-i18n="newPassword">New password</span><input id="reset-password-value" type="password" minlength="12" required /></label><label class="check-label"><input id="reset-force-change" type="checkbox" checked /><span data-i18n="forcePasswordChange">Require password change at next sign-in</span></label><div class="drawer-actions" style="position:static;margin:18px 0 0;padding:0;border:0;background:none"><button id="reset-password-cancel" class="soft-button" type="button" data-i18n="cancel">Cancel</button><button class="primary-button" type="submit" data-i18n="resetPassword">Reset password</button></div></form></section>
     </div>
 
+    <div id="totp-modal" class="modal-backdrop hidden" role="presentation">
+      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="totp-modal-title"><div class="modal-header"><div><h2 id="totp-modal-title" data-i18n="twoFactorAuth">Two-factor authentication</h2><p id="totp-modal-help"></p></div><button id="totp-modal-close" class="icon-button" type="button" aria-label="Close">×</button></div><div id="totp-setup-fields" class="hidden"><label><span data-i18n="totpSecret">Setup key</span><textarea id="totp-secret" readonly></textarea></label><label><span data-i18n="provisioningUri">Provisioning URI</span><textarea id="totp-uri" readonly></textarea></label></div><form id="totp-form"><label><span data-i18n="totpCode">Verification code</span><input id="totp-code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required /></label><div class="drawer-actions" style="position:static;margin:18px 0 0;padding:0;border:0;background:none"><button id="totp-cancel" class="soft-button" type="button" data-i18n="cancel">Cancel</button><button id="totp-submit" class="primary-button" type="submit"></button></div></form></section>
+    </div>
+
+    <div id="api-token-modal" class="modal-backdrop hidden" role="presentation">
+      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="api-token-title"><div class="modal-header"><div><h2 id="api-token-title" data-i18n="newApiToken">New API token</h2><p data-i18n="apiTokenShownOnce">The token is shown only once.</p></div><button id="api-token-close" class="icon-button" type="button" aria-label="Close">×</button></div><form id="api-token-form"><div id="api-token-fields"><label><span data-i18n="name">Name</span><input id="api-token-name" type="text" maxlength="80" required /></label><label><span data-i18n="scope">Scope</span><select id="api-token-scope"><option value="read" data-i18n="scopeRead">Read only</option><option value="write" data-i18n="scopeWrite">Read and write</option><option value="administrator" data-i18n="scopeAdministrator">Administrator</option></select></label><label><span data-i18n="expiryDays">Expiry (days)</span><input id="api-token-expiry" type="number" min="1" max="3650" data-placeholder="optional" /></label></div><label id="api-token-value-label" class="hidden"><span data-i18n="apiToken">API token</span><textarea id="api-token-value" readonly></textarea></label><div class="drawer-actions" style="position:static;margin:18px 0 0;padding:0;border:0;background:none"><button id="api-token-cancel" class="soft-button" type="button" data-i18n="cancel">Cancel</button><button id="api-token-submit" class="primary-button" type="submit" data-i18n="create">Create</button><button id="api-token-copy" class="primary-button hidden" type="button" data-i18n="copy">Copy</button></div></form></section>
+    </div>
+
+    <div id="fleet-modal" class="modal-backdrop hidden" role="presentation">
+      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="fleet-modal-title"><div class="modal-header"><div><h2 id="fleet-modal-title" data-i18n="newFleetPeer">Add server</h2><p data-i18n="fleetTokenHelp">The token is read from an environment variable on this server.</p></div><button id="fleet-modal-close" class="icon-button" type="button" aria-label="Close">×</button></div><form id="fleet-form"><div class="user-form-grid"><label><span data-i18n="name">Name</span><input id="fleet-name" type="text" maxlength="80" required /></label><label><span>URL</span><input id="fleet-url" type="url" required /></label><label><span data-i18n="region">Region</span><input id="fleet-region" type="text" maxlength="80" required /></label><label><span data-i18n="tokenEnvironment">Token environment</span><input id="fleet-token-env" type="text" pattern="LINKLAKE_[A-Z0-9_]+" required /></label><label><span data-i18n="priority">Priority</span><input id="fleet-priority" type="number" min="0" max="10000" value="100" required /></label><label><span data-i18n="weight">Weight</span><input id="fleet-weight" type="number" min="1" max="10000" value="100" required /></label><label class="check-label full"><input id="fleet-enabled" type="checkbox" checked /><span data-i18n="enabled">Enabled</span></label></div><div class="drawer-actions" style="position:static;margin:18px 0 0;padding:0;border:0;background:none"><button id="fleet-cancel" class="soft-button" type="button" data-i18n="cancel">Cancel</button><button class="primary-button" type="submit" data-i18n="save">Save</button></div></form></section>
+    </div>
+
     <div id="client-modal" class="modal-backdrop hidden" role="presentation">
       <section class="modal" role="dialog" aria-modal="true" aria-labelledby="client-modal-title"><div class="modal-header"><div><h2 id="client-modal-title" data-i18n="editClient">Edit client</h2><p id="client-modal-id" class="role-note"></p></div><button id="client-modal-close" class="icon-button" type="button" aria-label="Close">×</button></div><form id="client-form"><div class="user-form-grid"><label><span data-i18n="name">Name</span><input id="client-name" type="text" maxlength="80" required /></label><label><span data-i18n="clientGroup">Group</span><input id="client-group" type="text" maxlength="64" /></label><label class="full"><span data-i18n="tags">Tags</span><input id="client-tags" type="text" data-placeholder="tagsPlaceholder" /></label><label class="full"><span data-i18n="notes">Notes</span><textarea id="client-notes" maxlength="512"></textarea></label><label class="check-label full"><input id="client-enabled" type="checkbox" /><span data-i18n="clientEnabledHelp">Allow this identity to authenticate and receive policies</span></label></div><div class="drawer-actions" style="position:static;margin:18px 0 0;padding:0;border:0;background:none"><button id="client-cancel" class="soft-button" type="button" data-i18n="cancel">Cancel</button><button class="primary-button" type="submit" data-i18n="save">Save</button></div></form></section>
     </div>
@@ -567,15 +595,15 @@
       const WORDS = {
         en: {
           title: 'LinkLake Management Console', console: 'Management Console', appearance: 'Appearance', themeSystem: 'System', themeLight: 'Light', themeDark: 'Dark', palette: 'Palette', paletteLake: 'Lake', paletteOcean: 'Ocean', paletteJade: 'Jade', paletteViolet: 'Violet', globalSearch: 'Global search', globalSearchPlaceholder: 'Search clients, policies, ports, domains or IDs', noSearchResults: 'No matching clients or policies.',
-          loginTitle: 'Sign in to LinkLake', loginIntro: 'Use an administrator account to manage clients, forwarding services and runtime health.', username: 'Username', password: 'Password', usernamePlaceholder: 'Administrator username', passwordPlaceholder: 'Password', signIn: 'Sign in', newPassword: 'New password', confirmPassword: 'Confirm password', changePassword: 'Change password', passwordRequirement: 'Use at least 12 characters.', passwordsMismatch: 'The passwords do not match.',
-          overview: 'Overview', overviewSubtitle: 'Service health, live traffic and active alerts at a glance.', metrics: 'Runtime metrics', metricsSubtitle: 'Protocol activity, failure composition and infrastructure health.', services: 'Services', p2p: 'P2P network', p2pSubtitle: 'Inspect direct candidates, NAT mappings and relay fallback.', activity: 'Activity', activitySubtitle: 'Filter and inspect administrator, policy and tunnel events.', portGroupsShort: 'Ports', secretShort: 'Secret', httpProxyShort: 'Proxy',
+          loginTitle: 'Sign in to LinkLake', loginIntro: 'Use an administrator account to manage clients, forwarding services and runtime health.', username: 'Username', password: 'Password', usernamePlaceholder: 'Administrator username', passwordPlaceholder: 'Password', signIn: 'Sign in', newPassword: 'New password', confirmPassword: 'Confirm password', changePassword: 'Change password', passwordRequirement: 'Use at least 12 characters.', passwordsMismatch: 'The passwords do not match.', totpCode: 'Verification code', totpPlaceholder: '6-digit code', totpRequired: 'Enter the 6-digit code from your authenticator app.',
+          overview: 'Overview', overviewSubtitle: 'Service health, live traffic and active alerts at a glance.', metrics: 'Runtime metrics', metricsSubtitle: 'Protocol activity, failure composition and infrastructure health.', services: 'Services', p2p: 'P2P network', p2pSubtitle: 'Inspect direct candidates, NAT mappings and relay fallback.', fleet: 'Multi-cloud', fleetHelp: 'Monitor LinkLake servers and define preferred and failover entry points.', newFleetPeer: 'Add server', editFleetPeer: 'Edit server', fleetTokenHelp: 'The management token is read from an environment variable on this server.', region: 'Region', priority: 'Priority', weight: 'Weight', latency: 'Latency', device: 'Device', tokenEnvironment: 'Token environment', preferredEntry: 'Preferred entry', onlineServers: 'Online servers', failoverEntries: 'Failover entries', noFleetPeers: 'No multi-cloud servers configured.', fleetSaved: 'Server entry saved.', fleetDeleted: 'Server entry deleted.', confirmFleetDelete: 'Delete server {name}?', fleetConflict: 'Placement conflict', activity: 'Activity', activitySubtitle: 'Filter and inspect administrator, policy and tunnel events.', portGroupsShort: 'Ports', secretShort: 'Secret', httpProxyShort: 'Proxy',
           alertManagement: 'Alert management', alertManagementHelp: 'Configure persistent rules and inspect firing or resolved events.', newAlertRule: 'New rule', editAlertRule: 'Edit rule', alertRuleHelp: 'Choose a metric, threshold, evaluation window and notification channels.', notificationChannels: 'Notification channels', channelsConfigured: 'Webhook: {webhook} · SMTP: {smtp}', configured: 'configured', notConfigured: 'not configured', alertMetric: 'Metric', threshold: 'Threshold', alertTarget: 'Target', severity: 'Severity', comparator: 'Comparator', evaluationWindow: 'Evaluation window (seconds)', cooldown: 'Cooldown (seconds)', alertTargetPlaceholder: 'Optional client ID or policy kind:ID', metricClientOffline: 'Client offline', metricPolicyUnavailable: 'Policy unavailable', metricAuthenticationFailures: 'Authentication failures', metricTrafficRate: 'Traffic rate', metricActiveConnections: 'Active connections', metricCertificateDays: 'Certificate days remaining', severityInfo: 'Info', severityWarning: 'Warning', severityCritical: 'Critical', noAlertEvents: 'No active alerts.', noAlertRules: 'No alert rules.', alertRuleSaved: 'Alert rule saved.', alertRuleDeleted: 'Alert rule deleted.', confirmDeleteAlertRule: 'Delete this alert rule?', firing: 'Firing', resolved: 'Resolved',
           serverOnline: 'Server online', refresh: 'Refresh', refreshed: 'Updated', language: 'Language', signOut: 'Sign out', roleAdministrator: 'Administrator', roleOperator: 'Operator', roleAuditor: 'Auditor', role: 'Role', sessionExpires: 'Session expires {time}', authenticationSession: 'Cookie session',
           trafficTrend: 'Traffic trend', trafficTrendHelp: 'Server-side traffic history is persisted for up to 30 days.', inbound: 'Inbound', outbound: 'Outbound', activeSessions: 'Active sessions', noTrendData: 'Waiting for enough samples to calculate throughput.', noTrafficRange: 'No traffic in the selected range.',
           serviceHealth: 'Service health', serviceHealthHelp: 'Online policies by protocol.', certificateSummary: 'Certificates', alerts: 'Alerts', noAlerts: 'No active alerts.', clients: 'Clients', forwardingServices: 'Forwarding services', p2pNodes: 'Fresh / total P2P nodes', totalTraffic: 'Total traffic', configIssues: 'Configuration issues',
           protocolActivity: 'Protocol activity', protocolActivityHelp: 'Current active connections and sessions.', failureOverview: 'Failure overview', failureOverviewHelp: 'Cumulative failures since server startup.', serverUptime: 'Server uptime', requestsTotal: 'Requests', failuresTotal: 'Failures', reconnects: 'Reconnects', authenticationFailures: 'Authentication failures',
           tcpMetrics: 'TCP', udpMetrics: 'UDP', webMetrics: 'Web / TLS', proxyMetrics: 'Forward proxies', p2pMetrics: 'P2P', certificateMetrics: 'Certificates / ACME', systemMetrics: 'System', active: 'Active', pending: 'Pending', sessions: 'Sessions', packets: 'Packets', traffic: 'Traffic in / out', rejected: 'Rejected', failed: 'Failed', timeouts: 'Timeouts', transportErrors: 'Transport errors', drops: 'Drops', connections: 'Connections', direct: 'Direct', relay: 'Relay', managed: 'Managed', valid: 'Valid', expiring: 'Expiring soon', expired: 'Expired', nearestExpiry: 'Nearest expiry', orders: 'Orders', renewals: 'Renewals', challenges: 'HTTP-01 challenges',
-          newPolicy: 'New policy', editPolicy: 'Edit', duplicate: 'Duplicate', enable: 'Enable', disable: 'Disable', delete: 'Delete', cancel: 'Cancel', save: 'Save', saving: 'Saving…', search: 'Search', searchPolicies: 'Search by name, endpoint or client', status: 'Status', allStatuses: 'All statuses', online: 'Online', offline: 'Offline', enabled: 'Enabled', disabled: 'Disabled', all: 'All', policyCount: '{visible} of {total}', noPolicies: 'No policies match the current filters.', confirmDelete: 'Delete this policy and close its active sessions?', policyCreated: 'Policy created.', policyUpdated: 'Policy updated.', policyDeleted: 'Policy deleted.', policyEnabled: 'Policy enabled.', policyDisabled: 'Policy disabled.', exportPolicies: 'Export', exportCsv: 'Export CSV', importPolicies: 'Import', selectVisible: 'Select visible', selectedPolicies: '{count} selected', migrateClient: 'Migrate client', bulkCompleted: 'Bulk operation completed.', importCompleted: '{count} policies imported.', invalidImport: 'The policy import file is invalid.', confirmBulkDelete: 'Delete {count} selected policies and close their active sessions?',
+          newPolicy: 'New policy', editPolicy: 'Edit', duplicate: 'Duplicate', enable: 'Enable', disable: 'Disable', delete: 'Delete', cancel: 'Cancel', save: 'Save', create: 'Create', saving: 'Saving…', search: 'Search', searchPolicies: 'Search by name, endpoint or client', status: 'Status', allStatuses: 'All statuses', online: 'Online', offline: 'Offline', enabled: 'Enabled', disabled: 'Disabled', all: 'All', policyCount: '{visible} of {total}', noPolicies: 'No policies match the current filters.', confirmDelete: 'Delete this policy and close its active sessions?', policyCreated: 'Policy created.', policyUpdated: 'Policy updated.', policyDeleted: 'Policy deleted.', policyEnabled: 'Policy enabled.', policyDisabled: 'Policy disabled.', exportPolicies: 'Export', exportCsv: 'Export CSV', importPolicies: 'Import', selectVisible: 'Select visible', selectedPolicies: '{count} selected', migrateClient: 'Migrate client', bulkCompleted: 'Bulk operation completed.', importCompleted: '{count} policies imported.', invalidImport: 'The policy import file is invalid.', confirmBulkDelete: 'Delete {count} selected policies and close their active sessions?',
           tcpTitle: 'TCP tunnels', tcpSubtitle: 'Expose a TCP port and forward each connection to a selected client.', udpTitle: 'UDP tunnels', udpSubtitle: 'Forward UDP datagrams with session tracking and bandwidth controls.', portsTitle: 'Port groups', portsSubtitle: 'Manage multiple TCP or UDP port mappings as one policy.', httpTitle: 'HTTP / HTTPS routes', httpSubtitle: 'Route hostnames and automate HTTPS certificates.', sniTitle: 'TLS SNI pass-through', sniSubtitle: 'Forward TLS connections by SNI without terminating TLS.', secretTitle: 'Secret tunnels', secretSubtitle: 'Credential-based private access between provider and visitor clients.', socks5Title: 'SOCKS5 proxy', socks5Subtitle: 'Expose authenticated SOCKS5 TCP and UDP access.', httpProxyTitle: 'HTTP forward proxy', httpProxySubtitle: 'Expose an authenticated HTTP and CONNECT proxy.', acmeTitle: 'ACME automation', acmeSubtitle: 'Configure certificate issuance and renewal for HTTP routes.',
           client: 'Client', name: 'Name', tunnelName: 'Tunnel name', routeName: 'Route name', proxyName: 'Proxy name', publicPort: 'Public port', targetAddress: 'Target address', maxConnections: 'Maximum connections', bandwidthLimit: 'Bandwidth limit (B/s)', maxSessions: 'Maximum sessions', idleTimeout: 'Idle timeout (seconds)', protocol: 'Protocol', publicPorts: 'Public ports', targetHost: 'Target host', targetPorts: 'Target ports', hostname: 'Hostname', tlsMode: 'TLS mode', tlsDisabled: 'Disabled', tlsAutomatic: 'Automatic ACME', redirectHttps: 'Redirect HTTP to HTTPS', providerClient: 'Provider client', allowedVisitor: 'Allowed visitor client', anyAuthenticatedClient: 'Any authenticated client', proxyUsername: 'Proxy username', optional: 'Optional', unlimited: 'Unlimited', selectClient: 'Select a client', noClients: 'No enrolled clients are available.',
           createTcp: 'Create TCP tunnel', editTcp: 'Edit TCP tunnel', createUdp: 'Create UDP tunnel', editUdp: 'Edit UDP tunnel', createPorts: 'Create port group', editPorts: 'Edit port group', createHttp: 'Create HTTP route', editHttp: 'Edit HTTP route', createSni: 'Create SNI route', editSni: 'Edit SNI route', createSecret: 'Create secret tunnel', editSecret: 'Edit secret tunnel', createSocks5: 'Create SOCKS5 proxy', editSocks5: 'Edit SOCKS5 proxy', createHttpProxy: 'Create HTTP proxy', editHttpProxy: 'Edit HTTP proxy',
@@ -587,21 +615,21 @@
           auditLogin: 'Administrator signed in', auditLoginFailed: 'Administrator sign-in failed', auditPasswordChanged: 'Administrator password changed', auditLogout: 'Administrator signed out', auditClientEnrolled: 'Client enrolled', auditPolicyCreated: 'Policy created', auditPolicyUpdated: 'Policy updated', auditPolicyDeleted: 'Policy deleted', auditRegistered: 'Service registered', auditAcmeUpdated: 'ACME settings updated', auditCertificateStarted: 'Certificate operation started', auditCertificateSucceeded: 'Certificate operation succeeded', auditCertificateFailed: 'Certificate operation failed', auditP2pUpdated: 'P2P candidates updated', auditP2pDirect: 'P2P direct connection established', auditP2pRelay: 'P2P connection fell back to relay',
           signInFailed: 'Sign-in failed. Check the username and password.', signingIn: 'Signing in…', changeRequired: 'Change the initial password before using the management console.', changingPassword: 'Changing password…', passwordChanged: 'Password changed.', passwordChangeFailed: 'Unable to change the password. Use at least 12 characters.', signedOut: 'Signed out.', sessionExpired: 'The administrator session expired. Sign in again.', requestFailed: 'The server did not respond. Check the server and network connection.', statusFailed: 'Unable to load management data.', invalidResponse: 'The server returned an invalid response.',
           configIssueAlert: '{count} client configuration issue(s)', certificateExpiredAlert: '{count} expired certificate(s)', certificateExpiringAlert: '{count} certificate(s) expire within 30 days', authenticationFailureAlert: '{count} authentication failure(s) since startup', transportErrorAlert: '{count} transport or handshake error(s) since startup',
-          accessControl: 'Access control', userManagement: 'User management', userManagementHelp: 'Create accounts, assign roles and control access.', securitySessions: 'Security & sessions', securitySessionsHelp: 'Review active sign-ins and revoke sessions that are no longer trusted.', newUser: 'New user', displayName: 'Display name', lastLogin: 'Last login', actions: 'Actions', sessionId: 'Session ID', createdAt: 'Created', expiresAt: 'Expires', forcePasswordChange: 'Require password change at next sign-in', resetPassword: 'Reset password', revokeSessions: 'Revoke sessions', revoke: 'Revoke', userFormHelp: 'Passwords must contain at least 12 characters.', userCreated: 'User created.', userUpdated: 'User updated.', userDeleted: 'User deleted.', passwordReset: 'Password reset.', sessionsRevoked: 'Sessions revoked.', confirmUserDelete: 'Delete user {username}?', confirmRevokeSessions: 'Revoke every session for {username}?', confirmRevokeSession: 'Revoke this session?', never: 'Never', mustChangePassword: 'Must change password', currentSession: 'Current session', total: 'Total', searchUsers: 'Search username or display name', allRoles: 'All roles', userCount: '{visible} of {total}',
+          accessControl: 'Access control', userManagement: 'User management', userManagementHelp: 'Create accounts, assign roles and control access.', securitySessions: 'Security & sessions', securitySessionsHelp: 'Manage two-factor authentication, API credentials and active sign-ins.', newUser: 'New user', displayName: 'Display name', lastLogin: 'Last login', actions: 'Actions', sessionId: 'Session ID', createdAt: 'Created', expiresAt: 'Expires', forcePasswordChange: 'Require password change at next sign-in', resetPassword: 'Reset password', revokeSessions: 'Revoke sessions', revoke: 'Revoke', userFormHelp: 'Passwords must contain at least 12 characters.', userCreated: 'User created.', userUpdated: 'User updated.', userDeleted: 'User deleted.', passwordReset: 'Password reset.', sessionsRevoked: 'Sessions revoked.', confirmUserDelete: 'Delete user {username}?', confirmRevokeSessions: 'Revoke every session for {username}?', confirmRevokeSession: 'Revoke this session?', never: 'Never', mustChangePassword: 'Must change password', currentSession: 'Current session', total: 'Total', searchUsers: 'Search username or display name', allRoles: 'All roles', userCount: '{visible} of {total}', twoFactorAuth: 'Two-factor authentication', totpEnabled: 'Enabled. Sign-in requires an authenticator code.', totpDisabled: 'Disabled. Password-only sign-in is active.', setupTotp: 'Set up', disableTotp: 'Disable', totpSetupHelp: 'Add the setup key or URI to your authenticator, then enter the current code.', totpDisableHelp: 'Enter the current authenticator code to disable two-factor authentication.', totpSecret: 'Setup key', provisioningUri: 'Provisioning URI', totpEnabledMessage: 'Two-factor authentication enabled.', totpDisabledMessage: 'Two-factor authentication disabled.', invalidTotp: 'The verification code is invalid.', apiTokens: 'API tokens', apiTokensHelp: 'Create scoped tokens for automation and integrations.', newApiToken: 'New token', apiToken: 'API token', apiTokenShownOnce: 'This token is shown only once. Copy it before closing.', scope: 'Scope', scopeRead: 'Read only', scopeWrite: 'Read and write', scopeAdministrator: 'Administrator', expiryDays: 'Expiry (days)', lastUsed: 'Last used', activeSignIns: 'Active sign-ins', apiTokenCreated: 'API token created.', apiTokenRevoked: 'API token revoked.', confirmApiTokenRevoke: 'Revoke API token {name}?', noApiTokens: 'No API tokens.',
           clientManagement: 'Client management', clientManagementHelp: 'Organize client identities, revoke access and rotate credentials.', searchClients: 'Search name, group, tag, platform or ID', clientGroup: 'Group', tags: 'Tags', tagsPlaceholder: 'Comma-separated tags, such as game, home, asia', notes: 'Notes', platform: 'Platform', lastSeen: 'Last seen', configStatus: 'Config', editClient: 'Edit client', rotateToken: 'Rotate token', newClientToken: 'New client token', tokenShownOnce: 'This token is shown only once. Update the client configuration before closing.', clientToken: 'Client token', copy: 'Copy', done: 'Done', clientEnabledHelp: 'Allow this identity to authenticate and receive policies', clientUpdated: 'Client updated.', clientDeleted: 'Client deleted.', tokenRotated: 'Client token rotated.', tokenCopied: 'Token copied.', confirmClientDelete: 'Delete offline client {name}? Policies that reference it must be migrated first.', confirmTokenRotation: 'Rotate the token for {name}? The previous token will stop working immediately.', clientCount: '{visible} of {total}', localConfig: 'Local', reportOnlyConfig: 'Report only', managedConfig: 'Server managed', synchronized: 'Synchronized', conflict: 'Conflict', applyFailed: 'Apply failed', unknownConfig: 'Unknown',
           allowedPorts: 'Allowed: {ports}', reservedPorts: 'reserved: {ports}', errorUnknownClient: 'The selected client does not exist.', errorInvalidName: 'The name must contain 1 to 80 characters.', errorInvalidPort: 'The public port is outside the server policy. {ports}.', errorDuplicatePort: 'This public port is already assigned.', errorInvalidTarget: 'Use a valid host:port target.', errorInvalidHostname: 'The hostname is invalid.', errorDuplicateHostname: 'The hostname is already assigned.', errorInvalidLimit: 'One of the configured limits is invalid.', errorStorage: 'Policy storage is unavailable. Check the data directory and server log.', errorUnknownPolicy: 'The policy does not exist.', errorInvalidUsername: 'The proxy username is invalid.', errorInvalidPortExpression: 'Use single ports, comma-separated lists or ascending ranges.', errorPortCountMismatch: 'Public and target port counts must match.', errorDuplicatePortInGroup: 'A port appears more than once in this group.', errorTooManyMappings: 'A port group can contain at most 256 mappings.', errorAcme: 'The ACME request failed. Check the settings, DNS and server log.'
         },
         zh: {
           title: 'LinkLake 管理控制台', console: '管理控制台', appearance: '外观', themeSystem: '跟随系统', themeLight: '浅色', themeDark: '深色', palette: '配色', paletteLake: '湖蓝', paletteOcean: '海洋', paletteJade: '翡翠', paletteViolet: '紫罗兰', globalSearch: '全局搜索', globalSearchPlaceholder: '搜索客户端、策略、端口、域名或 ID', noSearchResults: '没有匹配的客户端或策略。',
-          loginTitle: '登录 LinkLake', loginIntro: '使用管理员账户登录，管理客户端、转发服务与运行状态。', username: '用户名', password: '密码', usernamePlaceholder: '管理员用户名', passwordPlaceholder: '密码', signIn: '登录', newPassword: '新密码', confirmPassword: '确认密码', changePassword: '修改密码', passwordRequirement: '密码至少需要 12 位。', passwordsMismatch: '两次输入的密码不一致。',
-          overview: '总览', overviewSubtitle: '集中查看服务健康、实时流量和活动告警。', metrics: '运行指标', metricsSubtitle: '查看协议活动、故障构成和基础设施健康状态。', services: '服务与转发', p2p: 'P2P 网络', p2pSubtitle: '查看直连候选、NAT 映射和中继回退。', activity: '活动', activitySubtitle: '筛选并检查管理员、策略和隧道事件。', portGroupsShort: '端口组', secretShort: '私密', httpProxyShort: '代理',
+          loginTitle: '登录 LinkLake', loginIntro: '使用管理员账户登录，管理客户端、转发服务与运行状态。', username: '用户名', password: '密码', usernamePlaceholder: '管理员用户名', passwordPlaceholder: '密码', signIn: '登录', newPassword: '新密码', confirmPassword: '确认密码', changePassword: '修改密码', passwordRequirement: '密码至少需要 12 位。', passwordsMismatch: '两次输入的密码不一致。', totpCode: '动态验证码', totpPlaceholder: '6 位验证码', totpRequired: '请输入身份验证器中的 6 位动态验证码。',
+          overview: '总览', overviewSubtitle: '集中查看服务健康、实时流量和活动告警。', metrics: '运行指标', metricsSubtitle: '查看协议活动、故障构成和基础设施健康状态。', services: '服务与转发', p2p: 'P2P 网络', p2pSubtitle: '查看直连候选、NAT 映射和中继回退。', fleet: '多云管理', fleetHelp: '集中监控 LinkLake 服务端，并定义首选入口与故障切换顺序。', newFleetPeer: '添加服务端', editFleetPeer: '编辑服务端', fleetTokenHelp: '管理令牌由当前服务端的环境变量读取，不写入数据库。', region: '地域', priority: '优先级', weight: '权重', latency: '延迟', device: '设备', tokenEnvironment: '令牌环境变量', preferredEntry: '首选入口', onlineServers: '在线服务端', failoverEntries: '故障切换入口', noFleetPeers: '尚未配置多云服务端。', fleetSaved: '服务端条目已保存。', fleetDeleted: '服务端条目已删除。', confirmFleetDelete: '确定删除服务端 {name} 吗？', fleetConflict: '部署冲突', activity: '活动', activitySubtitle: '筛选并检查管理员、策略和隧道事件。', portGroupsShort: '端口组', secretShort: '私密', httpProxyShort: '代理',
           alertManagement: '告警管理', alertManagementHelp: '配置持久化规则并查看触发或已恢复的事件。', newAlertRule: '新建规则', editAlertRule: '编辑规则', alertRuleHelp: '选择指标、阈值、评估窗口和通知通道。', notificationChannels: '通知通道', channelsConfigured: 'Webhook：{webhook} · SMTP：{smtp}', configured: '已配置', notConfigured: '未配置', alertMetric: '指标', threshold: '阈值', alertTarget: '目标', severity: '级别', comparator: '比较方式', evaluationWindow: '评估窗口（秒）', cooldown: '通知冷却（秒）', alertTargetPlaceholder: '可选：客户端 ID 或 策略类型:ID', metricClientOffline: '客户端离线', metricPolicyUnavailable: '策略不可用', metricAuthenticationFailures: '认证失败', metricTrafficRate: '流量速率', metricActiveConnections: '活动连接', metricCertificateDays: '证书剩余天数', severityInfo: '信息', severityWarning: '警告', severityCritical: '严重', noAlertEvents: '当前没有活动告警。', noAlertRules: '暂无告警规则。', alertRuleSaved: '告警规则已保存。', alertRuleDeleted: '告警规则已删除。', confirmDeleteAlertRule: '确定删除此告警规则吗？', firing: '触发中', resolved: '已恢复',
           serverOnline: '服务在线', refresh: '刷新', refreshed: '更新时间', language: '语言', signOut: '退出登录', roleAdministrator: '管理员', roleOperator: '运维人员', roleAuditor: '审计人员', role: '用户组', sessionExpires: '会话到期时间：{time}', authenticationSession: 'Cookie 会话',
           trafficTrend: '流量趋势', trafficTrendHelp: '服务端持久化保留最多 30 天流量历史。', inbound: '入站', outbound: '出站', activeSessions: '活跃会话', noTrendData: '正在等待足够的样本以计算实时速率。', noTrafficRange: '所选时间范围内没有流量。',
           serviceHealth: '服务健康度', serviceHealthHelp: '按协议查看在线策略数量。', certificateSummary: '证书摘要', alerts: '告警', noAlerts: '当前没有活动告警。', clients: '客户端', forwardingServices: '转发服务', p2pNodes: '新鲜 / 全部 P2P 节点', totalTraffic: '累计流量', configIssues: '配置问题',
           protocolActivity: '协议活动', protocolActivityHelp: '当前活跃连接和会话。', failureOverview: '故障概览', failureOverviewHelp: '服务启动以来的累计故障。', serverUptime: '运行时间', requestsTotal: '请求数', failuresTotal: '故障数', reconnects: '重连次数', authenticationFailures: '认证失败',
           tcpMetrics: 'TCP', udpMetrics: 'UDP', webMetrics: '网站 / TLS', proxyMetrics: '正向代理', p2pMetrics: 'P2P', certificateMetrics: '证书 / ACME', systemMetrics: '系统', active: '活跃', pending: '待配对', sessions: '会话', packets: '数据包', traffic: '入站 / 出站流量', rejected: '拒绝', failed: '失败', timeouts: '超时', transportErrors: '传输错误', drops: '丢弃', connections: '连接', direct: '直连', relay: '中继', managed: '托管', valid: '有效', expiring: '即将到期', expired: '已过期', nearestExpiry: '最近到期', orders: '订单', renewals: '续期', challenges: 'HTTP-01 挑战',
-          newPolicy: '新建策略', editPolicy: '编辑', duplicate: '复制', enable: '启用', disable: '停用', delete: '删除', cancel: '取消', save: '保存', saving: '正在保存…', search: '搜索', searchPolicies: '按名称、端点或客户端搜索', status: '状态', allStatuses: '全部状态', online: '在线', offline: '离线', enabled: '已启用', disabled: '已停用', all: '全部', policyCount: '显示 {visible} / {total}', noPolicies: '没有符合当前筛选条件的策略。', confirmDelete: '确定删除此策略并关闭活动会话吗？', policyCreated: '策略已创建。', policyUpdated: '策略已更新。', policyDeleted: '策略已删除。', policyEnabled: '策略已启用。', policyDisabled: '策略已停用。', exportPolicies: '导出', exportCsv: '导出 CSV', importPolicies: '导入', selectVisible: '选择当前结果', selectedPolicies: '已选择 {count} 项', migrateClient: '迁移客户端', bulkCompleted: '批量操作已完成。', importCompleted: '已导入 {count} 条策略。', invalidImport: '策略导入文件无效。', confirmBulkDelete: '确定删除选中的 {count} 条策略并关闭活动会话吗？',
+          newPolicy: '新建策略', editPolicy: '编辑', duplicate: '复制', enable: '启用', disable: '停用', delete: '删除', cancel: '取消', save: '保存', create: '创建', saving: '正在保存…', search: '搜索', searchPolicies: '按名称、端点或客户端搜索', status: '状态', allStatuses: '全部状态', online: '在线', offline: '离线', enabled: '已启用', disabled: '已停用', all: '全部', policyCount: '显示 {visible} / {total}', noPolicies: '没有符合当前筛选条件的策略。', confirmDelete: '确定删除此策略并关闭活动会话吗？', policyCreated: '策略已创建。', policyUpdated: '策略已更新。', policyDeleted: '策略已删除。', policyEnabled: '策略已启用。', policyDisabled: '策略已停用。', exportPolicies: '导出', exportCsv: '导出 CSV', importPolicies: '导入', selectVisible: '选择当前结果', selectedPolicies: '已选择 {count} 项', migrateClient: '迁移客户端', bulkCompleted: '批量操作已完成。', importCompleted: '已导入 {count} 条策略。', invalidImport: '策略导入文件无效。', confirmBulkDelete: '确定删除选中的 {count} 条策略并关闭活动会话吗？',
           tcpTitle: 'TCP 隧道', tcpSubtitle: '开放一个 TCP 端口，并将每个连接转发到指定客户端。', udpTitle: 'UDP 隧道', udpSubtitle: '通过会话跟踪和带宽控制转发 UDP 数据报。', portsTitle: '端口组', portsSubtitle: '将多个 TCP 或 UDP 端口映射作为一项策略管理。', httpTitle: 'HTTP / HTTPS 路由', httpSubtitle: '按域名路由并自动管理 HTTPS 证书。', sniTitle: 'TLS SNI 原样透传', sniSubtitle: '根据 SNI 转发 TLS 连接，不在服务端终止 TLS。', secretTitle: '私密隧道', secretSubtitle: '通过一次性凭据在服务提供端和访问端之间建立私密连接。', socks5Title: 'SOCKS5 代理', socks5Subtitle: '开放带认证的 SOCKS5 TCP 和 UDP 访问。', httpProxyTitle: 'HTTP 正向代理', httpProxySubtitle: '开放带认证的 HTTP 和 CONNECT 代理。', acmeTitle: 'ACME 自动化', acmeSubtitle: '配置 HTTP 路由的证书签发和自动续期。',
           client: '客户端', name: '名称', tunnelName: '隧道名称', routeName: '路由名称', proxyName: '代理名称', publicPort: '公网端口', targetAddress: '目标地址', maxConnections: '最大连接数', bandwidthLimit: '带宽上限（B/s）', maxSessions: '最大会话数', idleTimeout: '空闲超时（秒）', protocol: '协议', publicPorts: '公网端口', targetHost: '目标主机', targetPorts: '目标端口', hostname: '域名', tlsMode: 'TLS 模式', tlsDisabled: '停用', tlsAutomatic: '自动 ACME', redirectHttps: '将 HTTP 重定向到 HTTPS', providerClient: '服务提供客户端', allowedVisitor: '允许访问的客户端', anyAuthenticatedClient: '任意已认证客户端', proxyUsername: '代理用户名', optional: '可选', unlimited: '不限速', selectClient: '选择客户端', noClients: '当前没有已注册客户端。',
           createTcp: '新建 TCP 隧道', editTcp: '编辑 TCP 隧道', createUdp: '新建 UDP 隧道', editUdp: '编辑 UDP 隧道', createPorts: '新建端口组', editPorts: '编辑端口组', createHttp: '新建 HTTP 路由', editHttp: '编辑 HTTP 路由', createSni: '新建 SNI 路由', editSni: '编辑 SNI 路由', createSecret: '新建私密隧道', editSecret: '编辑私密隧道', createSocks5: '新建 SOCKS5 代理', editSocks5: '编辑 SOCKS5 代理', createHttpProxy: '新建 HTTP 代理', editHttpProxy: '编辑 HTTP 代理',
@@ -613,7 +641,7 @@
           auditLogin: '管理员已登录', auditLoginFailed: '管理员登录失败', auditPasswordChanged: '管理员密码已修改', auditLogout: '管理员已退出', auditClientEnrolled: '客户端已注册', auditPolicyCreated: '策略已创建', auditPolicyUpdated: '策略已更新', auditPolicyDeleted: '策略已删除', auditRegistered: '服务已注册', auditAcmeUpdated: 'ACME 设置已更新', auditCertificateStarted: '证书任务已开始', auditCertificateSucceeded: '证书任务已成功', auditCertificateFailed: '证书任务失败', auditP2pUpdated: 'P2P 候选地址已更新', auditP2pDirect: 'P2P 直连已建立', auditP2pRelay: 'P2P 连接已回退到中继',
           signInFailed: '登录失败，请检查用户名和密码。', signingIn: '正在登录…', changeRequired: '请先修改初始密码，再使用管理控制台。', changingPassword: '正在修改密码…', passwordChanged: '密码已修改。', passwordChangeFailed: '无法修改密码，请使用至少 12 位的新密码。', signedOut: '已退出登录。', sessionExpired: '管理员会话已过期，请重新登录。', requestFailed: '服务端没有响应，请检查服务和网络连接。', statusFailed: '无法加载管理数据。', invalidResponse: '服务端返回了无效响应。',
           configIssueAlert: '{count} 个客户端配置存在问题', certificateExpiredAlert: '{count} 张证书已过期', certificateExpiringAlert: '{count} 张证书将在 30 天内到期', authenticationFailureAlert: '服务启动以来发生 {count} 次认证失败', transportErrorAlert: '服务启动以来发生 {count} 次传输或握手错误',
-          accessControl: '访问控制', userManagement: '用户管理', userManagementHelp: '创建账户、分配用户组并控制访问权限。', securitySessions: '安全与会话', securitySessionsHelp: '检查当前登录并撤销不再可信的会话。', newUser: '新建用户', displayName: '显示名称', lastLogin: '最后登录', actions: '操作', sessionId: '会话 ID', createdAt: '创建时间', expiresAt: '到期时间', forcePasswordChange: '下次登录时必须修改密码', resetPassword: '重置密码', revokeSessions: '撤销会话', revoke: '撤销', userFormHelp: '密码至少需要 12 位。', userCreated: '用户已创建。', userUpdated: '用户已更新。', userDeleted: '用户已删除。', passwordReset: '密码已重置。', sessionsRevoked: '会话已撤销。', confirmUserDelete: '确定删除用户 {username} 吗？', confirmRevokeSessions: '确定撤销 {username} 的全部会话吗？', confirmRevokeSession: '确定撤销该会话吗？', never: '从未登录', mustChangePassword: '需要修改密码', currentSession: '当前会话', total: '总计', searchUsers: '搜索用户名或显示名称', allRoles: '全部用户组', userCount: '显示 {visible} / {total}',
+          accessControl: '访问控制', userManagement: '用户管理', userManagementHelp: '创建账户、分配用户组并控制访问权限。', securitySessions: '安全与会话', securitySessionsHelp: '管理双因素认证、API 凭据和当前登录设备。', newUser: '新建用户', displayName: '显示名称', lastLogin: '最后登录', actions: '操作', sessionId: '会话 ID', createdAt: '创建时间', expiresAt: '到期时间', forcePasswordChange: '下次登录时必须修改密码', resetPassword: '重置密码', revokeSessions: '撤销会话', revoke: '撤销', userFormHelp: '密码至少需要 12 位。', userCreated: '用户已创建。', userUpdated: '用户已更新。', userDeleted: '用户已删除。', passwordReset: '密码已重置。', sessionsRevoked: '会话已撤销。', confirmUserDelete: '确定删除用户 {username} 吗？', confirmRevokeSessions: '确定撤销 {username} 的全部会话吗？', confirmRevokeSession: '确定撤销该会话吗？', never: '从未登录', mustChangePassword: '需要修改密码', currentSession: '当前会话', total: '总计', searchUsers: '搜索用户名或显示名称', allRoles: '全部用户组', userCount: '显示 {visible} / {total}', twoFactorAuth: '双因素认证', totpEnabled: '已启用，登录时需要身份验证器动态验证码。', totpDisabled: '未启用，当前仅使用密码登录。', setupTotp: '开始设置', disableTotp: '关闭', totpSetupHelp: '将设置密钥或 URI 添加到身份验证器，然后输入当前验证码。', totpDisableHelp: '请输入当前动态验证码以关闭双因素认证。', totpSecret: '设置密钥', provisioningUri: '配置 URI', totpEnabledMessage: '双因素认证已启用。', totpDisabledMessage: '双因素认证已关闭。', invalidTotp: '动态验证码无效。', apiTokens: 'API 令牌', apiTokensHelp: '为自动化和外部集成创建限定权限的令牌。', newApiToken: '新建令牌', apiToken: 'API 令牌', apiTokenShownOnce: '该令牌只显示一次，关闭前请复制保存。', scope: '权限范围', scopeRead: '只读', scopeWrite: '读写', scopeAdministrator: '管理员', expiryDays: '有效天数', lastUsed: '最后使用', activeSignIns: '当前登录', apiTokenCreated: 'API 令牌已创建。', apiTokenRevoked: 'API 令牌已撤销。', confirmApiTokenRevoke: '确定撤销 API 令牌 {name} 吗？', noApiTokens: '暂无 API 令牌。',
           clientManagement: '客户端管理', clientManagementHelp: '整理客户端身份、撤销访问并轮换凭据。', searchClients: '搜索名称、分组、标签、平台或 ID', clientGroup: '分组', tags: '标签', tagsPlaceholder: '用逗号分隔，例如 game, home, asia', notes: '备注', platform: '平台', lastSeen: '最后在线', configStatus: '配置状态', editClient: '编辑客户端', rotateToken: '轮换令牌', newClientToken: '新客户端令牌', tokenShownOnce: '该令牌只显示一次，关闭前请更新客户端配置。', clientToken: '客户端令牌', copy: '复制', done: '完成', clientEnabledHelp: '允许该身份认证并接收策略', clientUpdated: '客户端已更新。', clientDeleted: '客户端已删除。', tokenRotated: '客户端令牌已轮换。', tokenCopied: '令牌已复制。', confirmClientDelete: '确定删除离线客户端 {name} 吗？引用它的策略必须先迁移。', confirmTokenRotation: '确定轮换 {name} 的令牌吗？旧令牌会立即失效。', clientCount: '显示 {visible} / {total}', localConfig: '本地配置', reportOnlyConfig: '仅上报', managedConfig: '服务端托管', synchronized: '已同步', conflict: '冲突', applyFailed: '应用失败', unknownConfig: '未知',
           allowedPorts: '允许范围：{ports}', reservedPorts: '保留端口：{ports}', errorUnknownClient: '所选客户端不存在。', errorInvalidName: '名称长度必须为 1 到 80 个字符。', errorInvalidPort: '公网端口不符合服务端策略。{ports}。', errorDuplicatePort: '该公网端口已被占用。', errorInvalidTarget: '请使用有效的 host:port 目标地址。', errorInvalidHostname: '域名格式无效。', errorDuplicateHostname: '该域名已被占用。', errorInvalidLimit: '某项限制参数无效。', errorStorage: '策略存储不可用，请检查数据目录和服务端日志。', errorUnknownPolicy: '策略不存在。', errorInvalidUsername: '代理用户名格式无效。', errorInvalidPortExpression: '请使用单端口、逗号列表或升序范围。', errorPortCountMismatch: '公网端口与目标端口数量必须一致。', errorDuplicatePortInGroup: '端口组内存在重复端口。', errorTooManyMappings: '一个端口组最多包含 256 个映射。', errorAcme: 'ACME 请求失败，请检查设置、DNS 和服务端日志。'
         }
@@ -743,6 +771,9 @@
         globalSearchTimer: null,
         users: [],
         sessions: [],
+        apiTokens: [],
+        fleetEditorId: null,
+        totpMode: 'enable',
         userEditor: { mode: 'create', username: null },
         resetUsername: null,
         alertEditorId: null,
@@ -751,15 +782,18 @@
       };
 
       const elements = Object.fromEntries([
-        'theme-color', 'appearance-button', 'appearance-popover', 'language', 'utility-session', 'account-shell', 'global-search-shell', 'global-search', 'global-search-results', 'login-shell', 'login', 'username', 'password', 'initial-password-form', 'initial-new-password', 'initial-confirm-password', 'workspace', 'workspace-title', 'workspace-subtitle', 'last-refresh', 'refresh', 'account-button', 'account-avatar', 'account-name', 'account-menu', 'account-menu-name', 'account-menu-role', 'account-menu-expiry', 'account-password', 'logout',
+        'theme-color', 'appearance-button', 'appearance-popover', 'language', 'utility-session', 'account-shell', 'global-search-shell', 'global-search', 'global-search-results', 'login-shell', 'login', 'username', 'password', 'login-totp-label', 'login-totp', 'initial-password-form', 'initial-new-password', 'initial-confirm-password', 'workspace', 'workspace-title', 'workspace-subtitle', 'last-refresh', 'refresh', 'account-button', 'account-avatar', 'account-name', 'account-menu', 'account-menu-name', 'account-menu-role', 'account-menu-expiry', 'account-password', 'account-security', 'logout',
         'overview-view', 'overview-kpis', 'traffic-chart', 'traffic-tooltip', 'traffic-chart-summary', 'export-metrics', 'service-health-summary', 'overview-alert-panel', 'overview-alerts',
         'metrics-view', 'metrics-kpis', 'activity-chart', 'failure-chart', 'tcp-metric-panel', 'udp-metric-panel', 'proxy-metric-panel', 'web-metric-panel', 'network-health-panel', 'system-metric-panel',
         'services-view', 'service-title', 'service-subtitle', 'new-policy', 'export-policies', 'import-policies', 'import-policies-file', 'service-toolbar', 'service-search', 'service-status-filter', 'service-count', 'service-bulk-toolbar', 'select-visible-policies', 'selected-policy-count', 'bulk-enable-policies', 'bulk-disable-policies', 'bulk-client-target', 'bulk-migrate-policies', 'bulk-delete-policies', 'service-list', 'acme-page',
-        'p2p-view', 'p2p-list', 'clients-view', 'client-search', 'client-status-filter', 'client-count', 'clients-list', 'users-view', 'new-user', 'user-search', 'user-role-filter', 'user-count', 'users-list', 'sessions-view', 'sessions-list', 'alerts-view', 'new-alert-rule', 'alert-channels', 'alert-events', 'alert-rules', 'activity-view', 'audit-search', 'audit-category', 'audit-count', 'audit-list', 'audit-load-more', 'export-audit',
+        'p2p-view', 'p2p-list', 'fleet-view', 'new-fleet-peer', 'fleet-summary', 'fleet-conflicts', 'fleet-list', 'clients-view', 'client-search', 'client-status-filter', 'client-count', 'clients-list', 'users-view', 'new-user', 'user-search', 'user-role-filter', 'user-count', 'users-list', 'sessions-view', 'totp-status', 'totp-action', 'new-api-token', 'api-tokens-list', 'sessions-list', 'alerts-view', 'new-alert-rule', 'alert-channels', 'alert-events', 'alert-rules', 'activity-view', 'audit-search', 'audit-category', 'audit-count', 'audit-list', 'audit-load-more', 'export-audit',
         'drawer-backdrop', 'policy-drawer', 'drawer-title', 'drawer-subtitle', 'drawer-close', 'drawer-cancel', 'policy-form', 'policy-fields', 'drawer-submit',
         'password-modal', 'password-modal-close', 'password-form', 'account-new-password', 'account-confirm-password', 'password-cancel',
         'user-modal', 'user-modal-title', 'user-modal-help', 'user-modal-close', 'user-form', 'user-username', 'user-display-name', 'user-role', 'user-password-label', 'user-password', 'user-enabled-label', 'user-enabled', 'user-force-change-label', 'user-force-change', 'user-cancel',
         'reset-password-modal', 'reset-password-close', 'reset-password-form', 'reset-password-value', 'reset-force-change', 'reset-password-cancel',
+        'totp-modal', 'totp-modal-title', 'totp-modal-help', 'totp-modal-close', 'totp-setup-fields', 'totp-secret', 'totp-uri', 'totp-form', 'totp-code', 'totp-cancel', 'totp-submit',
+        'api-token-modal', 'api-token-title', 'api-token-close', 'api-token-form', 'api-token-fields', 'api-token-name', 'api-token-scope', 'api-token-expiry', 'api-token-value-label', 'api-token-value', 'api-token-cancel', 'api-token-submit', 'api-token-copy',
+        'fleet-modal', 'fleet-modal-title', 'fleet-modal-close', 'fleet-form', 'fleet-name', 'fleet-url', 'fleet-region', 'fleet-token-env', 'fleet-priority', 'fleet-weight', 'fleet-enabled', 'fleet-cancel',
         'client-modal', 'client-modal-title', 'client-modal-id', 'client-modal-close', 'client-form', 'client-name', 'client-group', 'client-tags', 'client-notes', 'client-enabled', 'client-cancel', 'client-token-modal', 'client-token-close', 'client-token-value', 'client-token-copy', 'client-token-done', 'alert-rule-modal', 'alert-rule-title', 'alert-rule-close', 'alert-rule-form', 'alert-rule-name', 'alert-rule-metric', 'alert-rule-comparator', 'alert-rule-threshold', 'alert-rule-target', 'alert-rule-window', 'alert-rule-cooldown', 'alert-rule-severity', 'alert-rule-enabled', 'alert-rule-webhook', 'alert-rule-email', 'alert-rule-cancel', 'toast'
       ].map(id => [id.replaceAll('-', '_'), document.getElementById(id)]));
 
@@ -880,6 +914,8 @@
 
       async function apiFetch(url, options = {}) {
         const { skipAuthReset = false, timeoutMs = 15000, scope = 'default', ...request } = options;
+        request.headers = new Headers(request.headers || {});
+        if (!['GET', 'HEAD', 'OPTIONS'].includes(String(request.method || 'GET').toUpperCase())) request.headers.set('X-LinkLake-CSRF', '1');
         const controller = new AbortController();
         controller.linklakeScope = scope;
         state.activeControllers.add(controller);
@@ -908,11 +944,11 @@
           history.replaceState(null, '', '#/overview');
           return { view: 'overview', service: state.route.service || 'tcp' };
         }
-        if (['users', 'sessions'].includes(parts[0]) && state.identity?.role !== 'administrator') {
+        if (['users', 'sessions', 'fleet'].includes(parts[0]) && state.identity?.role !== 'administrator') {
           history.replaceState(null, '', '#/overview');
           return { view: 'overview', service: state.route.service || 'tcp' };
         }
-        if (['overview', 'metrics', 'clients', 'p2p', 'users', 'sessions', 'alerts', 'activity'].includes(parts[0])) return { view: parts[0], service: state.route.service || 'tcp' };
+        if (['overview', 'metrics', 'clients', 'p2p', 'fleet', 'users', 'sessions', 'alerts', 'activity'].includes(parts[0])) return { view: parts[0], service: state.route.service || 'tcp' };
         history.replaceState(null, '', '#/overview');
         return { view: 'overview', service: state.route.service || 'tcp' };
       }
@@ -928,6 +964,7 @@
           metrics: [t('metrics'), t('metricsSubtitle')],
           clients: [t('clientManagement'), t('clientManagementHelp')],
           p2p: [t('p2p'), t('p2pSubtitle')],
+          fleet: [t('fleet'), t('fleetHelp')],
           users: [t('userManagement'), t('userManagementHelp')],
           sessions: [t('securitySessions'), t('securitySessionsHelp')],
           alerts: [t('alertManagement'), t('alertManagementHelp')],
@@ -941,7 +978,7 @@
         const [title, subtitle] = routeCopy();
         elements.workspace_title.textContent = title;
         elements.workspace_subtitle.textContent = subtitle;
-        const views = { overview: elements.overview_view, metrics: elements.metrics_view, services: elements.services_view, clients: elements.clients_view, p2p: elements.p2p_view, users: elements.users_view, sessions: elements.sessions_view, alerts: elements.alerts_view, activity: elements.activity_view };
+        const views = { overview: elements.overview_view, metrics: elements.metrics_view, services: elements.services_view, clients: elements.clients_view, p2p: elements.p2p_view, fleet: elements.fleet_view, users: elements.users_view, sessions: elements.sessions_view, alerts: elements.alerts_view, activity: elements.activity_view };
         Object.entries(views).forEach(([name, element]) => element.classList.toggle('hidden', name !== state.route.view));
         document.querySelectorAll('[data-route-prefix]').forEach(link => link.classList.toggle('active', link.dataset.routePrefix === state.route.view));
         document.querySelectorAll('[data-service-route]').forEach(link => link.classList.toggle('active', state.route.view === 'services' && link.dataset.serviceRoute === state.route.service));
@@ -951,6 +988,7 @@
         else if (state.route.view === 'services') renderServices();
         else if (state.route.view === 'clients') renderClients();
         else if (state.route.view === 'p2p') renderP2p();
+        else if (state.route.view === 'fleet') renderFleet();
         else if (state.route.view === 'users') renderUsers();
         else if (state.route.view === 'sessions') renderSessions();
         else if (state.route.view === 'alerts') renderAlerts();
@@ -1937,6 +1975,83 @@
         });
       }
 
+      function renderFleet() {
+        const overview = state.dashboard.fleetOverview || { peers: [], conflicts: [], failover_order: [] };
+        const peers = overview.peers || [];
+        const preferred = peers.find(peer => peer.id === overview.preferred_peer_id);
+        elements.fleet_summary.replaceChildren(
+          createKpi(String(peers.filter(peer => peer.online).length), t('onlineServers'), `${peers.length} ${t('total')}`),
+          createKpi(preferred?.name || '—', t('preferredEntry'), preferred?.region || ''),
+          createKpi(String((overview.failover_order || []).length), t('failoverEntries')),
+          createKpi(formatBytes(peers.reduce((sum, peer) => sum + Number(peer.bytes_total || 0), 0)), t('traffic'))
+        );
+        elements.fleet_conflicts.replaceChildren();
+        (overview.conflicts || []).forEach(message => {
+          const item = document.createElement('div');
+          item.className = 'alert-item warning';
+          const strong = document.createElement('strong'); strong.textContent = t('fleetConflict');
+          const detail = document.createElement('span'); detail.textContent = message;
+          item.append(strong, detail);
+          elements.fleet_conflicts.append(item);
+        });
+        elements.fleet_list.replaceChildren();
+        if (!peers.length) {
+          const row = document.createElement('tr');
+          const cell = document.createElement('td'); cell.colSpan = 8; cell.textContent = t('noFleetPeers');
+          row.append(cell); elements.fleet_list.append(row); return;
+        }
+        peers.forEach(peer => {
+          const row = document.createElement('tr');
+          const status = !peer.enabled ? t('disabled') : peer.online ? t('online') : t('offline');
+          [peer.name, peer.region, status, peer.latency_millis == null ? '—' : `${peer.latency_millis} ms`, String(peer.priority), String(peer.weight), formatBytes(peer.bytes_total)].forEach(value => {
+            const cell = document.createElement('td'); cell.textContent = value; row.append(cell);
+          });
+          const actions = document.createElement('td'); actions.className = 'table-actions';
+          actions.append(actionButton(t('editPolicy'), () => openFleetModal(peer)), actionButton(t('delete'), () => deleteFleetPeer(peer), 'danger-button'));
+          row.append(actions); elements.fleet_list.append(row);
+        });
+      }
+
+      function openFleetModal(peer = null) {
+        state.fleetEditorId = peer?.id || null;
+        elements.fleet_modal_title.textContent = peer ? t('editFleetPeer') : t('newFleetPeer');
+        elements.fleet_name.value = peer?.name || '';
+        elements.fleet_url.value = peer?.url || 'https://';
+        elements.fleet_region.value = peer?.region || '';
+        elements.fleet_token_env.value = peer?.token_env || 'LINKLAKE_FLEET_TOKEN';
+        elements.fleet_priority.value = peer?.priority ?? 100;
+        elements.fleet_weight.value = peer?.weight ?? 100;
+        elements.fleet_enabled.checked = peer?.enabled ?? true;
+        elements.fleet_modal.classList.remove('hidden');
+        requestAnimationFrame(() => elements.fleet_name.focus());
+      }
+
+      function closeFleetModal() {
+        elements.fleet_modal.classList.add('hidden');
+        elements.fleet_form.reset();
+        state.fleetEditorId = null;
+      }
+
+      async function submitFleetPeer(event) {
+        event.preventDefault();
+        const submit = event.submitter;
+        setBusy(submit, true, 'saving');
+        const body = { name: elements.fleet_name.value.trim(), url: elements.fleet_url.value.trim(), region: elements.fleet_region.value.trim(), token_env: elements.fleet_token_env.value.trim(), priority: Number(elements.fleet_priority.value), weight: Number(elements.fleet_weight.value), enabled: elements.fleet_enabled.checked };
+        try {
+          const response = await apiFetch(state.fleetEditorId ? `/api/v1/fleet/peers/${encodeURIComponent(state.fleetEditorId)}` : '/api/v1/fleet/peers', { method: state.fleetEditorId ? 'PUT' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+          if (!response.ok) return showToast(await responseError(response), true);
+          closeFleetModal(); showToast(t('fleetSaved')); await loadManagementData({ forceHistory: false });
+        } catch (_) { showToast(t('requestFailed'), true); }
+        finally { setBusy(submit, false); }
+      }
+
+      async function deleteFleetPeer(peer) {
+        if (!confirm(t('confirmFleetDelete', { name: peer.name }))) return;
+        const response = await apiFetch(`/api/v1/fleet/peers/${encodeURIComponent(peer.id)}`, { method: 'DELETE' });
+        if (!response.ok) return showToast(await responseError(response), true);
+        showToast(t('fleetDeleted')); await loadManagementData({ forceHistory: false });
+      }
+
       function roleText(role) {
         return t({ administrator: 'roleAdministrator', operator: 'roleOperator', auditor: 'roleAuditor' }[role] || 'roleAuditor');
       }
@@ -2084,16 +2199,134 @@
 
       function renderSessions() {
         const sessions = state.dashboard.sessions || [];
+        const tokens = state.dashboard.apiTokens || [];
+        elements.totp_status.textContent = state.identity.totp_enabled ? t('totpEnabled') : t('totpDisabled');
+        elements.totp_action.textContent = state.identity.totp_enabled ? t('disableTotp') : t('setupTotp');
+        elements.api_tokens_list.replaceChildren();
+        if (!tokens.length) {
+          const row = document.createElement('tr');
+          const cell = document.createElement('td');
+          cell.colSpan = 6;
+          cell.textContent = t('noApiTokens');
+          row.append(cell);
+          elements.api_tokens_list.append(row);
+        }
+        tokens.forEach(token => {
+          const row = document.createElement('tr');
+          const scopeKey = { read: 'scopeRead', write: 'scopeWrite', administrator: 'scopeAdministrator' }[token.scope] || 'scopeRead';
+          [token.name, t(scopeKey), formatTimestamp(token.created_unix_seconds), token.expires_unix_seconds ? formatTimestamp(token.expires_unix_seconds) : t('never'), token.last_used_unix_seconds ? formatTimestamp(token.last_used_unix_seconds) : t('never')].forEach(value => {
+            const cell = document.createElement('td');
+            cell.textContent = value;
+            row.append(cell);
+          });
+          const actions = document.createElement('td');
+          actions.className = 'table-actions';
+          actions.append(actionButton(t('revoke'), () => revokeApiToken(token), 'danger-button'));
+          row.append(actions);
+          elements.api_tokens_list.append(row);
+        });
         elements.sessions_list.replaceChildren();
         sessions.forEach(session => {
           const row = document.createElement('tr');
           const current = session.session_id === state.identity.session_id;
-          [session.username, `${session.session_id}${current ? ` · ${t('currentSession')}` : ''}`, formatTimestamp(session.created_unix_seconds), formatTimestamp(session.expires_unix_seconds)].forEach(value => { const cell = document.createElement('td'); cell.textContent = value; row.append(cell); });
+          [session.username, `${session.session_id}${current ? ` · ${t('currentSession')}` : ''}`, session.remote_addr || '—', session.user_agent || '—', formatTimestamp(session.created_unix_seconds), formatTimestamp(session.expires_unix_seconds)].forEach(value => { const cell = document.createElement('td'); cell.textContent = value; row.append(cell); });
           const actions = document.createElement('td'); actions.className = 'table-actions';
           if (!current) actions.append(actionButton(t('revoke'), () => revokeSessionRecord(session), 'danger-button'));
           row.append(actions);
           elements.sessions_list.append(row);
         });
+      }
+
+      async function openTotpModal() {
+        state.totpMode = state.identity.totp_enabled ? 'disable' : 'enable';
+        elements.totp_form.reset();
+        elements.totp_setup_fields.classList.toggle('hidden', state.totpMode !== 'enable');
+        elements.totp_modal_help.textContent = t(state.totpMode === 'enable' ? 'totpSetupHelp' : 'totpDisableHelp');
+        elements.totp_submit.textContent = t(state.totpMode === 'enable' ? 'enable' : 'disableTotp');
+        if (state.totpMode === 'enable') {
+          const response = await apiFetch('/api/v1/auth/totp/setup', { method: 'POST' });
+          if (!response.ok) return showToast(await responseError(response), true);
+          const setup = await response.json();
+          elements.totp_secret.value = setup.secret;
+          elements.totp_uri.value = setup.provisioning_uri;
+        }
+        elements.totp_modal.classList.remove('hidden');
+        requestAnimationFrame(() => elements.totp_code.focus());
+      }
+
+      function closeTotpModal() {
+        elements.totp_modal.classList.add('hidden');
+        elements.totp_form.reset();
+        elements.totp_secret.value = '';
+        elements.totp_uri.value = '';
+      }
+
+      async function submitTotp(event) {
+        event.preventDefault();
+        const submit = event.submitter;
+        setBusy(submit, true, 'saving');
+        try {
+          const operation = state.totpMode === 'enable' ? 'enable' : 'disable';
+          const response = await apiFetch(`/api/v1/auth/totp/${operation}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: elements.totp_code.value }) });
+          if (!response.ok) return showToast(t('invalidTotp'), true);
+          closeTotpModal();
+          const identityResponse = await apiFetch('/api/v1/auth/me');
+          if (!identityResponse.ok) return;
+          state.identity = await identityResponse.json();
+          updateIdentityUi();
+          renderSessions();
+          showToast(t(operation === 'enable' ? 'totpEnabledMessage' : 'totpDisabledMessage'));
+        } catch (_) { showToast(t('requestFailed'), true); }
+        finally { setBusy(submit, false); }
+      }
+
+      function openApiTokenModal() {
+        elements.api_token_form.reset();
+        elements.api_token_fields.classList.remove('hidden');
+        elements.api_token_value_label.classList.add('hidden');
+        elements.api_token_submit.classList.remove('hidden');
+        elements.api_token_copy.classList.add('hidden');
+        elements.api_token_modal.classList.remove('hidden');
+        requestAnimationFrame(() => elements.api_token_name.focus());
+      }
+
+      function closeApiTokenModal() {
+        elements.api_token_modal.classList.add('hidden');
+        elements.api_token_form.reset();
+        elements.api_token_value.value = '';
+      }
+
+      async function submitApiToken(event) {
+        event.preventDefault();
+        const submit = event.submitter;
+        setBusy(submit, true, 'saving');
+        try {
+          const days = Number(elements.api_token_expiry.value || 0);
+          const response = await apiFetch('/api/v1/api-tokens', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: elements.api_token_name.value.trim(), scope: elements.api_token_scope.value, expires_unix_seconds: days > 0 ? Math.floor(Date.now() / 1000) + days * 86400 : null }) });
+          if (!response.ok) return showToast(await responseError(response), true);
+          const created = await response.json();
+          elements.api_token_value.value = created.token;
+          elements.api_token_fields.classList.add('hidden');
+          elements.api_token_value_label.classList.remove('hidden');
+          elements.api_token_submit.classList.add('hidden');
+          elements.api_token_copy.classList.remove('hidden');
+          showToast(t('apiTokenCreated'));
+          await loadManagementData({ forceHistory: false });
+        } catch (_) { showToast(t('requestFailed'), true); }
+        finally { setBusy(submit, false); }
+      }
+
+      async function copyApiToken() {
+        await navigator.clipboard.writeText(elements.api_token_value.value);
+        showToast(t('tokenCopied'));
+      }
+
+      async function revokeApiToken(token) {
+        if (!confirm(t('confirmApiTokenRevoke', { name: token.name }))) return;
+        const response = await apiFetch(`/api/v1/api-tokens/${encodeURIComponent(token.id)}`, { method: 'DELETE' });
+        if (!response.ok) return showToast(await responseError(response), true);
+        showToast(t('apiTokenRevoked'));
+        await loadManagementData({ forceHistory: false });
       }
 
       function alertMetricText(metric) {
@@ -2564,6 +2797,8 @@
         elements.workspace.classList.add('hidden');
         elements.login_shell.classList.remove('hidden');
         elements.login.classList.remove('hidden');
+        elements.login_totp_label.classList.add('hidden');
+        elements.login_totp.value = '';
         elements.initial_password_form.classList.add('hidden');
         if (messageKey) showToast(t(messageKey), messageKey !== 'signedOut');
       }
@@ -2635,11 +2870,25 @@
         const submit = event.submitter;
         setBusy(submit, true, 'signingIn');
         try {
-          const response = await apiFetch('/api/v1/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: elements.username.value, password: elements.password.value }), skipAuthReset: true });
+          const response = await apiFetch('/api/v1/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: elements.username.value, password: elements.password.value, totp_code: elements.login_totp_label.classList.contains('hidden') ? null : elements.login_totp.value }), skipAuthReset: true });
           if (generation !== state.sessionGeneration) return;
-          elements.password.value = '';
-          if (!response.ok) return showToast(t('signInFailed'), true);
+          if (!response.ok) {
+            const error = await response.json().catch(() => ({}));
+            if (error.code === 'totp_required') {
+              elements.login_totp_label.classList.remove('hidden');
+              elements.login_totp.required = true;
+              showToast(t('totpRequired'));
+              requestAnimationFrame(() => elements.login_totp.focus());
+              return;
+            }
+            elements.password.value = '';
+            elements.login_totp.value = '';
+            return showToast(error.code === 'invalid_totp_code' ? t('invalidTotp') : t('signInFailed'), true);
+          }
           const identity = await response.json();
+          elements.login.reset();
+          elements.login_totp_label.classList.add('hidden');
+          elements.login_totp.required = false;
           if (generation !== state.sessionGeneration) return;
           if (identity.password_change_required) return showInitialPassword(identity);
           showWorkspace(identity);
@@ -2710,7 +2959,7 @@
 
       function emptyDashboard() {
         const metrics = new Proxy({}, { get(target, key) { return key in target ? target[key] : 0; } });
-        return { status: {}, metrics, events: [], users: [], sessions: [], alertRules: [], alertEvents: [], alertChannels: {}, tcpPolicies: [], udpPolicies: [], portGroups: [], httpRoutes: [], sniRoutes: [], secretPolicies: [], socks5Policies: [], httpProxyPolicies: [], clients: [], p2pNodes: [], publicPortPolicy: { tcp_allowed: '32000-32999', udp_allowed: '32000-32999', tcp_reserved: '', udp_reserved: '' }, acme: { enabled: false, environment: 'staging', directory_url: acmeDirectories.staging, contact_email: '', terms_accepted: false, renew_before_days: 30, account_registered: false } };
+        return { status: {}, metrics, events: [], users: [], sessions: [], apiTokens: [], fleetOverview: { peers: [], conflicts: [], failover_order: [] }, alertRules: [], alertEvents: [], alertChannels: {}, tcpPolicies: [], udpPolicies: [], portGroups: [], httpRoutes: [], sniRoutes: [], secretPolicies: [], socks5Policies: [], httpProxyPolicies: [], clients: [], p2pNodes: [], publicPortPolicy: { tcp_allowed: '32000-32999', udp_allowed: '32000-32999', tcp_reserved: '', udp_reserved: '' }, acme: { enabled: false, environment: 'staging', directory_url: acmeDirectories.staging, contact_email: '', terms_accepted: false, renew_before_days: 30, account_registered: false } };
       }
 
       function managementRequestPlan() {
@@ -2720,9 +2969,10 @@
         ];
         if (state.route.view === 'metrics') return [...common, { key: 'metrics', url: '/api/v1/metrics' }, { key: 'history', url: historyQuery(), optional: true }];
         if (state.route.view === 'p2p') return [...common, { key: 'clients', url: '/api/v1/clients' }, { key: 'p2pNodes', url: '/api/v1/p2p/nodes' }];
+        if (state.route.view === 'fleet') return [...common, { key: 'fleetOverview', url: '/api/v1/fleet/overview' }];
         if (state.route.view === 'clients') return [...common, { key: 'clients', url: '/api/v1/clients' }];
         if (state.route.view === 'users') return [...common, { key: 'users', url: '/api/v1/users' }];
-        if (state.route.view === 'sessions') return [...common, { key: 'sessions', url: '/api/v1/sessions' }];
+        if (state.route.view === 'sessions') return [...common, { key: 'sessions', url: '/api/v1/sessions' }, { key: 'apiTokens', url: '/api/v1/api-tokens' }];
         if (state.route.view === 'alerts') return [...common, { key: 'alertRules', url: '/api/v1/alerts/rules' }, { key: 'alertEvents', url: '/api/v1/alerts/events?active=true&limit=100' }, { key: 'alertChannels', url: '/api/v1/alerts/channels' }];
         if (state.route.view === 'activity') return [...common, { key: 'events', url: `/api/v1/audit?limit=${Math.min(100, state.auditLimit)}` }];
         if (state.route.service === 'acme') return [...common, { key: 'acme', url: '/api/v1/acme/config' }];
@@ -2854,6 +3104,7 @@
         elements.global_search.addEventListener('focus', () => { if (elements.global_search_results.childElementCount) elements.global_search_results.classList.remove('hidden'); });
         elements.account_button.addEventListener('click', event => { event.stopPropagation(); togglePopover(elements.account_menu, elements.account_button); });
         elements.account_password.addEventListener('click', () => { togglePopover(elements.account_menu, elements.account_button, false); togglePasswordModal(true); });
+        elements.account_security.addEventListener('click', () => { togglePopover(elements.account_menu, elements.account_button, false); location.hash = '#/sessions'; });
         elements.logout.addEventListener('click', logout);
         document.addEventListener('click', event => {
           if (!elements.appearance_popover.contains(event.target) && !elements.appearance_button.contains(event.target)) togglePopover(elements.appearance_popover, elements.appearance_button, false);
@@ -2877,6 +3128,22 @@
         elements.reset_password_close.addEventListener('click', closeResetPassword);
         elements.reset_password_cancel.addEventListener('click', closeResetPassword);
         elements.reset_password_modal.addEventListener('click', event => { if (event.target === elements.reset_password_modal) closeResetPassword(); });
+        elements.totp_action.addEventListener('click', () => openTotpModal().catch(() => showToast(t('requestFailed'), true)));
+        elements.totp_form.addEventListener('submit', submitTotp);
+        elements.totp_modal_close.addEventListener('click', closeTotpModal);
+        elements.totp_cancel.addEventListener('click', closeTotpModal);
+        elements.totp_modal.addEventListener('click', event => { if (event.target === elements.totp_modal) closeTotpModal(); });
+        elements.new_api_token.addEventListener('click', openApiTokenModal);
+        elements.api_token_form.addEventListener('submit', submitApiToken);
+        elements.api_token_close.addEventListener('click', closeApiTokenModal);
+        elements.api_token_cancel.addEventListener('click', closeApiTokenModal);
+        elements.api_token_copy.addEventListener('click', copyApiToken);
+        elements.api_token_modal.addEventListener('click', event => { if (event.target === elements.api_token_modal) closeApiTokenModal(); });
+        elements.new_fleet_peer.addEventListener('click', () => openFleetModal());
+        elements.fleet_form.addEventListener('submit', submitFleetPeer);
+        elements.fleet_modal_close.addEventListener('click', closeFleetModal);
+        elements.fleet_cancel.addEventListener('click', closeFleetModal);
+        elements.fleet_modal.addEventListener('click', event => { if (event.target === elements.fleet_modal) closeFleetModal(); });
         elements.client_search.addEventListener('input', () => { state.clientSearch = elements.client_search.value; renderClients(); });
         elements.client_status_filter.addEventListener('change', () => { state.clientStatus = elements.client_status_filter.value; renderClients(); });
         elements.client_form.addEventListener('submit', submitClient);
@@ -2942,6 +3209,9 @@
             return;
           }
           if (event.key === 'Escape') {
+            if (!elements.fleet_modal.classList.contains('hidden')) return closeFleetModal();
+            if (!elements.api_token_modal.classList.contains('hidden')) return closeApiTokenModal();
+            if (!elements.totp_modal.classList.contains('hidden')) return closeTotpModal();
             if (!elements.alert_rule_modal.classList.contains('hidden')) return closeAlertRuleModal();
             if (!elements.client_token_modal.classList.contains('hidden')) return closeClientTokenModal();
             if (!elements.client_modal.classList.contains('hidden')) return closeClientModal();
