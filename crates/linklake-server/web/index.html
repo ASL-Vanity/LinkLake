@@ -1565,7 +1565,7 @@
             actionButton(t('duplicate'), () => duplicatePolicy(type, policy), 'soft-button', 'duplicate-policy'),
             actionButton(policy.enabled ? t('disable') : t('enable'), () => setPolicyEnabled(type, policy), 'soft-button', 'toggle-policy')
           );
-          if (state.identity.role === 'administrator' && ['tcp', 'udp', 'ports', 'http', 'sni'].includes(type)) {
+          if (state.identity.role === 'administrator' && ['tcp', 'udp', 'ports', 'http', 'sni', 'socks5', 'http-proxy'].includes(type)) {
             actions.append(actionButton(t('trafficControl'), () => openTrafficControl(type, policy), 'soft-button'));
           }
           if (type === 'http') appendHttpCertificateActions(actions, policy);

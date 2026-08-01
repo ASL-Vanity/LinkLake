@@ -1,3 +1,4 @@
+use crate::traffic_control::{TrafficDecision, TrafficPolicyKind};
 use crate::{
     client_registry::Authentication, record_audit, tcp_tunnel::BandwidthLimiter,
     tunnel_catalog::http_proxy_password_matches, AppState,
@@ -57,6 +58,7 @@ pub(crate) struct HttpProxyStatistics {
 #[derive(Clone)]
 struct PublicConnectionContext {
     state: Arc<AppState>,
+    policy_id: Uuid,
     client_id: Uuid,
     command_tx: mpsc::Sender<ControlFrame>,
     username: Arc<str>,
@@ -168,6 +170,7 @@ pub(crate) async fn register_proxy(
     );
     let context = PublicConnectionContext {
         state: state.clone(),
+        policy_id: runtime_policy.policy_id,
         client_id,
         command_tx,
         username: runtime_policy.username.into(),
@@ -266,7 +269,12 @@ async fn accept_public_connections(
         tokio::select! {
             _ = stop.changed() => break,
             accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => {
+                Ok((stream, source)) => {
+                    let decision = context.state.traffic_controls.lock().expect("traffic control catalog lock poisoned").authorize(TrafficPolicyKind::HttpProxy, context.policy_id, source.ip(), crate::unix_seconds());
+                    if !matches!(decision, Ok(TrafficDecision::Allowed)) {
+                        context.statistics.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     let Ok(policy_permit) = context.permits.clone().try_acquire_owned() else {
                         context.statistics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                         continue;
@@ -405,6 +413,20 @@ async fn serve_public_connection(
                 .statistics
                 .bytes_to_public
                 .fetch_add(to_public, Ordering::Relaxed);
+            if let Err(error) = context
+                .state
+                .traffic_controls
+                .lock()
+                .expect("traffic control catalog lock poisoned")
+                .record_bytes(
+                    TrafficPolicyKind::HttpProxy,
+                    context.policy_id,
+                    from_public.saturating_add(to_public),
+                    crate::unix_seconds(),
+                )
+            {
+                tracing::warn!("Could not persist HTTP proxy traffic usage: {error}");
+            }
         }
         Some(Ok(Err(error))) => {
             context
