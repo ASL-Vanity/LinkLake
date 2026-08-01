@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-version="${1:-0.4.0-rc.1}"
+if [ "$#" -lt 1 ] || [ -z "$1" ]; then
+  echo "用法: $0 <version> [build-root]" >&2
+  exit 64
+fi
+version="$1"
+case "$version" in
+  *[!0-9A-Za-z.+-]*|'')
+    echo "无效的版本号: $version" >&2
+    exit 64
+    ;;
+esac
 build_root="${2:-/root/linklake-build-$version}"
 binary="$build_root/target/release/linklake-server"
 installed=/usr/local/bin/linklake-server

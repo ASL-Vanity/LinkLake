@@ -5,7 +5,9 @@ project_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 manager_root="$project_root/apps/linklake_manager"
 output_directory="${1:-$project_root/dist}"
 version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' "$project_root/Cargo.toml" | head -n 1)"
+manager_version="$(sed -n 's/^version:[[:space:]]*\([^[:space:]]*\)/\1/p' "$manager_root/pubspec.yaml" | head -n 1)"
 test -n "$version"
+test -n "$manager_version"
 architecture="$(uname -m)"
 package_name="linklake-manager-$version-macos-$architecture"
 stage="$output_directory/$package_name"
@@ -15,7 +17,9 @@ flutter_bin="${FLUTTER:-flutter}"
 
 cd "$manager_root"
 "$flutter_bin" pub get
-"$flutter_bin" build macos --release
+"$flutter_bin" build macos --release \
+  --dart-define="LINKLAKE_MANAGER_VERSION=$manager_version" \
+  --dart-define="LINKLAKE_RELEASE_VERSION=$version"
 bundle="$(find "$manager_root/build/macos/Build/Products/Release" -maxdepth 1 -type d -name '*.app' -print | head -n 1)"
 test -n "$bundle"
 

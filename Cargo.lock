@@ -2145,7 +2145,7 @@ dependencies = [
 
 [[package]]
 name = "linklake-client"
-version = "0.6.0-rc.2"
+version = "0.6.0-rc.3"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2156,6 +2156,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "rustls-pemfile",
+ "semver",
  "serde",
  "serde_json",
  "sha2",
@@ -2172,7 +2173,7 @@ dependencies = [
 
 [[package]]
 name = "linklake-core"
-version = "0.6.0-rc.2"
+version = "0.6.0-rc.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -2184,7 +2185,7 @@ dependencies = [
 
 [[package]]
 name = "linklake-server"
-version = "0.6.0-rc.2"
+version = "0.6.0-rc.3"
 dependencies = [
  "anyhow",
  "arc-swap",

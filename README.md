@@ -111,7 +111,7 @@ LINKLAKE_RESERVED_UDP_PORTS=53
 - 目标客户端通过 `[client]` 中的 `p2p_bind` 同时监听 TCP 与 Iroh QUIC/UDP，并用 `p2p_endpoint` 登记 TCP 可达地址；两项必须成对配置。`p2p_tcp_enabled` 与 `p2p_iroh_enabled` 可分别关闭传输，但至少保留一种
 - Iroh QUIC 候选自动发布本地、STUN/QAD 公网映射和路由器端口映射地址；配置 `p2p_relay_url` 后使用自托管 Iroh 会合服务完成地址发现、NAT 映射检测和 UDP 打洞
 - 服务端持久化节点目录，候选每 30 秒刷新，120 秒内视为新鲜；Web UI 和 `GET /api/v1/p2p/nodes` 同时展示候选、UDP 可用性、映射行为、端口映射、会合服务与更新时间
-- 访问端 `[[secret_visitors]]` 默认使用 `prefer_direct = true`，会先申请绑定目标端、访问端、目标地址和协议版本的 HMAC-SHA256 短期票据；可显式设为 `false` 以始终使用中继
+- 访问端 `[[secret_visitors]]` 默认使用 `path_policy = "prefer_direct"`，会先申请绑定目标端、访问端、目标地址和协议版本的 HMAC-SHA256 短期票据；也可设置 `direct_only` 或 `relay_only`
 - 票据有效期 30 秒且只能消费一次；目标端通过已认证控制平面在线验证票据，拒绝过期、重放、签名错误和目标节点身份不匹配的请求
 - 候选缺失、直连超时、拒绝、认证失败或协议错误都会明确记录原因，并回退到现有 Secret 服务端中继；直连成功、中继回退和会话签发均有独立指标与审计
 - 访问端并发竞速所有 Iroh QUIC/UDP 与 TCP 候选，仅把单次票据交给首个成功建立传输层连接的候选；其余尝试立即取消
@@ -131,7 +131,7 @@ p2p_iroh_enabled = true
 name = "private-rdp-access"
 local_bind = "127.0.0.1:13389"
 access_key = "lls_replace-with-the-one-time-access-key"
-prefer_direct = true
+path_policy = "prefer_direct"
 ```
 
 自托管会合服务使用固定的 `iroh-relay 0.92.0`。生产配置、systemd 单元、Nginx WebSocket 反向代理片段和安装脚本位于 `packaging/iroh-relay/`；需为会合域名提供受信 TLS 证书，并开放公网 `443/tcp` 与 `7842/udp`。默认配置让 Relay 监听回环高位端口，避免与 Web UI 的 Nginx 监听冲突。该服务协助发现和打洞，不替代 LinkLake 的受控业务中继。
@@ -258,6 +258,16 @@ Linux systemd 服务默认把托管配置保存到 `/var/lib/linklake-client/man
 多云模式会为未显式设置 `managed_config_path` 的入口分别使用 `managed.<server-name>.toml`。任一云入口断线只影响该入口，其他入口继续运行；同一组本地 `local/report_only` 策略会复制到全部云入口。`server_managed` 模式下，可在各服务端 Web UI 建立指向同一目标地址的策略，从而把一个本地游戏或其他服务同时发布到云 A 和云 B。多云模式的 Secret 访问端必须在 `[[secret_visitors]]` 中使用 `server = "cloud-a"` 指定所属入口。
 
 远程控制连接还必须指定 `control_ca_cert` 和 `control_server_name`。公网端口范围由各服务端独立决定，因此云 A 与云 B 可以使用不同公网端口；TCP 与 UDP 仍可使用相同的数值端口。
+
+客户端可以按语义版本检查 GitHub Release。候选版本默认继续跟踪候选版本，稳定版本默认只跟踪稳定版本，也可以显式选择通道：
+
+```powershell
+linklake-client check-update --channel auto
+linklake-client check-update --channel stable
+linklake-client check-update --channel prerelease
+```
+
+输出为 JSON，包含当前版本、所选通道、最新版本、是否存在更新和 Release 地址；网络请求最长等待 15 秒。
 
 ## 管理与指标
 

@@ -111,7 +111,7 @@ Typical uses include RDP, SSH, databases, internal administration panels, and te
 - A provider uses `p2p_bind` in `[client]` for both TCP and Iroh QUIC/UDP and `p2p_endpoint` for its reachable TCP address; both settings are required together. `p2p_tcp_enabled` and `p2p_iroh_enabled` can disable either transport, but at least one must remain enabled
 - Iroh QUIC candidates automatically publish local, STUN/QAD public-mapping, and router port-mapping addresses. With `p2p_relay_url`, a self-hosted Iroh rendezvous service assists address discovery, NAT mapping detection, and UDP hole punching
 - The server persists a node directory. Providers refresh every 30 seconds and records remain fresh for 120 seconds; the Web UI and `GET /api/v1/p2p/nodes` show candidates, UDP capability, mapping behavior, port mapping, rendezvous URL, and age
-- `[[secret_visitors]]` defaults to `prefer_direct = true`, so the visitor first requests an HMAC-SHA256 ticket bound to the provider, visitor, target address, and protocol version; set it to `false` to always use relay
+- `[[secret_visitors]]` defaults to `path_policy = "prefer_direct"`, so the visitor first requests an HMAC-SHA256 ticket bound to the provider, visitor, target address, and protocol version; `direct_only` and `relay_only` are also available
 - Tickets expire after 30 seconds and are single-use. The provider validates them online over its authenticated control connection, rejecting expiration, replay, signature changes, and provider mismatch
 - Missing candidates, timeout, refusal, authentication failure, and protocol failure are reported explicitly before the visitor falls back to the existing secret-tunnel server relay; offers, direct successes, and relay fallbacks have separate metrics and audit events
 - Visitors race all Iroh QUIC/UDP and TCP candidates concurrently and send the single-use ticket only over the first transport-layer connection that succeeds; losing attempts are cancelled immediately
@@ -131,7 +131,7 @@ p2p_iroh_enabled = true
 name = "private-rdp-access"
 local_bind = "127.0.0.1:13389"
 access_key = "lls_replace-with-the-one-time-access-key"
-prefer_direct = true
+path_policy = "prefer_direct"
 ```
 
 Self-hosted rendezvous uses pinned `iroh-relay 0.92.0`. Production configuration, a systemd unit, an Nginx WebSocket reverse-proxy snippet, and an installer are under `packaging/iroh-relay/`. Supply a publicly trusted certificate for the relay hostname and expose public `443/tcp` and `7842/udp`. The default configuration binds the Relay to high loopback ports so it can coexist with the Web UI's Nginx listener. This service assists discovery and hole punching; it does not replace LinkLake's policy-controlled business relay.
@@ -252,6 +252,16 @@ The Linux systemd service stores managed state in `/var/lib/linklake-client/mana
 In multi-cloud mode, identities without an explicit `managed_config_path` use separate `managed.<server-name>.toml` files. A failed cloud entry does not stop the others. The same local-mode or report-only policy set is replicated to every entry. In server-managed mode, create policies on both servers that point to the same local target to publish one game or other local service through cloud A and cloud B. Multi-cloud secret visitors must select their entry with `server = "cloud-a"` in `[[secret_visitors]]`.
 
 Remote control connections also require `control_ca_cert` and `control_server_name`. Each cloud independently defines its public port policy, so cloud A and cloud B may use different public ports; TCP and UDP may still use the same numeric port.
+
+The client checks GitHub releases with semantic-version ordering. Prerelease builds follow prereleases by default, while stable builds follow stable releases unless a channel is selected explicitly:
+
+```powershell
+linklake-client check-update --channel auto
+linklake-client check-update --channel stable
+linklake-client check-update --channel prerelease
+```
+
+The JSON result contains the current version, resolved channel, latest version, update availability, and release URL. The network request has a 15-second timeout.
 
 ## Management and metrics
 

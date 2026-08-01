@@ -11,6 +11,10 @@ $manifest = Get-Content -Raw -LiteralPath (Join-Path $projectRoot 'Cargo.toml')
 $match = [regex]::Match($manifest, '(?ms)\[workspace\.package\].*?version\s*=\s*"([^"]+)"')
 if (-not $match.Success) { throw 'Could not read the workspace version.' }
 $version = $match.Groups[1].Value
+$pubspec = Get-Content -Raw -LiteralPath (Join-Path $managerRoot 'pubspec.yaml')
+$pubspecMatch = [regex]::Match($pubspec, '(?m)^version:\s*([^\s]+)')
+if (-not $pubspecMatch.Success) { throw 'Could not read the LinkLake Manager version.' }
+$managerVersion = $pubspecMatch.Groups[1].Value
 $packageName = "linklake-manager-$version-windows-x86_64"
 $stage = Join-Path $OutputDirectory $packageName
 $archive = Join-Path $OutputDirectory "$packageName.zip"
@@ -27,7 +31,9 @@ Push-Location $managerRoot
 try {
     & $FlutterExecutable pub get
     if ($LASTEXITCODE -ne 0) { throw 'Flutter dependency resolution failed.' }
-    & $FlutterExecutable build windows --release
+    & $FlutterExecutable build windows --release `
+        "--dart-define=LINKLAKE_MANAGER_VERSION=$managerVersion" `
+        "--dart-define=LINKLAKE_RELEASE_VERSION=$version"
     if ($LASTEXITCODE -ne 0) { throw 'Flutter Windows release build failed.' }
 }
 finally {

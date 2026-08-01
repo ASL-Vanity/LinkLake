@@ -62,7 +62,7 @@ config_mode = "local"
 name = "rc-acceptance-secret"
 local_bind = "127.0.0.1:32150"
 access_key = "{secrets['secret_access_key']}"
-prefer_direct = true
+path_policy = "prefer_direct"
 '''
 path = Path(sys.argv[2])
 path.write_text(content, encoding="utf-8")

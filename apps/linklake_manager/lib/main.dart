@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 
 import 'api_client.dart';
 import 'server_profiles.dart';
+import 'version.dart';
 
 void main() {
   runApp(const LinkLakeManagerApp());
@@ -484,6 +485,7 @@ class _DashboardPageState extends State<DashboardPage> {
   Map<String, dynamic> _fleet = {};
   Map<String, dynamic> _diagnostics = {};
   String? _latestRelease;
+  bool? _updateAvailable;
   final Map<String, List<dynamic>> _resources = {};
 
   bool get zh => _chinese;
@@ -1644,8 +1646,10 @@ class _DashboardPageState extends State<DashboardPage> {
           _jsonPanel(t('诊断结果', 'Diagnostic results'), _diagnostics),
         const SizedBox(height: 16),
         _jsonPanel(t('版本信息', 'Version information'), {
-          'manager_version': '0.5.0',
+          'manager_version': managerVersion,
+          'release_version': managerReleaseVersion,
           'latest_release': _latestRelease ?? t('尚未检查', 'Not checked'),
+          'update_available': _updateAvailable,
           'server': widget.api.baseUri.toString(),
           'platform': Platform.operatingSystem,
           'platform_version': Platform.operatingSystemVersion,
@@ -1665,19 +1669,30 @@ class _DashboardPageState extends State<DashboardPage> {
       try {
         final request = await releaseClient.getUrl(
           Uri.parse(
-            'https://api.github.com/repos/ASL-Vanity/LinkLake/releases?per_page=1',
+            'https://api.github.com/repos/ASL-Vanity/LinkLake/releases?per_page=30',
           ),
         );
         request.headers.set(
           HttpHeaders.userAgentHeader,
-          'LinkLake-Manager/0.5.0',
+          'LinkLake-Manager/$managerVersion',
         );
         final response = await request.close().timeout(
           const Duration(seconds: 15),
         );
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          throw HttpException(
+            'GitHub releases returned HTTP ${response.statusCode}',
+          );
+        }
         final decoded = jsonDecode(await utf8.decoder.bind(response).join());
-        if (decoded is List && decoded.isNotEmpty) {
-          _latestRelease = decoded.first['tag_name']?.toString();
+        if (decoded is List) {
+          _latestRelease = selectLatestReleaseTag(
+            decoded,
+            managerReleaseVersion,
+          );
+          _updateAvailable = _latestRelease == null
+              ? null
+              : isReleaseNewer(_latestRelease!, managerReleaseVersion);
         }
       } finally {
         releaseClient.close(force: true);

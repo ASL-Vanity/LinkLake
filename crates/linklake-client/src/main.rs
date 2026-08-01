@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use linklake_core::port_mapping::{parse_port_mappings, MAX_PORT_MAPPINGS};
 use linklake_core::target_pool::{parse_target_pool, select_weighted_target, WeightedTarget};
 use linklake_core::{
@@ -8,6 +8,7 @@ use linklake_core::{
     ManagedSecretTunnel, ManagedSocks5Proxy, ManagedTcpTunnel, ManagedTlsRoute, ManagedUdpTunnel,
     PRODUCT_NAME,
 };
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -171,6 +172,9 @@ enum Command {
     CheckUpdate {
         #[arg(long, default_value = "ASL-Vanity/LinkLake")]
         repository: String,
+        /// 更新通道。auto 会让候选版本继续接收候选版本，稳定版只接收稳定版。
+        #[arg(long, value_enum, default_value_t = UpdateChannel::Auto)]
+        channel: UpdateChannel,
     },
     /// 安装、卸载或控制本机 LinkLake 客户端系统服务。
     Service {
@@ -195,6 +199,24 @@ enum ServiceAction {
     Stop,
     Restart,
     Status,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum UpdateChannel {
+    Auto,
+    Stable,
+    Prerelease,
+}
+
+impl UpdateChannel {
+    fn resolve(self, current: &Version) -> Self {
+        match self {
+            Self::Auto if current.pre.is_empty() => Self::Stable,
+            Self::Auto => Self::Prerelease,
+            value => value,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -577,8 +599,11 @@ async fn run_cli() -> anyhow::Result<()> {
         Command::Logs { directory, lines } => {
             print_recent_logs(directory.as_deref(), lines)?;
         }
-        Command::CheckUpdate { repository } => {
-            let result = check_for_update(&repository).await?;
+        Command::CheckUpdate {
+            repository,
+            channel,
+        } => {
+            let result = check_for_update(&repository, channel).await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::Service { action } => control_client_service(action)?,
@@ -2019,22 +2044,36 @@ fn default_client_log_directory() -> PathBuf {
 
 #[derive(Serialize)]
 struct UpdateCheck {
-    current_version: &'static str,
+    current_version: String,
     latest_version: String,
     update_available: bool,
+    channel: UpdateChannel,
     release_url: Option<String>,
 }
 
-async fn check_for_update(repository: &str) -> anyhow::Result<UpdateCheck> {
+#[derive(Clone, Debug, Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    html_url: Option<String>,
+    draft: bool,
+    prerelease: bool,
+}
+
+async fn check_for_update(
+    repository: &str,
+    requested_channel: UpdateChannel,
+) -> anyhow::Result<UpdateCheck> {
     anyhow::ensure!(
         repository
             .split_once('/')
             .is_some_and(|(owner, name)| !owner.is_empty() && !name.is_empty()),
         "repository must use owner/name format"
     );
-    let response = reqwest::Client::new()
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()?
         .get(format!(
-            "https://api.github.com/repos/{repository}/releases/latest"
+            "https://api.github.com/repos/{repository}/releases?per_page=30"
         ))
         .header(
             "User-Agent",
@@ -2043,28 +2082,38 @@ async fn check_for_update(repository: &str) -> anyhow::Result<UpdateCheck> {
         .send()
         .await?
         .error_for_status()?;
-    #[derive(Deserialize)]
-    struct Release {
-        tag_name: String,
-        html_url: Option<String>,
-    }
-    let release: Release = response.json().await?;
-    let current = env!("CARGO_PKG_VERSION").trim_start_matches('v');
-    let latest = release.tag_name.trim_start_matches('v');
-    let update_available = version_components(latest) > version_components(current);
+    let releases: Vec<GithubRelease> = response.json().await?;
+    let current = Version::parse(env!("CARGO_PKG_VERSION"))?;
+    let channel = requested_channel.resolve(&current);
+    let (release, latest) = select_latest_release(&releases, channel).ok_or_else(|| {
+        anyhow::anyhow!("no valid release exists for the selected update channel")
+    })?;
+    let update_available = latest > current;
     Ok(UpdateCheck {
-        current_version: env!("CARGO_PKG_VERSION"),
-        latest_version: release.tag_name,
+        current_version: current.to_string(),
+        latest_version: release.tag_name.clone(),
         update_available,
-        release_url: release.html_url,
+        channel,
+        release_url: release.html_url.clone(),
     })
 }
 
-fn version_components(value: &str) -> Vec<u64> {
-    value
-        .split(['.', '-', '+'])
-        .map(|part| part.parse().unwrap_or(0))
-        .collect()
+fn select_latest_release(
+    releases: &[GithubRelease],
+    channel: UpdateChannel,
+) -> Option<(&GithubRelease, Version)> {
+    releases
+        .iter()
+        .filter(|release| !release.draft)
+        .filter_map(|release| {
+            Version::parse(release.tag_name.trim_start_matches('v'))
+                .ok()
+                .map(|version| (release, version))
+        })
+        .filter(|(release, version)| {
+            channel == UpdateChannel::Prerelease || (!release.prerelease && version.pre.is_empty())
+        })
+        .max_by(|(_, left), (_, right)| left.cmp(right))
 }
 
 #[cfg(windows)]
@@ -2352,7 +2401,8 @@ mod tests {
     use super::{
         load_managed_config, local_managed_config, managed_config_path, migrate_client_config,
         p2p_candidates, parse_client_config, persist_managed_config, run_configured_agents,
-        validate_managed_config, CURRENT_CLIENT_CONFIG_VERSION,
+        select_latest_release, validate_managed_config, GithubRelease, UpdateChannel,
+        CURRENT_CLIENT_CONFIG_VERSION,
     };
     use linklake_core::{
         managed_config_revision, read_control_frame, write_control_frame, ControlFrame,
@@ -2360,6 +2410,45 @@ mod tests {
         ManagedSocks5Proxy, ManagedTcpTunnel, ManagedTlsRoute,
     };
     use uuid::Uuid;
+
+    fn github_release(tag: &str, prerelease: bool) -> GithubRelease {
+        GithubRelease {
+            tag_name: tag.to_owned(),
+            html_url: Some(format!("https://example.test/{tag}")),
+            draft: false,
+            prerelease,
+        }
+    }
+
+    #[test]
+    fn update_channels_follow_semantic_version_precedence() {
+        let releases = vec![
+            github_release("v0.8.0-rc.1", false),
+            github_release("v0.7.0-rc.2", true),
+            github_release("v0.6.0", false),
+            github_release("not-a-version", false),
+        ];
+        let (_, stable) = select_latest_release(&releases, UpdateChannel::Stable).unwrap();
+        let (_, prerelease) = select_latest_release(&releases, UpdateChannel::Prerelease).unwrap();
+        assert_eq!(stable.to_string(), "0.6.0");
+        assert_eq!(prerelease.to_string(), "0.8.0-rc.1");
+        assert!(
+            semver::Version::parse("0.6.0").unwrap()
+                > semver::Version::parse("0.6.0-rc.2").unwrap()
+        );
+    }
+
+    #[test]
+    fn automatic_update_channel_matches_the_current_release_kind() {
+        assert_eq!(
+            UpdateChannel::Auto.resolve(&semver::Version::parse("1.0.0").unwrap()),
+            UpdateChannel::Stable
+        );
+        assert_eq!(
+            UpdateChannel::Auto.resolve(&semver::Version::parse("1.0.0-rc.1").unwrap()),
+            UpdateChannel::Prerelease
+        );
+    }
 
     #[test]
     fn parses_tcp_tunnel_configuration() {
