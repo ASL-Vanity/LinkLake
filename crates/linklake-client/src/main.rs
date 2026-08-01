@@ -7,13 +7,14 @@ use linklake_core::{
     ManagedSecretTunnel, ManagedSocks5Proxy, ManagedTcpTunnel, ManagedTlsRoute, ManagedUdpTunnel,
     PRODUCT_NAME,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     fs::{read_to_string, File, OpenOptions},
     io::{BufReader, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
+    process::Command as ProcessCommand,
     sync::Arc,
     time::Duration,
 };
@@ -147,6 +148,46 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// 验证配置、证书、控制端点和本地目标，并输出结构化诊断结果。
+    Diagnose {
+        #[arg(long, default_value = "linklake-client.toml")]
+        config: PathBuf,
+    },
+    /// 查看客户端滚动日志的最后若干行。
+    Logs {
+        #[arg(long)]
+        directory: Option<PathBuf>,
+        #[arg(long, default_value_t = 200)]
+        lines: usize,
+    },
+    /// 检查 GitHub Release 中是否有更新版本。
+    CheckUpdate {
+        #[arg(long, default_value = "ASL-Vanity/LinkLake")]
+        repository: String,
+    },
+    /// 安装、卸载或控制本机 LinkLake 客户端系统服务。
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceAction {
+    Install {
+        #[arg(long, default_value = "linklake-client.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        silent: bool,
+    },
+    Uninstall {
+        #[arg(long)]
+        silent: bool,
+    },
+    Start,
+    Stop,
+    Restart,
+    Status,
 }
 
 #[derive(Deserialize)]
@@ -503,6 +544,19 @@ async fn run_cli() -> anyhow::Result<()> {
                 output.display()
             );
         }
+        Command::Diagnose { config } => {
+            let report = diagnose_client_config(&config).await;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            anyhow::ensure!(report.ok, "client diagnostics found one or more errors");
+        }
+        Command::Logs { directory, lines } => {
+            print_recent_logs(directory.as_deref(), lines)?;
+        }
+        Command::CheckUpdate { repository } => {
+            let result = check_for_update(&repository).await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::Service { action } => control_client_service(action)?,
     }
     Ok(())
 }
@@ -1671,6 +1725,504 @@ fn migrate_client_config(input: &Path, output: &Path) -> anyhow::Result<()> {
         .open(output)?;
     file.write_all(migrated.as_bytes())?;
     file.sync_all()?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct DiagnosticCheck {
+    name: String,
+    ok: bool,
+    detail: String,
+}
+
+#[derive(Serialize)]
+struct DiagnosticReport {
+    ok: bool,
+    config_path: String,
+    checks: Vec<DiagnosticCheck>,
+}
+
+async fn diagnose_client_config(path: &Path) -> DiagnosticReport {
+    let mut checks = Vec::new();
+    let content = match read_to_string(path) {
+        Ok(content) => {
+            checks.push(DiagnosticCheck {
+                name: "config_file".to_owned(),
+                ok: true,
+                detail: format!("read {} bytes", content.len()),
+            });
+            content
+        }
+        Err(error) => {
+            checks.push(DiagnosticCheck {
+                name: "config_file".to_owned(),
+                ok: false,
+                detail: error.to_string(),
+            });
+            return DiagnosticReport {
+                ok: false,
+                config_path: path.display().to_string(),
+                checks,
+            };
+        }
+    };
+    let config = match parse_client_config(&content) {
+        Ok(config) => {
+            checks.push(DiagnosticCheck {
+                name: "config_schema".to_owned(),
+                ok: true,
+                detail: format!("config version {}", config.config_version),
+            });
+            config
+        }
+        Err(error) => {
+            checks.push(DiagnosticCheck {
+                name: "config_schema".to_owned(),
+                ok: false,
+                detail: error.to_string(),
+            });
+            return DiagnosticReport {
+                ok: false,
+                config_path: path.display().to_string(),
+                checks,
+            };
+        }
+    };
+    let identities = config
+        .client
+        .iter()
+        .chain(config.servers.iter())
+        .collect::<Vec<_>>();
+    for (index, identity) in identities.iter().enumerate() {
+        let name = identity
+            .name
+            .as_deref()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("server-{index}"));
+        if let Some(certificate) = identity.control_ca_cert.as_deref() {
+            checks.push(DiagnosticCheck {
+                name: format!("{name}.ca_certificate"),
+                ok: certificate.is_file(),
+                detail: certificate.display().to_string(),
+            });
+        }
+        match ControlTransport::new(
+            identity.control.clone(),
+            identity.control_ca_cert.clone(),
+            identity.control_server_name.clone(),
+        ) {
+            Ok(transport) => {
+                match timeout(Duration::from_secs(5), connect_control(&transport)).await {
+                    Ok(Ok(_)) => checks.push(DiagnosticCheck {
+                        name: format!("{name}.control"),
+                        ok: true,
+                        detail: identity.control.clone(),
+                    }),
+                    Ok(Err(error)) => checks.push(DiagnosticCheck {
+                        name: format!("{name}.control"),
+                        ok: false,
+                        detail: error.to_string(),
+                    }),
+                    Err(_) => checks.push(DiagnosticCheck {
+                        name: format!("{name}.control"),
+                        ok: false,
+                        detail: "connection timed out".to_owned(),
+                    }),
+                }
+            }
+            Err(error) => checks.push(DiagnosticCheck {
+                name: format!("{name}.control"),
+                ok: false,
+                detail: error.to_string(),
+            }),
+        }
+    }
+    let mut targets = config
+        .tcp_tunnels
+        .iter()
+        .map(|value| (format!("tcp.{}", value.name), value.target.clone()))
+        .chain(
+            config
+                .http_routes
+                .iter()
+                .map(|value| (format!("http.{}", value.name), value.target.clone())),
+        )
+        .chain(
+            config
+                .tls_routes
+                .iter()
+                .map(|value| (format!("sni.{}", value.name), value.target.clone())),
+        )
+        .chain(
+            config
+                .secret_tunnels
+                .iter()
+                .map(|value| (format!("secret.{}", value.name), value.target.clone())),
+        )
+        .collect::<Vec<_>>();
+    targets.sort();
+    targets.dedup();
+    for (name, target) in targets {
+        match timeout(Duration::from_secs(3), TcpStream::connect(&target)).await {
+            Ok(Ok(_)) => checks.push(DiagnosticCheck {
+                name: format!("target.{name}"),
+                ok: true,
+                detail: target,
+            }),
+            Ok(Err(error)) => checks.push(DiagnosticCheck {
+                name: format!("target.{name}"),
+                ok: false,
+                detail: error.to_string(),
+            }),
+            Err(_) => checks.push(DiagnosticCheck {
+                name: format!("target.{name}"),
+                ok: false,
+                detail: "connection timed out".to_owned(),
+            }),
+        }
+    }
+    let ok = checks.iter().all(|check| check.ok);
+    DiagnosticReport {
+        ok,
+        config_path: path.display().to_string(),
+        checks,
+    }
+}
+
+fn print_recent_logs(directory: Option<&Path>, line_limit: usize) -> anyhow::Result<()> {
+    let directory = directory
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("LINKLAKE_LOG_DIR").map(PathBuf::from))
+        .unwrap_or_else(default_client_log_directory);
+    let mut files = std::fs::read_dir(&directory)?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_file())
+        .collect::<Vec<_>>();
+    files.sort_by_key(|entry| entry.metadata().and_then(|value| value.modified()).ok());
+    let file = files
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("no client log files exist in {}", directory.display()))?;
+    let content = read_to_string(file.path())?;
+    let lines = content.lines().collect::<Vec<_>>();
+    for line in lines
+        .iter()
+        .skip(lines.len().saturating_sub(line_limit.clamp(1, 100_000)))
+    {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn default_client_log_directory() -> PathBuf {
+    #[cfg(windows)]
+    {
+        std::env::var_os("PROGRAMDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("C:\\ProgramData"))
+            .join("LinkLake")
+            .join("client-logs")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from("/usr/local/var/log/linklake-client")
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        PathBuf::from("/var/log/linklake-client")
+    }
+}
+
+#[derive(Serialize)]
+struct UpdateCheck {
+    current_version: &'static str,
+    latest_version: String,
+    update_available: bool,
+    release_url: Option<String>,
+}
+
+async fn check_for_update(repository: &str) -> anyhow::Result<UpdateCheck> {
+    anyhow::ensure!(
+        repository
+            .split_once('/')
+            .is_some_and(|(owner, name)| !owner.is_empty() && !name.is_empty()),
+        "repository must use owner/name format"
+    );
+    let response = reqwest::Client::new()
+        .get(format!(
+            "https://api.github.com/repos/{repository}/releases/latest"
+        ))
+        .header(
+            "User-Agent",
+            format!("LinkLake-Client/{}", env!("CARGO_PKG_VERSION")),
+        )
+        .send()
+        .await?
+        .error_for_status()?;
+    #[derive(Deserialize)]
+    struct Release {
+        tag_name: String,
+        html_url: Option<String>,
+    }
+    let release: Release = response.json().await?;
+    let current = env!("CARGO_PKG_VERSION").trim_start_matches('v');
+    let latest = release.tag_name.trim_start_matches('v');
+    let update_available = version_components(latest) > version_components(current);
+    Ok(UpdateCheck {
+        current_version: env!("CARGO_PKG_VERSION"),
+        latest_version: release.tag_name,
+        update_available,
+        release_url: release.html_url,
+    })
+}
+
+fn version_components(value: &str) -> Vec<u64> {
+    value
+        .split(['.', '-', '+'])
+        .map(|part| part.parse().unwrap_or(0))
+        .collect()
+}
+
+#[cfg(windows)]
+fn control_client_service(action: ServiceAction) -> anyhow::Result<()> {
+    control_windows_service(action)
+}
+
+#[cfg(target_os = "linux")]
+fn control_client_service(action: ServiceAction) -> anyhow::Result<()> {
+    control_systemd_service(action)
+}
+
+#[cfg(target_os = "macos")]
+fn control_client_service(action: ServiceAction) -> anyhow::Result<()> {
+    control_launchd_service(action)
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn control_client_service(_action: ServiceAction) -> anyhow::Result<()> {
+    anyhow::bail!("system service management is unsupported on this platform")
+}
+
+fn run_status(command: &mut ProcessCommand, description: &str) -> anyhow::Result<()> {
+    let status = command.status()?;
+    anyhow::ensure!(
+        status.success(),
+        "{description} failed with status {status}"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+fn control_windows_service(action: ServiceAction) -> anyhow::Result<()> {
+    let service = "LinkLakeClient";
+    match action {
+        ServiceAction::Install { config, silent } => {
+            anyhow::ensure!(config.is_file(), "client configuration does not exist");
+            parse_client_config(&read_to_string(&config)?)?;
+            let executable = std::env::current_exe()?;
+            let program_data = std::env::var_os("PROGRAMDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("C:\\ProgramData"));
+            let directory = program_data.join("LinkLake");
+            std::fs::create_dir_all(&directory)?;
+            let installed_config = directory.join("client.toml");
+            std::fs::copy(config, &installed_config)?;
+            let _ = ProcessCommand::new("sc.exe")
+                .args(["stop", service])
+                .status();
+            let _ = ProcessCommand::new("sc.exe")
+                .args(["delete", service])
+                .status();
+            let binary_path = format!(
+                "\"{}\" --windows-service \"{}\"",
+                executable.display(),
+                installed_config.display()
+            );
+            run_status(
+                ProcessCommand::new("sc.exe").args([
+                    "create",
+                    service,
+                    "start=",
+                    "auto",
+                    "DisplayName=",
+                    "LinkLake Client",
+                    "binPath=",
+                    &binary_path,
+                ]),
+                "Windows service installation",
+            )?;
+            run_status(
+                ProcessCommand::new("sc.exe").args([
+                    "failure",
+                    service,
+                    "reset=",
+                    "86400",
+                    "actions=",
+                    "restart/3000/restart/10000/restart/30000",
+                ]),
+                "Windows service recovery configuration",
+            )?;
+            run_status(
+                ProcessCommand::new("sc.exe").args(["start", service]),
+                "Windows service start",
+            )?;
+            if !silent {
+                println!(
+                    "LinkLake client service installed. Config: {}",
+                    installed_config.display()
+                );
+            }
+        }
+        ServiceAction::Uninstall { silent } => {
+            let _ = ProcessCommand::new("sc.exe")
+                .args(["stop", service])
+                .status();
+            run_status(
+                ProcessCommand::new("sc.exe").args(["delete", service]),
+                "Windows service uninstall",
+            )?;
+            if !silent {
+                println!("LinkLake client service uninstalled.");
+            }
+        }
+        ServiceAction::Start => run_status(
+            ProcessCommand::new("sc.exe").args(["start", service]),
+            "Windows service start",
+        )?,
+        ServiceAction::Stop => run_status(
+            ProcessCommand::new("sc.exe").args(["stop", service]),
+            "Windows service stop",
+        )?,
+        ServiceAction::Restart => {
+            let _ = ProcessCommand::new("sc.exe")
+                .args(["stop", service])
+                .status();
+            run_status(
+                ProcessCommand::new("sc.exe").args(["start", service]),
+                "Windows service restart",
+            )?;
+        }
+        ServiceAction::Status => run_status(
+            ProcessCommand::new("sc.exe").args(["query", service]),
+            "Windows service query",
+        )?,
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn control_systemd_service(action: ServiceAction) -> anyhow::Result<()> {
+    let unit = "linklake-client.service";
+    match action {
+        ServiceAction::Install { config, silent } => {
+            let root = ProcessCommand::new("id").arg("-u").output()?;
+            anyhow::ensure!(
+                root.status.success() && String::from_utf8_lossy(&root.stdout).trim() == "0",
+                "run service install as root"
+            );
+            parse_client_config(&read_to_string(&config)?)?;
+            std::fs::create_dir_all("/etc/linklake")?;
+            std::fs::copy(config, "/etc/linklake/client.toml")?;
+            let executable = std::env::current_exe()?;
+            let unit_body = format!(
+                "[Unit]\nDescription=LinkLake Client\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nEnvironment=LINKLAKE_LOG_DIR=/var/log/linklake-client\nExecStart={} run --config /etc/linklake/client.toml\nRestart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=multi-user.target\n",
+                executable.display()
+            );
+            std::fs::write(format!("/etc/systemd/system/{unit}"), unit_body)?;
+            run_status(
+                ProcessCommand::new("systemctl").arg("daemon-reload"),
+                "systemd reload",
+            )?;
+            run_status(
+                ProcessCommand::new("systemctl").args(["enable", "--now", unit]),
+                "systemd service install",
+            )?;
+            if !silent {
+                println!("LinkLake client systemd service installed.");
+            }
+        }
+        ServiceAction::Uninstall { silent } => {
+            let _ = ProcessCommand::new("systemctl")
+                .args(["disable", "--now", unit])
+                .status();
+            std::fs::remove_file(format!("/etc/systemd/system/{unit}"))?;
+            run_status(
+                ProcessCommand::new("systemctl").arg("daemon-reload"),
+                "systemd reload",
+            )?;
+            if !silent {
+                println!("LinkLake client systemd service uninstalled.");
+            }
+        }
+        ServiceAction::Start => run_status(
+            ProcessCommand::new("systemctl").args(["start", unit]),
+            "service start",
+        )?,
+        ServiceAction::Stop => run_status(
+            ProcessCommand::new("systemctl").args(["stop", unit]),
+            "service stop",
+        )?,
+        ServiceAction::Restart => run_status(
+            ProcessCommand::new("systemctl").args(["restart", unit]),
+            "service restart",
+        )?,
+        ServiceAction::Status => run_status(
+            ProcessCommand::new("systemctl").args(["status", "--no-pager", unit]),
+            "service status",
+        )?,
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn control_launchd_service(action: ServiceAction) -> anyhow::Result<()> {
+    let label = "com.linklake.client";
+    let plist = Path::new("/Library/LaunchDaemons/com.linklake.client.plist");
+    match action {
+        ServiceAction::Install { config, silent } => {
+            parse_client_config(&read_to_string(&config)?)?;
+            std::fs::create_dir_all("/usr/local/etc/linklake")?;
+            std::fs::copy(config, "/usr/local/etc/linklake/client.toml")?;
+            let executable = std::env::current_exe()?;
+            let body = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array><string>{}</string><string>run</string><string>--config</string><string>/usr/local/etc/linklake/client.toml</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>EnvironmentVariables</key><dict><key>LINKLAKE_LOG_DIR</key><string>/usr/local/var/log/linklake-client</string></dict></dict></plist>", executable.display());
+            std::fs::write(plist, body)?;
+            run_status(
+                ProcessCommand::new("launchctl").args([
+                    "bootstrap",
+                    "system",
+                    plist.to_str().unwrap(),
+                ]),
+                "launchd service install",
+            )?;
+            if !silent {
+                println!("LinkLake client launchd service installed.");
+            }
+        }
+        ServiceAction::Uninstall { silent } => {
+            let _ = ProcessCommand::new("launchctl")
+                .args(["bootout", "system", plist.to_str().unwrap()])
+                .status();
+            std::fs::remove_file(plist)?;
+            if !silent {
+                println!("LinkLake client launchd service uninstalled.");
+            }
+        }
+        ServiceAction::Start => run_status(
+            ProcessCommand::new("launchctl").args(["kickstart", "-k", &format!("system/{label}")]),
+            "service start",
+        )?,
+        ServiceAction::Stop => run_status(
+            ProcessCommand::new("launchctl").args(["kill", "SIGTERM", &format!("system/{label}")]),
+            "service stop",
+        )?,
+        ServiceAction::Restart => run_status(
+            ProcessCommand::new("launchctl").args(["kickstart", "-k", &format!("system/{label}")]),
+            "service restart",
+        )?,
+        ServiceAction::Status => run_status(
+            ProcessCommand::new("launchctl").args(["print", &format!("system/{label}")]),
+            "service status",
+        )?,
+    }
     Ok(())
 }
 

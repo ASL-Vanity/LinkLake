@@ -68,6 +68,24 @@ class LinkLakeApiClient {
     return _decodeObject(response.body);
   }
 
+  Future<Map<String, dynamic>> putObject(
+    String path,
+    Map<String, dynamic> body,
+  ) async {
+    final response = await _request('PUT', path, body: body);
+    if (response.body.isEmpty) return <String, dynamic>{};
+    return _decodeObject(response.body);
+  }
+
+  Future<void> post(String path, [Map<String, dynamic>? body]) async {
+    await _request('POST', path, body: body);
+  }
+
+  Future<String> getText(String path) async {
+    final response = await _request('GET', path);
+    return response.body;
+  }
+
   Future<void> delete(String path) async {
     await _request('DELETE', path);
   }

@@ -1,9 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 
 import 'api_client.dart';
+import 'server_profiles.dart';
 
 void main() {
   runApp(const LinkLakeManagerApp());
@@ -18,12 +20,14 @@ class LinkLakeManagerApp extends StatefulWidget {
 
 class _LinkLakeManagerAppState extends State<LinkLakeManagerApp> {
   bool _chinese = true;
+  ThemeMode _themeMode = ThemeMode.system;
 
   @override
   Widget build(BuildContext context) {
-    final scheme = ColorScheme.fromSeed(
-      seedColor: const Color(0xFF168AAD),
-      brightness: Brightness.light,
+    final scheme = ColorScheme.fromSeed(seedColor: const Color(0xFF168AAD));
+    final darkScheme = ColorScheme.fromSeed(
+      seedColor: const Color(0xFF38BDF8),
+      brightness: Brightness.dark,
     );
     return MaterialApp(
       debugShowCheckedModeBanner: false,
@@ -37,9 +41,18 @@ class _LinkLakeManagerAppState extends State<LinkLakeManagerApp> {
           margin: EdgeInsets.zero,
         ),
       ),
+      darkTheme: ThemeData(
+        colorScheme: darkScheme,
+        useMaterial3: true,
+        scaffoldBackgroundColor: const Color(0xFF06131D),
+        cardTheme: const CardThemeData(elevation: 0, margin: EdgeInsets.zero),
+      ),
+      themeMode: _themeMode,
       home: LoginPage(
         chinese: _chinese,
         onLanguageChanged: (value) => setState(() => _chinese = value),
+        themeMode: _themeMode,
+        onThemeChanged: (value) => setState(() => _themeMode = value),
       ),
     );
   }
@@ -50,10 +63,14 @@ class LoginPage extends StatefulWidget {
     super.key,
     required this.chinese,
     required this.onLanguageChanged,
+    required this.themeMode,
+    required this.onThemeChanged,
   });
 
   final bool chinese;
   final ValueChanged<bool> onLanguageChanged;
+  final ThemeMode themeMode;
+  final ValueChanged<ThemeMode> onThemeChanged;
 
   @override
   State<LoginPage> createState() => _LoginPageState();
@@ -65,6 +82,82 @@ class _LoginPageState extends State<LoginPage> {
   final _password = TextEditingController();
   bool _busy = false;
   String? _error;
+  List<ServerProfile> _profiles = const [];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadProfiles();
+  }
+
+  Future<void> _loadProfiles() async {
+    final profiles = await ServerProfileStore.load();
+    if (!mounted) return;
+    setState(() => _profiles = profiles);
+    if (profiles.isNotEmpty) _server.text = profiles.first.url;
+  }
+
+  Future<void> _manageProfiles() async {
+    final profiles = [..._profiles];
+    final name = TextEditingController();
+    final url = TextEditingController(text: 'https://');
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: Text(t('服务端列表', 'Server profiles')),
+          content: SizedBox(
+            width: 520,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                for (final profile in profiles)
+                  ListTile(
+                    leading: const Icon(Icons.cloud_outlined),
+                    title: Text(profile.name),
+                    subtitle: Text(profile.url),
+                    onTap: () {
+                      _server.text = profile.url;
+                      Navigator.pop(dialogContext);
+                    },
+                    trailing: IconButton(
+                      icon: const Icon(Icons.delete_outline),
+                      onPressed: () => setDialogState(() => profiles.remove(profile)),
+                    ),
+                  ),
+                const Divider(),
+                TextField(controller: name, decoration: InputDecoration(labelText: t('名称', 'Name'))),
+                const SizedBox(height: 10),
+                TextField(controller: url, decoration: InputDecoration(labelText: t('服务端地址', 'Server URL'))),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(dialogContext), child: Text(t('完成', 'Done'))),
+            FilledButton.icon(
+              onPressed: () {
+                final profileName = name.text.trim();
+                final profileUrl = url.text.trim().replaceAll(RegExp(r'/+$'), '');
+                if (profileName.isEmpty || !profileUrl.startsWith('http')) return;
+                setDialogState(() {
+                  profiles.removeWhere((value) => value.name == profileName);
+                  profiles.add(ServerProfile(name: profileName, url: profileUrl));
+                  name.clear();
+                  url.text = 'https://';
+                });
+              },
+              icon: const Icon(Icons.add),
+              label: Text(t('添加', 'Add')),
+            ),
+          ],
+        ),
+      ),
+    );
+    name.dispose();
+    url.dispose();
+    await ServerProfileStore.save(profiles);
+    if (mounted) setState(() => _profiles = profiles);
+  }
 
   String t(String zh, String en) => widget.chinese ? zh : en;
 
@@ -91,6 +184,8 @@ class _LoginPageState extends State<LoginPage> {
             api: api,
             chinese: widget.chinese,
             onLanguageChanged: widget.onLanguageChanged,
+            themeMode: widget.themeMode,
+            onThemeChanged: widget.onThemeChanged,
           ),
         ),
       );
@@ -190,6 +285,19 @@ class _LoginPageState extends State<LoginPage> {
                         textAlign: TextAlign.center,
                       ),
                       const SizedBox(height: 28),
+                      if (_profiles.isNotEmpty) ...[
+                        DropdownButtonFormField<String>(
+                          initialValue: _profiles.any((value) => value.url == _server.text) ? _server.text : null,
+                          items: [for (final profile in _profiles) DropdownMenuItem(value: profile.url, child: Text(profile.name))],
+                          onChanged: (value) { if (value != null) _server.text = value; },
+                          decoration: InputDecoration(
+                            labelText: t('服务端配置', 'Server profile'),
+                            prefixIcon: const Icon(Icons.dns_outlined),
+                            suffixIcon: IconButton(onPressed: _manageProfiles, icon: const Icon(Icons.settings_outlined)),
+                          ),
+                        ),
+                        const SizedBox(height: 14),
+                      ],
                       TextField(
                         controller: _server,
                         autofillHints: const [AutofillHints.url],
@@ -251,11 +359,15 @@ class DashboardPage extends StatefulWidget {
     required this.api,
     required this.chinese,
     required this.onLanguageChanged,
+    required this.themeMode,
+    required this.onThemeChanged,
   });
 
   final LinkLakeApiClient api;
   final bool chinese;
   final ValueChanged<bool> onLanguageChanged;
+  final ThemeMode themeMode;
+  final ValueChanged<ThemeMode> onThemeChanged;
 
   @override
   State<DashboardPage> createState() => _DashboardPageState();
@@ -272,6 +384,12 @@ class _DashboardPageState extends State<DashboardPage> {
   List<dynamic> _clients = [];
   List<dynamic> _p2p = [];
   List<dynamic> _audit = [];
+  List<dynamic> _alerts = [];
+  List<dynamic> _alertRules = [];
+  List<dynamic> _users = [];
+  List<dynamic> _sessions = [];
+  Map<String, dynamic> _diagnostics = {};
+  String? _latestRelease;
   final Map<String, List<dynamic>> _resources = {};
 
   bool get zh => _chinese;
@@ -309,6 +427,10 @@ class _DashboardPageState extends State<DashboardPage> {
         widget.api.getList('/api/v1/socks5-proxies'),
         widget.api.getList('/api/v1/http-proxies'),
         widget.api.getList('/api/v1/port-groups'),
+        widget.api.getList('/api/v1/alerts/events?active=true&limit=100'),
+        widget.api.getList('/api/v1/alerts/rules'),
+        widget.api.getList('/api/v1/users'),
+        widget.api.getList('/api/v1/sessions'),
       ]);
       if (!mounted) return;
       setState(() {
@@ -326,6 +448,10 @@ class _DashboardPageState extends State<DashboardPage> {
           ..['socks5'] = values[10]
           ..['proxy'] = values[11]
           ..['group'] = values[12];
+        _alerts = values[13];
+        _alertRules = values[14];
+        _users = values[15];
+        _sessions = values[16];
         _error = null;
       });
     } catch (error) {
@@ -343,6 +469,8 @@ class _DashboardPageState extends State<DashboardPage> {
         builder: (_) => LoginPage(
           chinese: zh,
           onLanguageChanged: widget.onLanguageChanged,
+          themeMode: widget.themeMode,
+          onThemeChanged: widget.onThemeChanged,
         ),
       ),
     );
@@ -355,6 +483,9 @@ class _DashboardPageState extends State<DashboardPage> {
       (Icons.devices_outlined, t('客户端', 'Clients')),
       (Icons.swap_horiz, t('服务', 'Services')),
       (Icons.hub_outlined, 'P2P'),
+      (Icons.warning_amber_outlined, t('告警', 'Alerts')),
+      (Icons.manage_accounts_outlined, t('用户', 'Users')),
+      (Icons.build_outlined, t('诊断', 'Diagnostics')),
       (Icons.receipt_long_outlined, t('审计', 'Audit')),
     ];
     return Scaffold(
@@ -381,6 +512,17 @@ class _DashboardPageState extends State<DashboardPage> {
             },
             icon: const Icon(Icons.language),
             label: Text(zh ? 'English' : '中文'),
+          ),
+          PopupMenuButton<ThemeMode>(
+            tooltip: t('外观', 'Appearance'),
+            initialValue: widget.themeMode,
+            onSelected: widget.onThemeChanged,
+            itemBuilder: (_) => [
+              PopupMenuItem(value: ThemeMode.system, child: Text(t('跟随系统', 'System'))),
+              PopupMenuItem(value: ThemeMode.light, child: Text(t('浅色', 'Light'))),
+              PopupMenuItem(value: ThemeMode.dark, child: Text(t('深色', 'Dark'))),
+            ],
+            icon: const Icon(Icons.palette_outlined),
           ),
           IconButton(onPressed: _logout, tooltip: t('退出', 'Sign out'), icon: const Icon(Icons.logout)),
           const SizedBox(width: 8),
@@ -422,6 +564,9 @@ class _DashboardPageState extends State<DashboardPage> {
         1 => _clientsPage(),
         2 => _servicesPage(),
         3 => _p2pPage(),
+        4 => _alertsPage(),
+        5 => _usersPage(),
+        6 => _diagnosticsPage(),
         _ => _auditPage(),
       };
 
@@ -519,6 +664,252 @@ class _DashboardPageState extends State<DashboardPage> {
           ],
         ),
       );
+
+  Widget _alertsPage() => _pagePadding(
+        ListView(
+          children: [
+            Row(
+              children: [
+                Expanded(child: _pageTitle(t('告警管理', 'Alert management'), t('持久化规则、活动事件和通知通道', 'Persistent rules, active events, and notification channels'))),
+                FilledButton.icon(onPressed: () => _showAlertRule(), icon: const Icon(Icons.add), label: Text(t('新建规则', 'New rule'))),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Text(t('活动告警', 'Active alerts'), style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 8),
+            if (_alerts.isEmpty) _emptyCard(t('当前没有活动告警', 'No active alerts')),
+            for (final raw in _alerts) _recordCard(raw as Map<String, dynamic>, titleKeys: const ['rule_name', 'subject'], stateKey: 'active'),
+            const SizedBox(height: 20),
+            Text(t('告警规则', 'Alert rules'), style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 8),
+            if (_alertRules.isEmpty) _emptyCard(t('暂无规则', 'No rules')),
+            for (final raw in _alertRules)
+              Card(
+                margin: const EdgeInsets.only(bottom: 10),
+                child: ListTile(
+                  leading: Icon((raw as Map<String, dynamic>)['severity'] == 'critical' ? Icons.error_outline : Icons.warning_amber_outlined),
+                  title: Text('${raw['name']} · ${raw['metric']}'),
+                  subtitle: Text('${raw['comparator']} ${raw['threshold']} · ${raw['evaluation_window_seconds']}s · ${raw['target'] ?? '*'}'),
+                  trailing: Wrap(
+                    spacing: 4,
+                    children: [
+                      IconButton(onPressed: () => _showAlertRule(raw), icon: const Icon(Icons.edit_outlined)),
+                      IconButton(onPressed: () => _deleteAlertRule(raw), icon: const Icon(Icons.delete_outline)),
+                    ],
+                  ),
+                ),
+              ),
+          ],
+        ),
+      );
+
+  Future<void> _showAlertRule([Map<String, dynamic>? rule]) async {
+    final name = TextEditingController(text: rule?['name']?.toString() ?? '');
+    final threshold = TextEditingController(text: rule?['threshold']?.toString() ?? '1');
+    final target = TextEditingController(text: rule?['target']?.toString() ?? '');
+    final window = TextEditingController(text: rule?['evaluation_window_seconds']?.toString() ?? '300');
+    final cooldown = TextEditingController(text: rule?['cooldown_seconds']?.toString() ?? '900');
+    var metric = rule?['metric']?.toString() ?? 'client_offline';
+    var comparator = rule?['comparator']?.toString() ?? 'greater_or_equal';
+    var severity = rule?['severity']?.toString() ?? 'warning';
+    var enabled = rule?['enabled'] != false;
+    var webhook = rule?['notify_webhook'] == true;
+    var email = rule?['notify_email'] == true;
+    String? error;
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: Text(rule == null ? t('新建告警规则', 'New alert rule') : t('编辑告警规则', 'Edit alert rule')),
+          content: SizedBox(
+            width: 560,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextField(controller: name, decoration: InputDecoration(labelText: t('名称', 'Name'))),
+                  const SizedBox(height: 10),
+                  DropdownButtonFormField<String>(
+                    initialValue: metric,
+                    items: const [
+                      DropdownMenuItem(value: 'client_offline', child: Text('client_offline')),
+                      DropdownMenuItem(value: 'policy_unavailable', child: Text('policy_unavailable')),
+                      DropdownMenuItem(value: 'authentication_failures', child: Text('authentication_failures')),
+                      DropdownMenuItem(value: 'traffic_bytes_per_second', child: Text('traffic_bytes_per_second')),
+                      DropdownMenuItem(value: 'active_connections', child: Text('active_connections')),
+                      DropdownMenuItem(value: 'certificate_days_remaining', child: Text('certificate_days_remaining')),
+                    ],
+                    onChanged: (value) => setDialogState(() => metric = value ?? metric),
+                    decoration: InputDecoration(labelText: t('指标', 'Metric')),
+                  ),
+                  const SizedBox(height: 10),
+                  Row(children: [
+                    Expanded(child: DropdownButtonFormField<String>(initialValue: comparator, items: const [DropdownMenuItem(value: 'greater_or_equal', child: Text('≥')), DropdownMenuItem(value: 'less_or_equal', child: Text('≤'))], onChanged: (value) => setDialogState(() => comparator = value ?? comparator), decoration: InputDecoration(labelText: t('比较', 'Comparator')))),
+                    const SizedBox(width: 10),
+                    Expanded(child: TextField(controller: threshold, keyboardType: TextInputType.number, decoration: InputDecoration(labelText: t('阈值', 'Threshold')))),
+                  ]),
+                  const SizedBox(height: 10),
+                  TextField(controller: target, decoration: InputDecoration(labelText: t('目标（可选）', 'Target (optional)'))),
+                  const SizedBox(height: 10),
+                  Row(children: [
+                    Expanded(child: TextField(controller: window, keyboardType: TextInputType.number, decoration: InputDecoration(labelText: t('评估窗口（秒）', 'Window (seconds)')))),
+                    const SizedBox(width: 10),
+                    Expanded(child: TextField(controller: cooldown, keyboardType: TextInputType.number, decoration: InputDecoration(labelText: t('冷却（秒）', 'Cooldown (seconds)')))),
+                  ]),
+                  const SizedBox(height: 10),
+                  DropdownButtonFormField<String>(initialValue: severity, items: const [DropdownMenuItem(value: 'info', child: Text('info')), DropdownMenuItem(value: 'warning', child: Text('warning')), DropdownMenuItem(value: 'critical', child: Text('critical'))], onChanged: (value) => setDialogState(() => severity = value ?? severity), decoration: InputDecoration(labelText: t('级别', 'Severity'))),
+                  CheckboxListTile(value: enabled, onChanged: (value) => setDialogState(() => enabled = value ?? true), title: Text(t('启用', 'Enabled'))),
+                  CheckboxListTile(value: webhook, onChanged: (value) => setDialogState(() => webhook = value ?? false), title: const Text('Webhook')),
+                  CheckboxListTile(value: email, onChanged: (value) => setDialogState(() => email = value ?? false), title: const Text('Email')),
+                  if (error != null) Text(error!, style: TextStyle(color: Theme.of(context).colorScheme.error)),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(dialogContext), child: Text(t('取消', 'Cancel'))),
+            FilledButton(onPressed: () async {
+              try {
+                final body = <String, dynamic>{'name': name.text.trim(), 'metric': metric, 'comparator': comparator, 'threshold': double.parse(threshold.text), 'target': target.text.trim().isEmpty ? null : target.text.trim(), 'evaluation_window_seconds': int.parse(window.text), 'cooldown_seconds': int.parse(cooldown.text), 'severity': severity, 'notify_webhook': webhook, 'notify_email': email, 'enabled': enabled};
+                if (rule == null) { await widget.api.postObject('/api/v1/alerts/rules', body); } else { await widget.api.putObject('/api/v1/alerts/rules/${rule['id']}', body); }
+                if (dialogContext.mounted) Navigator.pop(dialogContext);
+                await _refresh(silent: true);
+              } catch (value) { setDialogState(() => error = value.toString()); }
+            }, child: Text(t('保存', 'Save'))),
+          ],
+        ),
+      ),
+    );
+    for (final controller in [name, threshold, target, window, cooldown]) { controller.dispose(); }
+  }
+
+  Future<void> _deleteAlertRule(Map<String, dynamic> rule) async {
+    await widget.api.delete('/api/v1/alerts/rules/${rule['id']}');
+    await _refresh(silent: true);
+  }
+
+  Widget _usersPage() => _pagePadding(
+        ListView(
+          children: [
+            Row(children: [Expanded(child: _pageTitle(t('用户与会话', 'Users and sessions'), t('角色、登录状态和活动会话', 'Roles, sign-in state, and active sessions'))), FilledButton.icon(onPressed: _showCreateUser, icon: const Icon(Icons.person_add_alt_1), label: Text(t('新建用户', 'New user')))]),
+            const SizedBox(height: 16),
+            for (final raw in _users) _recordCard(raw as Map<String, dynamic>, titleKeys: const ['username', 'display_name'], stateKey: 'enabled'),
+            const SizedBox(height: 20),
+            Text(t('活动会话', 'Active sessions'), style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 8),
+            for (final raw in _sessions) _recordCard(raw as Map<String, dynamic>, titleKeys: const ['username', 'session_id']),
+          ],
+        ),
+      );
+
+  Future<void> _showCreateUser() async {
+    final username = TextEditingController();
+    final displayName = TextEditingController();
+    final password = TextEditingController();
+    var role = 'operator';
+    String? error;
+    await showDialog<void>(context: context, builder: (dialogContext) => StatefulBuilder(builder: (context, setDialogState) => AlertDialog(
+      title: Text(t('新建用户', 'New user')),
+      content: SizedBox(width: 460, child: Column(mainAxisSize: MainAxisSize.min, children: [
+        TextField(controller: username, decoration: InputDecoration(labelText: t('用户名', 'Username'))), const SizedBox(height: 10),
+        TextField(controller: displayName, decoration: InputDecoration(labelText: t('显示名称', 'Display name'))), const SizedBox(height: 10),
+        TextField(controller: password, obscureText: true, decoration: InputDecoration(labelText: t('密码（至少 12 位）', 'Password (12+ characters)'))), const SizedBox(height: 10),
+        DropdownButtonFormField<String>(initialValue: role, items: const [DropdownMenuItem(value: 'administrator', child: Text('administrator')), DropdownMenuItem(value: 'operator', child: Text('operator')), DropdownMenuItem(value: 'auditor', child: Text('auditor'))], onChanged: (value) => setDialogState(() => role = value ?? role), decoration: InputDecoration(labelText: t('角色', 'Role'))),
+        if (error != null) Padding(padding: const EdgeInsets.only(top: 10), child: Text(error!, style: TextStyle(color: Theme.of(context).colorScheme.error))),
+      ])),
+      actions: [TextButton(onPressed: () => Navigator.pop(dialogContext), child: Text(t('取消', 'Cancel'))), FilledButton(onPressed: () async { try { await widget.api.postObject('/api/v1/users', {'username': username.text.trim(), 'display_name': displayName.text.trim(), 'role': role, 'password': password.text, 'force_password_change': true}); if (dialogContext.mounted) Navigator.pop(dialogContext); await _refresh(silent: true); } catch (value) { setDialogState(() => error = value.toString()); } }, child: Text(t('创建', 'Create')))],
+    )));
+    username.dispose(); displayName.dispose(); password.dispose();
+  }
+
+  Widget _diagnosticsPage() => _pagePadding(
+        ListView(
+          children: [
+            Row(children: [Expanded(child: _pageTitle(t('连接与配置诊断', 'Connection and configuration diagnostics'), t('检查管理 API、延迟、版本和本地环境', 'Check management API, latency, version, and local environment'))), FilledButton.icon(onPressed: _runDiagnostics, icon: const Icon(Icons.play_arrow), label: Text(t('开始诊断', 'Run diagnostics')))]),
+            const SizedBox(height: 16),
+            Wrap(spacing: 8, runSpacing: 8, children: [
+              OutlinedButton.icon(onPressed: _showLocalDiagnose, icon: const Icon(Icons.fact_check_outlined), label: Text(t('诊断本地配置', 'Diagnose local config'))),
+              OutlinedButton.icon(onPressed: _showServiceInstall, icon: const Icon(Icons.install_desktop_outlined), label: Text(t('安装客户端服务', 'Install client service'))),
+              OutlinedButton.icon(onPressed: () => _runServiceAction('status'), icon: const Icon(Icons.info_outline), label: Text(t('服务状态', 'Service status'))),
+              OutlinedButton.icon(onPressed: () => _runServiceAction('restart'), icon: const Icon(Icons.restart_alt), label: Text(t('重启服务', 'Restart service'))),
+              OutlinedButton.icon(onPressed: _showLocalLogs, icon: const Icon(Icons.description_outlined), label: Text(t('查看本地日志', 'View local logs'))),
+            ]),
+            const SizedBox(height: 16),
+            if (_diagnostics.isEmpty) _emptyCard(t('尚未运行诊断', 'Diagnostics have not run yet')) else _jsonPanel(t('诊断结果', 'Diagnostic results'), _diagnostics),
+            const SizedBox(height: 16),
+            _jsonPanel(t('版本信息', 'Version information'), {'manager_version': '0.5.0', 'latest_release': _latestRelease ?? t('尚未检查', 'Not checked'), 'server': widget.api.baseUri.toString(), 'platform': Platform.operatingSystem, 'platform_version': Platform.operatingSystemVersion}),
+          ],
+        ),
+      );
+
+  Future<void> _runDiagnostics() async {
+    final started = DateTime.now();
+    try {
+      final health = await widget.api.getObject('/api/v1/health');
+      final status = await widget.api.getObject('/api/v1/status');
+      final channels = await widget.api.getObject('/api/v1/alerts/channels');
+      final releaseClient = HttpClient()..connectionTimeout = const Duration(seconds: 10);
+      try {
+        final request = await releaseClient.getUrl(Uri.parse('https://api.github.com/repos/ASL-Vanity/LinkLake/releases?per_page=1'));
+        request.headers.set(HttpHeaders.userAgentHeader, 'LinkLake-Manager/0.5.0');
+        final response = await request.close().timeout(const Duration(seconds: 15));
+        final decoded = jsonDecode(await utf8.decoder.bind(response).join());
+        if (decoded is List && decoded.isNotEmpty) _latestRelease = decoded.first['tag_name']?.toString();
+      } finally { releaseClient.close(force: true); }
+      if (!mounted) return;
+      setState(() => _diagnostics = {'ok': true, 'latency_ms': DateTime.now().difference(started).inMilliseconds, 'health': health, 'status': status, 'notifications': channels, 'client_count': _clients.length, 'policy_count': _resources.values.fold<int>(0, (total, values) => total + values.length), 'timestamp': DateTime.now().toIso8601String()});
+    } catch (error) {
+      if (mounted) setState(() => _diagnostics = {'ok': false, 'error': error.toString(), 'latency_ms': DateTime.now().difference(started).inMilliseconds});
+    }
+  }
+
+  String _clientBinary() {
+    final directory = File(Platform.resolvedExecutable).parent.path;
+    final name = Platform.isWindows ? 'linklake-client.exe' : 'linklake-client';
+    final bundled = File('$directory${Platform.pathSeparator}$name');
+    return bundled.existsSync() ? bundled.path : name;
+  }
+
+  Future<ProcessResult> _runClient(List<String> arguments) => Process.run(_clientBinary(), arguments);
+
+  Future<String?> _askConfigPath(String title) async {
+    final controller = TextEditingController(text: Platform.isWindows ? r'C:\ProgramData\LinkLake\client.toml' : '/etc/linklake/client.toml');
+    final result = await showDialog<String>(context: context, builder: (dialogContext) => AlertDialog(
+      title: Text(title),
+      content: SizedBox(width: 520, child: TextField(controller: controller, decoration: InputDecoration(labelText: t('配置文件路径', 'Configuration file path')))),
+      actions: [TextButton(onPressed: () => Navigator.pop(dialogContext), child: Text(t('取消', 'Cancel'))), FilledButton(onPressed: () => Navigator.pop(dialogContext, controller.text.trim()), child: Text(t('继续', 'Continue')))],
+    ));
+    controller.dispose();
+    return result;
+  }
+
+  Future<void> _showLocalDiagnose() async {
+    final path = await _askConfigPath(t('诊断本地配置', 'Diagnose local configuration'));
+    if (path == null || path.isEmpty) return;
+    final result = await _runClient(['diagnose', '--config', path]);
+    if (!mounted) return;
+    setState(() => _diagnostics['local_client'] = {'exit_code': result.exitCode, 'stdout': result.stdout.toString(), 'stderr': result.stderr.toString()});
+  }
+
+  Future<void> _showServiceInstall() async {
+    final path = await _askConfigPath(t('安装客户端服务', 'Install client service'));
+    if (path == null || path.isEmpty) return;
+    final result = await _runClient(['service', 'install', '--config', path, '--silent']);
+    if (!mounted) return;
+    setState(() => _diagnostics['service_install'] = {'exit_code': result.exitCode, 'stdout': result.stdout.toString(), 'stderr': result.stderr.toString(), 'note': t('安装系统服务通常需要以管理员/root 身份运行 Manager。', 'Installing a system service usually requires running Manager as administrator/root.')});
+  }
+
+  Future<void> _runServiceAction(String action) async {
+    final result = await _runClient(['service', action]);
+    if (!mounted) return;
+    setState(() => _diagnostics['service_$action'] = {'exit_code': result.exitCode, 'stdout': result.stdout.toString(), 'stderr': result.stderr.toString()});
+  }
+
+  Future<void> _showLocalLogs() async {
+    final result = await _runClient(['logs', '--lines', '200']);
+    if (!mounted) return;
+    setState(() => _diagnostics['local_logs'] = {'exit_code': result.exitCode, 'stdout': result.stdout.toString(), 'stderr': result.stderr.toString()});
+  }
 
   Widget _auditPage() => _pagePadding(
         ListView(
