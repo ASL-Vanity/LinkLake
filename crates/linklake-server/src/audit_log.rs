@@ -68,6 +68,34 @@ impl AuditLog {
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+
+    pub(crate) fn export(
+        &self,
+        from_unix_seconds: Option<i64>,
+        to_unix_seconds: Option<i64>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<AuditEvent>> {
+        let mut statement = self.database.prepare(
+            "SELECT id, occurred_unix_seconds, action, subject, detail FROM audit_events WHERE (?1 IS NULL OR occurred_unix_seconds >= ?1) AND (?2 IS NULL OR occurred_unix_seconds <= ?2) ORDER BY id DESC LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![
+                from_unix_seconds,
+                to_unix_seconds,
+                limit.clamp(1, 100_000) as i64
+            ],
+            |row| {
+                Ok(AuditEvent {
+                    id: row.get(0)?,
+                    occurred_unix_seconds: row.get(1)?,
+                    action: row.get(2)?,
+                    subject: row.get(3)?,
+                    detail: row.get(4)?,
+                })
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
 }
 
 fn limit_text(value: &str, maximum_bytes: usize) -> String {
