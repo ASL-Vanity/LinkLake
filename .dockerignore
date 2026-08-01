@@ -6,6 +6,10 @@ data
 logs
 .tmp-*
 apps/linklake_manager/build
+apps/linklake_manager/.dart_tool
+apps/linklake_manager/windows/flutter/ephemeral
+apps/linklake_manager/linux/flutter/ephemeral
+apps/linklake_manager/macos/Flutter/ephemeral
 deploy/linklake.env
 deploy/secrets
 deploy/certs

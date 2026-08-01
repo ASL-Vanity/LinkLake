@@ -5,6 +5,7 @@ use linklake_core::{
     ControlFrame, ManagedConfigMode, ManagedConfigStatus,
 };
 use std::{
+    net::SocketAddr,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
@@ -107,13 +108,15 @@ pub(crate) async fn run_control_listener(
             accepted = listener.accept() => accepted,
         };
         match accepted {
-            Ok((stream, _)) => {
+            Ok((stream, source)) => {
                 state
                     .metrics
                     .control_connections_total
                     .fetch_add(1, Ordering::Relaxed);
                 let state = state.clone();
-                tokio::spawn(async move { handle_connection(state, Box::new(stream)).await });
+                tokio::spawn(
+                    async move { handle_connection(state, Box::new(stream), source).await },
+                );
             }
             Err(error) => tracing::error!("TCP control listener accept error: {error}"),
         }
@@ -132,7 +135,7 @@ pub(crate) async fn run_tls_control_listener(
             accepted = listener.accept() => accepted,
         };
         match accepted {
-            Ok((stream, _)) => {
+            Ok((stream, source)) => {
                 state
                     .metrics
                     .control_connections_total
@@ -141,7 +144,9 @@ pub(crate) async fn run_tls_control_listener(
                 let acceptor = acceptor.clone();
                 tokio::spawn(async move {
                     match acceptor.accept(stream).await {
-                        Ok(tls_stream) => handle_connection(state, Box::new(tls_stream)).await,
+                        Ok(tls_stream) => {
+                            handle_connection(state, Box::new(tls_stream), source).await
+                        }
                         Err(error) => {
                             state
                                 .metrics
@@ -157,7 +162,11 @@ pub(crate) async fn run_tls_control_listener(
     }
 }
 
-pub(crate) async fn handle_connection(state: Arc<AppState>, mut stream: BoxedIo) {
+pub(crate) async fn handle_connection(
+    state: Arc<AppState>,
+    mut stream: BoxedIo,
+    source: SocketAddr,
+) {
     let frame = match read_control_frame(&mut stream).await {
         Ok(frame) => frame,
         Err(error) => {
@@ -235,6 +244,7 @@ pub(crate) async fn handle_connection(state: Arc<AppState>, mut stream: BoxedIo)
                 client_id,
                 client_token,
                 access_key,
+                source.ip(),
             )
             .await;
         }

@@ -61,7 +61,8 @@ managed_config_path = "managed.toml"
 # name = "private-rdp-access"
 # local_bind = "127.0.0.1:13389"
 # access_key = "lls_replace-with-the-one-time-access-key"
-# prefer_direct = true
+# path_policy = "prefer_direct" # prefer_direct | direct_only | relay_only
+# prefer_direct = true # 旧配置兼容项；设置 path_policy 后以 path_policy 为准。
 
 # SOCKS5 出口端可由 Web UI 托管下发；用户名和一次性密码只属于服务端公网策略。
 # [[socks5_proxies]]

@@ -2,8 +2,11 @@
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::{fs, path::Path};
+use std::{collections::HashMap, fs, path::Path};
 use uuid::Uuid;
+
+use crate::tunnel_catalog::{CreateTcpTunnelPolicy, CreateUdpTunnelPolicy, TunnelCatalog};
+use linklake_core::ClientSummary;
 
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct UpsertFleetPeer {
@@ -44,6 +47,234 @@ pub(crate) struct FleetPeer {
     pub(crate) enabled: bool,
     pub(crate) created_unix_seconds: u64,
     pub(crate) updated_unix_seconds: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct FleetTcpPolicy {
+    pub(crate) client_name: String,
+    pub(crate) name: String,
+    pub(crate) public_port: u16,
+    pub(crate) target_addr: String,
+    pub(crate) max_connections: u16,
+    pub(crate) bandwidth_limit_bps: Option<u64>,
+    pub(crate) enabled: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct FleetUdpPolicy {
+    pub(crate) client_name: String,
+    pub(crate) name: String,
+    pub(crate) public_port: u16,
+    pub(crate) target_addr: String,
+    pub(crate) max_sessions: u16,
+    pub(crate) session_idle_timeout_seconds: u32,
+    pub(crate) bandwidth_limit_bps: Option<u64>,
+    pub(crate) enabled: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct FleetPolicyBundle {
+    #[serde(default)]
+    pub(crate) tcp: Vec<FleetTcpPolicy>,
+    #[serde(default)]
+    pub(crate) udp: Vec<FleetUdpPolicy>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct FleetImportResult {
+    pub(crate) created: usize,
+    pub(crate) unchanged: usize,
+    pub(crate) conflicts: Vec<String>,
+}
+
+pub(crate) fn export_policy_bundle(
+    clients: &[ClientSummary],
+    tunnels: &TunnelCatalog,
+) -> anyhow::Result<FleetPolicyBundle> {
+    let client_names = clients
+        .iter()
+        .map(|client| (client.client_id, client.name.as_str()))
+        .collect::<HashMap<_, _>>();
+    let tcp = tunnels
+        .list()?
+        .into_iter()
+        .filter_map(|policy| {
+            client_names
+                .get(&policy.client_id)
+                .map(|client_name| FleetTcpPolicy {
+                    client_name: (*client_name).to_owned(),
+                    name: policy.name,
+                    public_port: policy.public_port,
+                    target_addr: policy.target_addr,
+                    max_connections: policy.max_connections,
+                    bandwidth_limit_bps: policy.bandwidth_limit_bps,
+                    enabled: policy.enabled,
+                })
+        })
+        .collect();
+    let udp = tunnels
+        .list_udp()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?
+        .into_iter()
+        .filter_map(|policy| {
+            client_names
+                .get(&policy.client_id)
+                .map(|client_name| FleetUdpPolicy {
+                    client_name: (*client_name).to_owned(),
+                    name: policy.name,
+                    public_port: policy.public_port,
+                    target_addr: policy.target_addr,
+                    max_sessions: policy.max_sessions,
+                    session_idle_timeout_seconds: policy.session_idle_timeout_seconds,
+                    bandwidth_limit_bps: policy.bandwidth_limit_bps,
+                    enabled: policy.enabled,
+                })
+        })
+        .collect();
+    Ok(FleetPolicyBundle { tcp, udp })
+}
+
+pub(crate) fn import_policy_bundle(
+    bundle: &FleetPolicyBundle,
+    clients: &[ClientSummary],
+    tunnels: &mut TunnelCatalog,
+    dry_run: bool,
+) -> anyhow::Result<FleetImportResult> {
+    let mut result = FleetImportResult::default();
+    let mut clients_by_name = HashMap::<&str, Vec<Uuid>>::new();
+    for client in clients.iter().filter(|client| client.enabled) {
+        clients_by_name
+            .entry(client.name.as_str())
+            .or_default()
+            .push(client.client_id);
+    }
+    let mut existing_tcp = tunnels.list()?;
+    let mut existing_udp = tunnels
+        .list_udp()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
+    for policy in &bundle.tcp {
+        let Some(ids) = clients_by_name.get(policy.client_name.as_str()) else {
+            result.conflicts.push(format!(
+                "TCP {}: client '{}' is missing",
+                policy.name, policy.client_name
+            ));
+            continue;
+        };
+        if ids.len() != 1 {
+            result.conflicts.push(format!(
+                "TCP {}: client name '{}' is ambiguous",
+                policy.name, policy.client_name
+            ));
+            continue;
+        }
+        let client_id = ids[0];
+        if let Some(existing) = existing_tcp.iter().find(|item| item.name == policy.name) {
+            if existing.client_id == client_id
+                && existing.public_port == policy.public_port
+                && existing.target_addr == policy.target_addr
+                && existing.max_connections == policy.max_connections
+                && existing.bandwidth_limit_bps == policy.bandwidth_limit_bps
+                && existing.enabled == policy.enabled
+            {
+                result.unchanged += 1;
+            } else {
+                result.conflicts.push(format!(
+                    "TCP {}: an incompatible policy with the same name exists",
+                    policy.name
+                ));
+            }
+            continue;
+        }
+        if !dry_run {
+            match tunnels.create(CreateTcpTunnelPolicy {
+                client_id,
+                name: policy.name.clone(),
+                public_port: policy.public_port,
+                target_addr: policy.target_addr.clone(),
+                max_connections: Some(policy.max_connections),
+                bandwidth_limit_bps: policy.bandwidth_limit_bps,
+            }) {
+                Ok(created) => {
+                    if !policy.enabled {
+                        tunnels.set_enabled(created.id, false)?;
+                    }
+                    existing_tcp.push(created);
+                }
+                Err(error) => {
+                    result
+                        .conflicts
+                        .push(format!("TCP {}: {error}", policy.name));
+                    continue;
+                }
+            }
+        }
+        result.created += 1;
+    }
+
+    for policy in &bundle.udp {
+        let Some(ids) = clients_by_name.get(policy.client_name.as_str()) else {
+            result.conflicts.push(format!(
+                "UDP {}: client '{}' is missing",
+                policy.name, policy.client_name
+            ));
+            continue;
+        };
+        if ids.len() != 1 {
+            result.conflicts.push(format!(
+                "UDP {}: client name '{}' is ambiguous",
+                policy.name, policy.client_name
+            ));
+            continue;
+        }
+        let client_id = ids[0];
+        if let Some(existing) = existing_udp.iter().find(|item| item.name == policy.name) {
+            if existing.client_id == client_id
+                && existing.public_port == policy.public_port
+                && existing.target_addr == policy.target_addr
+                && existing.max_sessions == policy.max_sessions
+                && existing.session_idle_timeout_seconds == policy.session_idle_timeout_seconds
+                && existing.bandwidth_limit_bps == policy.bandwidth_limit_bps
+                && existing.enabled == policy.enabled
+            {
+                result.unchanged += 1;
+            } else {
+                result.conflicts.push(format!(
+                    "UDP {}: an incompatible policy with the same name exists",
+                    policy.name
+                ));
+            }
+            continue;
+        }
+        if !dry_run {
+            match tunnels.create_udp(CreateUdpTunnelPolicy {
+                client_id,
+                name: policy.name.clone(),
+                public_port: policy.public_port,
+                target_addr: policy.target_addr.clone(),
+                max_sessions: Some(policy.max_sessions),
+                session_idle_timeout_seconds: Some(policy.session_idle_timeout_seconds),
+                bandwidth_limit_bps: policy.bandwidth_limit_bps,
+            }) {
+                Ok(created) => {
+                    if !policy.enabled {
+                        tunnels
+                            .set_udp_enabled(created.id, false)
+                            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                    }
+                    existing_udp.push(created);
+                }
+                Err(error) => {
+                    result
+                        .conflicts
+                        .push(format!("UDP {}: {error}", policy.name));
+                    continue;
+                }
+            }
+        }
+        result.created += 1;
+    }
+    Ok(result)
 }
 
 pub(crate) struct FleetCatalog {
@@ -228,6 +459,27 @@ fn read_peer(row: &rusqlite::Row<'_>) -> rusqlite::Result<FleetPeer> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use linklake_core::{ManagedConfigMode, ManagedConfigStatus};
+
+    fn client(name: &str) -> ClientSummary {
+        ClientSummary {
+            client_id: Uuid::new_v4(),
+            name: name.to_owned(),
+            platform: "linux".to_owned(),
+            group_name: None,
+            tags: Vec::new(),
+            notes: None,
+            enabled: true,
+            created_unix_seconds: 1,
+            token_rotated_unix_seconds: None,
+            last_seen_unix_seconds: 1,
+            config_mode: ManagedConfigMode::ServerManaged,
+            config_sync_status: ManagedConfigStatus::Synchronized,
+            applied_config_revision: None,
+            config_sync_error: None,
+            config_checked_unix_seconds: None,
+        }
+    }
 
     #[test]
     fn peers_are_validated_and_persisted() {
@@ -257,5 +509,47 @@ mod tests {
             id
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn policy_import_previews_creates_and_reports_conflicts_without_overwriting() {
+        let clients = vec![client("edge")];
+        let mut catalog = TunnelCatalog::open(None).unwrap();
+        let bundle = FleetPolicyBundle {
+            tcp: vec![FleetTcpPolicy {
+                client_name: "edge".into(),
+                name: "game".into(),
+                public_port: 32010,
+                target_addr: "127.0.0.1:2333@2,127.0.0.1:2444@1".into(),
+                max_connections: 64,
+                bandwidth_limit_bps: None,
+                enabled: true,
+            }],
+            udp: vec![FleetUdpPolicy {
+                client_name: "edge".into(),
+                name: "voice".into(),
+                public_port: 32011,
+                target_addr: "127.0.0.1:2334".into(),
+                max_sessions: 256,
+                session_idle_timeout_seconds: 120,
+                bandwidth_limit_bps: None,
+                enabled: true,
+            }],
+        };
+        let preview = import_policy_bundle(&bundle, &clients, &mut catalog, true).unwrap();
+        assert_eq!(preview.created, 2);
+        assert!(catalog.list().unwrap().is_empty());
+
+        let applied = import_policy_bundle(&bundle, &clients, &mut catalog, false).unwrap();
+        assert_eq!(applied.created, 2);
+        assert!(applied.conflicts.is_empty());
+        let repeated = import_policy_bundle(&bundle, &clients, &mut catalog, false).unwrap();
+        assert_eq!(repeated.unchanged, 2);
+
+        let mut conflicting = bundle.clone();
+        conflicting.tcp[0].public_port = 32012;
+        let result = import_policy_bundle(&conflicting, &clients, &mut catalog, false).unwrap();
+        assert_eq!(result.conflicts.len(), 1);
+        assert_eq!(catalog.list().unwrap()[0].public_port, 32010);
     }
 }

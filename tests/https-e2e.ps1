@@ -3,6 +3,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$PSDefaultParameterValues['Invoke-RestMethod:Headers'] = @{ 'X-LinkLake-CSRF' = '1' }
+$PSDefaultParameterValues['Invoke-WebRequest:Headers'] = @{ 'X-LinkLake-CSRF' = '1' }
 Set-StrictMode -Version Latest
 Add-Type -AssemblyName System.Net.Http
 if (Test-Path -LiteralPath 'Variable:PSNativeCommandUseErrorActionPreference') {

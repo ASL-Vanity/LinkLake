@@ -39,4 +39,5 @@ config_mode = "server_managed"
 # name = "private-rdp-access"
 # local_bind = "127.0.0.1:13389"
 # access_key = "lls_replace-with-the-one-time-access-key"
-# prefer_direct = true
+# path_policy = "prefer_direct" # prefer_direct | direct_only | relay_only
+# prefer_direct = true # Legacy compatibility; path_policy takes precedence.

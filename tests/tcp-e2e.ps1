@@ -3,6 +3,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$PSDefaultParameterValues['Invoke-RestMethod:Headers'] = @{ 'X-LinkLake-CSRF' = '1' }
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $targetRoot = Join-Path $projectRoot 'target\e2e'
 $serverPath = Join-Path $targetRoot 'debug\linklake-server.exe'

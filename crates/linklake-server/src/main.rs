@@ -51,7 +51,7 @@ use certificate_catalog::{
 };
 use certificate_manager::CertificateManager;
 use client_registry::{Authentication, ClientRegistry, UpdateClient};
-use fleet::{FleetCatalog, FleetPeer, UpsertFleetPeer};
+use fleet::{FleetCatalog, FleetImportResult, FleetPeer, FleetPolicyBundle, UpsertFleetPeer};
 use http_route_catalog::{
     CreateHttpRouteError, CreateHttpRoutePolicy, HttpRouteCatalog, HttpRoutePolicy,
     UpdateHttpRoutePolicy,
@@ -951,6 +951,35 @@ struct FleetOverview {
     peers: Vec<FleetPeerStatus>,
 }
 
+#[derive(Deserialize, Serialize)]
+struct FleetImportRequest {
+    bundle: FleetPolicyBundle,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Deserialize)]
+struct FleetSyncRequest {
+    #[serde(default)]
+    peer_ids: Vec<Uuid>,
+    #[serde(default = "default_true_value")]
+    dry_run: bool,
+}
+
+fn default_true_value() -> bool {
+    true
+}
+
+#[derive(Serialize)]
+struct FleetPeerSyncResult {
+    peer_id: Uuid,
+    peer_name: String,
+    created: usize,
+    unchanged: usize,
+    conflicts: Vec<String>,
+    error: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum MetricsHistoryProtocol {
@@ -1803,6 +1832,8 @@ async fn run_server(
             put(update_fleet_peer).delete(delete_fleet_peer),
         )
         .route("/api/v1/fleet/overview", get(fleet_overview))
+        .route("/api/v1/fleet/import", post(import_fleet_policies))
+        .route("/api/v1/fleet/sync", post(sync_fleet_policies))
         .route(
             "/api/v1/traffic-controls/:kind/:policy_id",
             get(get_traffic_control)
@@ -5681,6 +5712,156 @@ async fn fleet_overview(
         conflicts,
         peers: statuses,
     }))
+}
+
+async fn import_fleet_policies(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<FleetImportRequest>,
+) -> Result<Json<FleetImportResult>, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    let clients = state
+        .clients
+        .lock()
+        .expect("client registry lock poisoned")
+        .summaries();
+    let result = fleet::import_policy_bundle(
+        &request.bundle,
+        &clients,
+        &mut state
+            .tunnel_catalog
+            .lock()
+            .expect("tunnel catalog lock poisoned"),
+        request.dry_run,
+    )
+    .map_err(coded_fleet_error)?;
+    record_audit(
+        &state,
+        if request.dry_run {
+            "fleet.policy_import.previewed"
+        } else {
+            "fleet.policy_import.applied"
+        },
+        "fleet",
+        &format!(
+            "actor={}; created={}; unchanged={}; conflicts={}",
+            principal.username,
+            result.created,
+            result.unchanged,
+            result.conflicts.len()
+        ),
+    );
+    Ok(Json(result))
+}
+
+async fn sync_fleet_policies(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<FleetSyncRequest>,
+) -> Result<Json<Vec<FleetPeerSyncResult>>, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    let clients = state
+        .clients
+        .lock()
+        .expect("client registry lock poisoned")
+        .summaries();
+    let bundle = fleet::export_policy_bundle(
+        &clients,
+        &state
+            .tunnel_catalog
+            .lock()
+            .expect("tunnel catalog lock poisoned"),
+    )
+    .map_err(coded_fleet_error)?;
+    let peers = state
+        .fleet
+        .lock()
+        .expect("fleet catalog lock poisoned")
+        .list()
+        .map_err(coded_fleet_error)?
+        .into_iter()
+        .filter(|peer| {
+            peer.enabled && (request.peer_ids.is_empty() || request.peer_ids.contains(&peer.id))
+        })
+        .collect::<Vec<_>>();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| coded_fleet_error(error.into()))?;
+    let mut results = Vec::with_capacity(peers.len());
+    for peer in peers {
+        let Some(token) =
+            std::env::var_os(&peer.token_env).and_then(|value| value.into_string().ok())
+        else {
+            results.push(FleetPeerSyncResult {
+                peer_id: peer.id,
+                peer_name: peer.name,
+                created: 0,
+                unchanged: 0,
+                conflicts: Vec::new(),
+                error: Some("management token environment variable is not configured".to_owned()),
+            });
+            continue;
+        };
+        let response = client
+            .post(format!("{}/api/v1/fleet/import", peer.url))
+            .bearer_auth(token)
+            .json(&FleetImportRequest {
+                bundle: bundle.clone(),
+                dry_run: request.dry_run,
+            })
+            .send()
+            .await;
+        match response {
+            Ok(response) if response.status().is_success() => {
+                match response.json::<FleetImportResult>().await {
+                    Ok(imported) => results.push(FleetPeerSyncResult {
+                        peer_id: peer.id,
+                        peer_name: peer.name,
+                        created: imported.created,
+                        unchanged: imported.unchanged,
+                        conflicts: imported.conflicts,
+                        error: None,
+                    }),
+                    Err(error) => results.push(FleetPeerSyncResult {
+                        peer_id: peer.id,
+                        peer_name: peer.name,
+                        created: 0,
+                        unchanged: 0,
+                        conflicts: Vec::new(),
+                        error: Some(format!("invalid peer response: {error}")),
+                    }),
+                }
+            }
+            Ok(response) => results.push(FleetPeerSyncResult {
+                peer_id: peer.id,
+                peer_name: peer.name,
+                created: 0,
+                unchanged: 0,
+                conflicts: Vec::new(),
+                error: Some(format!("peer returned HTTP {}", response.status())),
+            }),
+            Err(error) => results.push(FleetPeerSyncResult {
+                peer_id: peer.id,
+                peer_name: peer.name,
+                created: 0,
+                unchanged: 0,
+                conflicts: Vec::new(),
+                error: Some(error.to_string()),
+            }),
+        }
+    }
+    record_audit(
+        &state,
+        if request.dry_run {
+            "fleet.policy_sync.previewed"
+        } else {
+            "fleet.policy_sync.applied"
+        },
+        "fleet",
+        &format!("actor={}; peers={}", principal.username, results.len()),
+    );
+    Ok(Json(results))
 }
 
 async fn get_traffic_control(

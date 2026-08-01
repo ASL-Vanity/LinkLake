@@ -114,6 +114,8 @@ struct UdpAssociation {
 }
 
 struct UdpProxyContext {
+    state: Arc<AppState>,
+    policy_id: Uuid,
     public_port: u16,
     associations: Mutex<HashMap<Uuid, UdpAssociation>>,
     commands: mpsc::Sender<UdpRuntimeCommand>,
@@ -230,6 +232,8 @@ pub(crate) async fn register_proxy(
         }
         let (udp_command_tx, udp_command_rx) = mpsc::channel(256);
         let udp_context = Arc::new(UdpProxyContext {
+            state: state.clone(),
+            policy_id: runtime_policy.policy_id,
             public_port,
             associations: Mutex::new(HashMap::new()),
             commands: udp_command_tx,
@@ -404,6 +408,7 @@ async fn run_udp_runtime(
     let mut reassembler = UdpReassembler::new(UdpReassemblyConfig::default())?;
     let mut receive_buffer = vec![0_u8; MAX_UDP_DATAGRAM_BYTES];
     let mut next_datagram_id = 1_u64;
+    let mut usage_pending = 0_u64;
     let mut cleanup = interval(Duration::from_secs(1));
     cleanup.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
@@ -472,6 +477,7 @@ async fn run_udp_runtime(
                 if sent {
                     statistics.udp_datagrams_from_public.fetch_add(1, Ordering::Relaxed);
                     statistics.udp_bytes_from_public.fetch_add(received as u64, Ordering::Relaxed);
+                    usage_pending = usage_pending.saturating_add(received as u64);
                 } else {
                     statistics.udp_dropped_datagrams.fetch_add(1, Ordering::Relaxed);
                 }
@@ -517,15 +523,50 @@ async fn run_udp_runtime(
                 if socket.send_to(&payload, endpoint).await? == payload.len() {
                     statistics.udp_datagrams_to_public.fetch_add(1, Ordering::Relaxed);
                     statistics.udp_bytes_to_public.fetch_add(payload.len() as u64, Ordering::Relaxed);
+                    usage_pending = usage_pending.saturating_add(payload.len() as u64);
                 }
             },
             _ = cleanup.tick() => {
+                if usage_pending != 0 {
+                    if let Err(error) = context
+                        .state
+                        .traffic_controls
+                        .lock()
+                        .expect("traffic control catalog lock poisoned")
+                        .record_bytes(
+                            TrafficPolicyKind::Socks5,
+                            context.policy_id,
+                            usage_pending,
+                            crate::unix_seconds(),
+                        )
+                    {
+                        tracing::warn!("Could not persist SOCKS5 UDP traffic usage: {error}");
+                    } else {
+                        usage_pending = 0;
+                    }
+                }
                 let expired = reassembler.expire(std::time::Instant::now());
                 statistics.udp_dropped_datagrams.fetch_add(
                     expired.incomplete_datagrams as u64,
                     Ordering::Relaxed,
                 );
             }
+        }
+    }
+    if usage_pending != 0 {
+        if let Err(error) = context
+            .state
+            .traffic_controls
+            .lock()
+            .expect("traffic control catalog lock poisoned")
+            .record_bytes(
+                TrafficPolicyKind::Socks5,
+                context.policy_id,
+                usage_pending,
+                crate::unix_seconds(),
+            )
+        {
+            tracing::warn!("Could not persist final SOCKS5 UDP traffic usage: {error}");
         }
     }
     control_reader.abort();

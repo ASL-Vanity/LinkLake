@@ -8,6 +8,20 @@ LinkLake 的代码实现、自动化测试与项目文档由 OpenAI GPT-5.6 完�
 
 当前版本已完成 TCP 与 UDP 生产化、多端口/端口范围、Secret 私密隧道、TLS SNI 原样透传、多节点 P2P 直连与显式服务端中继回退、SOCKS5 TCP/UDP 代理、HTTP 正向代理/CONNECT、HTTP 域名路由以及第一阶段原生 HTTPS 与 ACME 证书自动化。
 
+## 高级网络与安全
+
+- TCP、UDP、HTTP、TLS SNI 和 Secret 目标支持加权目标池，例如 `127.0.0.1:2333@2,127.0.0.1:2444@1`；权重只参与新连接或新会话的加权轮询，最多 16 个目标，不会复制展开目标列表。
+- 每条策略可配置允许/拒绝 CIDR、每分钟新连接上限、UTC 星期/时间窗口和持久化 UTC 日流量配额。Web UI 与 Flutter Manager 均可编辑，TCP、UDP、端口组、HTTP、SNI、Secret 中继、SOCKS5 TCP/UDP 与 HTTP Proxy 均计入控制。
+- Secret 访问端推荐使用 `path_policy = "prefer_direct"`；也可设置 `direct_only` 或 `relay_only`。旧配置 `prefer_direct = true/false` 继续兼容。
+- 管理平面支持 RFC 6238 TOTP、活动会话撤销，以及只显示一次、数据库仅保存 SHA-256 摘要的 `llapi_` API Token；权限范围为 `read`、`write`、`administrator`。
+- 多云管理可监控服务端健康、优先级、权重和故障切换顺序，并可预览或执行 TCP/UDP 策略同步。同步按启用客户端的唯一名称映射，只创建缺失策略；同名但参数不同的策略会报告冲突且不会覆盖。
+
+## 部署与可观测性
+
+- [Docker Compose](deploy/docker-compose.yml) 提供 LinkLake、Prometheus 和 Grafana；`/api/v1/metrics/prometheus` 使用 Bearer 鉴权并输出 `linklake_` 指标。
+- [部署指南](docs/deployment.md) 包含 Nginx、Caddy、Cloudflare DNS-only/代理边界、最小权限 DNS Token、DEB/RPM 和容器证书要求。
+- Linux 发布资产包含 `.deb`、`.rpm` 及 SHA-256；Cloudflare DNS 幂等更新脚本位于 `scripts/cloudflare-dns-upsert.ps1`。
+
 ## TCP 生产能力
 
 - TLS 控制通道、Argon2 客户端令牌、精确策略授权

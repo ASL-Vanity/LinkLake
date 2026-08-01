@@ -8,6 +8,20 @@ LinkLake's code implementation, automated tests, and project documentation were 
 
 The current release completes production TCP and UDP, multi-port/range forwarding, secret tunnels, byte-preserving TLS SNI pass-through, multi-node P2P direct paths with explicit server-relay fallback, SOCKS5 TCP/UDP, HTTP forward proxy/CONNECT, HTTP host routing, and the first stage of native HTTPS with ACME certificate automation.
 
+## Advanced networking and security
+
+- TCP, UDP, HTTP, TLS SNI, and Secret targets accept weighted pools such as `127.0.0.1:2333@2,127.0.0.1:2444@1`. Weights select new connections or sessions without expanding the list; one pool supports up to 16 targets.
+- Every policy can define allow/deny CIDRs, new connections per minute, UTC weekday/time windows, and a persistent UTC daily byte quota. Web UI and Flutter Manager can edit these controls; TCP, UDP, port groups, HTTP, SNI, Secret relay, SOCKS5 TCP/UDP, and HTTP Proxy usage is accounted.
+- Secret visitors should use `path_policy = "prefer_direct"`; `direct_only` and `relay_only` are also supported. Legacy `prefer_direct = true/false` remains compatible.
+- The management plane supports RFC 6238 TOTP, active-session revocation, and one-time `llapi_` API tokens stored only as SHA-256 digests. Scopes are `read`, `write`, and `administrator`.
+- Multi-cloud management monitors health, priority, weight, and failover order, and can preview or apply TCP/UDP policy synchronization. Enabled clients are mapped by a unique name; only missing policies are created, while incompatible same-name policies are reported without overwrite.
+
+## Deployment and observability
+
+- [Docker Compose](deploy/docker-compose.yml) includes LinkLake, Prometheus, and Grafana. `/api/v1/metrics/prometheus` requires Bearer authentication and exports `linklake_` metrics.
+- The [deployment guide](docs/deployment.md) covers Nginx, Caddy, Cloudflare DNS-only/proxy boundaries, least-privilege DNS tokens, DEB/RPM, and container certificate requirements.
+- Linux release assets include `.deb`, `.rpm`, and SHA-256 files. The idempotent Cloudflare DNS helper is `scripts/cloudflare-dns-upsert.ps1`.
+
 ## Production TCP capabilities
 
 - TLS control channel, Argon2 client tokens, and exact policy authorization

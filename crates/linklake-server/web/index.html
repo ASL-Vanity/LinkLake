@@ -500,7 +500,7 @@
           <section id="p2p-view" class="view-panel hidden"><div class="section-heading"><div><h2 data-i18n="p2p">P2P network</h2><p data-i18n="p2pSubtitle">Inspect direct candidates, NAT mappings and relay fallback.</p></div></div><div id="p2p-list" class="p2p-list"></div></section>
 
           <section id="fleet-view" class="view-panel hidden">
-            <div class="access-toolbar"><div><h2 data-i18n="fleet">Multi-cloud</h2><p class="role-note" data-i18n="fleetHelp">Monitor LinkLake servers and define preferred and failover entry points.</p></div><button id="new-fleet-peer" class="primary-button" type="button" data-i18n="newFleetPeer">Add server</button></div>
+            <div class="access-toolbar"><div><h2 data-i18n="fleet">Multi-cloud</h2><p class="role-note" data-i18n="fleetHelp">Monitor LinkLake servers and define preferred and failover entry points.</p></div><div class="toolbar-actions"><button id="preview-fleet-sync" class="soft-button" type="button" data-i18n="previewFleetSync">Preview sync</button><button id="apply-fleet-sync" class="soft-button" type="button" data-i18n="applyFleetSync">Apply sync</button><button id="new-fleet-peer" class="primary-button" type="button" data-i18n="newFleetPeer">Add server</button></div></div>
             <div id="fleet-summary" class="kpi-grid" style="margin-bottom:12px"></div>
             <div id="fleet-conflicts" class="alert-list" style="margin-bottom:12px"></div>
             <div class="data-table-wrap"><table class="data-table"><thead><tr><th data-i18n="name">Name</th><th data-i18n="region">Region</th><th data-i18n="status">Status</th><th data-i18n="latency">Latency</th><th data-i18n="priority">Priority</th><th data-i18n="weight">Weight</th><th data-i18n="traffic">Traffic</th><th data-i18n="actions">Actions</th></tr></thead><tbody id="fleet-list"></tbody></table></div>
@@ -598,6 +598,7 @@
 
       const WORDS = {
         en: {
+          previewFleetSync: 'Preview sync', applyFleetSync: 'Apply sync', fleetSyncPreviewed: 'Sync preview completed.', fleetSyncApplied: 'TCP/UDP policies synchronized.',
           title: 'LinkLake Management Console', console: 'Management Console', appearance: 'Appearance', themeSystem: 'System', themeLight: 'Light', themeDark: 'Dark', palette: 'Palette', paletteLake: 'Lake', paletteOcean: 'Ocean', paletteJade: 'Jade', paletteViolet: 'Violet', globalSearch: 'Global search', globalSearchPlaceholder: 'Search clients, policies, ports, domains or IDs', noSearchResults: 'No matching clients or policies.',
           loginTitle: 'Sign in to LinkLake', loginIntro: 'Use an administrator account to manage clients, forwarding services and runtime health.', username: 'Username', password: 'Password', usernamePlaceholder: 'Administrator username', passwordPlaceholder: 'Password', signIn: 'Sign in', newPassword: 'New password', confirmPassword: 'Confirm password', changePassword: 'Change password', passwordRequirement: 'Use at least 12 characters.', passwordsMismatch: 'The passwords do not match.', totpCode: 'Verification code', totpPlaceholder: '6-digit code', totpRequired: 'Enter the 6-digit code from your authenticator app.',
           overview: 'Overview', overviewSubtitle: 'Service health, live traffic and active alerts at a glance.', metrics: 'Runtime metrics', metricsSubtitle: 'Protocol activity, failure composition and infrastructure health.', services: 'Services', p2p: 'P2P network', p2pSubtitle: 'Inspect direct candidates, NAT mappings and relay fallback.', fleet: 'Multi-cloud', fleetHelp: 'Monitor LinkLake servers and define preferred and failover entry points.', newFleetPeer: 'Add server', editFleetPeer: 'Edit server', fleetTokenHelp: 'The management token is read from an environment variable on this server.', region: 'Region', priority: 'Priority', weight: 'Weight', latency: 'Latency', device: 'Device', tokenEnvironment: 'Token environment', preferredEntry: 'Preferred entry', onlineServers: 'Online servers', failoverEntries: 'Failover entries', noFleetPeers: 'No multi-cloud servers configured.', fleetSaved: 'Server entry saved.', fleetDeleted: 'Server entry deleted.', confirmFleetDelete: 'Delete server {name}?', fleetConflict: 'Placement conflict', activity: 'Activity', activitySubtitle: 'Filter and inspect administrator, policy and tunnel events.', portGroupsShort: 'Ports', secretShort: 'Secret', httpProxyShort: 'Proxy',
@@ -624,6 +625,7 @@
           allowedPorts: 'Allowed: {ports}', reservedPorts: 'reserved: {ports}', errorUnknownClient: 'The selected client does not exist.', errorInvalidName: 'The name must contain 1 to 80 characters.', errorInvalidPort: 'The public port is outside the server policy. {ports}.', errorDuplicatePort: 'This public port is already assigned.', errorInvalidTarget: 'Use a valid host:port target.', errorInvalidHostname: 'The hostname is invalid.', errorDuplicateHostname: 'The hostname is already assigned.', errorInvalidLimit: 'One of the configured limits is invalid.', errorStorage: 'Policy storage is unavailable. Check the data directory and server log.', errorUnknownPolicy: 'The policy does not exist.', errorInvalidUsername: 'The proxy username is invalid.', errorInvalidPortExpression: 'Use single ports, comma-separated lists or ascending ranges.', errorPortCountMismatch: 'Public and target port counts must match.', errorDuplicatePortInGroup: 'A port appears more than once in this group.', errorTooManyMappings: 'A port group can contain at most 256 mappings.', errorAcme: 'The ACME request failed. Check the settings, DNS and server log.'
         },
         zh: {
+          previewFleetSync: '预览同步', applyFleetSync: '执行同步', fleetSyncPreviewed: '同步预览已完成。', fleetSyncApplied: 'TCP/UDP 策略同步完成。',
           title: 'LinkLake 管理控制台', console: '管理控制台', appearance: '外观', themeSystem: '跟随系统', themeLight: '浅色', themeDark: '深色', palette: '配色', paletteLake: '湖蓝', paletteOcean: '海洋', paletteJade: '翡翠', paletteViolet: '紫罗兰', globalSearch: '全局搜索', globalSearchPlaceholder: '搜索客户端、策略、端口、域名或 ID', noSearchResults: '没有匹配的客户端或策略。',
           loginTitle: '登录 LinkLake', loginIntro: '使用管理员账户登录，管理客户端、转发服务与运行状态。', username: '用户名', password: '密码', usernamePlaceholder: '管理员用户名', passwordPlaceholder: '密码', signIn: '登录', newPassword: '新密码', confirmPassword: '确认密码', changePassword: '修改密码', passwordRequirement: '密码至少需要 12 位。', passwordsMismatch: '两次输入的密码不一致。', totpCode: '动态验证码', totpPlaceholder: '6 位验证码', totpRequired: '请输入身份验证器中的 6 位动态验证码。',
           overview: '总览', overviewSubtitle: '集中查看服务健康、实时流量和活动告警。', metrics: '运行指标', metricsSubtitle: '查看协议活动、故障构成和基础设施健康状态。', services: '服务与转发', p2p: 'P2P 网络', p2pSubtitle: '查看直连候选、NAT 映射和中继回退。', fleet: '多云管理', fleetHelp: '集中监控 LinkLake 服务端，并定义首选入口与故障切换顺序。', newFleetPeer: '添加服务端', editFleetPeer: '编辑服务端', fleetTokenHelp: '管理令牌由当前服务端的环境变量读取，不写入数据库。', region: '地域', priority: '优先级', weight: '权重', latency: '延迟', device: '设备', tokenEnvironment: '令牌环境变量', preferredEntry: '首选入口', onlineServers: '在线服务端', failoverEntries: '故障切换入口', noFleetPeers: '尚未配置多云服务端。', fleetSaved: '服务端条目已保存。', fleetDeleted: '服务端条目已删除。', confirmFleetDelete: '确定删除服务端 {name} 吗？', fleetConflict: '部署冲突', activity: '活动', activitySubtitle: '筛选并检查管理员、策略和隧道事件。', portGroupsShort: '端口组', secretShort: '私密', httpProxyShort: '代理',
@@ -791,7 +793,7 @@
         'overview-view', 'overview-kpis', 'traffic-chart', 'traffic-tooltip', 'traffic-chart-summary', 'export-metrics', 'service-health-summary', 'overview-alert-panel', 'overview-alerts',
         'metrics-view', 'metrics-kpis', 'activity-chart', 'failure-chart', 'tcp-metric-panel', 'udp-metric-panel', 'proxy-metric-panel', 'web-metric-panel', 'network-health-panel', 'system-metric-panel',
         'services-view', 'service-title', 'service-subtitle', 'new-policy', 'export-policies', 'import-policies', 'import-policies-file', 'service-toolbar', 'service-search', 'service-status-filter', 'service-count', 'service-bulk-toolbar', 'select-visible-policies', 'selected-policy-count', 'bulk-enable-policies', 'bulk-disable-policies', 'bulk-client-target', 'bulk-migrate-policies', 'bulk-delete-policies', 'service-list', 'acme-page',
-        'p2p-view', 'p2p-list', 'fleet-view', 'new-fleet-peer', 'fleet-summary', 'fleet-conflicts', 'fleet-list', 'clients-view', 'client-search', 'client-status-filter', 'client-count', 'clients-list', 'users-view', 'new-user', 'user-search', 'user-role-filter', 'user-count', 'users-list', 'sessions-view', 'totp-status', 'totp-action', 'new-api-token', 'api-tokens-list', 'sessions-list', 'alerts-view', 'new-alert-rule', 'alert-channels', 'alert-events', 'alert-rules', 'activity-view', 'audit-search', 'audit-category', 'audit-count', 'audit-list', 'audit-load-more', 'export-audit',
+        'p2p-view', 'p2p-list', 'fleet-view', 'new-fleet-peer', 'preview-fleet-sync', 'apply-fleet-sync', 'fleet-summary', 'fleet-conflicts', 'fleet-list', 'clients-view', 'client-search', 'client-status-filter', 'client-count', 'clients-list', 'users-view', 'new-user', 'user-search', 'user-role-filter', 'user-count', 'users-list', 'sessions-view', 'totp-status', 'totp-action', 'new-api-token', 'api-tokens-list', 'sessions-list', 'alerts-view', 'new-alert-rule', 'alert-channels', 'alert-events', 'alert-rules', 'activity-view', 'audit-search', 'audit-category', 'audit-count', 'audit-list', 'audit-load-more', 'export-audit',
         'drawer-backdrop', 'policy-drawer', 'drawer-title', 'drawer-subtitle', 'drawer-close', 'drawer-cancel', 'policy-form', 'policy-fields', 'drawer-submit',
         'password-modal', 'password-modal-close', 'password-form', 'account-new-password', 'account-confirm-password', 'password-cancel',
         'user-modal', 'user-modal-title', 'user-modal-help', 'user-modal-close', 'user-form', 'user-username', 'user-display-name', 'user-role', 'user-password-label', 'user-password', 'user-enabled-label', 'user-enabled', 'user-force-change-label', 'user-force-change', 'user-cancel',
@@ -2061,6 +2063,26 @@
         showToast(t('fleetDeleted')); await loadManagementData({ forceHistory: false });
       }
 
+      async function runFleetSync(dryRun, button) {
+        if (!dryRun && !confirm(t('applyFleetSync'))) return;
+        setBusy(button, true, dryRun ? 'previewFleetSync' : 'applyFleetSync');
+        try {
+          const response = await apiFetch('/api/v1/fleet/sync', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ dry_run: dryRun }) });
+          if (!response.ok) return showToast(await responseError(response), true);
+          const results = await response.json();
+          elements.fleet_conflicts.replaceChildren();
+          for (const result of results) {
+            const item = document.createElement('div');
+            item.className = `alert-item ${(result.error || result.conflicts?.length) ? 'warning' : 'info'}`;
+            item.textContent = `${result.peer_name}: created ${result.created}, unchanged ${result.unchanged}${result.conflicts?.length ? `, conflicts ${result.conflicts.join(' | ')}` : ''}${result.error ? `, error ${result.error}` : ''}`;
+            elements.fleet_conflicts.append(item);
+          }
+          showToast(t(dryRun ? 'fleetSyncPreviewed' : 'fleetSyncApplied'));
+          if (!dryRun) await loadManagementData({ forceHistory: false });
+        } catch (_) { showToast(t('requestFailed'), true); }
+        finally { setBusy(button, false); }
+      }
+
       function trafficKind(type) {
         return type === 'ports' ? 'port_group' : type === 'http-proxy' ? 'http_proxy' : type;
       }
@@ -3216,6 +3238,8 @@
         elements.api_token_copy.addEventListener('click', copyApiToken);
         elements.api_token_modal.addEventListener('click', event => { if (event.target === elements.api_token_modal) closeApiTokenModal(); });
         elements.new_fleet_peer.addEventListener('click', () => openFleetModal());
+        elements.preview_fleet_sync.addEventListener('click', event => runFleetSync(true, event.currentTarget));
+        elements.apply_fleet_sync.addEventListener('click', event => runFleetSync(false, event.currentTarget));
         elements.fleet_form.addEventListener('submit', submitFleetPeer);
         elements.fleet_modal_close.addEventListener('click', closeFleetModal);
         elements.fleet_cancel.addEventListener('click', closeFleetModal);

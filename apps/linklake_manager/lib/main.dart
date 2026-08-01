@@ -834,6 +834,20 @@ class _DashboardPageState extends State<DashboardPage> {
                   raw as Map<String, dynamic>,
                   titleKeys: const ['name', 'hostname', 'id'],
                   stateKey: 'online',
+                  trailing:
+                      _identity['role']?.toString() == 'administrator' &&
+                          raw['id'] != null
+                      ? IconButton(
+                          tooltip: t('流量控制', 'Traffic control'),
+                          onPressed: () =>
+                              _showTrafficControl(switch (entry.key) {
+                                'proxy' => 'http_proxy',
+                                'group' => 'port_group',
+                                _ => entry.key,
+                              }, raw),
+                          icon: const Icon(Icons.security_outlined),
+                        )
+                      : null,
                 ),
             const SizedBox(height: 18),
           ],
@@ -2160,6 +2174,257 @@ class _DashboardPageState extends State<DashboardPage> {
     target.dispose();
   }
 
+  Future<void> _showTrafficControl(
+    String kind,
+    Map<String, dynamic> policy,
+  ) async {
+    final path = '/api/v1/traffic-controls/$kind/${policy['id']}';
+    Map<String, dynamic>? current;
+    try {
+      current = await widget.api.getObject(path);
+    } on LinkLakeApiException catch (error) {
+      if (error.statusCode != 404) rethrow;
+    }
+    if (!mounted) return;
+
+    final allowed = TextEditingController(
+      text: ((current?['allowed_cidrs'] as List?) ?? const []).join('\n'),
+    );
+    final denied = TextEditingController(
+      text: ((current?['denied_cidrs'] as List?) ?? const []).join('\n'),
+    );
+    final rate = TextEditingController(
+      text: current?['max_connections_per_minute']?.toString() ?? '',
+    );
+    final quota = TextEditingController(
+      text: current?['daily_quota_bytes'] == null
+          ? ''
+          : ((current!['daily_quota_bytes'] as num) / 1048576)
+                .toStringAsFixed(2)
+                .replaceFirst(RegExp(r'\.00$'), ''),
+    );
+    final weekdays = TextEditingController(
+      text: ((current?['active_weekdays_utc'] as List?) ?? const []).join(','),
+    );
+    String minuteText(dynamic value) {
+      if (value == null) return '';
+      final minute = (value as num).toInt();
+      return '${(minute ~/ 60).toString().padLeft(2, '0')}:${(minute % 60).toString().padLeft(2, '0')}';
+    }
+
+    final start = TextEditingController(
+      text: minuteText(current?['start_minute_utc']),
+    );
+    final end = TextEditingController(
+      text: minuteText(current?['end_minute_utc']),
+    );
+    var enabled = current?['enabled'] != false;
+    String? error;
+    bool saved = false;
+
+    List<String> splitValues(String value) => value
+        .split(RegExp(r'[\s,]+'))
+        .map((item) => item.trim())
+        .where((item) => item.isNotEmpty)
+        .toList();
+    int? optionalInt(String value) {
+      final text = value.trim();
+      return text.isEmpty ? null : int.parse(text);
+    }
+
+    int? parseMinute(String value) {
+      final text = value.trim();
+      if (text.isEmpty) return null;
+      final match = RegExp(r'^(\d{1,2}):(\d{2})$').firstMatch(text);
+      if (match == null) throw const FormatException('invalid time');
+      final hour = int.parse(match.group(1)!);
+      final minute = int.parse(match.group(2)!);
+      if (hour > 23 || minute > 59) {
+        throw const FormatException('invalid time');
+      }
+      return hour * 60 + minute;
+    }
+
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: Text(
+            '${t('流量控制', 'Traffic control')} · ${policy['name'] ?? policy['hostname'] ?? policy['id']}',
+          ),
+          content: SizedBox(
+            width: 620,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    value: enabled,
+                    onChanged: (value) => setDialogState(() => enabled = value),
+                    title: Text(t('启用限制', 'Enable controls')),
+                  ),
+                  TextField(
+                    controller: allowed,
+                    minLines: 2,
+                    maxLines: 4,
+                    decoration: InputDecoration(
+                      labelText: t('允许 CIDR（每行一个）', 'Allowed CIDRs'),
+                      hintText: '10.0.0.0/8',
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: denied,
+                    minLines: 2,
+                    maxLines: 4,
+                    decoration: InputDecoration(
+                      labelText: t('拒绝 CIDR（每行一个）', 'Denied CIDRs'),
+                      hintText: '198.51.100.0/24',
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: rate,
+                          keyboardType: TextInputType.number,
+                          decoration: InputDecoration(
+                            labelText: t('每分钟新连接上限', 'New connections/minute'),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: TextField(
+                          controller: quota,
+                          keyboardType: const TextInputType.numberWithOptions(
+                            decimal: true,
+                          ),
+                          decoration: InputDecoration(
+                            labelText: t('每日流量配额 MiB', 'Daily quota MiB'),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: weekdays,
+                    decoration: InputDecoration(
+                      labelText: t('UTC 星期（周一=0，逗号分隔）', 'UTC weekdays (Mon=0)'),
+                      hintText: '0,1,2,3,4',
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: start,
+                          decoration: InputDecoration(
+                            labelText: t('UTC 开始时间', 'UTC start'),
+                            hintText: '09:00',
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: TextField(
+                          controller: end,
+                          decoration: InputDecoration(
+                            labelText: t('UTC 结束时间', 'UTC end'),
+                            hintText: '18:00',
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  if (current?['used_today_bytes'] != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 12),
+                      child: Align(
+                        alignment: Alignment.centerLeft,
+                        child: Text(
+                          '${t('今日已用', 'Used today')}: ${current!['used_today_bytes']} bytes',
+                        ),
+                      ),
+                    ),
+                  if (error != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 12),
+                      child: Text(
+                        error!,
+                        style: TextStyle(
+                          color: Theme.of(context).colorScheme.error,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            if (current != null)
+              TextButton(
+                onPressed: () async {
+                  await widget.api.delete(path);
+                  if (dialogContext.mounted) Navigator.pop(dialogContext);
+                },
+                child: Text(t('清除限制', 'Clear controls')),
+              ),
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: Text(t('取消', 'Cancel')),
+            ),
+            FilledButton(
+              onPressed: () async {
+                try {
+                  final startMinute = parseMinute(start.text);
+                  final endMinute = parseMinute(end.text);
+                  if ((startMinute == null) != (endMinute == null)) {
+                    throw FormatException(
+                      t('开始和结束时间必须同时填写', 'Enter both start and end'),
+                    );
+                  }
+                  final quotaText = quota.text.trim();
+                  await widget.api.putObject(path, {
+                    'allowed_cidrs': splitValues(allowed.text),
+                    'denied_cidrs': splitValues(denied.text),
+                    'max_connections_per_minute': optionalInt(rate.text),
+                    'daily_quota_bytes': quotaText.isEmpty
+                        ? null
+                        : (double.parse(quotaText) * 1048576).round(),
+                    'active_weekdays_utc': splitValues(
+                      weekdays.text,
+                    ).map(int.parse).toList(),
+                    'start_minute_utc': startMinute,
+                    'end_minute_utc': endMinute,
+                    'enabled': enabled,
+                  });
+                  saved = true;
+                  if (dialogContext.mounted) Navigator.pop(dialogContext);
+                } catch (value) {
+                  setDialogState(() => error = value.toString());
+                }
+              },
+              child: Text(t('保存', 'Save')),
+            ),
+          ],
+        ),
+      ),
+    );
+    allowed.dispose();
+    denied.dispose();
+    rate.dispose();
+    quota.dispose();
+    weekdays.dispose();
+    start.dispose();
+    end.dispose();
+    if (saved && mounted) await _refresh(silent: true);
+  }
+
   Widget _p2pCard(Map<String, dynamic> value) {
     final candidates = (value['candidates'] as List? ?? [])
         .map((raw) {
@@ -2202,6 +2467,7 @@ class _DashboardPageState extends State<DashboardPage> {
     Map<String, dynamic> value, {
     required List<String> titleKeys,
     String? stateKey,
+    Widget? trailing,
   }) {
     final title = titleKeys
         .map((key) => value[key])
@@ -2222,6 +2488,7 @@ class _DashboardPageState extends State<DashboardPage> {
           subtitle: SelectableText(
             const JsonEncoder.withIndent('  ').convert(value),
           ),
+          trailing: trailing,
         ),
       ),
     );

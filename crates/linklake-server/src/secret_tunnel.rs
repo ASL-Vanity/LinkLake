@@ -2,10 +2,12 @@ use crate::{
     client_registry::Authentication,
     record_audit,
     tcp_tunnel::{copy_bidirectional_with_limit, BandwidthLimiter},
+    traffic_control::{TrafficDecision, TrafficPolicyKind},
     AppState,
 };
 use linklake_core::{read_control_frame, write_control_frame, BoxedIo, ControlFrame};
 use std::{
+    net::IpAddr,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
@@ -207,6 +209,7 @@ pub(crate) async fn connect_visitor(
     visitor_client_id: Uuid,
     client_token: String,
     access_key: String,
+    source_ip: IpAddr,
 ) {
     if !authenticated_client(&state, visitor_client_id, &client_token) {
         reject(&state, &mut visitor_stream, "invalid client credentials").await;
@@ -227,6 +230,38 @@ pub(crate) async fn connect_visitor(
         .await;
         return;
     };
+    let traffic_decision = state
+        .traffic_controls
+        .lock()
+        .expect("traffic control catalog lock poisoned")
+        .authorize(
+            TrafficPolicyKind::Secret,
+            runtime_policy.policy_id,
+            source_ip,
+            crate::unix_seconds(),
+        );
+    match traffic_decision {
+        Ok(TrafficDecision::Allowed) => {}
+        Ok(decision) => {
+            reject(
+                &state,
+                &mut visitor_stream,
+                &format!("secret tunnel traffic control rejected connection: {decision:?}"),
+            )
+            .await;
+            return;
+        }
+        Err(error) => {
+            tracing::warn!("Secret traffic control evaluation failed: {error}");
+            reject(
+                &state,
+                &mut visitor_stream,
+                "secret tunnel traffic control is temporarily unavailable",
+            )
+            .await;
+            return;
+        }
+    }
     let context = state
         .secret_tunnels
         .lock()
@@ -368,6 +403,19 @@ pub(crate) async fn connect_visitor(
                         .statistics
                         .bytes_to_visitor
                         .fetch_add(to_visitor, Ordering::Relaxed);
+                    if let Err(error) = state
+                        .traffic_controls
+                        .lock()
+                        .expect("traffic control catalog lock poisoned")
+                        .record_bytes(
+                            TrafficPolicyKind::Secret,
+                            runtime_policy.policy_id,
+                            from_visitor.saturating_add(to_visitor),
+                            crate::unix_seconds(),
+                        )
+                    {
+                        tracing::warn!("Could not record Secret traffic usage: {error}");
+                    }
                 }
                 Some(Ok(Err(error))) => {
                     context

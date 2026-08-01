@@ -59,7 +59,7 @@ async function loginPage(targetPage, loginUsername, loginPassword) {
 
 async function pageApi(targetPage, url, options = {}) {
   return targetPage.evaluate(async ({ url, options }) => {
-    const response = await fetch(url, { ...options, headers: { 'Content-Type': 'application/json', ...(options.headers || {}) } });
+    const response = await fetch(url, { ...options, headers: { 'Content-Type': 'application/json', 'X-LinkLake-CSRF': '1', ...(options.headers || {}) } });
     return { status: response.status, body: await response.json().catch(() => null) };
   }, { url, options });
 }
@@ -165,6 +165,12 @@ try {
   await page.waitForFunction(() => document.querySelector('#service-list')?.textContent?.includes('Disabled') || document.querySelector('#service-list')?.textContent?.includes('已停用'));
   assert(await page.locator('#export-policies').isVisible(), '策略导出入口不可见');
   assert(await page.locator('#import-policies').isVisible(), '策略导入入口不可见');
+
+  await openRoute('#/fleet');
+  await page.locator('#fleet-view:not(.hidden)').waitFor();
+  await page.locator('#preview-fleet-sync').click();
+  await page.waitForTimeout(250);
+  assert(pageErrors.length === 0, `多云同步预览触发页面错误：${pageErrors.join('; ')}`);
 
   // 管理员通过真实界面创建、编辑、重置和撤销用户会话。
   await openRoute('#/users');
