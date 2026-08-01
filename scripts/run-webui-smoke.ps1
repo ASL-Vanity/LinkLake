@@ -68,6 +68,8 @@ try {
     $startInfo.EnvironmentVariables['LINKLAKE_UDP_RELAY_BIND'] = "127.0.0.1:$UdpRelayPort"
     $startInfo.EnvironmentVariables['LINKLAKE_UDP_RELAY_ENDPOINT'] = "127.0.0.1:$UdpRelayPort"
     $startInfo.EnvironmentVariables['LINKLAKE_UDP_RELAY_SERVER_NAME'] = 'localhost'
+    $startInfo.EnvironmentVariables['LINKLAKE_PUBLIC_PORT_RANGES'] = '18080-18081,32900-32999'
+    $startInfo.EnvironmentVariables['LINKLAKE_RESERVED_TCP_PORTS'] = '18081'
     $startInfo.EnvironmentVariables['LINKLAKE_DATA_DIR'] = $dataDir
     $startInfo.EnvironmentVariables['LINKLAKE_ADMIN_USERNAME'] = $adminUsername
     $startInfo.EnvironmentVariables['LINKLAKE_ADMIN_PASSWORD'] = $adminPassword
@@ -88,11 +90,18 @@ try {
 
     $enrollmentHeaders = @{ Authorization = "Bearer $enrollmentToken" }
     $managementHeaders = @{ Authorization = "Bearer $managementToken" }
+    $portPolicy = Invoke-RestMethod -Uri "$baseUrl/api/v1/public-port-policy" -Headers $managementHeaders
+    if ($portPolicy.tcp_allowed -ne '18080-18081,32900-32999' -or $portPolicy.udp_allowed -ne '18080-18081,32900-32999') {
+        throw "公网端口允许策略未按服务端配置返回：$($portPolicy | ConvertTo-Json -Compress)"
+    }
+    if ([string]$portPolicy.tcp_reserved -notmatch '18081') {
+        throw "TCP 保留端口策略未包含显式保留端口：$($portPolicy.tcp_reserved)"
+    }
     $client = Invoke-LinkLakeJson -Method Post -Path '/api/v1/clients/enroll' -Headers $enrollmentHeaders -Body @{ name = 'smoke-client'; platform = 'windows' }
     $clientId = [string]$client.client_id
 
     $policies = @(
-        @{ Path = '/api/v1/tcp-tunnels'; Body = @{ client_id = $clientId; name = 'smoke-tcp'; public_port = 32901; target_addr = '127.0.0.1:18001'; max_connections = 64; bandwidth_limit_bps = $null } },
+        @{ Path = '/api/v1/tcp-tunnels'; Body = @{ client_id = $clientId; name = 'smoke-tcp'; public_port = 18080; target_addr = '127.0.0.1:18001'; max_connections = 64; bandwidth_limit_bps = $null } },
         @{ Path = '/api/v1/udp-tunnels'; Body = @{ client_id = $clientId; name = 'smoke-udp'; public_port = 32902; target_addr = '127.0.0.1:18002'; max_sessions = 256; session_idle_timeout_seconds = 120; bandwidth_limit_bps = $null } },
         @{ Path = '/api/v1/port-groups'; Body = @{ client_id = $clientId; name = 'smoke-ports'; protocol = 'tcp'; public_ports = '32910-32911'; target_host = '127.0.0.1'; target_ports = '18110-18111'; max_connections = 64; max_sessions = $null; session_idle_timeout_seconds = $null; bandwidth_limit_bps = $null } },
         @{ Path = '/api/v1/http-routes'; Body = @{ client_id = $clientId; name = 'smoke-http'; hostname = 'smoke.linklake.test'; target_addr = '127.0.0.1:18080'; max_connections = 64 } },

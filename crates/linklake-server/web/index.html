@@ -515,7 +515,7 @@
           auditLogin: 'Administrator signed in', auditLoginFailed: 'Administrator sign-in failed', auditPasswordChanged: 'Administrator password changed', auditLogout: 'Administrator signed out', auditClientEnrolled: 'Client enrolled', auditPolicyCreated: 'Policy created', auditPolicyUpdated: 'Policy updated', auditPolicyDeleted: 'Policy deleted', auditRegistered: 'Service registered', auditAcmeUpdated: 'ACME settings updated', auditCertificateStarted: 'Certificate operation started', auditCertificateSucceeded: 'Certificate operation succeeded', auditCertificateFailed: 'Certificate operation failed', auditP2pUpdated: 'P2P candidates updated', auditP2pDirect: 'P2P direct connection established', auditP2pRelay: 'P2P connection fell back to relay',
           signInFailed: 'Sign-in failed. Check the username and password.', signingIn: 'Signing in…', changeRequired: 'Change the initial password before using the management console.', changingPassword: 'Changing password…', passwordChanged: 'Password changed.', passwordChangeFailed: 'Unable to change the password. Use at least 12 characters.', signedOut: 'Signed out.', sessionExpired: 'The administrator session expired. Sign in again.', requestFailed: 'The server did not respond. Check the server and network connection.', statusFailed: 'Unable to load management data.', invalidResponse: 'The server returned an invalid response.',
           configIssueAlert: '{count} client configuration issue(s)', certificateExpiredAlert: '{count} expired certificate(s)', certificateExpiringAlert: '{count} certificate(s) expire within 30 days', authenticationFailureAlert: '{count} authentication failure(s) since startup', transportErrorAlert: '{count} transport or handshake error(s) since startup',
-          errorUnknownClient: 'The selected client does not exist.', errorInvalidName: 'The name must contain 1 to 80 characters.', errorInvalidPort: 'The public port must be between 32000 and 32999.', errorDuplicatePort: 'This public port is already assigned.', errorInvalidTarget: 'Use a valid host:port target.', errorInvalidHostname: 'The hostname is invalid.', errorDuplicateHostname: 'The hostname is already assigned.', errorInvalidLimit: 'One of the configured limits is invalid.', errorStorage: 'Policy storage is unavailable. Check the data directory and server log.', errorUnknownPolicy: 'The policy does not exist.', errorInvalidUsername: 'The proxy username is invalid.', errorInvalidPortExpression: 'Use single ports, comma-separated lists or ascending ranges.', errorPortCountMismatch: 'Public and target port counts must match.', errorDuplicatePortInGroup: 'A port appears more than once in this group.', errorTooManyMappings: 'A port group can contain at most 256 mappings.', errorAcme: 'The ACME request failed. Check the settings, DNS and server log.'
+          allowedPorts: 'Allowed: {ports}', reservedPorts: 'reserved: {ports}', errorUnknownClient: 'The selected client does not exist.', errorInvalidName: 'The name must contain 1 to 80 characters.', errorInvalidPort: 'The public port is outside the server policy. {ports}.', errorDuplicatePort: 'This public port is already assigned.', errorInvalidTarget: 'Use a valid host:port target.', errorInvalidHostname: 'The hostname is invalid.', errorDuplicateHostname: 'The hostname is already assigned.', errorInvalidLimit: 'One of the configured limits is invalid.', errorStorage: 'Policy storage is unavailable. Check the data directory and server log.', errorUnknownPolicy: 'The policy does not exist.', errorInvalidUsername: 'The proxy username is invalid.', errorInvalidPortExpression: 'Use single ports, comma-separated lists or ascending ranges.', errorPortCountMismatch: 'Public and target port counts must match.', errorDuplicatePortInGroup: 'A port appears more than once in this group.', errorTooManyMappings: 'A port group can contain at most 256 mappings.', errorAcme: 'The ACME request failed. Check the settings, DNS and server log.'
         },
         zh: {
           title: 'LinkLake 管理控制台', console: '管理控制台', appearance: '外观', themeSystem: '跟随系统', themeLight: '浅色', themeDark: '深色', palette: '配色', paletteLake: '湖蓝', paletteOcean: '海洋', paletteJade: '翡翠', paletteViolet: '紫罗兰',
@@ -538,7 +538,7 @@
           auditLogin: '管理员已登录', auditLoginFailed: '管理员登录失败', auditPasswordChanged: '管理员密码已修改', auditLogout: '管理员已退出', auditClientEnrolled: '客户端已注册', auditPolicyCreated: '策略已创建', auditPolicyUpdated: '策略已更新', auditPolicyDeleted: '策略已删除', auditRegistered: '服务已注册', auditAcmeUpdated: 'ACME 设置已更新', auditCertificateStarted: '证书任务已开始', auditCertificateSucceeded: '证书任务已成功', auditCertificateFailed: '证书任务失败', auditP2pUpdated: 'P2P 候选地址已更新', auditP2pDirect: 'P2P 直连已建立', auditP2pRelay: 'P2P 连接已回退到中继',
           signInFailed: '登录失败，请检查用户名和密码。', signingIn: '正在登录…', changeRequired: '请先修改初始密码，再使用管理控制台。', changingPassword: '正在修改密码…', passwordChanged: '密码已修改。', passwordChangeFailed: '无法修改密码，请使用至少 12 位的新密码。', signedOut: '已退出登录。', sessionExpired: '管理员会话已过期，请重新登录。', requestFailed: '服务端没有响应，请检查服务和网络连接。', statusFailed: '无法加载管理数据。', invalidResponse: '服务端返回了无效响应。',
           configIssueAlert: '{count} 个客户端配置存在问题', certificateExpiredAlert: '{count} 张证书已过期', certificateExpiringAlert: '{count} 张证书将在 30 天内到期', authenticationFailureAlert: '服务启动以来发生 {count} 次认证失败', transportErrorAlert: '服务启动以来发生 {count} 次传输或握手错误',
-          errorUnknownClient: '所选客户端不存在。', errorInvalidName: '名称长度必须为 1 到 80 个字符。', errorInvalidPort: '公网端口必须在 32000 到 32999 之间。', errorDuplicatePort: '该公网端口已被占用。', errorInvalidTarget: '请使用有效的 host:port 目标地址。', errorInvalidHostname: '域名格式无效。', errorDuplicateHostname: '该域名已被占用。', errorInvalidLimit: '某项限制参数无效。', errorStorage: '策略存储不可用，请检查数据目录和服务端日志。', errorUnknownPolicy: '策略不存在。', errorInvalidUsername: '代理用户名格式无效。', errorInvalidPortExpression: '请使用单端口、逗号列表或升序范围。', errorPortCountMismatch: '公网端口与目标端口数量必须一致。', errorDuplicatePortInGroup: '端口组内存在重复端口。', errorTooManyMappings: '一个端口组最多包含 256 个映射。', errorAcme: 'ACME 请求失败，请检查设置、DNS 和服务端日志。'
+          allowedPorts: '允许范围：{ports}', reservedPorts: '保留端口：{ports}', errorUnknownClient: '所选客户端不存在。', errorInvalidName: '名称长度必须为 1 到 80 个字符。', errorInvalidPort: '公网端口不符合服务端策略。{ports}。', errorDuplicatePort: '该公网端口已被占用。', errorInvalidTarget: '请使用有效的 host:port 目标地址。', errorInvalidHostname: '域名格式无效。', errorDuplicateHostname: '该域名已被占用。', errorInvalidLimit: '某项限制参数无效。', errorStorage: '策略存储不可用，请检查数据目录和服务端日志。', errorUnknownPolicy: '策略不存在。', errorInvalidUsername: '代理用户名格式无效。', errorInvalidPortExpression: '请使用单端口、逗号列表或升序范围。', errorPortCountMismatch: '公网端口与目标端口数量必须一致。', errorDuplicatePortInGroup: '端口组内存在重复端口。', errorTooManyMappings: '一个端口组最多包含 256 个映射。', errorAcme: 'ACME 请求失败，请检查设置、DNS 和服务端日志。'
         }
       };
 
@@ -548,7 +548,7 @@
           fields: [
             { name: 'client_id', label: 'client', type: 'client', required: true, full: true },
             { name: 'name', label: 'tunnelName', type: 'text', required: true, full: true },
-            { name: 'public_port', label: 'publicPort', type: 'number', min: 32000, max: 32999, required: true },
+            { name: 'public_port', label: 'publicPort', type: 'number', min: 1, max: 65535, required: true, portProtocol: 'tcp' },
             { name: 'target_addr', label: 'targetAddress', type: 'text', required: true, full: true },
             { name: 'max_connections', label: 'maxConnections', type: 'number', min: 1, max: 1024, required: true, default: 64 },
             { name: 'bandwidth_limit_bps', label: 'bandwidthLimit', type: 'number', min: 1024, max: 1000000000 }
@@ -559,7 +559,7 @@
           fields: [
             { name: 'client_id', label: 'client', type: 'client', required: true, full: true },
             { name: 'name', label: 'tunnelName', type: 'text', required: true, full: true },
-            { name: 'public_port', label: 'publicPort', type: 'number', min: 32000, max: 32999, required: true },
+            { name: 'public_port', label: 'publicPort', type: 'number', min: 1, max: 65535, required: true, portProtocol: 'udp' },
             { name: 'target_addr', label: 'targetAddress', type: 'text', required: true, full: true },
             { name: 'max_sessions', label: 'maxSessions', type: 'number', min: 1, max: 4096, required: true, default: 256 },
             { name: 'session_idle_timeout_seconds', label: 'idleTimeout', type: 'number', min: 30, max: 3600, required: true, default: 120 },
@@ -572,7 +572,7 @@
             { name: 'client_id', label: 'client', type: 'client', required: true, full: true },
             { name: 'name', label: 'tunnelName', type: 'text', required: true, full: true },
             { name: 'protocol', label: 'protocol', type: 'select', options: [{ value: 'tcp', label: 'TCP' }, { value: 'udp', label: 'UDP' }], required: true, default: 'tcp' },
-            { name: 'public_ports', label: 'publicPorts', type: 'text', required: true, full: true },
+            { name: 'public_ports', label: 'publicPorts', type: 'text', required: true, full: true, portProtocolField: 'protocol' },
             { name: 'target_host', label: 'targetHost', type: 'text', required: true },
             { name: 'target_ports', label: 'targetPorts', type: 'text', required: true },
             { name: 'max_connections', label: 'maxConnections', type: 'number', min: 1, max: 1024, default: 64, when: { field: 'protocol', value: 'tcp' } },
@@ -620,7 +620,7 @@
           fields: [
             { name: 'client_id', label: 'client', type: 'client', required: true, full: true },
             { name: 'name', label: 'proxyName', type: 'text', required: true, full: true },
-            { name: 'public_port', label: 'publicPort', type: 'number', min: 32000, max: 32999, required: true },
+            { name: 'public_port', label: 'publicPort', type: 'number', min: 1, max: 65535, required: true, portProtocol: 'tcp' },
             { name: 'username', label: 'proxyUsername', type: 'text', required: true },
             { name: 'max_connections', label: 'maxConnections', type: 'number', min: 1, max: 1024, required: true, default: 64 },
             { name: 'bandwidth_limit_bps', label: 'bandwidthLimit', type: 'number', min: 1024, max: 1000000000 }
@@ -631,7 +631,7 @@
           fields: [
             { name: 'client_id', label: 'client', type: 'client', required: true, full: true },
             { name: 'name', label: 'proxyName', type: 'text', required: true, full: true },
-            { name: 'public_port', label: 'publicPort', type: 'number', min: 32000, max: 32999, required: true },
+            { name: 'public_port', label: 'publicPort', type: 'number', min: 1, max: 65535, required: true, portProtocol: 'tcp' },
             { name: 'username', label: 'proxyUsername', type: 'text', required: true },
             { name: 'max_connections', label: 'maxConnections', type: 'number', min: 1, max: 1024, required: true, default: 64 },
             { name: 'bandwidth_limit_bps', label: 'bandwidthLimit', type: 'number', min: 1024, max: 1000000000 }
@@ -761,8 +761,9 @@
       }
 
       function readApiErrorCode(code, fallback = 'requestFailed') {
+        if (code === 'invalid_public_port') return t('errorInvalidPort', { ports: portPolicyDescription() });
         const map = {
-          unknown_client: 'errorUnknownClient', invalid_name: 'errorInvalidName', invalid_public_port: 'errorInvalidPort', duplicate_public_port: 'errorDuplicatePort', duplicate_tcp_public_port: 'errorDuplicatePort', invalid_target: 'errorInvalidTarget', invalid_hostname: 'errorInvalidHostname', duplicate_hostname: 'errorDuplicateHostname', duplicate_sni_hostname: 'errorDuplicateHostname', invalid_connection_limit: 'errorInvalidLimit', invalid_session_limit: 'errorInvalidLimit', invalid_idle_timeout: 'errorInvalidLimit', invalid_bandwidth_limit: 'errorInvalidLimit', invalid_socks5_username: 'errorInvalidUsername', invalid_http_proxy_username: 'errorInvalidUsername', invalid_port_expression: 'errorInvalidPortExpression', port_count_mismatch: 'errorPortCountMismatch', duplicate_port_in_group: 'errorDuplicatePortInGroup', too_many_port_mappings: 'errorTooManyMappings', unknown_udp_tunnel: 'errorUnknownPolicy', unknown_port_group: 'errorUnknownPolicy', unknown_http_route: 'errorUnknownPolicy', unknown_sni_route: 'errorUnknownPolicy', unknown_secret_tunnel: 'errorUnknownPolicy', unknown_socks5_proxy: 'errorUnknownPolicy', unknown_http_proxy: 'errorUnknownPolicy', udp_policy_storage_error: 'errorStorage', port_group_policy_storage_error: 'errorStorage', http_route_policy_storage_error: 'errorStorage', sni_route_policy_storage_error: 'errorStorage', secret_policy_storage_error: 'errorStorage', socks5_policy_storage_error: 'errorStorage', http_proxy_policy_storage_error: 'errorStorage'
+          unknown_client: 'errorUnknownClient', invalid_name: 'errorInvalidName', invalid_public_port: 'errorInvalidPort', duplicate_public_port: 'errorDuplicatePort', duplicate_tcp_public_port: 'errorDuplicatePort', invalid_target: 'errorInvalidTarget', invalid_hostname: 'errorInvalidHostname', duplicate_hostname: 'errorDuplicateHostname', duplicate_sni_hostname: 'errorDuplicateHostname', invalid_connection_limit: 'errorInvalidLimit', invalid_session_limit: 'errorInvalidLimit', invalid_idle_timeout: 'errorInvalidLimit', invalid_bandwidth_limit: 'errorInvalidLimit', invalid_socks5_username: 'errorInvalidUsername', invalid_http_proxy_username: 'errorInvalidUsername', invalid_port_expression: 'errorInvalidPortExpression', port_count_mismatch: 'errorPortCountMismatch', duplicate_port_in_group: 'errorDuplicatePortInGroup', too_many_port_mappings: 'errorTooManyMappings', unknown_policy: 'errorUnknownPolicy', unknown_udp_tunnel: 'errorUnknownPolicy', unknown_port_group: 'errorUnknownPolicy', unknown_http_route: 'errorUnknownPolicy', unknown_sni_route: 'errorUnknownPolicy', unknown_secret_tunnel: 'errorUnknownPolicy', unknown_socks5_proxy: 'errorUnknownPolicy', unknown_http_proxy: 'errorUnknownPolicy', tcp_policy_storage_error: 'errorStorage', udp_policy_storage_error: 'errorStorage', port_group_policy_storage_error: 'errorStorage', http_route_policy_storage_error: 'errorStorage', sni_route_policy_storage_error: 'errorStorage', secret_policy_storage_error: 'errorStorage', socks5_policy_storage_error: 'errorStorage', http_proxy_policy_storage_error: 'errorStorage'
         };
         if (String(code || '').includes('acme') || String(code || '').includes('certificate') || String(code || '').includes('tls_')) return t('errorAcme');
         return t(map[code] || fallback);
@@ -1599,7 +1600,24 @@
 
       function fieldLabel(field) {
         const suffix = !field.required && field.type !== 'checkbox' ? ` · ${t('optional')}` : '';
-        return `${t(field.label)}${suffix}`;
+        const protocol = field.portProtocol || (field.portProtocolField ? (state.drawer.values?.[field.portProtocolField] || 'tcp') : null);
+        const portHint = protocol ? ` · ${portPolicyDescription(protocol)}` : '';
+        return `${t(field.label)}${suffix}${portHint}`;
+      }
+
+      function allowedPortExpression(protocol = null) {
+        const policy = state.dashboard?.publicPortPolicy;
+        if (!policy) return '32000-32999';
+        const selected = protocol || (state.drawer.type === 'udp' ? 'udp' : state.drawer.type === 'ports' ? (state.drawer.values?.protocol || 'tcp') : 'tcp');
+        return selected === 'udp' ? policy.udp_allowed : policy.tcp_allowed;
+      }
+
+      function portPolicyDescription(protocol = null) {
+        const selected = protocol || (state.drawer.type === 'udp' ? 'udp' : state.drawer.type === 'ports' ? (state.drawer.values?.protocol || 'tcp') : 'tcp');
+        const policy = state.dashboard?.publicPortPolicy;
+        const allowed = allowedPortExpression(selected);
+        const reserved = policy ? (selected === 'udp' ? policy.udp_reserved : policy.tcp_reserved) : '';
+        return `${t('allowedPorts', { ports: allowed })}${reserved ? `; ${t('reservedPorts', { ports: reserved })}` : ''}`;
       }
 
       function appendClientOptions(select, optional = false) {
@@ -1673,6 +1691,14 @@
           wrapper.classList.toggle('hidden', !visible);
           const input = wrapper.querySelector('input,select,textarea');
           if (input) input.disabled = !visible;
+        });
+      }
+
+      function updateDrawerPortLabels() {
+        if (!state.drawer.open) return;
+        POLICY_TYPES[state.drawer.type].fields.filter(field => field.portProtocol || field.portProtocolField).forEach(field => {
+          const span = elements.policy_fields.querySelector(`[data-field-name="${field.name}"] > span`);
+          if (span) span.textContent = fieldLabel(field);
         });
       }
 
@@ -1991,11 +2017,11 @@
 
       function emptyDashboard() {
         const metrics = new Proxy({}, { get(target, key) { return key in target ? target[key] : 0; } });
-        return { status: {}, metrics, events: [], tcpPolicies: [], udpPolicies: [], portGroups: [], httpRoutes: [], sniRoutes: [], secretPolicies: [], socks5Policies: [], httpProxyPolicies: [], clients: [], p2pNodes: [], acme: { enabled: false, environment: 'staging', directory_url: acmeDirectories.staging, contact_email: '', terms_accepted: false, renew_before_days: 30, account_registered: false } };
+        return { status: {}, metrics, events: [], tcpPolicies: [], udpPolicies: [], portGroups: [], httpRoutes: [], sniRoutes: [], secretPolicies: [], socks5Policies: [], httpProxyPolicies: [], clients: [], p2pNodes: [], publicPortPolicy: { tcp_allowed: '32000-32999', udp_allowed: '32000-32999', tcp_reserved: '', udp_reserved: '' }, acme: { enabled: false, environment: 'staging', directory_url: acmeDirectories.staging, contact_email: '', terms_accepted: false, renew_before_days: 30, account_registered: false } };
       }
 
       function managementRequestPlan() {
-        const common = [{ key: 'status', url: '/api/v1/status' }];
+        const common = [{ key: 'status', url: '/api/v1/status' }, { key: 'publicPortPolicy', url: '/api/v1/public-port-policy' }];
         if (state.route.view === 'overview') return [...common,
           { key: 'metrics', url: '/api/v1/metrics' }, { key: 'tcpPolicies', url: '/api/v1/tcp-tunnels' }, { key: 'udpPolicies', url: '/api/v1/udp-tunnels' }, { key: 'portGroups', url: '/api/v1/port-groups' }, { key: 'httpRoutes', url: '/api/v1/http-routes' }, { key: 'sniRoutes', url: '/api/v1/sni-routes' }, { key: 'secretPolicies', url: '/api/v1/secret-tunnels' }, { key: 'socks5Policies', url: '/api/v1/socks5-proxies' }, { key: 'httpProxyPolicies', url: '/api/v1/http-proxies' }, { key: 'clients', url: '/api/v1/clients' }, { key: 'history', url: historyQuery(), optional: true }
         ];
@@ -2135,7 +2161,7 @@
         elements.service_search.addEventListener('input', () => { state.serviceSearch = elements.service_search.value; renderServices(); });
         elements.service_status_filter.addEventListener('change', () => { state.serviceStatus = elements.service_status_filter.value; renderServices(); });
         elements.policy_form.addEventListener('submit', submitPolicy);
-        elements.policy_form.addEventListener('input', () => { state.drawer.dirty = true; state.drawer.values = collectDrawerValues(); updateDrawerConditions(); });
+        elements.policy_form.addEventListener('input', () => { state.drawer.dirty = true; state.drawer.values = collectDrawerValues(); updateDrawerConditions(); updateDrawerPortLabels(); });
         elements.drawer_close.addEventListener('click', () => cancelEdit());
         elements.drawer_cancel.addEventListener('click', () => cancelEdit());
         elements.drawer_backdrop.addEventListener('click', () => cancelEdit());

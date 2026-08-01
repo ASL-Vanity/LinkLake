@@ -10,6 +10,7 @@ mod http_route_catalog;
 mod http_tunnel;
 mod p2p_control;
 mod p2p_node_catalog;
+mod public_port_policy;
 mod secret_tunnel;
 mod secret_tunnel_catalog;
 mod sni_route_catalog;
@@ -48,6 +49,7 @@ use linklake_core::{
     PRODUCT_NAME,
 };
 use p2p_node_catalog::{P2pNodeCatalog, P2pNodeRecord};
+use public_port_policy::{PublicPortPolicy, PublicPortPolicyView};
 use secret_tunnel_catalog::{
     CreateSecretTunnelPolicy, CreatedSecretTunnelPolicy, SecretPolicyError, SecretTunnelCatalog,
     SecretTunnelPolicy, UpdateSecretTunnelPolicy,
@@ -273,6 +275,7 @@ struct AppState {
     login_hash_permits: Arc<Semaphore>,
     audit: Mutex<AuditLog>,
     management_cookies_secure: bool,
+    public_port_policy: PublicPortPolicy,
     clients: Mutex<ClientRegistry>,
     tunnel_catalog: Mutex<TunnelCatalog>,
     tunnels: Mutex<HashMap<u16, tcp_tunnel::TunnelRegistration>>,
@@ -949,6 +952,33 @@ fn coded_management_error(error: ApiError) -> CodedApiError {
     CodedApiError(error.0, "management_authorization_failed", error.1)
 }
 
+fn coded_tcp_policy_error(error: anyhow::Error) -> CodedApiError {
+    let message = error.to_string();
+    let code = if message.contains("tunnel name is invalid") {
+        "invalid_name"
+    } else if message.contains("public port is outside") {
+        "invalid_public_port"
+    } else if message.contains("target address is invalid") {
+        "invalid_target"
+    } else if message.contains("connection limit is invalid") {
+        "invalid_connection_limit"
+    } else if message.contains("bandwidth limit is invalid") {
+        "invalid_bandwidth_limit"
+    } else if message.contains("public port is already assigned")
+        || message.contains("UNIQUE constraint failed")
+    {
+        "duplicate_public_port"
+    } else {
+        "tcp_policy_storage_error"
+    };
+    let status = match code {
+        "tcp_policy_storage_error" => StatusCode::INTERNAL_SERVER_ERROR,
+        "duplicate_public_port" => StatusCode::CONFLICT,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    CodedApiError(status, code, "TCP tunnel policy operation failed")
+}
+
 fn coded_http_route_creation_error(error: CreateHttpRouteError) -> CodedApiError {
     match error {
         CreateHttpRouteError::InvalidName => CodedApiError(
@@ -1210,6 +1240,22 @@ async fn run_server(
     let udp_relay_server_name = std::env::var("LINKLAKE_UDP_RELAY_SERVER_NAME")
         .ok()
         .filter(|value| !value.trim().is_empty());
+    let public_port_policy = PublicPortPolicy::from_environment(
+        std::iter::once(address)
+            .chain(std::iter::once(control_address))
+            .chain(http_address)
+            .chain(https_address)
+            .chain(sni_address),
+        udp_relay_address,
+    )?;
+    let public_port_policy_view = public_port_policy.view();
+    tracing::info!(
+        tcp_allowed = %public_port_policy_view.tcp_allowed,
+        tcp_reserved = %public_port_policy_view.tcp_reserved,
+        udp_allowed = %public_port_policy_view.udp_allowed,
+        udp_reserved = %public_port_policy_view.udp_reserved,
+        "Loaded public port policy"
+    );
     let control_cert = std::env::var("LINKLAKE_CONTROL_CERT_PATH").ok();
     let control_key = std::env::var("LINKLAKE_CONTROL_KEY_PATH").ok();
     let management_cert = std::env::var("LINKLAKE_MANAGEMENT_CERT_PATH").ok();
@@ -1325,8 +1371,12 @@ async fn run_server(
         login_hash_permits: Arc::new(Semaphore::new(LOGIN_HASH_CONCURRENCY)),
         audit: Mutex::new(AuditLog::open(data_dir.as_deref())?),
         management_cookies_secure,
+        public_port_policy: public_port_policy.clone(),
         clients: Mutex::new(ClientRegistry::open(data_dir.as_deref())?),
-        tunnel_catalog: Mutex::new(TunnelCatalog::open(data_dir.as_deref())?),
+        tunnel_catalog: Mutex::new(TunnelCatalog::open_with_port_policy(
+            data_dir.as_deref(),
+            public_port_policy,
+        )?),
         tunnels: Mutex::new(HashMap::new()),
         tunnel_statistics: Mutex::new(HashMap::new()),
         seen_tunnel_registrations: Mutex::new(HashSet::new()),
@@ -1373,6 +1423,7 @@ async fn run_server(
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/change-password", post(change_password))
         .route("/api/v1/status", get(status))
+        .route("/api/v1/public-port-policy", get(get_public_port_policy))
         .route("/api/v1/metrics", get(metrics))
         .route("/api/v1/metrics/history", get(metrics_history))
         .route(
@@ -1688,6 +1739,14 @@ async fn health() -> Json<HealthResponse> {
         api_version: API_VERSION,
         status: "ok",
     })
+}
+
+async fn get_public_port_policy(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<PublicPortPolicyView>, ApiError> {
+    authorize_management(&state, &headers)?;
+    Ok(Json(state.public_port_policy.view()))
 }
 
 async fn status(
@@ -3690,16 +3749,17 @@ async fn create_tcp_tunnel(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(request): Json<CreateTcpTunnelPolicy>,
-) -> Result<Json<TcpTunnelPolicy>, ApiError> {
-    authorize_management(&state, &headers)?;
+) -> Result<Json<TcpTunnelPolicy>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
     if !state
         .clients
         .lock()
         .expect("client registry lock poisoned")
         .contains(request.client_id)
     {
-        return Err(ApiError(
+        return Err(CodedApiError(
             StatusCode::BAD_REQUEST,
+            "unknown_client",
             "unknown client for tunnel policy",
         ));
     }
@@ -3708,7 +3768,7 @@ async fn create_tcp_tunnel(
         .lock()
         .expect("tunnel catalog lock poisoned")
         .create(request)
-        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "could not create tunnel policy"))?;
+        .map_err(coded_tcp_policy_error)?;
     record_audit(
         &state,
         "tcp_tunnel.policy.created",
@@ -3726,16 +3786,17 @@ async fn update_tcp_tunnel(
     headers: HeaderMap,
     Path(tunnel_id): Path<Uuid>,
     Json(request): Json<UpdateTcpTunnelPolicy>,
-) -> Result<Json<TcpTunnelPolicy>, ApiError> {
-    authorize_management(&state, &headers)?;
+) -> Result<Json<TcpTunnelPolicy>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
     if !state
         .clients
         .lock()
         .expect("client registry lock poisoned")
         .contains(request.client_id)
     {
-        return Err(ApiError(
+        return Err(CodedApiError(
             StatusCode::BAD_REQUEST,
+            "unknown_client",
             "unknown client for tunnel policy",
         ));
     }
@@ -3745,16 +3806,25 @@ async fn update_tcp_tunnel(
             .lock()
             .expect("tunnel catalog lock poisoned");
         let old = catalog.policy_by_id(tunnel_id).map_err(|_| {
-            ApiError(
+            CodedApiError(
                 StatusCode::INTERNAL_SERVER_ERROR,
+                "tcp_policy_storage_error",
                 "could not read tunnel policy",
             )
         })?;
         let updated = catalog
             .update(tunnel_id, request)
-            .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "could not update tunnel policy"))?;
-        let old = old.ok_or(ApiError(StatusCode::NOT_FOUND, "unknown tunnel policy"))?;
-        let updated = updated.ok_or(ApiError(StatusCode::NOT_FOUND, "unknown tunnel policy"))?;
+            .map_err(coded_tcp_policy_error)?;
+        let old = old.ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_policy",
+            "unknown tunnel policy",
+        ))?;
+        let updated = updated.ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_policy",
+            "unknown tunnel policy",
+        ))?;
         (old, updated)
     };
     // 更新后强制旧注册重新配对，使目标地址、端口和限流参数立即生效。
@@ -6330,9 +6400,9 @@ mod windows_service_host {
 mod tests {
     use super::{
         apply_cache_control, auth_me_response, build_metrics_history_response,
-        certificate_target_matches, coded_http_route_creation_error, login_throttle_identity,
-        management_session_cookie, normalize_metrics_history_step, parse_metrics_history_range,
-        release_certificate_job_slot, reserve_certificate_job_slot,
+        certificate_target_matches, coded_http_route_creation_error, coded_tcp_policy_error,
+        login_throttle_identity, management_session_cookie, normalize_metrics_history_step,
+        parse_metrics_history_range, release_certificate_job_slot, reserve_certificate_job_slot,
         select_certificate_maintenance_operation, session_cookie_header, tcp_history_error_total,
         udp_history_error_total, udp_metrics_response, CertificateOperation, HistoryCounters,
         LoginResponse, LoginThrottle, MetricsHistory, MetricsHistoryProtocol, MetricsHistorySample,
@@ -6915,6 +6985,32 @@ mod tests {
             let response = coded_http_route_creation_error(error);
             assert_eq!(response.0, expected_status);
             assert_eq!(response.1, expected_code);
+        }
+    }
+
+    #[test]
+    fn tcp_policy_errors_have_stable_api_codes() {
+        let cases = [
+            (
+                "public port is outside the permitted range",
+                StatusCode::BAD_REQUEST,
+                "invalid_public_port",
+            ),
+            (
+                "public port is already assigned",
+                StatusCode::CONFLICT,
+                "duplicate_public_port",
+            ),
+            (
+                "target address is invalid",
+                StatusCode::BAD_REQUEST,
+                "invalid_target",
+            ),
+        ];
+        for (message, expected_status, expected_code) in cases {
+            let error = coded_tcp_policy_error(anyhow::anyhow!(message));
+            assert_eq!(error.0, expected_status);
+            assert_eq!(error.1, expected_code);
         }
     }
 

@@ -35,7 +35,7 @@ The current UDP implementation includes:
 - Bidirectional packet and byte counters, reassembly/session timeouts, and transport errors
 - Bilingual Web UI management and multi-policy `[[udp_tunnels]]` client configuration
 
-TCP and UDP have separate operating-system port namespaces, so TCP `32001` and UDP `32001` may coexist. A UDP public port can belong to only one UDP policy. The current UDP public port range is `32000-32999`.
+TCP and UDP have separate operating-system port namespaces, so TCP `32001` and UDP `32001` may coexist. A UDP public port can belong to only one UDP policy. The default public range is `32000-32999`; the server can independently configure TCP and UDP with single ports or multiple ranges anywhere in `1-65535`.
 
 The UDP relay is disabled by default. Setting `LINKLAKE_UDP_RELAY_BIND` enables it and also requires an externally reachable `LINKLAKE_UDP_RELAY_ENDPOINT` plus `LINKLAKE_UDP_RELAY_SERVER_NAME` matching the control-channel certificate. UDP has completed automated local acceptance and end-to-end acceptance across an independent public test host, a Linux server, and a Windows client.
 
@@ -48,7 +48,7 @@ UDP and QUIC DATAGRAM are both best-effort transports; LinkLake does not turn UD
 - TCP and UDP port groups accept single ports, comma-separated lists, ascending inclusive ranges, and mixed expressions such as `32001,32010-32012`
 - Public and target expressions map one-to-one in expansion order. For example, public `32001,32010-32012` maps to target `2333,2400-2402`; the expanded counts must match
 - Expressions are normalized before persistence. Descending ranges, duplicate ports, out-of-range values, and ambiguous syntax are rejected; one group may expand to at most 256 mappings
-- Public ports remain limited to `32000-32999`, while target ports may use `1-65535`. The target host is entered separately as a domain, IPv4 address, or IPv6 address without a port
+- Public ports must be allowed by the server policy and must not be reserved. Target ports may use `1-65535`. The target host is entered separately as a domain, IPv4 address, or IPv6 address without a port
 - TCP groups share the TCP namespace with regular TCP tunnels, SOCKS5, HTTP forward proxies, and other TCP groups. UDP groups share the UDP namespace with regular UDP tunnels, SOCKS5 UDP, and other UDP groups
 - TCP and UDP may use the same numeric public ports. Group creation is transactional, so any conflicting mapping rejects the entire group
 - Server-managed mode expands a group into the existing TCP/UDP client tasks. The Web UI manages whole-group lifecycle and reports online mappings, connections or sessions, and traffic
@@ -63,6 +63,23 @@ public_ports = "32001,32010-32012"
 target_host = "127.0.0.1"
 target_ports = "2333,2400-2402"
 ```
+
+### Public port policy
+
+The compatible default permits only `32000-32999`. Servers support these environment variables:
+
+```text
+# Shared TCP/UDP default. Single ports, comma-separated lists, and ascending ranges are accepted.
+LINKLAKE_PUBLIC_PORT_RANGES=80,443,10000-19999,30000-65535
+# Optional protocol-specific overrides.
+LINKLAKE_TCP_PUBLIC_PORTS=80,443,10000-65535
+LINKLAKE_UDP_PUBLIC_PORTS=10000-65535
+# TCP port 22 is reserved by default; add host SSH, database, or other service ports here.
+LINKLAKE_RESERVED_TCP_PORTS=22,25,3306
+LINKLAKE_RESERVED_UDP_PORTS=53
+```
+
+The actual management API, control, HTTP/HTTPS, TLS-SNI, and UDP-relay listener ports are automatically added to the corresponding reserved set. The Web UI reads `GET /api/v1/public-port-policy` and displays the active policy in forwarding forms. If a new range excludes a policy already stored in the database, startup fails with the conflicting policy instead of silently leaving it offline. Linux needs root or `CAP_NET_BIND_SERVICE` for `1-1023`; the packaged systemd unit grants only that capability, while manual runs must arrange it separately. Cloud security groups, host firewalls, and other listeners still determine actual reachability.
 
 ## Secret tunnels
 
@@ -202,7 +219,7 @@ cargo run -p linklake-client -- agent `
   --name development-tcp
 ```
 
-Production clients should use the server-managed mode shown in [examples/linklake-client.toml](examples/linklake-client.toml). The `[client]` section keeps the control endpoint, CA, client ID/token, and optional P2P listener/candidate. The server derives per-client TCP/UDP/port-group/HTTP/TLS-SNI, secret-provider, SOCKS5-exit, and HTTP-forward-proxy exit configuration from Web UI policies, assigns a SHA-256 revision, and delivers it to the client:
+Production clients should use the server-managed mode shown in [examples/linklake-client.toml](examples/linklake-client.toml). Use `[client]` for one cloud, or multiple `[[servers]]` entries from [examples/linklake-client-multi-server.toml](examples/linklake-client-multi-server.toml). Each identity keeps an independent control endpoint, CA, client ID/token, and optional P2P settings. Every server independently delivers SHA-256-revisioned TCP/UDP/port-group/HTTP/TLS-SNI, secret-provider, SOCKS5-exit, and HTTP-forward-proxy configuration:
 
 ```powershell
 cargo run -p linklake-client -- run --config .\linklake-client.toml
@@ -218,12 +235,15 @@ The server never delivers or modifies the client token, CA, control endpoint, P2
 
 The Linux systemd service stores managed state in `/var/lib/linklake-client/managed.toml` by default. Windows stores it beside the bootstrap configuration. Override the location with `managed_config_path` or `LINKLAKE_STATE_DIR`.
 
-Remote control connections also require `control_ca_cert` and `control_server_name`. Public TCP and UDP ports both use `32000-32999`; the two protocols may use the same numeric port.
+In multi-cloud mode, identities without an explicit `managed_config_path` use separate `managed.<server-name>.toml` files. A failed cloud entry does not stop the others. The same local-mode or report-only policy set is replicated to every entry. In server-managed mode, create policies on both servers that point to the same local target to publish one game or other local service through cloud A and cloud B. Multi-cloud secret visitors must select their entry with `server = "cloud-a"` in `[[secret_visitors]]`.
+
+Remote control connections also require `control_ca_cert` and `control_server_name`. Each cloud independently defines its public port policy, so cloud A and cloud B may use different public ports; TCP and UDP may still use the same numeric port.
 
 ## Management and metrics
 
 - Public health endpoint: `GET /api/v1/health`
 - Authenticated metrics endpoint: `GET /api/v1/metrics`
+- Public port policy: `GET /api/v1/public-port-policy`
 - TCP policies: `GET/POST /api/v1/tcp-tunnels`
 - UDP policies: `GET/POST /api/v1/udp-tunnels`
 - Enable or disable a UDP policy: `POST /api/v1/udp-tunnels/:id/enabled`
@@ -299,7 +319,7 @@ LINKLAKE_UDP_RELAY_ENDPOINT=udp.example.com:32104
 LINKLAKE_UDP_RELAY_SERVER_NAME=udp.example.com
 ```
 
-Relay QUIC TLS reuses `LINKLAKE_CONTROL_CERT_PATH` and `LINKLAKE_CONTROL_KEY_PATH`. Open the relay UDP port and the UDP ports actually assigned to policies in both the cloud security group and the host firewall; do not expose the complete `32000-32999/udp` range unless it is required.
+Relay QUIC TLS reuses `LINKLAKE_CONTROL_CERT_PATH` and `LINKLAKE_CONTROL_KEY_PATH`. Open the relay UDP port and the UDP ports actually assigned to policies in both the cloud security group and the host firewall; do not expose the complete allowed range unless it is required.
 
 Public UDP service ports are IPv4-only in this first release. Binding the relay to IPv6 alone does not enable IPv6 access to policy ports.
 

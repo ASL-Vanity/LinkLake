@@ -38,7 +38,7 @@ const CONTROL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const CONTROL_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
 const TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MANAGED_CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(5);
-const CURRENT_CLIENT_CONFIG_VERSION: u32 = 1;
+const CURRENT_CLIENT_CONFIG_VERSION: u32 = 2;
 
 fn default_true() -> bool {
     true
@@ -156,11 +156,13 @@ struct HealthResponse {
     status: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct ClientConfigFile {
     #[serde(default)]
     config_version: u32,
     client: Option<ClientIdentityConfig>,
+    #[serde(default)]
+    servers: Vec<ClientIdentityConfig>,
     #[serde(default)]
     tcp_tunnels: Vec<TcpTunnelConfig>,
     #[serde(default)]
@@ -183,6 +185,7 @@ struct ClientConfigFile {
 
 #[derive(Clone, Deserialize)]
 struct ClientIdentityConfig {
+    name: Option<String>,
     control: String,
     control_ca_cert: Option<PathBuf>,
     control_server_name: Option<String>,
@@ -260,6 +263,7 @@ struct SecretTunnelConfig {
 
 #[derive(Clone, Deserialize)]
 struct SecretVisitorConfig {
+    server: Option<String>,
     name: String,
     local_bind: String,
     access_key: String,
@@ -509,10 +513,65 @@ async fn run_configured_agents(
 ) -> anyhow::Result<()> {
     let content = read_to_string(&path)?;
     let config = parse_client_config(&content)?;
+    if !config.servers.is_empty() {
+        return run_multi_server_agents(path, config, shutdown).await;
+    }
     if let Some(identity) = config.client.clone() {
         return run_supervised_agents(path, config, identity, shutdown).await;
     }
     run_legacy_agents(config, shutdown).await
+}
+
+async fn run_multi_server_agents(
+    bootstrap_path: PathBuf,
+    config: ClientConfigFile,
+    shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> anyhow::Result<()> {
+    let mut tasks = JoinSet::new();
+    let mut shutdown_senders = Vec::new();
+    for identity in config.servers.clone() {
+        let server_name = identity
+            .name
+            .clone()
+            .expect("multi-server identity name validated");
+        let mut server_config = config.clone();
+        server_config.client = Some(identity.clone());
+        server_config.servers.clear();
+        server_config
+            .secret_visitors
+            .retain(|visitor| visitor.server.as_deref() == Some(server_name.as_str()));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        shutdown_senders.push(shutdown_tx);
+        let path = bootstrap_path.clone();
+        tasks.spawn(async move {
+            tracing::info!(server = %server_name, "Starting cloud entry supervisor");
+            let result =
+                run_supervised_agents(path, server_config, identity, Some(shutdown_rx)).await;
+            if let Err(error) = &result {
+                tracing::error!(server = %server_name, "Cloud entry supervisor stopped: {error}");
+            }
+            result
+        });
+    }
+
+    match shutdown {
+        Some(shutdown) => {
+            let _ = shutdown.await;
+        }
+        None => wait_for_os_shutdown().await,
+    }
+    for sender in shutdown_senders {
+        let _ = sender.send(());
+    }
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!("Cloud entry stopped with an error: {error}"),
+            Err(error) => tracing::warn!("Cloud entry task failed: {error}"),
+        }
+    }
+    tracing::info!("All LinkLake cloud entry supervisors stopped.");
+    Ok(())
 }
 
 async fn run_legacy_agents(
@@ -1077,8 +1136,8 @@ fn local_managed_config(config: &ClientConfigFile) -> ManagedClientConfig {
         let parsed = parse_port_mappings(
             &group.public_ports,
             &group.target_ports,
-            32_000,
-            32_999,
+            1,
+            u16::MAX,
             MAX_PORT_MAPPINGS,
         )
         .expect("local port group should already be validated");
@@ -1178,15 +1237,21 @@ fn managed_shapes_equal(left: &ManagedClientConfig, right: &ManagedClientConfig)
 }
 
 fn managed_config_path(bootstrap_path: &Path, identity: &ClientIdentityConfig) -> PathBuf {
+    let default_name = identity
+        .name
+        .as_deref()
+        .map(safe_server_name)
+        .map(|name| format!("managed.{name}.toml"))
+        .unwrap_or_else(|| "managed.toml".to_owned());
     if identity.managed_config_path.is_none() {
         if let Some(state_dir) = std::env::var_os("LINKLAKE_STATE_DIR") {
-            return PathBuf::from(state_dir).join("managed.toml");
+            return PathBuf::from(state_dir).join(&default_name);
         }
     }
     let configured = identity
         .managed_config_path
         .clone()
-        .unwrap_or_else(|| PathBuf::from("managed.toml"));
+        .unwrap_or_else(|| PathBuf::from(default_name));
     if configured.is_absolute() {
         configured
     } else {
@@ -1195,6 +1260,18 @@ fn managed_config_path(bootstrap_path: &Path, identity: &ClientIdentityConfig) -
             .unwrap_or_else(|| Path::new("."))
             .join(configured)
     }
+}
+
+fn safe_server_name(name: &str) -> String {
+    name.chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn load_managed_config(path: &Path) -> anyhow::Result<ManagedClientConfig> {
@@ -1263,7 +1340,7 @@ fn validate_managed_config(config: &ManagedClientConfig) -> anyhow::Result<()> {
     for tunnel in &config.tcp_tunnels {
         anyhow::ensure!(
             !tunnel.name.trim().is_empty()
-                && (32_000..=32_999).contains(&tunnel.public_port)
+                && tunnel.public_port != 0
                 && !tunnel.target_addr.trim().is_empty()
                 && tcp_ports.insert(tunnel.public_port),
             "managed TCP tunnel is invalid or duplicated"
@@ -1273,7 +1350,7 @@ fn validate_managed_config(config: &ManagedClientConfig) -> anyhow::Result<()> {
     for tunnel in &config.udp_tunnels {
         anyhow::ensure!(
             !tunnel.name.trim().is_empty()
-                && (32_000..=32_999).contains(&tunnel.public_port)
+                && tunnel.public_port != 0
                 && !tunnel.target_addr.trim().is_empty()
                 && udp_ports.insert(tunnel.public_port),
             "managed UDP tunnel is invalid or duplicated"
@@ -1312,7 +1389,7 @@ fn validate_managed_config(config: &ManagedClientConfig) -> anyhow::Result<()> {
     for proxy in &config.socks5_proxies {
         anyhow::ensure!(
             !proxy.name.trim().is_empty()
-                && (32_000..=32_999).contains(&proxy.public_port)
+                && proxy.public_port != 0
                 && tcp_ports.insert(proxy.public_port)
                 && socks5_names.insert(proxy.name.clone()),
             "managed SOCKS5 proxy is invalid or duplicated"
@@ -1322,7 +1399,7 @@ fn validate_managed_config(config: &ManagedClientConfig) -> anyhow::Result<()> {
     for proxy in &config.http_proxies {
         anyhow::ensure!(
             !proxy.name.trim().is_empty()
-                && (32_000..=32_999).contains(&proxy.public_port)
+                && proxy.public_port != 0
                 && tcp_ports.insert(proxy.public_port)
                 && http_proxy_names.insert(proxy.name.clone()),
             "managed HTTP proxy is invalid or duplicated"
@@ -1353,6 +1430,44 @@ async fn wait_for_os_shutdown() {
     }
 }
 
+fn validate_client_identity(identity: &ClientIdentityConfig) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !identity.control.trim().is_empty() && !identity.client_token.trim().is_empty(),
+        "the client identity configuration is incomplete"
+    );
+    anyhow::ensure!(
+        identity.p2p_bind.is_some() == identity.p2p_endpoint.is_some(),
+        "p2p_bind and p2p_endpoint must be configured together"
+    );
+    if let (Some(bind), Some(endpoint)) = (&identity.p2p_bind, &identity.p2p_endpoint) {
+        anyhow::ensure!(
+            bind.parse::<std::net::SocketAddr>().is_ok()
+                && endpoint.parse::<std::net::SocketAddr>().is_ok(),
+            "p2p_bind and p2p_endpoint must be valid IP socket addresses"
+        );
+        anyhow::ensure!(
+            identity.p2p_tcp_enabled || identity.p2p_iroh_enabled,
+            "at least one P2P transport must be enabled"
+        );
+    }
+    anyhow::ensure!(
+        identity
+            .p2p_relay_url
+            .as_ref()
+            .is_none_or(|value| value.starts_with("https://") && value.len() <= 512),
+        "p2p_relay_url must be an HTTPS relay URL"
+    );
+    Ok(())
+}
+
+fn valid_server_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'-' | b'_'))
+}
+
 fn parse_client_config(content: &str) -> anyhow::Result<ClientConfigFile> {
     let config: ClientConfigFile = toml::from_str(content)?;
     anyhow::ensure!(
@@ -1372,39 +1487,63 @@ fn parse_client_config(content: &str) -> anyhow::Result<ClientConfigFile> {
         parse_port_mappings(
             &group.public_ports,
             &group.target_ports,
-            32_000,
-            32_999,
+            1,
+            u16::MAX,
             MAX_PORT_MAPPINGS,
         )
         .map_err(|error| anyhow::anyhow!("local port group is invalid: {error}"))?;
     }
-    if let Some(identity) = &config.client {
-        anyhow::ensure!(
-            !identity.control.trim().is_empty() && !identity.client_token.trim().is_empty(),
-            "the client identity configuration is incomplete"
-        );
-        anyhow::ensure!(
-            identity.p2p_bind.is_some() == identity.p2p_endpoint.is_some(),
-            "p2p_bind and p2p_endpoint must be configured together"
-        );
-        if let (Some(bind), Some(endpoint)) = (&identity.p2p_bind, &identity.p2p_endpoint) {
+    anyhow::ensure!(
+        config.client.is_none() || config.servers.is_empty(),
+        "use either [client] or [[servers]], not both"
+    );
+    let mut server_names = HashSet::new();
+    let mut p2p_binds = HashSet::new();
+    for identity in config.client.iter().chain(config.servers.iter()) {
+        validate_client_identity(identity)?;
+        if let Some(name) = identity.name.as_deref() {
             anyhow::ensure!(
-                bind.parse::<std::net::SocketAddr>().is_ok()
-                    && endpoint.parse::<std::net::SocketAddr>().is_ok(),
-                "p2p_bind and p2p_endpoint must be valid IP socket addresses"
-            );
-            anyhow::ensure!(
-                identity.p2p_tcp_enabled || identity.p2p_iroh_enabled,
-                "at least one P2P transport must be enabled"
+                valid_server_name(name) && server_names.insert(name.to_owned()),
+                "multi-server names must be unique and contain only letters, numbers, '-' or '_'"
             );
         }
+        if let Some(bind) = identity.p2p_bind.as_deref() {
+            anyhow::ensure!(
+                p2p_binds.insert(bind.to_owned()),
+                "multi-server P2P bind addresses must be unique"
+            );
+        }
+    }
+    if !config.servers.is_empty() {
         anyhow::ensure!(
-            identity
-                .p2p_relay_url
-                .as_ref()
-                .is_none_or(|value| { value.starts_with("https://") && value.len() <= 512 }),
-            "p2p_relay_url must be an HTTPS relay URL"
+            config
+                .servers
+                .iter()
+                .all(|identity| identity.name.is_some()),
+            "every [[servers]] entry requires a unique name"
         );
+        for visitor in &config.secret_visitors {
+            anyhow::ensure!(
+                visitor
+                    .server
+                    .as_ref()
+                    .is_some_and(|name| server_names.contains(name)),
+                "each secret visitor in multi-server mode must reference an existing server"
+            );
+        }
+        let mut managed_paths = HashSet::new();
+        for identity in &config.servers {
+            let name = identity.name.as_deref().expect("server name validated");
+            let path = identity.managed_config_path.clone().unwrap_or_else(|| {
+                PathBuf::from(format!("managed.{}.toml", safe_server_name(name)))
+            });
+            anyhow::ensure!(
+                managed_paths.insert(path),
+                "multi-server managed_config_path values must be unique"
+            );
+        }
+    }
+    if config.client.is_some() || !config.servers.is_empty() {
         for tunnel in &config.secret_tunnels {
             anyhow::ensure!(
                 !tunnel.name.trim().is_empty() && !tunnel.target.trim().is_empty(),
@@ -1440,7 +1579,7 @@ fn parse_client_config(content: &str) -> anyhow::Result<ClientConfigFile> {
         for proxy in &config.socks5_proxies {
             anyhow::ensure!(
                 !proxy.name.trim().is_empty()
-                    && (32_000..=32_999).contains(&proxy.public_port)
+                    && proxy.public_port != 0
                     && socks5_names.insert(proxy.name.clone())
                     && socks5_ports.insert(proxy.public_port),
                 "local SOCKS5 proxy is invalid or duplicated"
@@ -1451,7 +1590,7 @@ fn parse_client_config(content: &str) -> anyhow::Result<ClientConfigFile> {
         for proxy in &config.http_proxies {
             anyhow::ensure!(
                 !proxy.name.trim().is_empty()
-                    && (32_000..=32_999).contains(&proxy.public_port)
+                    && proxy.public_port != 0
                     && http_proxy_names.insert(proxy.name.clone())
                     && http_proxy_ports.insert(proxy.public_port),
                 "local HTTP proxy is invalid or duplicated"
@@ -1574,11 +1713,12 @@ fn valid_port_group_target_host(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        load_managed_config, local_managed_config, migrate_client_config, p2p_candidates,
-        parse_client_config, persist_managed_config, validate_managed_config,
-        CURRENT_CLIENT_CONFIG_VERSION,
+        load_managed_config, local_managed_config, managed_config_path, migrate_client_config,
+        p2p_candidates, parse_client_config, persist_managed_config, run_configured_agents,
+        validate_managed_config, CURRENT_CLIENT_CONFIG_VERSION,
     };
     use linklake_core::{
+        managed_config_revision, read_control_frame, write_control_frame, ControlFrame,
         ManagedClientConfig, ManagedConfigMode, ManagedHttpProxy, ManagedSecretTunnel,
         ManagedSocks5Proxy, ManagedTcpTunnel, ManagedTlsRoute,
     };
@@ -1751,6 +1891,145 @@ mod tests {
     }
 
     #[test]
+    fn multi_server_configuration_replicates_local_service_and_separates_state_files() {
+        let config = parse_client_config(
+            r#"
+                config_version = 2
+
+                [[servers]]
+                name = "cloud-a"
+                control = "a.example.test:32101"
+                client_id = "00000000-0000-0000-0000-000000000001"
+                client_token = "token-a"
+                config_mode = "local"
+
+                [[servers]]
+                name = "cloud-b"
+                control = "b.example.test:32101"
+                client_id = "00000000-0000-0000-0000-000000000002"
+                client_token = "token-b"
+                config_mode = "local"
+
+                [[tcp_tunnels]]
+                name = "game-server"
+                public_port = 443
+                target = "127.0.0.1:2333"
+            "#,
+        )
+        .expect("multi-server configuration should parse");
+        assert_eq!(config.servers.len(), 2);
+        assert_eq!(config.tcp_tunnels[0].public_port, 443);
+        let bootstrap = std::path::Path::new("C:/LinkLake/linklake-client.toml");
+        assert_ne!(
+            managed_config_path(bootstrap, &config.servers[0]),
+            managed_config_path(bootstrap, &config.servers[1])
+        );
+    }
+
+    #[test]
+    fn multi_server_configuration_rejects_duplicate_names() {
+        assert!(parse_client_config(
+            r#"
+                config_version = 2
+                [[servers]]
+                name = "cloud"
+                control = "a.example.test:32101"
+                client_id = "00000000-0000-0000-0000-000000000001"
+                client_token = "token-a"
+                config_mode = "server_managed"
+                [[servers]]
+                name = "cloud"
+                control = "b.example.test:32101"
+                client_id = "00000000-0000-0000-0000-000000000002"
+                client_token = "token-b"
+                config_mode = "server_managed"
+            "#,
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn multi_server_runtime_polls_both_cloud_entries() {
+        async fn serve_managed_config_once(
+            listener: tokio::net::TcpListener,
+            expected_client_id: Uuid,
+        ) {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            match read_control_frame(&mut stream).await.unwrap() {
+                ControlFrame::RequestManagedConfig { client_id, .. } => {
+                    assert_eq!(client_id, expected_client_id);
+                }
+                frame => panic!("unexpected frame: {frame:?}"),
+            }
+            let mut config = ManagedClientConfig {
+                revision: String::new(),
+                tcp_tunnels: Vec::new(),
+                udp_tunnels: Vec::new(),
+                http_routes: Vec::new(),
+                tls_routes: Vec::new(),
+                secret_tunnels: Vec::new(),
+                socks5_proxies: Vec::new(),
+                http_proxies: Vec::new(),
+            };
+            config.revision = managed_config_revision(&config).unwrap();
+            write_control_frame(&mut stream, &ControlFrame::ManagedConfig { config })
+                .await
+                .unwrap();
+        }
+
+        let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address_a = listener_a.local_addr().unwrap();
+        let address_b = listener_b.local_addr().unwrap();
+        let client_a = Uuid::new_v4();
+        let client_b = Uuid::new_v4();
+        let server_a = tokio::spawn(serve_managed_config_once(listener_a, client_a));
+        let server_b = tokio::spawn(serve_managed_config_once(listener_b, client_b));
+
+        let root = std::env::temp_dir().join(format!("linklake-multi-server-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let bootstrap = root.join("client.toml");
+        std::fs::write(
+            &bootstrap,
+            format!(
+                r#"
+                    config_version = 2
+                    [[servers]]
+                    name = "cloud-a"
+                    control = "{address_a}"
+                    client_id = "{client_a}"
+                    client_token = "token-a"
+                    config_mode = "server_managed"
+                    managed_config_path = "managed-a.toml"
+                    [[servers]]
+                    name = "cloud-b"
+                    control = "{address_b}"
+                    client_id = "{client_b}"
+                    client_token = "token-b"
+                    config_mode = "server_managed"
+                    managed_config_path = "managed-b.toml"
+                "#
+            ),
+        )
+        .unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let runner = tokio::spawn(run_configured_agents(bootstrap, Some(shutdown_rx)));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            server_a.await.unwrap();
+            server_b.await.unwrap();
+        })
+        .await
+        .expect("both cloud entries should receive a managed-config request");
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), runner)
+            .await
+            .expect("multi-server client should stop")
+            .unwrap()
+            .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn parses_local_tls_sni_route() {
         let config = parse_client_config(
             r#"
@@ -1864,7 +2143,7 @@ mod tests {
         .expect("legacy config should write");
         migrate_client_config(&input, &output).expect("config should migrate");
         let migrated = std::fs::read_to_string(&output).expect("migrated config should read");
-        assert!(migrated.contains("config_version = 1"));
+        assert!(migrated.contains(&format!("config_version = {CURRENT_CLIENT_CONFIG_VERSION}")));
         assert_eq!(
             parse_client_config(&migrated)
                 .expect("migrated config should validate")

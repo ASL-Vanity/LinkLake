@@ -1,0 +1,42 @@
+config_version = 2
+
+# 同一客户端在每台云服务器上需要分别注册，并填写各自返回的客户端 ID 和令牌。
+# 每个入口独立拉取 Web UI 策略、保存托管配置和运行转发任务。
+[[servers]]
+name = "cloud-a"
+control = "a.example.com:32101"
+control_ca_cert = "C:\LinkLake\cloud-a-control-ca.pem"
+control_server_name = "a.example.com"
+client_id = "00000000-0000-0000-0000-000000000001"
+client_token = "replace-with-cloud-a-client-token"
+config_mode = "server_managed"
+
+[[servers]]
+name = "cloud-b"
+control = "b.example.com:32101"
+control_ca_cert = "C:\LinkLake\cloud-b-control-ca.pem"
+control_server_name = "b.example.com"
+client_id = "00000000-0000-0000-0000-000000000002"
+client_token = "replace-with-cloud-b-client-token"
+config_mode = "server_managed"
+
+# 未指定 managed_config_path 时会自动保存为：
+# managed.cloud-a.toml
+# managed.cloud-b.toml
+#
+# 在两台服务端 Web UI 中分别创建指向同一目标（例如 127.0.0.1:2333）的策略，
+# 即可让云 A 和云 B 同时提供公网入口，公网端口可由各服务端独立选择。
+
+# local/report_only 模式下，下面这类本地策略会复制到全部 [[servers]] 入口。
+# [[tcp_tunnels]]
+# name = "game-server"
+# public_port = 32001
+# target = "127.0.0.1:2333"
+
+# Secret 访问端不会复制，必须明确指定所属入口。
+# [[secret_visitors]]
+# server = "cloud-a"
+# name = "private-rdp-access"
+# local_bind = "127.0.0.1:13389"
+# access_key = "lls_replace-with-the-one-time-access-key"
+# prefer_direct = true

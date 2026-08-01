@@ -48,7 +48,7 @@ from pathlib import Path
 
 secrets = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 visitor = secrets["visitor"]
-content = f'''config_version = 1
+content = f'''config_version = 2
 
 [client]
 control = "control.linklake.odelake.com:32101"

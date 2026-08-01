@@ -4,14 +4,12 @@ use sha2::{Digest, Sha256};
 use std::{fmt, fs, net::Ipv6Addr, path::Path};
 use uuid::Uuid;
 
+use crate::public_port_policy::PublicPortPolicy;
+
 use linklake_core::port_mapping::{
     parse_port_mappings, ParsedPortMappings, PortMappingError, MAX_PORT_MAPPINGS,
 };
 
-pub(crate) const MIN_TCP_TUNNEL_PORT: u16 = 32_000;
-pub(crate) const MAX_TCP_TUNNEL_PORT: u16 = 32_999;
-pub(crate) const MIN_UDP_TUNNEL_PORT: u16 = 32_000;
-pub(crate) const MAX_UDP_TUNNEL_PORT: u16 = 32_999;
 const DEFAULT_MAX_CONNECTIONS: u16 = 64;
 const DEFAULT_MAX_SESSIONS: u16 = 256;
 const MAX_UDP_SESSIONS: u16 = 4_096;
@@ -348,6 +346,7 @@ impl PortGroupPolicyError {
             Self::InvalidPorts(PortMappingError::CountMismatch) => "port_count_mismatch",
             Self::InvalidPorts(PortMappingError::DuplicatePort) => "duplicate_port_in_group",
             Self::InvalidPorts(PortMappingError::TooManyPorts) => "too_many_port_mappings",
+            Self::InvalidPorts(PortMappingError::PortOutOfRange) => "invalid_public_port",
             Self::InvalidPorts(_) => "invalid_port_expression",
             Self::InvalidTargetHost => "invalid_target_host",
             Self::InvalidConnectionLimit => "invalid_connection_limit",
@@ -433,10 +432,19 @@ impl From<rusqlite::Error> for UdpPolicyError {
 
 pub(crate) struct TunnelCatalog {
     database: Connection,
+    public_port_policy: PublicPortPolicy,
 }
 
 impl TunnelCatalog {
+    #[cfg(test)]
     pub(crate) fn open(data_dir: Option<&Path>) -> anyhow::Result<Self> {
+        Self::open_with_port_policy(data_dir, PublicPortPolicy::development_default())
+    }
+
+    pub(crate) fn open_with_port_policy(
+        data_dir: Option<&Path>,
+        public_port_policy: PublicPortPolicy,
+    ) -> anyhow::Result<Self> {
         let database = match data_dir {
             Some(data_dir) => {
                 fs::create_dir_all(data_dir)?;
@@ -536,14 +544,18 @@ impl TunnelCatalog {
                 [],
             )?;
         }
-        Ok(Self { database })
+        validate_existing_public_ports(&database, &public_port_policy)?;
+        Ok(Self {
+            database,
+            public_port_policy,
+        })
     }
 
     pub(crate) fn create(
         &mut self,
         request: CreateTcpTunnelPolicy,
     ) -> anyhow::Result<TcpTunnelPolicy> {
-        validate_policy(&request)?;
+        validate_policy(&self.public_port_policy, &request)?;
         let proxy_port_in_use: bool = self.database.query_row(
             "SELECT EXISTS(SELECT 1 FROM socks5_proxy_policies WHERE public_port = ?1 UNION ALL SELECT 1 FROM http_proxy_policies WHERE public_port = ?1 UNION ALL SELECT 1 FROM port_group_mappings WHERE protocol = 'tcp' AND public_port = ?1)",
             [request.public_port],
@@ -619,7 +631,7 @@ impl TunnelCatalog {
         id: Uuid,
         request: UpdateTcpTunnelPolicy,
     ) -> anyhow::Result<Option<TcpTunnelPolicy>> {
-        validate_policy(&request)?;
+        validate_policy(&self.public_port_policy, &request)?;
         let Some(current) = self.policy_by_id(id)? else {
             return Ok(None);
         };
@@ -704,7 +716,7 @@ impl TunnelCatalog {
         &mut self,
         request: CreateSocks5ProxyPolicy,
     ) -> Result<CreatedSocks5ProxyPolicy, Socks5PolicyError> {
-        validate_socks5_policy(&request)?;
+        validate_socks5_policy(&self.public_port_policy, &request)?;
         let tcp_port_in_use: bool = self.database.query_row(
             "SELECT EXISTS(SELECT 1 FROM tcp_tunnel_policies WHERE public_port = ?1 UNION ALL SELECT 1 FROM udp_tunnel_policies WHERE public_port = ?1 UNION ALL SELECT 1 FROM http_proxy_policies WHERE public_port = ?1 UNION ALL SELECT 1 FROM port_group_mappings WHERE public_port = ?1)",
             [request.public_port],
@@ -807,7 +819,7 @@ impl TunnelCatalog {
         id: Uuid,
         request: UpdateSocks5ProxyPolicy,
     ) -> Result<Option<Socks5ProxyPolicy>, Socks5PolicyError> {
-        validate_socks5_policy(&request)?;
+        validate_socks5_policy(&self.public_port_policy, &request)?;
         let Some(current) = self.socks5_policy_by_id(id)? else {
             return Ok(None);
         };
@@ -884,7 +896,7 @@ impl TunnelCatalog {
         &mut self,
         request: CreateHttpProxyPolicy,
     ) -> Result<CreatedHttpProxyPolicy, HttpProxyPolicyError> {
-        validate_http_proxy_policy(&request)?;
+        validate_http_proxy_policy(&self.public_port_policy, &request)?;
         let port_in_use: bool = self.database.query_row(
             "SELECT EXISTS(SELECT 1 FROM tcp_tunnel_policies WHERE public_port = ?1 UNION ALL SELECT 1 FROM socks5_proxy_policies WHERE public_port = ?1 UNION ALL SELECT 1 FROM port_group_mappings WHERE protocol = 'tcp' AND public_port = ?1)",
             [request.public_port],
@@ -987,7 +999,7 @@ impl TunnelCatalog {
         id: Uuid,
         request: UpdateHttpProxyPolicy,
     ) -> Result<Option<HttpProxyPolicy>, HttpProxyPolicyError> {
-        validate_http_proxy_policy(&request)?;
+        validate_http_proxy_policy(&self.public_port_policy, &request)?;
         let Some(current) = self.http_proxy_policy_by_id(id)? else {
             return Ok(None);
         };
@@ -1064,7 +1076,7 @@ impl TunnelCatalog {
         &mut self,
         request: CreateUdpTunnelPolicy,
     ) -> Result<UdpTunnelPolicy, UdpPolicyError> {
-        validate_udp_policy(&request)?;
+        validate_udp_policy(&self.public_port_policy, &request)?;
         let port_in_use: bool = self.database.query_row(
             "SELECT EXISTS(SELECT 1 FROM socks5_proxy_policies WHERE public_port = ?1 UNION ALL SELECT 1 FROM port_group_mappings WHERE protocol = 'udp' AND public_port = ?1)",
             [request.public_port],
@@ -1165,7 +1177,7 @@ impl TunnelCatalog {
         id: Uuid,
         request: UpdateUdpTunnelPolicy,
     ) -> Result<Option<UdpTunnelPolicy>, UdpPolicyError> {
-        validate_udp_policy(&request)?;
+        validate_udp_policy(&self.public_port_policy, &request)?;
         let Some(current) = self.udp_policy_by_id(id)? else {
             return Ok(None);
         };
@@ -1283,7 +1295,7 @@ impl TunnelCatalog {
         &mut self,
         request: CreatePortGroupPolicy,
     ) -> Result<PortGroupPolicy, PortGroupPolicyError> {
-        let parsed = validate_port_group_policy(&request)?;
+        let parsed = validate_port_group_policy(&self.public_port_policy, &request)?;
         let target_host = request.target_host.trim().to_owned();
         let policy = PortGroupPolicy {
             id: Uuid::new_v4(),
@@ -1388,7 +1400,7 @@ impl TunnelCatalog {
         id: Uuid,
         request: UpdatePortGroupPolicy,
     ) -> Result<Option<PortGroupPolicy>, PortGroupPolicyError> {
-        let parsed = validate_port_group_policy(&request)?;
+        let parsed = validate_port_group_policy(&self.public_port_policy, &request)?;
         let Some(current) = self.port_group_by_id(id)? else {
             return Ok(None);
         };
@@ -1536,6 +1548,54 @@ impl TunnelCatalog {
     }
 }
 
+fn validate_existing_public_ports(
+    database: &Connection,
+    public_port_policy: &PublicPortPolicy,
+) -> anyhow::Result<()> {
+    for (table, protocol) in [
+        ("tcp_tunnel_policies", "tcp"),
+        ("http_proxy_policies", "tcp"),
+        ("udp_tunnel_policies", "udp"),
+        ("socks5_proxy_policies", "both"),
+    ] {
+        let mut statement = database.prepare(&format!("SELECT public_port FROM {table}"))?;
+        let ports = statement
+            .query_map([], |row| row.get::<_, u16>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for port in ports {
+            let allowed = match protocol {
+                "tcp" => public_port_policy.allows_tcp(port),
+                "udp" => public_port_policy.allows_udp(port),
+                _ => public_port_policy.allows_tcp(port) && public_port_policy.allows_udp(port),
+            };
+            anyhow::ensure!(
+                allowed,
+                "existing {table} policy uses public port {port}, which is blocked by the configured public port policy"
+            );
+        }
+    }
+    let mut statement = database.prepare(
+        "SELECT protocol, public_port FROM port_group_mappings ORDER BY policy_id, rowid",
+    )?;
+    let mappings = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u16>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (protocol, port) in mappings {
+        let allowed = match protocol.as_str() {
+            "tcp" => public_port_policy.allows_tcp(port),
+            "udp" => public_port_policy.allows_udp(port),
+            _ => false,
+        };
+        anyhow::ensure!(
+            allowed,
+            "existing {protocol} port-group mapping uses public port {port}, which is blocked by the configured public port policy"
+        );
+    }
+    Ok(())
+}
+
 fn read_port_group_policy(row: &rusqlite::Row<'_>) -> rusqlite::Result<PortGroupPolicy> {
     let id: String = row.get(0)?;
     let client_id: String = row.get(1)?;
@@ -1558,6 +1618,7 @@ fn read_port_group_policy(row: &rusqlite::Row<'_>) -> rusqlite::Result<PortGroup
 }
 
 fn validate_port_group_policy(
+    public_port_policy: &PublicPortPolicy,
     request: &CreatePortGroupPolicy,
 ) -> Result<ParsedPortMappings, PortGroupPolicyError> {
     let name = request.name.trim();
@@ -1589,14 +1650,24 @@ fn validate_port_group_policy(
     {
         return Err(PortGroupPolicyError::InvalidBandwidthLimit);
     }
-    parse_port_mappings(
+    let parsed = parse_port_mappings(
         &request.public_ports,
         &request.target_ports,
-        MIN_TCP_TUNNEL_PORT,
-        MAX_TCP_TUNNEL_PORT,
+        1,
+        u16::MAX,
         MAX_PORT_MAPPINGS,
     )
-    .map_err(PortGroupPolicyError::InvalidPorts)
+    .map_err(PortGroupPolicyError::InvalidPorts)?;
+    let ports_allowed = parsed.pairs.iter().all(|pair| match request.protocol {
+        PortGroupProtocol::Tcp => public_port_policy.allows_tcp(pair.public_port),
+        PortGroupProtocol::Udp => public_port_policy.allows_udp(pair.public_port),
+    });
+    if !ports_allowed {
+        return Err(PortGroupPolicyError::InvalidPorts(
+            PortMappingError::PortOutOfRange,
+        ));
+    }
+    Ok(parsed)
 }
 
 fn target_addr(host: &str, port: u16) -> String {
@@ -1664,12 +1735,15 @@ fn read_http_proxy_policy(row: &rusqlite::Row<'_>) -> rusqlite::Result<HttpProxy
     })
 }
 
-fn validate_socks5_policy(request: &CreateSocks5ProxyPolicy) -> Result<(), Socks5PolicyError> {
+fn validate_socks5_policy(
+    public_port_policy: &PublicPortPolicy,
+    request: &CreateSocks5ProxyPolicy,
+) -> Result<(), Socks5PolicyError> {
     let name = request.name.trim();
     if name.is_empty() || name.len() > 80 || name.chars().any(char::is_control) {
         return Err(Socks5PolicyError::InvalidName);
     }
-    if !(MIN_TCP_TUNNEL_PORT..=MAX_TCP_TUNNEL_PORT).contains(&request.public_port) {
+    if !public_port_policy.allows_tcp(request.public_port) {
         return Err(Socks5PolicyError::InvalidPublicPort);
     }
     let username = request.username.trim();
@@ -1694,12 +1768,15 @@ fn validate_socks5_policy(request: &CreateSocks5ProxyPolicy) -> Result<(), Socks
     Ok(())
 }
 
-fn validate_http_proxy_policy(request: &CreateHttpProxyPolicy) -> Result<(), HttpProxyPolicyError> {
+fn validate_http_proxy_policy(
+    public_port_policy: &PublicPortPolicy,
+    request: &CreateHttpProxyPolicy,
+) -> Result<(), HttpProxyPolicyError> {
     let name = request.name.trim();
     if name.is_empty() || name.len() > 80 || name.chars().any(char::is_control) {
         return Err(HttpProxyPolicyError::InvalidName);
     }
-    if !(MIN_TCP_TUNNEL_PORT..=MAX_TCP_TUNNEL_PORT).contains(&request.public_port) {
+    if !public_port_policy.allows_tcp(request.public_port) {
         return Err(HttpProxyPolicyError::InvalidPublicPort);
     }
     let username = request.username.trim();
@@ -1760,13 +1837,16 @@ fn hash_http_proxy_password_bytes(password: &[u8]) -> String {
     format!("{:x}", Sha256::digest(password))
 }
 
-fn validate_policy(request: &CreateTcpTunnelPolicy) -> anyhow::Result<()> {
+fn validate_policy(
+    public_port_policy: &PublicPortPolicy,
+    request: &CreateTcpTunnelPolicy,
+) -> anyhow::Result<()> {
     anyhow::ensure!(
         !request.name.trim().is_empty() && request.name.len() <= 80,
         "tunnel name is invalid"
     );
     anyhow::ensure!(
-        (MIN_TCP_TUNNEL_PORT..=MAX_TCP_TUNNEL_PORT).contains(&request.public_port),
+        public_port_policy.allows_tcp(request.public_port),
         "public port is outside the permitted range"
     );
     anyhow::ensure!(
@@ -1799,12 +1879,15 @@ fn valid_target_address(value: &str) -> bool {
         && port.parse::<u16>().is_ok_and(|port| port != 0)
 }
 
-fn validate_udp_policy(request: &CreateUdpTunnelPolicy) -> Result<(), UdpPolicyError> {
+fn validate_udp_policy(
+    public_port_policy: &PublicPortPolicy,
+    request: &CreateUdpTunnelPolicy,
+) -> Result<(), UdpPolicyError> {
     let name = request.name.trim();
     if name.is_empty() || name.len() > 80 || name.chars().any(char::is_control) {
         return Err(UdpPolicyError::InvalidName);
     }
-    if !(MIN_UDP_TUNNEL_PORT..=MAX_UDP_TUNNEL_PORT).contains(&request.public_port) {
+    if !public_port_policy.allows_udp(request.public_port) {
         return Err(UdpPolicyError::InvalidPublicPort);
     }
     let target = request.target_addr.trim();
@@ -1885,6 +1968,8 @@ mod tests {
     use std::fs;
     use uuid::Uuid;
 
+    use crate::public_port_policy::PublicPortPolicy;
+
     fn udp_request(client_id: Uuid, public_port: u16) -> CreateUdpTunnelPolicy {
         CreateUdpTunnelPolicy {
             client_id,
@@ -1917,6 +2002,26 @@ mod tests {
             max_connections: Some(8),
             bandwidth_limit_bps: Some(1_048_576),
         }
+    }
+
+    #[test]
+    fn custom_public_port_policy_is_enforced_by_catalog() {
+        let policy =
+            PublicPortPolicy::for_test("80,443,10000-65535", "53,10000-65535", "443", "53");
+        let mut catalog = TunnelCatalog::open_with_port_policy(None, policy).unwrap();
+        let client_id = Uuid::new_v4();
+        let request = |public_port| CreateTcpTunnelPolicy {
+            client_id,
+            name: format!("tcp-{public_port}"),
+            public_port,
+            target_addr: "127.0.0.1:2333".to_owned(),
+            max_connections: None,
+            bandwidth_limit_bps: None,
+        };
+        assert!(catalog.create(request(80)).is_ok());
+        assert!(catalog.create(request(443)).is_err());
+        assert!(catalog.create(request(9_999)).is_err());
+        assert!(catalog.create(request(10_000)).is_ok());
     }
 
     fn port_group_request(

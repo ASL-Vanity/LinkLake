@@ -35,7 +35,7 @@ LinkLake 的代码实现、自动化测试与项目文档由 OpenAI GPT-5.6 完�
 - 双向数据包、流量、重组超时、会话超时和传输错误指标
 - 中英文 Web UI 与 `[[udp_tunnels]]` 多策略客户端配置
 
-TCP 与 UDP 使用独立的操作系统端口命名空间，因此可以同时创建 TCP `32001` 和 UDP `32001`；同一个 UDP 公网端口只能属于一条 UDP 策略。当前 UDP 公网端口范围为 `32000-32999`。
+TCP 与 UDP 使用独立的操作系统端口命名空间，因此可以同时创建 TCP `32001` 和 UDP `32001`；同一个 UDP 公网端口只能属于一条 UDP 策略。默认公网端口范围为 `32000-32999`，服务端可分别为 TCP、UDP 配置 `1-65535` 内的单端口或多个区间。
 
 UDP relay 默认不启用。只有设置 `LINKLAKE_UDP_RELAY_BIND` 时才会启动，并且必须同时提供外部可达的 `LINKLAKE_UDP_RELAY_ENDPOINT` 和与控制通道证书匹配的 `LINKLAKE_UDP_RELAY_SERVER_NAME`。UDP 已完成自动化本地验收以及独立公网服务器、Linux 服务端和 Windows 客户端之间的端到端验收。
 
@@ -48,7 +48,7 @@ UDP 和 QUIC DATAGRAM 均为最佳努力传输，LinkLake 不会把 UDP 转换�
 - TCP、UDP 均可创建端口组，公网端口和目标端口支持单端口、逗号列表、升序闭区间及其混合形式，例如 `32001,32010-32012`
 - 两侧按展开顺序一一映射，例如公网 `32001,32010-32012` 对应目标 `2333,2400-2402`；展开数量必须相同
 - 表达式会在保存前规范化；拒绝降序范围、重复端口、越界端口和歧义语法，每组最多展开 256 个映射
-- 公网端口仍限制为 `32000-32999`，目标端口允许 `1-65535`；目标主机单独填写域名、IPv4 或 IPv6，不包含端口
+- 公网端口必须符合服务端配置的允许范围且不能属于保留端口，目标端口允许 `1-65535`；目标主机单独填写域名、IPv4 或 IPv6，不包含端口
 - TCP 端口组与普通 TCP、SOCKS5、HTTP 正向代理和其他 TCP 端口组共享端口命名空间；UDP 端口组与普通 UDP、SOCKS5 UDP 和其他 UDP 端口组共享 UDP 命名空间
 - TCP 与 UDP 可使用相同数值的公网端口。创建端口组使用数据库事务，任一映射冲突时整组均不会写入
 - 服务端托管模式会把端口组展开为现有 TCP/UDP 客户端任务；整组启停、删除、在线映射数量、连接/会话和流量统计均可在 Web UI 查看
@@ -63,6 +63,23 @@ public_ports = "32001,32010-32012"
 target_host = "127.0.0.1"
 target_ports = "2333,2400-2402"
 ```
+
+### 公网端口策略
+
+默认策略保持兼容，仅允许 `32000-32999`。服务端支持以下环境变量：
+
+```text
+# TCP、UDP 共用的默认允许范围；可使用单端口、逗号列表和升序区间。
+LINKLAKE_PUBLIC_PORT_RANGES=80,443,10000-19999,30000-65535
+# 可选：分别覆盖 TCP 或 UDP 允许范围。
+LINKLAKE_TCP_PUBLIC_PORTS=80,443,10000-65535
+LINKLAKE_UDP_PUBLIC_PORTS=10000-65535
+# 22 默认属于 TCP 保留端口；可在此增加 SSH、数据库或其他宿主机服务端口。
+LINKLAKE_RESERVED_TCP_PORTS=22,25,3306
+LINKLAKE_RESERVED_UDP_PORTS=53
+```
+
+管理 API、控制通道、HTTP/HTTPS、TLS SNI 和 UDP relay 当前实际监听的端口会自动加入相应协议的保留集合。Web UI 从 `GET /api/v1/public-port-policy` 读取策略并在表单中显示。若现有数据库策略被新范围排除，服务端会拒绝启动并明确报告冲突策略，避免静默离线。Linux 监听 `1-1023` 需要 root 或 `CAP_NET_BIND_SERVICE`，官方 systemd 服务已仅授予该能力；手动运行时需要自行处理。云安全组、系统防火墙和其他进程占用仍会影响实际可达性。
 
 ## Secret 私密隧道
 
@@ -208,7 +225,7 @@ cargo run -p linklake-client -- agent `
   --name development-tcp
 ```
 
-生产客户端推荐使用 [examples/linklake-client.toml](examples/linklake-client.toml) 中的服务端托管模式。`[client]` 保存控制地址、CA、客户端 ID/令牌以及可选 P2P 监听与候选地址，Web UI 中的 TCP、UDP、端口组、HTTP、TLS SNI、Secret 目标端、SOCKS5 出口和 HTTP 正向代理出口策略由服务端按客户端生成带 SHA-256 修订号的配置并下发：
+生产客户端推荐使用 [examples/linklake-client.toml](examples/linklake-client.toml) 中的服务端托管模式。单云使用 `[client]`；多云使用 [examples/linklake-client-multi-server.toml](examples/linklake-client-multi-server.toml) 中的多个 `[[servers]]`。每个身份独立保存控制地址、CA、客户端 ID/令牌以及可选 P2P 设置，服务端分别下发带 SHA-256 修订号的 TCP、UDP、端口组、HTTP、TLS SNI、Secret 目标端、SOCKS5 和 HTTP 正向代理配置：
 
 ```powershell
 cargo run -p linklake-client -- run --config .\linklake-client.toml
@@ -224,12 +241,15 @@ cargo run -p linklake-client -- run --config .\linklake-client.toml
 
 Linux systemd 服务默认把托管配置保存到 `/var/lib/linklake-client/managed.toml`；Windows 默认保存在引导配置文件旁边。也可以通过 `managed_config_path` 或 `LINKLAKE_STATE_DIR` 指定位置。
 
-远程控制连接还必须指定 `control_ca_cert` 和 `control_server_name`。当前公网 TCP、UDP 端口范围均为 `32000-32999`，两个协议可以使用相同的数值端口。
+多云模式会为未显式设置 `managed_config_path` 的入口分别使用 `managed.<server-name>.toml`。任一云入口断线只影响该入口，其他入口继续运行；同一组本地 `local/report_only` 策略会复制到全部云入口。`server_managed` 模式下，可在各服务端 Web UI 建立指向同一目标地址的策略，从而把一个本地游戏或其他服务同时发布到云 A 和云 B。多云模式的 Secret 访问端必须在 `[[secret_visitors]]` 中使用 `server = "cloud-a"` 指定所属入口。
+
+远程控制连接还必须指定 `control_ca_cert` 和 `control_server_name`。公网端口范围由各服务端独立决定，因此云 A 与云 B 可以使用不同公网端口；TCP 与 UDP 仍可使用相同的数值端口。
 
 ## 管理与指标
 
 - 健康检查：`GET /api/v1/health`
 - 登录后指标：`GET /api/v1/metrics`
+- 公网端口策略：`GET /api/v1/public-port-policy`
 - TCP 策略：`GET/POST /api/v1/tcp-tunnels`
 - UDP 策略：`GET/POST /api/v1/udp-tunnels`
 - UDP 策略启停：`POST /api/v1/udp-tunnels/:id/enabled`
@@ -305,7 +325,7 @@ LINKLAKE_UDP_RELAY_ENDPOINT=udp.example.com:32104
 LINKLAKE_UDP_RELAY_SERVER_NAME=udp.example.com
 ```
 
-relay QUIC TLS 复用 `LINKLAKE_CONTROL_CERT_PATH` 和 `LINKLAKE_CONTROL_KEY_PATH`。必须在云安全组和系统防火墙中开放 relay 的 UDP 端口，以及实际创建的 UDP 公网策略端口；不要在没有需要时开放整个 `32000-32999/udp` 范围。
+relay QUIC TLS 复用 `LINKLAKE_CONTROL_CERT_PATH` 和 `LINKLAKE_CONTROL_KEY_PATH`。必须在云安全组和系统防火墙中开放 relay 的 UDP 端口，以及实际创建的 UDP 公网策略端口；不要在没有需要时开放整个允许范围。
 
 当前 UDP 公网业务端口首版仅绑定 IPv4；仅把 relay 绑定到 IPv6 并不会自动提供 IPv6 业务端口访问。
 

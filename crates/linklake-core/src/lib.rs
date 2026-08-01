@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 pub mod p2p_protocol;
 pub mod port_mapping;
+pub mod public_ports;
 pub mod socks5_udp;
 pub mod udp_protocol;
 pub mod udp_reassembly;

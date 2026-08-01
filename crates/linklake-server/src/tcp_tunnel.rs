@@ -19,8 +19,6 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 
-const MIN_TCP_TUNNEL_PORT: u16 = 32_000;
-const MAX_TCP_TUNNEL_PORT: u16 = 32_999;
 const CONNECTION_PAIR_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTION_MAX_LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
 const CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(35);
@@ -489,16 +487,12 @@ async fn register_tunnel(
         send_error(&mut stream, "tunnel name and target address are required").await;
         return;
     }
-    if !(MIN_TCP_TUNNEL_PORT..=MAX_TCP_TUNNEL_PORT).contains(&public_port) {
+    if !state.public_port_policy.allows_tcp(public_port) {
         state
             .metrics
             .registration_rejections_total
             .fetch_add(1, Ordering::Relaxed);
-        send_error(
-            &mut stream,
-            "public port is outside the development range 32000-32999",
-        )
-        .await;
+        send_error(&mut stream, "public port is not allowed by server policy").await;
         return;
     }
     let runtime_policy = state
