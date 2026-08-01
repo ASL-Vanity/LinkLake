@@ -2,6 +2,21 @@
 
 本项目采用语义化版本号。候选版本用于完整验收，不代表已对外发布。
 
+## 0.6.0-rc.1 - 2026-08-01
+
+### 高级网络与多云
+
+- 新增加权多目标池，TCP、UDP、HTTP、SNI 与 Secret 按新连接/会话进行加权轮询。
+- 新增 CIDR、连接速率、UTC 时间窗口和持久化日流量配额，并接入全部公网代理与 Secret 中继数据面。
+- P2P 新增 `prefer_direct`、`direct_only`、`relay_only` 路径策略，继续兼容旧 `prefer_direct` 布尔配置。
+- 多云管理新增 TCP/UDP 策略同步预览与安全导入；按客户端名称映射，仅创建缺失策略，同名差异策略报告冲突且不覆盖。
+
+### 管理安全与部署
+
+- 新增 RFC 6238 TOTP、活动会话管理以及 `read/write/administrator` 限权 API Token。
+- 新增 Docker Compose、Prometheus、Grafana、Nginx、Caddy、Cloudflare DNS 自动化、DEB/RPM 与原生包校验。
+- Flutter Manager 新增 TOTP、API Token、多云和策略流量控制管理。
+
 ## 0.5.0-rc.1 - 2026-08-01
 
 ### 管理界面与权限
