@@ -50,6 +50,7 @@ use certificate_catalog::{
     RouteTlsMode, RouteTlsPolicy, UpdateAcmeConfig, UpdateRouteTlsPolicy,
 };
 use certificate_manager::CertificateManager;
+use clap::{Parser, Subcommand};
 use client_registry::{Authentication, ClientRegistry, UpdateClient};
 use fleet::{FleetCatalog, FleetImportResult, FleetPeer, FleetPolicyBundle, UpsertFleetPeer};
 use http_route_catalog::{
@@ -57,11 +58,12 @@ use http_route_catalog::{
     UpdateHttpRoutePolicy,
 };
 use linklake_core::{
-    managed_config_revision, BoxedIo, ClientEnrollmentRequest, ClientEnrollmentResponse,
+    managed_config_revision, BoxedIo, BuildInfo, ClientEnrollmentRequest, ClientEnrollmentResponse,
     ManagedClientConfig, ManagedHttpProxy, ManagedHttpRoute, ManagedSecretTunnel,
     ManagedSocks5Proxy, ManagedTcpTunnel, ManagedTlsRoute, ManagedUdpTunnel, API_VERSION,
     PRODUCT_NAME,
 };
+use linklake_update::{SignaturePolicy, UpdateChannel, UpdateProduct};
 use p2p_node_catalog::{P2pNodeCatalog, P2pNodeRecord};
 use public_port_policy::{PublicPortPolicy, PublicPortPolicyView};
 use rusqlite::{params, Connection};
@@ -1471,6 +1473,12 @@ fn route_tls_view(
 }
 
 fn main() -> anyhow::Result<()> {
+    if print_version_if_requested("LinkLake Server")? {
+        return Ok(());
+    }
+    if run_update_utility()? {
+        return Ok(());
+    }
     if run_database_utility()? {
         return Ok(());
     }
@@ -1484,6 +1492,198 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("--windows-service is available only on Windows");
     }
     tokio::runtime::Runtime::new()?.block_on(run_server(None))
+}
+
+fn print_version_if_requested(product: &'static str) -> anyhow::Result<bool> {
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if arguments.iter().any(|value| value == "--version-json") {
+        println!("{}", serde_json::to_string(&BuildInfo::current(product))?);
+        return Ok(true);
+    }
+    if arguments.iter().any(|value| value == "--version") {
+        println!("{}", BuildInfo::current(product).display_line());
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+#[derive(Parser)]
+#[command(name = "linklake-server", disable_version_flag = true)]
+struct ServerMaintenanceCli {
+    #[command(subcommand)]
+    command: ServerMaintenanceCommand,
+}
+
+#[derive(Subcommand)]
+enum ServerMaintenanceCommand {
+    CheckUpdate {
+        #[arg(long, default_value = "ASL-Vanity/LinkLake")]
+        repository: String,
+        #[arg(long, value_enum, default_value_t = UpdateChannel::Auto)]
+        channel: UpdateChannel,
+        #[arg(long)]
+        development_signature: bool,
+    },
+    Update {
+        #[command(subcommand)]
+        action: ServerUpdateAction,
+    },
+    #[command(name = "__update-helper", hide = true)]
+    UpdateHelper {
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long)]
+        plan_sha256: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServerUpdateAction {
+    Download {
+        #[arg(long, default_value = "ASL-Vanity/LinkLake")]
+        repository: String,
+        #[arg(long, value_enum, default_value_t = UpdateChannel::Auto)]
+        channel: UpdateChannel,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long)]
+        allow_downgrade: bool,
+        #[arg(long)]
+        development_signature: bool,
+    },
+    Apply {
+        #[arg(long, default_value = "ASL-Vanity/LinkLake")]
+        repository: String,
+        #[arg(long, value_enum, default_value_t = UpdateChannel::Auto)]
+        channel: UpdateChannel,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long)]
+        allow_downgrade: bool,
+        #[arg(long)]
+        development_signature: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+    Status {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    Rollback {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+fn run_update_utility() -> anyhow::Result<bool> {
+    let first = std::env::args_os().nth(1);
+    let recognized = matches!(
+        first.as_deref().and_then(|value| value.to_str()),
+        Some("check-update" | "update" | "__update-helper")
+    );
+    if !recognized {
+        return Ok(false);
+    }
+    let command = ServerMaintenanceCli::parse().command;
+    match command {
+        ServerMaintenanceCommand::CheckUpdate {
+            repository,
+            channel,
+            development_signature,
+        } => {
+            let result = tokio::runtime::Runtime::new()?.block_on(linklake_update::check(
+                UpdateProduct::Server,
+                &repository,
+                channel,
+                signature_policy(development_signature),
+            ))?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        ServerMaintenanceCommand::Update { action } => match action {
+            ServerUpdateAction::Download {
+                repository,
+                channel,
+                state_dir,
+                allow_downgrade,
+                development_signature,
+            } => {
+                let state = state_dir.unwrap_or_else(|| {
+                    linklake_update::default_state_directory(UpdateProduct::Server)
+                });
+                let result =
+                    tokio::runtime::Runtime::new()?.block_on(linklake_update::download(
+                        UpdateProduct::Server,
+                        &repository,
+                        channel,
+                        &state,
+                        allow_downgrade,
+                        signature_policy(development_signature),
+                    ))?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            }
+            ServerUpdateAction::Apply {
+                repository,
+                channel,
+                state_dir,
+                allow_downgrade,
+                development_signature,
+                yes,
+            } => {
+                let state = state_dir.unwrap_or_else(|| {
+                    linklake_update::default_state_directory(UpdateProduct::Server)
+                });
+                let result = tokio::runtime::Runtime::new()?.block_on(linklake_update::apply(
+                    UpdateProduct::Server,
+                    &repository,
+                    channel,
+                    &state,
+                    allow_downgrade,
+                    yes,
+                    signature_policy(development_signature),
+                ))?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            }
+            ServerUpdateAction::Status { state_dir } => {
+                let state = state_dir.unwrap_or_else(|| {
+                    linklake_update::default_state_directory(UpdateProduct::Server)
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&linklake_update::status(
+                        UpdateProduct::Server,
+                        &state,
+                    )?)?
+                );
+            }
+            ServerUpdateAction::Rollback { state_dir, yes } => {
+                let state = state_dir.unwrap_or_else(|| {
+                    linklake_update::default_state_directory(UpdateProduct::Server)
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&linklake_update::rollback(
+                        UpdateProduct::Server,
+                        &state,
+                        yes,
+                    )?)?
+                );
+            }
+        },
+        ServerMaintenanceCommand::UpdateHelper { plan, plan_sha256 } => {
+            linklake_update::run_helper(&plan, &plan_sha256)?;
+        }
+    }
+    Ok(true)
+}
+
+fn signature_policy(development: bool) -> SignaturePolicy {
+    if development {
+        SignaturePolicy::Development
+    } else {
+        SignaturePolicy::Production
+    }
 }
 
 fn run_database_utility() -> anyhow::Result<bool> {

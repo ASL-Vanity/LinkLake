@@ -14,6 +14,8 @@ stage="$output_directory/$package_name"
 archive="$output_directory/$package_name.tar.gz"
 source_date_epoch="${SOURCE_DATE_EPOCH:-$(git -C "$project_root" log -1 --format=%ct 2>/dev/null || date +%s)}"
 flutter_bin="${FLUTTER:-flutter}"
+commit="$(git -C "$project_root" rev-parse --short=12 HEAD)"
+export LINKLAKE_GIT_COMMIT="$commit"
 
 cd "$manager_root"
 cargo build --release -p linklake-client --locked --manifest-path "$project_root/Cargo.toml"
@@ -36,8 +38,8 @@ cp "$project_root/README.md" "$project_root/README.en.md" "$project_root/LICENSE
   "$project_root/THIRD_PARTY_NOTICES.md" "$project_root/THIRD_PARTY_LICENSES.html" \
   "$project_root/TRADEMARKS.md" "$stage/"
 cp "$manager_root/README.md" "$stage/MANAGER_README.md"
-printf '{"product":"LinkLake Manager","component":"manager","version":"%s","target":"macos-%s","built_unix_seconds":%s}\n' \
-  "$version" "$architecture" "$source_date_epoch" >"$stage/release.json"
+printf '{"product":"LinkLake Manager","component":"manager","version":"%s","target":"macos-%s","built_unix_seconds":%s,"commit":"%s"}\n' \
+  "$version" "$architecture" "$source_date_epoch" "$commit" >"$stage/release.json"
 find "$stage" -exec touch -t "$(date -r "$source_date_epoch" +%Y%m%d%H%M.%S)" {} +
 tar -C "$output_directory" -czf "$archive" "$package_name"
 (cd "$output_directory" && shasum -a 256 "$(basename "$archive")" >"$(basename "$archive").sha256")

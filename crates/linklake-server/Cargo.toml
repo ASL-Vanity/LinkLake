@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+clap.workspace = true
 getrandom.workspace = true
 argon2.workspace = true
 arc-swap.workspace = true
@@ -21,6 +22,7 @@ hyper-util.workspace = true
 hmac.workspace = true
 instant-acme.workspace = true
 linklake-core = { path = "../linklake-core" }
+linklake-update = { path = "../linklake-update" }
 quinn.workspace = true
 reqwest.workspace = true
 serde.workspace = true
