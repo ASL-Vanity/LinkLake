@@ -115,33 +115,106 @@ try {
   await page.locator('#clients-list tr').filter({ hasText: 'unused-client' }).getByRole('button', { name: /Delete|删除/ }).click();
   await page.waitForFunction(() => !document.querySelector('#clients-list')?.textContent?.includes('unused-client'));
 
-  // 验证五套完整视觉风格、明暗模式和持久化。
-  await page.locator('#appearance-button').click();
-  await page.locator('[data-theme-choice="light"]').click();
-  const visualStyles = [];
-  for (const palette of ['lake', 'ocean', 'jade', 'violet', 'contrast']) {
+  // 验证五套完整材质语言、明暗模式独立性、系统跟随、降级动效和持久化。
+  const palettes = ['lake', 'ocean', 'jade', 'violet', 'contrast'];
+  async function chooseAppearance(mode, palette, keepOpen = false) {
+    if (await page.locator('#appearance-popover').evaluate(node => node.classList.contains('hidden'))) {
+      await page.locator('#appearance-button').click();
+    }
+    await page.locator(`[data-theme-choice="${mode}"]`).click();
     await page.locator(`[data-palette-choice="${palette}"]`).click();
+    if (!keepOpen) await page.locator('#appearance-button').click();
+    await page.waitForTimeout(320);
+  }
+
+  await page.setViewportSize({ width: 1920, height: 1080 });
+  const visualStyles = [];
+  for (const palette of palettes) {
+    await chooseAppearance('light', palette, true);
     visualStyles.push(await page.evaluate(() => {
       const rootStyle = getComputedStyle(document.documentElement);
       const panelStyle = getComputedStyle(document.querySelector('.chart-panel'));
+      const topbarStyle = getComputedStyle(document.querySelector('.utility-bar'));
+      const sidebarStyle = getComputedStyle(document.querySelector('.sidebar'));
+      const menuStyle = getComputedStyle(document.querySelector('.popover'));
+      const inputStyle = getComputedStyle(document.querySelector('input'));
+      const tableHeaderStyle = getComputedStyle(document.querySelector('.data-table th'));
+      const bodyTexture = getComputedStyle(document.body, '::after');
       return {
         palette: document.documentElement.dataset.palette,
+        material: rootStyle.getPropertyValue('--material-name').trim(),
         background: rootStyle.getPropertyValue('--bg').trim(),
-        surface: rootStyle.getPropertyValue('--surface').trim(),
-        line: rootStyle.getPropertyValue('--line').trim(),
+        pageBackground: getComputedStyle(document.body).backgroundImage,
+        texture: bodyTexture.backgroundImage,
+        cardBackground: panelStyle.backgroundImage + panelStyle.backgroundColor,
+        topbarBackground: topbarStyle.backgroundImage + topbarStyle.backgroundColor,
+        sidebarBackground: sidebarStyle.backgroundImage + sidebarStyle.backgroundColor,
+        menuBackground: menuStyle.backgroundImage + menuStyle.backgroundColor,
+        inputBackground: inputStyle.backgroundImage + inputStyle.backgroundColor,
+        tableHeaderBackground: tableHeaderStyle.backgroundImage + tableHeaderStyle.backgroundColor,
         radius: panelStyle.borderRadius,
+        borderWidth: panelStyle.borderWidth,
+        borderStyle: panelStyle.borderStyle,
         shadow: panelStyle.boxShadow,
+        backdropFilter: panelStyle.backdropFilter,
+        chartGridDash: rootStyle.getPropertyValue('--chart-grid-dash').trim(),
+        chartStrokeWidth: rootStyle.getPropertyValue('--chart-stroke-width').trim(),
+        density: rootStyle.getPropertyValue('--density-space').trim(),
+        hoverLift: rootStyle.getPropertyValue('--hover-lift').trim(),
       };
     }));
+    if (palette === 'lake') {
+      await page.screenshot({ path: path.join(outputDir, 'theme-picker-material-previews.png') });
+    }
+    await page.locator('#appearance-button').click();
+    await openRoute('#/overview');
+    await page.locator('#traffic-chart').waitFor({ state: 'visible' });
+    await page.screenshot({ path: path.join(outputDir, `theme-${palette}-desktop-1920-light.png`), fullPage: true });
   }
-  assert(new Set(visualStyles.map(style => style.background)).size === 5, '五套视觉风格没有分别改变页面背景');
-  assert(new Set(visualStyles.map(style => style.radius)).size >= 4, '视觉风格仍只是换色，没有改变结构质感');
-  await page.locator('[data-theme-choice="dark"]').click();
+
+  assert(new Set(visualStyles.map(style => style.material)).size === 5, '五套主题缺少唯一的材质身份 token');
+  assert(new Set(visualStyles.map(style => style.cardBackground)).size === 5, '五套主题的卡片材质没有实质差异');
+  assert(new Set(visualStyles.map(style => style.topbarBackground)).size >= 4, '顶栏材质差异不足');
+  assert(new Set(visualStyles.map(style => style.sidebarBackground)).size >= 4, '侧栏材质差异不足');
+  assert(new Set(visualStyles.map(style => style.menuBackground)).size >= 4, '菜单材质差异不足');
+  assert(new Set(visualStyles.map(style => style.inputBackground)).size >= 4, '输入框材质差异不足');
+  assert(new Set(visualStyles.map(style => style.tableHeaderBackground)).size >= 4, '表格材质差异不足');
+  assert(new Set(visualStyles.map(style => style.radius)).size >= 4, '视觉风格仍只是换色，没有改变圆角体系');
+  assert(new Set(visualStyles.map(style => style.shadow)).size >= 4, '视觉风格没有建立不同阴影层级');
+  assert(new Set(visualStyles.map(style => style.backdropFilter)).size >= 3, '玻璃、实体和辉光主题的滤镜差异不足');
+  assert(new Set(visualStyles.map(style => style.chartGridDash)).size === 5, '五套主题没有独立图表网格节奏');
+  assert(new Set(visualStyles.map(style => style.chartStrokeWidth)).size === 5, '五套主题没有独立图表线条粗细');
+  assert(new Set(visualStyles.map(style => `${style.borderWidth}/${style.borderStyle}`)).size >= 2, '高对比主题没有使用更强边框');
+  assert(await page.locator('.theme-preview .preview-card').count() === 5, '主题选择器缺少卡片材质缩略预览');
+  assert(await page.locator('.theme-preview .preview-chart').count() === 5, '主题选择器缺少图表材质缩略预览');
+
+  await chooseAppearance('dark', 'contrast');
   await page.waitForTimeout(250);
   const contrastOnPrimary = await page.locator('.nav-link.active').evaluate(node => ({ color: getComputedStyle(node).color, background: getComputedStyle(node).backgroundColor }));
   assert(contrastOnPrimary.color === 'rgb(0, 0, 0)' && contrastOnPrimary.background === 'rgb(255, 230, 0)', `高对比深色主题主色文字不可读：${JSON.stringify(contrastOnPrimary)}`);
-  await page.locator('[data-theme-choice="light"]').click();
-  await page.locator('[data-palette-choice="violet"]').click();
+
+  await page.emulateMedia({ colorScheme: 'dark', reducedMotion: 'reduce' });
+  await chooseAppearance('system', 'jade');
+  assert(await page.evaluate(() => document.documentElement.dataset.scheme === 'dark'), '跟随系统未响应深色偏好');
+  assert(await page.evaluate(() => document.documentElement.dataset.palette === 'jade'), '切换跟随系统时材质主题被意外改变');
+  const reducedMotion = await page.locator('#overview-view').evaluate(node => getComputedStyle(node).animationDuration);
+  assert(Number.parseFloat(reducedMotion) <= 0.01, `reduced-motion 未关闭主题动效：${reducedMotion}`);
+  await page.emulateMedia({ colorScheme: 'light', reducedMotion: 'no-preference' });
+  await page.waitForFunction(() => document.documentElement.dataset.scheme === 'light');
+  assert(await page.evaluate(() => document.documentElement.dataset.palette === 'jade'), '系统明暗变化不应改变材质主题');
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  for (const palette of palettes) {
+    await chooseAppearance('dark', palette);
+    await openRoute('#/overview');
+    await page.locator('#traffic-chart').waitFor({ state: 'visible' });
+    const themeOverflow = await page.evaluate(() => ({ html: document.documentElement.scrollWidth - document.documentElement.clientWidth, body: document.body.scrollWidth - document.body.clientWidth }));
+    assert(themeOverflow.html === 0 && themeOverflow.body === 0, `${palette} 材质主题移动端横向溢出：${JSON.stringify(themeOverflow)}`);
+    await page.screenshot({ path: path.join(outputDir, `theme-${palette}-mobile-390-dark.png`), fullPage: true });
+  }
+
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await chooseAppearance('light', 'violet');
   assert(await page.evaluate(() => document.documentElement.dataset.scheme === 'light'), '浅色主题未生效');
   assert(await page.evaluate(() => document.documentElement.dataset.palette === 'violet'), '紫罗兰配色未生效');
   await page.reload({ waitUntil: 'domcontentloaded' });
