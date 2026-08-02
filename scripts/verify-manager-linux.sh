@@ -10,7 +10,8 @@ test -f "$archive"
 test -f "$checksum"
 (cd "$output_directory" && sha256sum -c "$(basename "$checksum")")
 entries="$(tar -tzf "$archive" | sed 's#^[^/]*/##')"
-for entry in linklake_manager lib/libflutter_linux_gtk.so data/icudtl.dat data/flutter_assets/AssetManifest.bin README.md README.en.md MANAGER_README.md LICENSE NOTICE THIRD_PARTY_NOTICES.md THIRD_PARTY_LICENSES.html TRADEMARKS.md release.json; do
+for entry in linklake_manager linklake-client lib/libflutter_linux_gtk.so data/icudtl.dat data/flutter_assets/AssetManifest.bin README.md README.en.md MANAGER_README.md LICENSE NOTICE THIRD_PARTY_NOTICES.md THIRD_PARTY_LICENSES.html TRADEMARKS.md release.json; do
   printf '%s\n' "$entries" | grep -Fx "$entry" >/dev/null || { echo "Missing archive entry: $entry" >&2; exit 1; }
 done
+printf '%s\n' "$entries" | grep -Fx 'linklake-client' >/dev/null
 echo "Verified $archive"

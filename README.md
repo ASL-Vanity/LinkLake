@@ -1,4 +1,4 @@
-# LinkLake v2
+# LinkLake
 
 [English](README.en.md) | 中文
 
@@ -269,6 +269,28 @@ linklake-client check-update --channel prerelease
 
 输出为 JSON，包含当前版本、所选通道、最新版本、是否存在更新和 Release 地址；网络请求最长等待 15 秒。
 
+### 安全自动更新与回滚
+
+客户端可以把“检查更新”继续到可信下载、原子安装和回滚：
+
+```powershell
+linklake-client update download
+linklake-client update apply --yes
+linklake-client update status
+linklake-client update rollback --yes
+```
+
+- `download` 仅下载和验证，不修改正在使用的程序。
+- `apply` 自动下载最新兼容版本，创建备份，并启动独立帮助进程替换客户端；替换系统安装目录通常需要管理员/root 权限。
+- `status` 返回最后一次操作的 `scheduled/installing/succeeded/rolled_back/failed` 状态。
+- `rollback` 使用最近一份与当前安装不同且摘要有效的备份。降级下载必须额外传入 `--allow-downgrade`。
+- 自动安装目标必须支持 `linklake-client --version`，因此不会自动安装 0.7.0-rc.1 之前的旧包；旧客户端仍可作为已验证备份被恢复。
+- 默认状态目录位于当前用户的本地状态目录，也可以通过 `--state-dir` 显式指定。
+
+安全验证链包括：HTTPS 与仓库路径约束、GitHub 资产 SHA-256、独立 `.sha256`、下载大小、ZIP/TAR 路径与条目限制、`release.json` 产品/版本/平台、暂存二进制摘要、带摘要的帮助进程计划、安装前目标摘要、安装后 `--version` 以及系统服务恢复。更新器只替换 `linklake-client`，不会覆盖配置、托管状态、证书或日志。任一安装或服务检查失败时会自动恢复备份。
+
+自动更新的信任根是配置的 GitHub 仓库、GitHub HTTPS 和发布资产摘要。发布账号或仓库权限本身遭到入侵不在 SHA-256 能够解决的威胁范围内，因此仍应启用 GitHub 强认证、最小权限和发布保护；未来可在代码签名基础设施就绪后增加独立发布签名。
+
 ## 管理与指标
 
 - 健康检查：`GET /api/v1/health`
@@ -308,7 +330,7 @@ linklake-client check-update --channel prerelease
 - 指标与策略视图包括 P2P 节点新鲜度、直连与中继回退、TLS SNI ClientHello/未知域名/连接/流量、Secret 连接和流量、SOCKS5 请求/认证/连接/流量、HTTP 正向代理请求/CONNECT/认证/畸形报文/流量、UDP 会话/数据包/流量/丢包/超时、HTTP/HTTPS 路由流量和失败、TLS 握手失败、证书总数、30 天内到期、已过期、ACME 订单、续期和 HTTP-01 挑战
 - `LINKLAKE_MANAGEMENT_TOKEN` 可作为自动化 API Bearer Token，不用于 Web 登录
 - Web UI 支持管理员、运维人员和审计人员三种用户组：管理员拥有全部权限，运维人员可管理客户端与转发策略，审计人员只读；当前用户和最后一个启用的管理员受到保护
-- Web UI 提供湖蓝、海洋、翡翠、紫罗兰四套完整浅色/深色主题，跟随系统只切换明暗，不改变所选配色
+- Web UI 提供极光湖面、极简海洋、翡翠纸面、霓虹深空和高对比度五套完整视觉风格；每套风格独立定义背景、材质、圆角、边框、阴影和图表表现，并支持跟随系统切换明暗模式
 
 日志目录通过 `LINKLAKE_LOG_DIR` 设置。服务端未设置时默认使用 `LINKLAKE_DATA_DIR/logs`；客户端未设置时输出到控制台，服务安装器会为其设置轮转日志目录。
 

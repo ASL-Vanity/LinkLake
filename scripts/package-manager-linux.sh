@@ -13,8 +13,13 @@ stage="$output_directory/$package_name"
 archive="$output_directory/$package_name.tar.gz"
 source_date_epoch="${SOURCE_DATE_EPOCH:-$(git -C "$project_root" log -1 --format=%ct 2>/dev/null || date +%s)}"
 flutter_bin="${FLUTTER:-flutter}"
+cargo_bin="${CARGO:-cargo}"
+if [ -x "$HOME/.cargo/bin/cargo" ]; then
+  cargo_bin="$HOME/.cargo/bin/cargo"
+fi
 
 cd "$manager_root"
+"$cargo_bin" build --release -p linklake-client --locked --manifest-path "$project_root/Cargo.toml"
 "$flutter_bin" pub get
 "$flutter_bin" build linux --release \
   --dart-define="LINKLAKE_MANAGER_VERSION=$manager_version" \
@@ -26,6 +31,7 @@ rm -rf -- "$stage"
 rm -f -- "$archive" "$archive.sha256"
 install -d "$stage"
 cp -a "$bundle/." "$stage/"
+cp "$project_root/target/release/linklake-client" "$stage/linklake-client"
 cp "$project_root/README.md" "$project_root/README.en.md" "$project_root/LICENSE" "$project_root/NOTICE" \
   "$project_root/THIRD_PARTY_NOTICES.md" "$project_root/THIRD_PARTY_LICENSES.html" \
   "$project_root/TRADEMARKS.md" "$stage/"

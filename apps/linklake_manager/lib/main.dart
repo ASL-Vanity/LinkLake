@@ -12,6 +12,15 @@ void main() {
   runApp(const LinkLakeManagerApp());
 }
 
+// 集中维护客户端更新命令，避免界面按钮与命令行协议发生偏差。
+List<String> clientUpdateArguments(String action) => switch (action) {
+  'check' => ['check-update'],
+  'download' => ['update', 'download'],
+  'apply' => ['update', 'apply', '--yes'],
+  'rollback' => ['update', 'rollback', '--yes'],
+  _ => ['update', 'status'],
+};
+
 class LinkLakeManagerApp extends StatefulWidget {
   const LinkLakeManagerApp({super.key});
 
@@ -75,7 +84,7 @@ class LoginPage extends StatefulWidget {
 }
 
 class _LoginPageState extends State<LoginPage> {
-  final _server = TextEditingController(text: 'https://linklake.odelake.com');
+  final _server = TextEditingController(text: 'https://link.odelake.com');
   final _username = TextEditingController(text: 'admin');
   final _password = TextEditingController();
   final _totp = TextEditingController();
@@ -486,6 +495,7 @@ class _DashboardPageState extends State<DashboardPage> {
   Map<String, dynamic> _diagnostics = {};
   String? _latestRelease;
   bool? _updateAvailable;
+  bool _clientUpdateBusy = false;
   final Map<String, List<dynamic>> _resources = {};
 
   bool get zh => _chinese;
@@ -1637,6 +1647,41 @@ class _DashboardPageState extends State<DashboardPage> {
               icon: const Icon(Icons.description_outlined),
               label: Text(t('查看本地日志', 'View local logs')),
             ),
+            OutlinedButton.icon(
+              onPressed: _clientUpdateBusy
+                  ? null
+                  : () => _runClientUpdate('check'),
+              icon: const Icon(Icons.manage_search_outlined),
+              label: Text(t('检查客户端更新', 'Check client update')),
+            ),
+            OutlinedButton.icon(
+              onPressed: _clientUpdateBusy
+                  ? null
+                  : () => _runClientUpdate('download'),
+              icon: const Icon(Icons.download_for_offline_outlined),
+              label: Text(t('下载并验证', 'Download and verify')),
+            ),
+            FilledButton.icon(
+              onPressed: _clientUpdateBusy
+                  ? null
+                  : () => _confirmClientUpdate('apply'),
+              icon: const Icon(Icons.system_update_alt),
+              label: Text(t('安装客户端更新', 'Install client update')),
+            ),
+            OutlinedButton.icon(
+              onPressed: _clientUpdateBusy
+                  ? null
+                  : () => _confirmClientUpdate('rollback'),
+              icon: const Icon(Icons.settings_backup_restore),
+              label: Text(t('回滚客户端', 'Rollback client')),
+            ),
+            OutlinedButton.icon(
+              onPressed: _clientUpdateBusy
+                  ? null
+                  : () => _runClientUpdate('status'),
+              icon: const Icon(Icons.fact_check_outlined),
+              label: Text(t('更新状态', 'Update status')),
+            ),
           ],
         ),
         const SizedBox(height: 16),
@@ -1950,7 +1995,14 @@ class _DashboardPageState extends State<DashboardPage> {
     final directory = File(Platform.resolvedExecutable).parent.path;
     final name = Platform.isWindows ? 'linklake-client.exe' : 'linklake-client';
     final bundled = File('$directory${Platform.pathSeparator}$name');
-    return bundled.existsSync() ? bundled.path : name;
+    if (bundled.existsSync()) return bundled.path;
+    if (Platform.isMacOS) {
+      final resources = File(
+        '${Directory(directory).parent.path}${Platform.pathSeparator}Resources${Platform.pathSeparator}$name',
+      );
+      if (resources.existsSync()) return resources.path;
+    }
+    return name;
   }
 
   Future<ProcessResult> _runClient(List<String> arguments) =>
@@ -2054,6 +2106,76 @@ class _DashboardPageState extends State<DashboardPage> {
         'stderr': result.stderr.toString(),
       },
     );
+  }
+
+  Future<void> _confirmClientUpdate(String action) async {
+    final rollback = action == 'rollback';
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(
+          rollback
+              ? t('确认回滚客户端', 'Confirm client rollback')
+              : t('确认安装客户端更新', 'Confirm client update'),
+        ),
+        content: Text(
+          rollback
+              ? t(
+                  '将使用最后一份经过校验的客户端备份。更新帮助进程会停止匹配的系统服务、原子替换程序并重新启动服务。',
+                  'The last verified client backup will be used. The update helper stops the matching service, atomically replaces the binary, and restarts the service.',
+                )
+              : t(
+                  '将从官方 GitHub Release 下载程序，校验 GitHub 摘要、SHA-256 文件、平台、版本和归档内容，然后创建备份并原子替换。失败时会自动恢复。',
+                  'The client is downloaded from the official GitHub release and validated against GitHub metadata, the SHA-256 file, platform, version, and archive contents. A backup is created and restored automatically on failure.',
+                ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: Text(t('取消', 'Cancel')),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: Text(rollback ? t('回滚', 'Rollback') : t('安装', 'Install')),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) await _runClientUpdate(action);
+  }
+
+  Future<void> _runClientUpdate(String action) async {
+    setState(() => _clientUpdateBusy = true);
+    try {
+      final arguments = clientUpdateArguments(action);
+      final result = await _runClient(arguments);
+      Map<String, dynamic>? followUp;
+      if ((action == 'apply' || action == 'rollback') && result.exitCode == 0) {
+        await Future<void>.delayed(const Duration(seconds: 3));
+        final status = await _runClient(['update', 'status']);
+        followUp = {
+          'exit_code': status.exitCode,
+          'stdout': status.stdout.toString(),
+          'stderr': status.stderr.toString(),
+        };
+      }
+      if (!mounted) return;
+      setState(
+        () => _diagnostics['client_update'] = {
+          'action': action,
+          'exit_code': result.exitCode,
+          'stdout': result.stdout.toString(),
+          'stderr': result.stderr.toString(),
+          'status_after_schedule': followUp,
+          'administrator_note': t(
+            '替换系统安装目录中的客户端通常需要以管理员/root 身份运行 Manager。',
+            'Replacing a client in a system installation usually requires running Manager as administrator/root.',
+          ),
+        },
+      );
+    } finally {
+      if (mounted) setState(() => _clientUpdateBusy = false);
+    }
   }
 
   Widget _auditPage() => _pagePadding(

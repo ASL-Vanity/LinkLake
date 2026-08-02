@@ -46,7 +46,11 @@ $manifestData = [ordered]@{
     target = 'windows-x86_64'
     built_unix_seconds = $sourceDateEpoch
 } | ConvertTo-Json
-Set-Content -LiteralPath (Join-Path $stage 'release.json') -Value $manifestData -Encoding utf8
+[IO.File]::WriteAllText(
+    (Join-Path $stage 'release.json'),
+    $manifestData + "`n",
+    [Text.UTF8Encoding]::new($false)
+)
 
 Get-ChildItem -LiteralPath $stage -Recurse -File | ForEach-Object {
     $_.LastWriteTimeUtc = $archiveTimestamp.UtcDateTime

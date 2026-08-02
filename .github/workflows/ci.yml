@@ -105,6 +105,9 @@ jobs:
           if ($failed) { throw 'PowerShell syntax validation failed.' }
       - name: Run unit tests
         run: cargo test --workspace --locked
+      - name: Run updater replacement and rollback end-to-end tests
+        shell: pwsh
+        run: ./tests/update-e2e.ps1
       - name: Run TCP end-to-end tests
         shell: powershell
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\tcp-e2e.ps1

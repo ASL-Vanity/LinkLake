@@ -29,6 +29,8 @@ $archiveTimestamp = [DateTimeOffset]::FromUnixTimeSeconds($sourceDateEpoch)
 
 Push-Location $managerRoot
 try {
+    & cargo build --release -p linklake-client --locked --manifest-path (Join-Path $projectRoot 'Cargo.toml')
+    if ($LASTEXITCODE -ne 0) { throw 'LinkLake client release build failed.' }
     & $FlutterExecutable pub get
     if ($LASTEXITCODE -ne 0) { throw 'Flutter dependency resolution failed.' }
     & $FlutterExecutable build windows --release `
@@ -50,6 +52,7 @@ if (Test-Path -LiteralPath $archive) { Remove-Item -LiteralPath $archive -Force 
 if (Test-Path -LiteralPath "$archive.sha256") { Remove-Item -LiteralPath "$archive.sha256" -Force }
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 Copy-Item -Path (Join-Path $bundle '*') -Destination $stage -Recurse -Force
+Copy-Item -LiteralPath (Join-Path $projectRoot 'target\release\linklake-client.exe') -Destination $stage
 Copy-Item -LiteralPath (Join-Path $projectRoot 'README.md'), `
     (Join-Path $projectRoot 'README.en.md'), (Join-Path $projectRoot 'LICENSE'), `
     (Join-Path $projectRoot 'NOTICE'), (Join-Path $projectRoot 'THIRD_PARTY_NOTICES.md'), `
@@ -58,13 +61,18 @@ Copy-Item -LiteralPath (Join-Path $projectRoot 'README.md'), `
 Copy-Item -LiteralPath (Join-Path $managerRoot 'README.md') `
     -Destination (Join-Path $stage 'MANAGER_README.md')
 
-[ordered]@{
+$releaseManifest = [ordered]@{
     product = 'LinkLake Manager'
     component = 'manager'
     version = $version
     target = 'windows-x86_64'
     built_unix_seconds = $sourceDateEpoch
-} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stage 'release.json') -Encoding utf8
+} | ConvertTo-Json
+[IO.File]::WriteAllText(
+    (Join-Path $stage 'release.json'),
+    $releaseManifest + "`n",
+    [Text.UTF8Encoding]::new($false)
+)
 
 Get-ChildItem -LiteralPath $stage -Recurse -File | ForEach-Object {
     $_.LastWriteTimeUtc = $archiveTimestamp.UtcDateTime

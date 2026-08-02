@@ -15,7 +15,7 @@
           const systemDark = matchMedia('(prefers-color-scheme: dark)').matches;
           root.dataset.themeMode = ['system', 'light', 'dark'].includes(mode) ? mode : 'system';
           root.dataset.scheme = mode === 'system' ? (systemDark ? 'dark' : 'light') : mode;
-          root.dataset.palette = ['lake', 'ocean', 'jade', 'violet'].includes(palette) ? palette : 'lake';
+          root.dataset.palette = ['lake', 'ocean', 'jade', 'violet', 'contrast'].includes(palette) ? palette : 'lake';
         } catch (_) {}
       })();
     </script>
@@ -25,6 +25,7 @@
         font-synthesis: none;
         --brand-a: #0896a6;
         --brand-b: #3568e8;
+        --on-primary: #fff;
         --success: #16a36a;
         --warning: #d89a20;
         --danger: #db5b68;
@@ -33,6 +34,13 @@
         --radius-sm: 11px;
         --radius-md: 15px;
         --radius-lg: 21px;
+        --motion-fast: 120ms;
+        --motion-medium: 190ms;
+        --motion-slow: 270ms;
+        --motion-ease: cubic-bezier(.22, 1, .36, 1);
+        --panel-shadow: 0 18px 45px var(--shadow);
+        --panel-blur: 18px;
+        --panel-border-width: 1px;
       }
       html[data-scheme="dark"][data-palette="lake"] {
         color-scheme: dark;
@@ -60,9 +68,11 @@
       html[data-scheme="light"][data-palette="jade"] { color-scheme:light; --brand-a:#059669;--brand-b:#047857;--accent:#059669;--accent-soft:#05966918;--primary:#047857;--primary-soft:#04785718;--bg:#edf8f3;--bg-elevated:#fbfffd;--surface:#fff;--surface-2:#e4f3eb;--surface-3:#f3faf6;--surface-hover:#dcefe5;--text:#193d30;--text-strong:#09291f;--muted:#577b6d;--faint:#78978b;--line:#b4d6c7;--line-soft:#18513c18;--overlay:#173d2e66;--shadow:#245e4622;--chart-grid:#18513c18;--chart-label:#608476;--success:#087d55;--warning:#ae7509;--danger:#c54551;--focus-ring:#0aa874; }
       html[data-scheme="dark"][data-palette="violet"] { color-scheme:dark; --brand-a:#a47aff;--brand-b:#7651e8;--accent:#a47aff;--accent-soft:#a47aff24;--primary:#7651e8;--primary-soft:#7651e822;--bg:#120d1d;--bg-elevated:#1b142a;--surface:#241a36;--surface-2:#322449;--surface-3:#1a1328;--surface-hover:#3c2b55;--text:#f3edfb;--text-strong:#fffaff;--muted:#c0add5;--faint:#9680ad;--line:#5a4175;--line-soft:#d1b5f418;--overlay:#08040edc;--shadow:#0009;--chart-grid:#d1b5f41a;--chart-label:#b49fca;--success:#35c58a;--warning:#e6aa39;--danger:#ed657d;--focus-ring:#ad83ff; }
       html[data-scheme="light"][data-palette="violet"] { color-scheme:light; --brand-a:#8b5cf6;--brand-b:#6d28d9;--accent:#8b5cf6;--accent-soft:#8b5cf618;--primary:#6d28d9;--primary-soft:#6d28d918;--bg:#f6f1fc;--bg-elevated:#fffcff;--surface:#fff;--surface-2:#efe7f8;--surface-3:#faf6fd;--surface-hover:#e9dff4;--text:#422f55;--text-strong:#281738;--muted:#765f89;--faint:#9583a5;--line:#d1c0df;--line-soft:#4e2a6918;--overlay:#3c295066;--shadow:#593c7022;--chart-grid:#4e2a6918;--chart-label:#806d91;--success:#13845d;--warning:#ad730a;--danger:#c34559;--focus-ring:#9467f7; }
+      html[data-scheme="dark"][data-palette="contrast"] { color-scheme:dark; --brand-a:#00e5ff;--brand-b:#ffe600;--accent:#00e5ff;--accent-soft:#00e5ff24;--primary:#ffe600;--primary-soft:#ffe60022;--on-primary:#000;--bg:#000;--bg-elevated:#080808;--surface:#0d0d0d;--surface-2:#161616;--surface-3:#050505;--surface-hover:#202020;--text:#fff;--text-strong:#fff;--muted:#d7d7d7;--faint:#aaa;--line:#fff;--line-soft:#ffffff40;--overlay:#000e;--shadow:#000;--chart-grid:#ffffff32;--chart-label:#fff;--success:#3cff9b;--warning:#ffe600;--danger:#ff5267;--focus-ring:#00e5ff; }
+      html[data-scheme="light"][data-palette="contrast"] { color-scheme:light; --brand-a:#005fcc;--brand-b:#5b21b6;--accent:#005fcc;--accent-soft:#005fcc20;--primary:#4c1d95;--primary-soft:#4c1d9520;--bg:#fff;--bg-elevated:#fff;--surface:#fff;--surface-2:#f2f2f2;--surface-3:#f8f8f8;--surface-hover:#e8e8e8;--text:#000;--text-strong:#000;--muted:#222;--faint:#444;--line:#000;--line-soft:#00000045;--overlay:#0009;--shadow:#0003;--chart-grid:#00000030;--chart-label:#111;--success:#006b3c;--warning:#8a5700;--danger:#b00020;--focus-ring:#005fcc; }
       * { box-sizing: border-box; }
       html { min-width: 320px; background: var(--bg); }
-      body { min-height: 100vh; margin: 0; color: var(--text); background: var(--bg); }
+      body { min-height: 100vh; margin: 0; color: var(--text); background: var(--bg); transition: color var(--motion-medium) var(--motion-ease), background var(--motion-medium) var(--motion-ease); }
       body::before { position: fixed; inset: 0; z-index: -1; content: ""; pointer-events: none; background: radial-gradient(circle at 12% -8%, var(--accent-soft), transparent 38%), radial-gradient(circle at 95% 12%, var(--primary-soft), transparent 34%); }
       button, input, select, textarea { font: inherit; }
       button, a { -webkit-tap-highlight-color: transparent; }
@@ -78,9 +88,9 @@
       .brand-mark { flex: 0 0 auto; width: 32px; height: 32px; }
       .brand-mark .shore-a { fill: var(--brand-a); }
       .brand-mark .shore-b { fill: var(--brand-b); }
-      .utility-bar { position: relative; z-index: 30; display: flex; align-items: center; justify-content: space-between; min-height: 64px; padding: 12px clamp(16px, 3vw, 34px); border-bottom: 1px solid var(--line-soft); background: color-mix(in srgb, var(--bg) 86%, transparent); backdrop-filter: blur(18px); }
+      .utility-bar { position: sticky; top: 0; z-index: 30; display: grid; grid-template-columns: minmax(180px, auto) minmax(280px, 680px) minmax(0, 1fr); align-items: center; min-height: 64px; padding: 10px clamp(18px, 2vw, 36px); border-bottom: 1px solid var(--line-soft); background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(var(--panel-blur)); }
       .utility-brand, .sidebar-brand, .login-brand { display: flex; align-items: center; gap: 11px; }
-      .global-search { position: relative; flex: 1 1 320px; max-width: 620px; margin: 0 18px; }
+      .global-search { position: relative; width: 100%; max-width: 680px; margin: 0 20px; }
       .global-search input { min-height: 38px; padding-left: 14px; background: var(--surface); }
       .global-search-results { position: absolute; top: calc(100% + 8px); left: 0; right: 0; z-index: 90; max-height: min(520px, 70vh); overflow: auto; padding: 8px; border: 1px solid var(--line); border-radius: var(--radius-md); background: var(--bg-elevated); box-shadow: 0 18px 48px var(--shadow); }
       .global-search-results button { display: grid; width: 100%; gap: 3px; padding: 9px 10px; color: var(--text); border: 0; border-radius: 9px; text-align: left; background: transparent; }
@@ -89,24 +99,34 @@
       .global-search-results small { color: var(--muted); font-size: 10px; overflow-wrap: anywhere; }
       .utility-brand strong, .sidebar-brand strong { color: var(--text-strong); font-size: 15px; letter-spacing: .01em; }
       .utility-brand small, .sidebar-brand small { display: block; margin-top: 2px; color: var(--faint); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
-      .utility-actions, .utility-session, .header-actions, .inline-actions, .drawer-actions, .filter-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-      .utility-session { padding-left: 8px; border-left: 1px solid var(--line-soft); }
-      .icon-button, .soft-button, .primary-button, .danger-button, .chip-button { min-height: 38px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 10px; font-weight: 700; transition: background .16s, border-color .16s, transform .16s, opacity .16s; }
+      .utility-actions, .utility-session, .utility-preferences, .header-actions, .inline-actions, .drawer-actions, .filter-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+      .utility-actions { justify-content: flex-end; min-width: 0; }
+      .utility-session { gap: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 11px; background: var(--surface); }
+      .utility-session .health-pill, .utility-session .time-pill { border: 0; border-radius: 0; background: transparent; }
+      .utility-session .time-pill { border-left: 1px solid var(--line-soft); }
+      .utility-preferences { gap: 5px; padding-left: 8px; border-left: 1px solid var(--line-soft); }
+      .icon-button, .soft-button, .primary-button, .danger-button, .chip-button { min-height: 38px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 10px; font-weight: 700; transition: color var(--motion-fast) var(--motion-ease), background var(--motion-fast) var(--motion-ease), border-color var(--motion-fast) var(--motion-ease), transform var(--motion-fast) var(--motion-ease), opacity var(--motion-fast) var(--motion-ease), box-shadow var(--motion-fast) var(--motion-ease); }
       .icon-button, .soft-button, .chip-button { color: var(--text); background: var(--surface); }
       .icon-button:hover, .soft-button:hover, .chip-button:hover { border-color: var(--accent); background: var(--surface-hover); }
-      .primary-button { color: #fff; background: var(--primary); border-color: var(--primary); }
+      .primary-button { color: var(--on-primary); background: var(--primary); border-color: var(--primary); }
       .danger-button { color: #fff; background: var(--danger); border-color: var(--danger); }
       .icon-button:active, .soft-button:active, .primary-button:active, .danger-button:active { transform: translateY(1px); }
       button:disabled { cursor: wait; opacity: .55; transform: none; }
       .icon-button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; }
       .icon-button svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
-      .popover { position: fixed; top: 58px; right: 18px; z-index: 80; width: min(330px, calc(100vw - 28px)); padding: 14px; border: 1px solid var(--line); border-radius: var(--radius-md); background: var(--bg-elevated); box-shadow: 0 20px 55px var(--shadow); }
+      .popover { position: fixed; top: 58px; right: 18px; z-index: 80; width: min(520px, calc(100vw - 28px)); padding: 16px; border: 1px solid var(--line); border-radius: var(--radius-md); background: var(--bg-elevated); box-shadow: 0 20px 55px var(--shadow); transform-origin: top right; animation: popover-in var(--motion-medium) var(--motion-ease); }
       .popover h3 { margin-bottom: 10px; }
       .choice-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; margin-bottom: 14px; }
-      .choice-grid.palette-grid { grid-template-columns: repeat(4, 1fr); margin-bottom: 0; }
+      .choice-grid.palette-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-bottom: 0; }
       .choice-grid button { min-height: 38px; padding: 7px; color: var(--muted); border: 1px solid var(--line-soft); border-radius: 9px; background: var(--surface-3); }
       .choice-grid button.active { color: var(--text-strong); border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
-      .palette-swatch { display: block; width: 30px; height: 10px; margin: 0 auto 5px; border: 1px solid #ffffff33; border-radius: 99px; background: linear-gradient(90deg, var(--swatch-bg) 0 33%, var(--swatch-surface) 33% 66%, var(--swatch-accent) 66%); }
+      .palette-grid button { display: grid; grid-template-columns: 66px minmax(0, 1fr); align-items: center; gap: 10px; min-height: 64px; text-align: left; }
+      .theme-preview { position: relative; display: grid; grid-template-columns: 18px 1fr; gap: 4px; width: 66px; height: 42px; padding: 5px; overflow: hidden; border: 1px solid #ffffff33; border-radius: var(--preview-radius, 10px); background: var(--swatch-bg); box-shadow: var(--preview-shadow, none); }
+      .theme-preview::before { content: ""; border-radius: calc(var(--preview-radius, 10px) / 2); background: var(--swatch-nav, var(--swatch-surface)); }
+      .theme-preview::after { content: ""; border-radius: calc(var(--preview-radius, 10px) / 2); background: linear-gradient(145deg, var(--swatch-surface), var(--swatch-accent)); }
+      .theme-choice-copy strong, .theme-choice-copy small { display: block; }
+      .theme-choice-copy strong { color: var(--text-strong); font-size: 11px; }
+      .theme-choice-copy small { margin-top: 3px; color: var(--faint); font-size: 9px; line-height: 1.35; }
       .login-shell { display: grid; place-items: center; min-height: calc(100vh - 64px); padding: 34px 18px 72px; }
       .login-card { width: min(470px, 100%); padding: clamp(25px, 5vw, 40px); border: 1px solid var(--line); border-radius: 25px; background: color-mix(in srgb, var(--surface) 94%, transparent); box-shadow: 0 28px 82px var(--shadow); }
       .login-brand { flex-direction: column; gap: 10px; margin-bottom: 28px; text-align: center; }
@@ -123,14 +143,14 @@
       .check-label { display: flex; grid-template-columns: none; align-items: flex-start; gap: 9px; }
       .check-label input { flex: 0 0 auto; width: 18px; min-height: 18px; margin-top: 1px; }
       .login-card form .primary-button { width: 100%; min-height: 46px; margin-top: 3px; }
-      .workspace { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 22px; width: min(2200px, 100%); min-width: 0; max-width: 100%; margin: 0 auto; padding: 24px clamp(16px, 2.4vw, 42px) 50px; }
-      .sidebar { position: sticky; top: 88px; min-width: 0; max-width: 100%; max-height: calc(100vh - 112px); overflow: auto; padding: 16px 12px; border: 1px solid var(--line); border-radius: var(--radius-lg); background: color-mix(in srgb, var(--surface) 94%, transparent); box-shadow: 0 18px 45px var(--shadow); }
+      .workspace { display: grid; grid-template-columns: clamp(220px, 13vw, 260px) minmax(0, 1fr); gap: clamp(18px, 1.5vw, 28px); width: 100%; min-width: 0; max-width: none; margin: 0; padding: 24px clamp(24px, 2vw, 40px) 52px; }
+      .sidebar { position: sticky; top: 88px; min-width: 0; max-width: 100%; max-height: calc(100vh - 112px); overflow: auto; padding: 18px 14px; border: var(--panel-border-width) solid var(--line); border-radius: var(--radius-lg); background: color-mix(in srgb, var(--surface) 94%, transparent); box-shadow: var(--panel-shadow); backdrop-filter: blur(var(--panel-blur)); }
       .sidebar-brand { padding: 4px 8px 18px; border-bottom: 1px solid var(--line-soft); }
-      .sidebar-brand .brand-mark { width: 30px; height: 30px; }
+      .sidebar-brand .brand-mark { width: 36px; height: 36px; }
       .nav { display: grid; min-width: 0; max-width: 100%; gap: 5px; margin-top: 14px; }
-      .nav-link { display: flex; align-items: center; gap: 10px; min-height: 42px; padding: 9px 11px; color: var(--muted); border: 1px solid transparent; border-radius: 10px; font-size: 13px; font-weight: 700; }
-      .nav-link:hover { color: var(--text); background: var(--surface-hover); }
-      .nav-link.active { color: #fff; border-color: var(--primary); background: var(--primary); }
+      .nav-link { display: flex; align-items: center; gap: 11px; min-height: 45px; padding: 10px 12px; color: var(--muted); border: 1px solid transparent; border-radius: 11px; font-size: 13px; font-weight: 750; transition: color var(--motion-fast) var(--motion-ease), background var(--motion-fast) var(--motion-ease), border-color var(--motion-fast) var(--motion-ease), transform var(--motion-fast) var(--motion-ease); }
+      .nav-link:hover { color: var(--text); background: var(--surface-hover); transform: translateX(2px); }
+      .nav-link.active { color: var(--on-primary); border-color: var(--primary); background: var(--primary); }
       .nav-icon { width: 19px; color: currentColor; text-align: center; }
       .nav-group-label { margin: 16px 10px 6px; color: var(--faint); font-size: 10px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
       .service-subnav { display: grid; min-width: 0; max-width: 100%; grid-template-columns: 1fr 1fr; gap: 4px; }
@@ -144,7 +164,7 @@
       .health-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--success); box-shadow: 0 0 0 4px color-mix(in srgb, var(--success) 18%, transparent); }
       .account-wrap { position: relative; }
       .account-button { min-width: 44px; padding: 6px 10px 6px 7px; }
-      .avatar { display: grid; place-items: center; width: 27px; height: 27px; border-radius: 50%; color: #fff; background: var(--primary); font-size: 12px; }
+      .avatar { display: grid; place-items: center; width: 27px; height: 27px; border-radius: 50%; color: var(--on-primary); background: var(--primary); font-size: 12px; }
       .account-menu { position: absolute; top: calc(100% + 8px); right: 0; z-index: 60; width: min(300px, calc(100vw - 34px)); padding: 13px; border: 1px solid var(--line); border-radius: var(--radius-md); background: var(--bg-elevated); box-shadow: 0 18px 48px var(--shadow); }
       .account-card { padding: 10px; border-radius: 11px; background: var(--surface-3); }
       .account-card strong { display: block; color: var(--text-strong); }
@@ -152,11 +172,11 @@
       .account-menu .menu-list { display: grid; gap: 5px; margin-top: 10px; }
       .account-menu .menu-list button { width: 100%; min-height: 38px; padding: 8px 10px; color: var(--text); border: 0; border-radius: 9px; text-align: left; background: transparent; }
       .account-menu .menu-list button:hover { background: var(--surface-hover); }
-      .view-panel { min-width: 0; }
+      .view-panel { min-width: 0; animation: view-enter var(--motion-slow) var(--motion-ease); }
       .section-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 14px; }
       .section-heading h2 { margin-bottom: 4px; }
       .section-heading p { margin-bottom: 0; font-size: 12px; }
-      .panel, .chart-panel, .metric-panel, .service-card, .p2p-card, .audit-item { border: 1px solid var(--line-soft); border-radius: var(--radius-md); background: var(--surface); }
+      .panel, .chart-panel, .metric-panel, .service-card, .p2p-card, .audit-item { border: var(--panel-border-width) solid var(--line-soft); border-radius: var(--radius-md); background: var(--surface); box-shadow: var(--component-shadow, none); transition: border-color var(--motion-fast) var(--motion-ease), background var(--motion-medium) var(--motion-ease), box-shadow var(--motion-medium) var(--motion-ease), transform var(--motion-fast) var(--motion-ease), opacity var(--motion-fast) var(--motion-ease); }
       .panel, .chart-panel, .metric-panel { padding: 16px; }
       .kpi-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin-bottom: 12px; }
       .kpi-card { min-width: 0; min-height: 96px; padding: 15px; border: 1px solid var(--line-soft); border-radius: 14px; background: linear-gradient(145deg, var(--surface-2), var(--surface)); }
@@ -164,12 +184,13 @@
       .kpi-card span { display: block; color: var(--muted); font-size: 11px; line-height: 1.4; }
       .kpi-card small { display: block; margin-top: 8px; color: var(--faint); font-size: 10px; }
       .chart-panel { position: relative; min-width: 0; margin-bottom: 12px; }
+      .chart-panel.is-loading::after { position: absolute; inset: 0; z-index: 3; display: grid; place-items: center; content: attr(data-loading-label); color: var(--muted); border-radius: inherit; background: color-mix(in srgb, var(--surface) 70%, transparent); backdrop-filter: blur(3px); animation: fade-in var(--motion-fast) var(--motion-ease); }
       .panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
       .panel-heading h3 { margin-bottom: 3px; }
       .panel-heading p { margin-bottom: 0; font-size: 11px; }
       .range-switch { display: flex; gap: 4px; padding: 3px; border: 1px solid var(--line-soft); border-radius: 10px; background: var(--surface-3); }
       .range-switch button { min-width: 43px; padding: 5px 8px; color: var(--muted); border: 0; border-radius: 7px; background: transparent; font-size: 10px; font-weight: 800; }
-      .range-switch button.active { color: #fff; background: var(--primary); }
+      .range-switch button.active { color: var(--on-primary); background: var(--primary); }
       .chart-wrap { position: relative; min-width: 0; height: 245px; }
       .chart-wrap.compact { height: 205px; }
       canvas { display: block; width: 100%; height: 100%; }
@@ -216,22 +237,39 @@
       .service-header p { margin-bottom: 0; font-size: 12px; }
       .service-toolbar { display: grid; grid-template-columns: minmax(180px, 1fr) 170px auto; gap: 8px; margin-bottom: 12px; }
       .service-toolbar input, .service-toolbar select { min-height: 40px; }
-      .service-list { display: grid; gap: 9px; }
-      .service-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; padding: 14px 15px; }
+      .service-insights, .client-insights { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(300px, .8fr); gap: 12px; margin-bottom: 12px; }
+      .insight-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(92px, 1fr)); gap: 8px; margin-bottom: 10px; }
+      .insight-kpi { min-width: 0; padding: 10px 11px; border: 1px solid var(--line-soft); border-radius: 10px; background: var(--surface-3); }
+      .insight-kpi strong { display: block; color: var(--text-strong); font-size: 18px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .insight-kpi span { display: block; margin-top: 3px; color: var(--faint); font-size: 9px; }
+      .service-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(560px, 100%), 1fr)); gap: 9px; }
+      .service-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 10px; min-height: 0; padding: 11px 12px; }
       .service-card:hover { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); }
-      .service-card h3 { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-bottom: 7px; font-size: 14px; }
+      .service-card h3 { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 5px; font-size: 12px; }
       .policy-select { display: inline-flex; align-items: center; }
       .policy-select input { width: 18px; min-height: 18px; margin: 0 2px 0 0; }
       .badge { display: inline-flex; align-items: center; min-height: 22px; padding: 3px 7px; border-radius: 999px; color: var(--muted); background: var(--surface-3); font-size: 9px; font-weight: 800; text-transform: uppercase; }
       .badge.online { color: var(--success); background: color-mix(in srgb, var(--success) 12%, var(--surface-3)); }
       .badge.offline { color: var(--faint); }
       .badge.warning { color: var(--warning); background: color-mix(in srgb, var(--warning) 12%, var(--surface-3)); }
-      .endpoint { margin-bottom: 8px; color: var(--text); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; overflow-wrap: anywhere; }
-      .service-stats { display: flex; flex-wrap: wrap; gap: 5px 12px; color: var(--muted); font-size: 10px; line-height: 1.45; }
+      .endpoint { margin-bottom: 5px; color: var(--text); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 10px; overflow-wrap: anywhere; }
+      .service-stats { display: flex; flex-wrap: wrap; gap: 3px 10px; color: var(--muted); font-size: 9px; line-height: 1.35; }
       .service-stats strong { color: var(--text); }
       .service-error { margin-top: 8px; color: var(--danger); font-size: 10px; overflow-wrap: anywhere; }
-      .service-actions { display: flex; flex-wrap: wrap; align-content: flex-start; justify-content: flex-end; gap: 6px; max-width: 290px; }
-      .service-actions button { min-height: 32px; padding: 6px 9px; font-size: 10px; }
+      .service-actions { display: flex; flex-wrap: nowrap; align-content: flex-start; justify-content: flex-end; gap: 5px; max-width: 230px; }
+      .service-actions button, .action-menu summary { min-height: 30px; padding: 5px 8px; font-size: 9px; }
+      .action-menu { position: relative; }
+      .action-menu summary { display: inline-flex; align-items: center; list-style: none; color: var(--text); border: 1px solid var(--line); border-radius: 9px; background: var(--surface); cursor: pointer; font-weight: 700; }
+      .action-menu summary::-webkit-details-marker { display: none; }
+      .action-menu-popover { position: absolute; top: calc(100% + 6px); right: 0; z-index: 25; display: grid; min-width: 150px; gap: 4px; padding: 6px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg-elevated); box-shadow: 0 16px 38px var(--shadow); animation: popover-in var(--motion-fast) var(--motion-ease); }
+      .action-menu-popover button { width: 100%; justify-content: flex-start; }
+      .client-presence { display: grid; gap: 3px; }
+      .client-presence strong { display: inline-flex; align-items: center; gap: 6px; }
+      .client-presence i { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); }
+      .client-presence.online i { background: var(--success); box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 16%, transparent); }
+      .client-presence.offline i { background: var(--warning); }
+      .client-presence.disabled i { background: var(--faint); }
+      .client-presence small { color: var(--faint); font-size: 9px; }
       .empty-state { padding: 34px 18px; border: 1px dashed var(--line); border-radius: var(--radius-md); color: var(--muted); text-align: center; background: var(--surface); }
       .drawer-backdrop { position: fixed; inset: 0; z-index: 90; background: var(--overlay); }
       .drawer { position: fixed; top: 0; right: 0; z-index: 100; display: grid; grid-template-rows: auto minmax(0, 1fr); width: min(520px, 100vw); height: 100vh; border-left: 1px solid var(--line); background: var(--bg-elevated); box-shadow: -24px 0 70px var(--shadow); }
@@ -273,14 +311,30 @@
       .data-table th { color: var(--faint); background: var(--surface-3); font-size: 10px; text-transform: uppercase; letter-spacing: .05em; }
       .data-table tr:last-child td { border-bottom: 0; }
       .data-table td:first-child { color: var(--text-strong); font-weight: 800; }
+      .cell-stack { display: grid; gap: 3px; }
+      .cell-stack small { color: var(--faint); font-size: 9px; }
       .table-actions { display: flex; flex-wrap: wrap; gap: 5px; justify-content: flex-end; }
       .table-actions button { min-height: 30px; padding: 5px 8px; font-size: 10px; }
       .access-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 12px; }
       .role-note { margin: 0; font-size: 11px; }
       .user-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
       .user-form-grid .full { grid-column: 1 / -1; }
-      .modal-backdrop { position: fixed; inset: 0; z-index: 110; display: grid; place-items: center; padding: 20px; background: var(--overlay); }
-      .modal { width: min(440px, 100%); padding: 20px; border: 1px solid var(--line); border-radius: var(--radius-lg); background: var(--bg-elevated); box-shadow: 0 28px 70px var(--shadow); }
+      .modal-backdrop { position: fixed; inset: 0; z-index: 110; display: grid; place-items: center; padding: 20px; background: var(--overlay); animation: fade-in var(--motion-medium) var(--motion-ease); }
+      .modal { width: min(440px, 100%); padding: 20px; border: 1px solid var(--line); border-radius: var(--radius-lg); background: var(--bg-elevated); box-shadow: 0 28px 70px var(--shadow); animation: modal-in var(--motion-medium) var(--motion-ease); }
+      @keyframes view-enter { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+      @keyframes popover-in { from { opacity: 0; transform: translateY(-5px) scale(.985); } to { opacity: 1; transform: none; } }
+      @keyframes modal-in { from { opacity: 0; transform: translateY(10px) scale(.985); } to { opacity: 1; transform: none; } }
+      @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+      html[data-palette="lake"] { --panel-shadow: 0 18px 48px var(--shadow); --panel-blur: 20px; --component-shadow: 0 8px 24px color-mix(in srgb, var(--shadow) 48%, transparent); }
+      html[data-palette="lake"] body::before { background: radial-gradient(circle at 10% -10%, var(--accent-soft), transparent 42%), radial-gradient(circle at 92% 8%, var(--primary-soft), transparent 36%), linear-gradient(140deg, transparent 45%, color-mix(in srgb, var(--primary-soft) 32%, transparent)); }
+      html[data-palette="ocean"] { --radius-xs: 4px; --radius-sm: 6px; --radius-md: 8px; --radius-lg: 11px; --panel-shadow: none; --panel-blur: 0px; --component-shadow: none; }
+      html[data-palette="ocean"] body::before { background-image: linear-gradient(var(--chart-grid) 1px, transparent 1px), linear-gradient(90deg, var(--chart-grid) 1px, transparent 1px); background-size: 38px 38px; mask-image: linear-gradient(to bottom, #0008, transparent 72%); }
+      html[data-palette="jade"] { --radius-xs: 10px; --radius-sm: 14px; --radius-md: 18px; --radius-lg: 26px; --panel-shadow: 0 10px 28px var(--shadow); --panel-blur: 0px; --component-shadow: 0 3px 12px color-mix(in srgb, var(--shadow) 40%, transparent); }
+      html[data-palette="jade"] body::before { background: linear-gradient(125deg, var(--accent-soft), transparent 42%), radial-gradient(circle at 88% 12%, var(--primary-soft), transparent 32%); }
+      html[data-palette="violet"] { --panel-shadow: 0 0 32px color-mix(in srgb, var(--primary) 16%, var(--shadow)); --panel-blur: 14px; --component-shadow: inset 0 0 22px color-mix(in srgb, var(--primary) 7%, transparent), 0 10px 34px var(--shadow); }
+      html[data-palette="violet"] .panel, html[data-palette="violet"] .chart-panel, html[data-palette="violet"] .metric-panel, html[data-palette="violet"] .service-card { border-color: color-mix(in srgb, var(--primary) 34%, var(--line-soft)); }
+      html[data-palette="contrast"] { --radius-xs: 0px; --radius-sm: 2px; --radius-md: 3px; --radius-lg: 4px; --panel-shadow: none; --panel-blur: 0px; --component-shadow: none; --panel-border-width: 2px; }
+      html[data-palette="contrast"] body::before { display: none; }
       .modal-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
       .modal-header h2 { margin-bottom: 4px; }
       .toast { position: fixed; right: 20px; bottom: 20px; z-index: 140; max-width: min(520px, calc(100vw - 40px)); padding: 11px 14px; border: 1px solid var(--line); border-radius: 11px; color: var(--text); background: var(--bg-elevated); box-shadow: 0 16px 42px var(--shadow); font-size: 11px; line-height: 1.5; }
@@ -301,7 +355,7 @@
         .overview-grid { grid-template-columns: 1fr; }
       }
       @media (max-width: 760px) {
-        .utility-bar { flex-wrap: wrap; }
+        .utility-bar { display: flex; flex-wrap: wrap; }
         .global-search { order: 3; flex-basis: 100%; max-width: none; margin: 6px 0 0; }
         .utility-brand small { display: none; }
         .workspace { padding-top: 16px; }
@@ -314,7 +368,7 @@
         .kpi-card:last-child:nth-child(odd) { grid-column: 1 / -1; }
         .metrics-layout .span-8, .metrics-layout .span-6, .metrics-layout .span-4 { grid-column: 1 / -1; }
         .service-toolbar, .activity-toolbar { grid-template-columns: 1fr; }
-        .service-card { grid-template-columns: 1fr; }
+        .service-card, .service-insights, .client-insights { grid-template-columns: 1fr; }
         .service-actions { justify-content: flex-start; max-width: none; }
         .drawer-grid { grid-template-columns: 1fr; }
         .drawer-grid .full { grid-column: auto; }
@@ -350,6 +404,10 @@
       }
       @media (min-width: 1600px) {
         .metrics-layout .metric-panel { grid-column: span 4; }
+        .sidebar-brand strong { font-size: 17px; }
+        .sidebar-brand small { font-size: 10px; }
+        .nav-link { min-height: 48px; font-size: 14px; }
+        .service-subnav .nav-link { min-height: 38px; font-size: 12px; }
       }
       @media (prefers-reduced-motion: reduce) {
         *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; }
@@ -367,13 +425,15 @@
         <div id="utility-session" class="utility-session hidden">
           <span class="health-pill"><span class="health-dot"></span><span data-i18n="serverOnline">Server online</span></span>
           <span id="last-refresh" class="time-pill">—</span>
-          <button id="refresh" class="icon-button" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0 2 5M20 4v7h-7"/></svg><span class="button-label" data-i18n="refresh">Refresh</span></button>
         </div>
-        <button id="appearance-button" class="icon-button" type="button" aria-haspopup="dialog" aria-controls="appearance-popover" aria-expanded="false">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.41M17.66 6.34l1.41-1.41"/></svg>
-          <span class="button-label" data-i18n="appearance">Appearance</span>
-        </button>
-        <button id="language" class="icon-button" type="button" aria-label="Switch language">ZH</button>
+        <button id="refresh" class="icon-button" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0 2 5M20 4v7h-7"/></svg><span class="button-label" data-i18n="refresh">Refresh</span></button>
+        <div class="utility-preferences">
+          <button id="appearance-button" class="icon-button" type="button" aria-haspopup="dialog" aria-controls="appearance-popover" aria-expanded="false">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.41M17.66 6.34l1.41-1.41"/></svg>
+            <span class="button-label" data-i18n="appearance">Appearance</span>
+          </button>
+          <button id="language" class="icon-button" type="button" aria-label="Switch language">ZH</button>
+        </div>
         <div id="account-shell" class="account-wrap hidden">
           <button id="account-button" class="icon-button account-button" type="button" aria-haspopup="menu" aria-expanded="false"><span id="account-avatar" class="avatar">A</span><span id="account-name" class="button-label">admin</span></button>
           <div id="account-menu" class="account-menu hidden" role="menu">
@@ -395,12 +455,13 @@
         <button type="button" data-theme-choice="light" data-i18n="themeLight">Light</button>
         <button type="button" data-theme-choice="dark" data-i18n="themeDark">Dark</button>
       </div>
-      <h3 data-i18n="palette">Palette</h3>
-      <div class="choice-grid palette-grid" aria-label="Color palette">
-        <button type="button" data-palette-choice="lake"><span class="palette-swatch" style="--swatch-bg:#06131d;--swatch-surface:#0c2433;--swatch-accent:#16b4bd"></span><span data-i18n="paletteLake">Lake</span></button>
-        <button type="button" data-palette-choice="ocean"><span class="palette-swatch" style="--swatch-bg:#07111f;--swatch-surface:#0d2239;--swatch-accent:#20a7ec"></span><span data-i18n="paletteOcean">Ocean</span></button>
-        <button type="button" data-palette-choice="jade"><span class="palette-swatch" style="--swatch-bg:#071611;--swatch-surface:#0d2a20;--swatch-accent:#25c991"></span><span data-i18n="paletteJade">Jade</span></button>
-        <button type="button" data-palette-choice="violet"><span class="palette-swatch" style="--swatch-bg:#120d1d;--swatch-surface:#241a36;--swatch-accent:#a47aff"></span><span data-i18n="paletteViolet">Violet</span></button>
+      <h3 data-i18n="visualStyle">Visual style</h3>
+      <div class="choice-grid palette-grid" aria-label="Visual style">
+        <button type="button" data-palette-choice="lake"><span class="theme-preview" style="--swatch-bg:#06131d;--swatch-nav:#0c2433;--swatch-surface:#123246;--swatch-accent:#16b4bd;--preview-radius:12px;--preview-shadow:0 4px 12px #0008"></span><span class="theme-choice-copy"><strong data-i18n="styleAurora">Aurora</strong><small data-i18n="styleAuroraHelp">Layered glass and lake light</small></span></button>
+        <button type="button" data-palette-choice="ocean"><span class="theme-preview" style="--swatch-bg:#07111f;--swatch-nav:#0d2239;--swatch-surface:#142f4e;--swatch-accent:#20a7ec;--preview-radius:3px"></span><span class="theme-choice-copy"><strong data-i18n="styleMinimal">Minimal</strong><small data-i18n="styleMinimalHelp">Flat, precise and information dense</small></span></button>
+        <button type="button" data-palette-choice="jade"><span class="theme-preview" style="--swatch-bg:#edf8f3;--swatch-nav:#e4f3eb;--swatch-surface:#fff;--swatch-accent:#059669;--preview-radius:14px;--preview-shadow:0 3px 8px #245e4622"></span><span class="theme-choice-copy"><strong data-i18n="stylePaper">Paper</strong><small data-i18n="stylePaperHelp">Soft surfaces and clear boundaries</small></span></button>
+        <button type="button" data-palette-choice="violet"><span class="theme-preview" style="--swatch-bg:#120d1d;--swatch-nav:#241a36;--swatch-surface:#322449;--swatch-accent:#a47aff;--preview-radius:10px;--preview-shadow:0 0 12px #7651e888"></span><span class="theme-choice-copy"><strong data-i18n="styleNeon">Neon</strong><small data-i18n="styleNeonHelp">Deep space and restrained glow</small></span></button>
+        <button type="button" data-palette-choice="contrast"><span class="theme-preview" style="--swatch-bg:#000;--swatch-nav:#0d0d0d;--swatch-surface:#fff;--swatch-accent:#ffe600;--preview-radius:0"></span><span class="theme-choice-copy"><strong data-i18n="styleContrast">High contrast</strong><small data-i18n="styleContrastHelp">Strong borders and accessible contrast</small></span></button>
       </div>
     </div>
 
@@ -462,24 +523,28 @@
         <section class="workspace-main">
           <header class="workspace-header">
             <div><h1 id="workspace-title">Overview</h1><p id="workspace-subtitle"></p></div>
+            <div id="workspace-service-actions" class="inline-actions hidden"><button id="export-policies" class="soft-button" type="button" data-i18n="exportPolicies">Export</button><button id="import-policies" class="soft-button" type="button" data-i18n="importPolicies">Import</button><input id="import-policies-file" class="hidden" type="file" accept="application/json,.json" /><button id="new-policy" class="primary-button" type="button" data-action="new-policy" data-i18n="newPolicy">New policy</button></div>
+            <div id="workspace-fleet-actions" class="inline-actions admin-only hidden"><button id="preview-fleet-sync" class="soft-button" type="button" data-i18n="previewFleetSync">Preview sync</button><button id="apply-fleet-sync" class="soft-button" type="button" data-i18n="applyFleetSync">Apply sync</button><button id="new-fleet-peer" class="primary-button" type="button" data-i18n="newFleetPeer">Add server</button></div>
+            <div id="workspace-user-actions" class="inline-actions admin-only hidden"><button id="new-user" class="primary-button" type="button" data-i18n="newUser">New user</button></div>
+            <div id="workspace-alert-actions" class="inline-actions hidden"><button id="new-alert-rule" class="primary-button" type="button" data-i18n="newAlertRule">New rule</button></div>
           </header>
 
           <section id="overview-view" class="view-panel hidden">
             <div id="overview-kpis" class="kpi-grid"></div>
             <section class="chart-panel">
               <div class="panel-heading"><div><h3 data-i18n="trafficTrend">Traffic trend</h3><p data-i18n="trafficTrendHelp">Server-side traffic history is persisted for up to 30 days.</p></div><div class="inline-actions"><button id="export-metrics" class="soft-button" type="button" data-i18n="exportCsv">Export CSV</button><div class="range-switch" aria-label="Traffic range"><button type="button" data-trend-range="1h" class="active">1h</button><button type="button" data-trend-range="12h">12h</button><button type="button" data-trend-range="1d">1d</button><button type="button" data-trend-range="7d">7d</button><button type="button" data-trend-range="30d">30d</button></div></div></div>
-              <div class="chart-wrap"><canvas id="traffic-chart" role="img" aria-label="Inbound and outbound traffic trend"></canvas><div id="traffic-tooltip" class="chart-tooltip hidden"></div></div>
+              <div class="chart-wrap"><canvas id="traffic-chart" role="img" aria-label="Inbound and outbound traffic trend" data-i18n-aria-label="trafficTrendChartLabel"></canvas><div id="traffic-tooltip" class="chart-tooltip hidden"></div></div>
               <p id="traffic-chart-summary" class="sr-only" aria-live="polite"></p>
             </section>
             <div class="overview-grid"><section class="panel"><div class="panel-heading"><div><h3 data-i18n="serviceHealth">Service health</h3><p data-i18n="serviceHealthHelp">Online policies by protocol.</p></div></div><div id="service-health-summary" class="summary-list"></div></section></div>
-            <section id="overview-alert-panel" class="panel hidden" style="margin-top:12px"><div class="panel-heading"><h3 data-i18n="alerts">Alerts</h3></div><div id="overview-alerts" class="alert-list"></div></section>
+            <section id="overview-alert-panel" class="panel hidden" style="margin-top:12px"><div class="panel-heading"><h3 data-i18n="alerts">Alerts</h3><button id="overview-alert-more" class="soft-button" type="button" data-i18n="more">More</button></div><div id="overview-alerts" class="alert-list"></div></section>
           </section>
 
           <section id="metrics-view" class="view-panel hidden">
             <div id="metrics-kpis" class="kpi-grid"></div>
             <div id="metrics-dashboard" class="metrics-layout">
-              <section class="chart-panel span-8"><div class="panel-heading"><div><h3 data-i18n="protocolActivity">Protocol activity</h3><p data-i18n="protocolActivityHelp">Current active connections and sessions.</p></div></div><div class="chart-wrap compact"><canvas id="activity-chart" role="img" aria-label="Protocol activity bar chart"></canvas></div></section>
-              <section class="chart-panel span-4"><div class="panel-heading"><div><h3 data-i18n="failureOverview">Failure overview</h3><p data-i18n="failureOverviewHelp">Cumulative failures since server startup.</p></div></div><div class="chart-wrap compact"><canvas id="failure-chart" role="img" aria-label="Failure overview bar chart"></canvas></div></section>
+              <section class="chart-panel span-8"><div class="panel-heading"><div><h3 data-i18n="protocolActivity">Protocol activity</h3><p data-i18n="protocolActivityHelp">Current active connections and sessions.</p></div></div><div class="chart-wrap compact"><canvas id="activity-chart" role="img" aria-label="Protocol activity bar chart" data-i18n-aria-label="protocolActivityChartLabel"></canvas></div></section>
+              <section class="chart-panel span-4"><div class="panel-heading"><div><h3 data-i18n="failureOverview">Failure overview</h3><p data-i18n="failureOverviewHelp">Cumulative failures since server startup.</p></div></div><div class="chart-wrap compact"><canvas id="failure-chart" role="img" aria-label="Failure overview bar chart" data-i18n-aria-label="failureOverviewChartLabel"></canvas></div></section>
               <section id="tcp-metric-panel" class="metric-panel span-6"></section>
               <section id="udp-metric-panel" class="metric-panel span-6"></section>
               <section id="proxy-metric-panel" class="metric-panel span-6"></section>
@@ -490,36 +555,39 @@
           </section>
 
           <section id="services-view" class="view-panel hidden">
-            <div class="service-header"><div><h2 id="service-title"></h2><p id="service-subtitle"></p></div><div class="inline-actions"><button id="export-policies" class="soft-button" type="button" data-i18n="exportPolicies">Export</button><button id="import-policies" class="soft-button" type="button" data-i18n="importPolicies">Import</button><input id="import-policies-file" class="hidden" type="file" accept="application/json,.json" /><button id="new-policy" class="primary-button" type="button" data-action="new-policy" data-i18n="newPolicy">New policy</button></div></div>
+            <div id="service-insights" class="service-insights hidden">
+              <section class="chart-panel"><div class="panel-heading"><div><h3 id="service-trend-title" data-i18n="protocolTrend">Protocol trend</h3><p data-i18n="protocolTrendHelp">Traffic, activity and errors for the selected protocol.</p></div><div class="range-switch" aria-label="Protocol range"><button type="button" data-service-range="1h" class="active">1h</button><button type="button" data-service-range="12h">12h</button><button type="button" data-service-range="1d">1d</button><button type="button" data-service-range="7d">7d</button><button type="button" data-service-range="30d">30d</button></div></div><div id="service-insight-kpis" class="insight-kpis"></div><div class="chart-wrap compact"><canvas id="service-trend-chart" role="img" aria-label="Protocol traffic trend" data-i18n-aria-label="protocolTrendChartLabel"></canvas></div></section>
+              <section class="chart-panel"><div class="panel-heading"><div><h3 data-i18n="policyStatusChart">Policy status</h3><p data-i18n="policyStatusChartHelp">Current availability and workload distribution.</p></div></div><div class="chart-wrap compact"><canvas id="service-status-chart" role="img" aria-label="Policy status chart" data-i18n-aria-label="policyStatusChartLabel"></canvas></div></section>
+            </div>
             <div id="service-toolbar" class="service-toolbar"><label class="sr-only" for="service-search" data-i18n="search">Search</label><input id="service-search" type="search" data-placeholder="searchPolicies" /><label class="sr-only" for="service-status-filter" data-i18n="status">Status</label><select id="service-status-filter"><option value="all" data-i18n="allStatuses">All statuses</option><option value="online" data-i18n="online">Online</option><option value="offline" data-i18n="offline">Offline</option><option value="enabled" data-i18n="enabled">Enabled</option><option value="disabled" data-i18n="disabled">Disabled</option></select><span id="service-count" class="time-pill">0</span></div>
             <div id="service-bulk-toolbar" class="panel inline-actions hidden" style="margin-bottom:12px;padding:10px"><button id="select-visible-policies" class="soft-button" type="button" data-i18n="selectVisible">Select visible</button><span id="selected-policy-count" class="time-pill">0</span><button id="bulk-enable-policies" class="soft-button" type="button" data-i18n="enable">Enable</button><button id="bulk-disable-policies" class="soft-button" type="button" data-i18n="disable">Disable</button><select id="bulk-client-target" style="width:auto;min-width:180px"></select><button id="bulk-migrate-policies" class="soft-button" type="button" data-i18n="migrateClient">Migrate client</button><button id="bulk-delete-policies" class="danger-button" type="button" data-i18n="delete">Delete</button></div>
             <div id="service-list" class="service-list"></div>
             <div id="acme-page" class="hidden"></div>
           </section>
 
-          <section id="p2p-view" class="view-panel hidden"><div class="section-heading"><div><h2 data-i18n="p2p">P2P network</h2><p data-i18n="p2pSubtitle">Inspect direct candidates, NAT mappings and relay fallback.</p></div></div><div id="p2p-list" class="p2p-list"></div></section>
+          <section id="p2p-view" class="view-panel hidden"><div id="p2p-list" class="p2p-list"></div></section>
 
           <section id="fleet-view" class="view-panel hidden">
-            <div class="access-toolbar"><div><h2 data-i18n="fleet">Multi-cloud</h2><p class="role-note" data-i18n="fleetHelp">Monitor LinkLake servers and define preferred and failover entry points.</p></div><div class="toolbar-actions"><button id="preview-fleet-sync" class="soft-button" type="button" data-i18n="previewFleetSync">Preview sync</button><button id="apply-fleet-sync" class="soft-button" type="button" data-i18n="applyFleetSync">Apply sync</button><button id="new-fleet-peer" class="primary-button" type="button" data-i18n="newFleetPeer">Add server</button></div></div>
             <div id="fleet-summary" class="kpi-grid" style="margin-bottom:12px"></div>
             <div id="fleet-conflicts" class="alert-list" style="margin-bottom:12px"></div>
             <div class="data-table-wrap"><table class="data-table"><thead><tr><th data-i18n="name">Name</th><th data-i18n="region">Region</th><th data-i18n="status">Status</th><th data-i18n="latency">Latency</th><th data-i18n="priority">Priority</th><th data-i18n="weight">Weight</th><th data-i18n="traffic">Traffic</th><th data-i18n="actions">Actions</th></tr></thead><tbody id="fleet-list"></tbody></table></div>
           </section>
 
           <section id="clients-view" class="view-panel hidden">
-            <div class="section-heading"><div><h2 data-i18n="clientManagement">Client management</h2><p data-i18n="clientManagementHelp">Organize client identities, revoke access and rotate credentials.</p></div></div>
+            <div class="client-insights">
+              <section class="chart-panel"><div class="panel-heading"><div><h3 data-i18n="clientStatusOverview">Client status overview</h3><p data-i18n="clientStatusOverviewHelp">Availability and configuration state for the filtered clients.</p></div></div><div id="client-insight-kpis" class="insight-kpis"></div><div class="chart-wrap compact"><canvas id="client-status-chart" role="img" aria-label="Client status chart" data-i18n-aria-label="clientStatusChartLabel"></canvas></div></section>
+              <section class="chart-panel"><div class="panel-heading"><div><h3 data-i18n="clientPlatformChart">Platform and configuration</h3><p data-i18n="clientPlatformChartHelp">Platform and managed configuration distribution.</p></div></div><div class="chart-wrap compact"><canvas id="client-platform-chart" role="img" aria-label="Client platform chart" data-i18n-aria-label="clientPlatformChartLabel"></canvas></div></section>
+            </div>
             <div class="service-toolbar"><label class="sr-only" for="client-search" data-i18n="search">Search</label><input id="client-search" type="search" data-placeholder="searchClients" /><label class="sr-only" for="client-status-filter" data-i18n="status">Status</label><select id="client-status-filter"><option value="all" data-i18n="allStatuses">All statuses</option><option value="online" data-i18n="online">Online</option><option value="offline" data-i18n="offline">Offline</option><option value="enabled" data-i18n="enabled">Enabled</option><option value="disabled" data-i18n="disabled">Disabled</option></select><span id="client-count" class="time-pill">0</span></div>
             <div class="data-table-wrap"><table class="data-table"><thead><tr><th data-i18n="name">Name</th><th data-i18n="clientGroup">Group</th><th data-i18n="tags">Tags</th><th data-i18n="platform">Platform</th><th data-i18n="status">Status</th><th data-i18n="lastSeen">Last seen</th><th data-i18n="configStatus">Config</th><th data-i18n="actions">Actions</th></tr></thead><tbody id="clients-list"></tbody></table></div>
           </section>
 
           <section id="users-view" class="view-panel hidden">
-            <div class="access-toolbar"><div><h2 data-i18n="userManagement">User management</h2><p class="role-note" data-i18n="userManagementHelp">Create accounts, assign roles and control access.</p></div><button id="new-user" class="primary-button" type="button" data-i18n="newUser">New user</button></div>
             <div class="service-toolbar"><label class="sr-only" for="user-search" data-i18n="search">Search</label><input id="user-search" type="search" data-placeholder="searchUsers" /><label class="sr-only" for="user-role-filter" data-i18n="role">Role</label><select id="user-role-filter"><option value="all" data-i18n="allRoles">All roles</option><option value="administrator" data-i18n="roleAdministrator">Administrator</option><option value="operator" data-i18n="roleOperator">Operator</option><option value="auditor" data-i18n="roleAuditor">Auditor</option></select><span id="user-count" class="time-pill">0</span></div>
             <div class="data-table-wrap"><table class="data-table"><thead><tr><th data-i18n="username">Username</th><th data-i18n="displayName">Display name</th><th data-i18n="role">Role</th><th data-i18n="status">Status</th><th data-i18n="lastLogin">Last login</th><th data-i18n="activeSessions">Active sessions</th><th data-i18n="actions">Actions</th></tr></thead><tbody id="users-list"></tbody></table></div>
           </section>
 
           <section id="sessions-view" class="view-panel hidden">
-            <div class="section-heading"><div><h2 data-i18n="securitySessions">Security & sessions</h2><p data-i18n="securitySessionsHelp">Review active sign-ins and revoke sessions that are no longer trusted.</p></div></div>
             <div class="overview-grid" style="margin-bottom:12px">
               <section class="panel"><div class="panel-heading"><div><h3 data-i18n="twoFactorAuth">Two-factor authentication</h3><p id="totp-status" class="role-note"></p></div><button id="totp-action" class="soft-button" type="button"></button></div></section>
               <section class="panel"><div class="panel-heading"><div><h3 data-i18n="apiTokens">API tokens</h3><p data-i18n="apiTokensHelp">Create scoped tokens for automation and integrations.</p></div><button id="new-api-token" class="primary-button" type="button" data-i18n="newApiToken">New token</button></div></section>
@@ -530,14 +598,12 @@
           </section>
 
           <section id="alerts-view" class="view-panel hidden">
-            <div class="access-toolbar"><div><h2 data-i18n="alertManagement">Alert management</h2><p class="role-note" data-i18n="alertManagementHelp">Configure persistent rules and inspect firing or resolved events.</p></div><button id="new-alert-rule" class="primary-button" type="button" data-i18n="newAlertRule">New rule</button></div>
             <section class="panel" style="margin-bottom:12px"><div class="panel-heading"><div><h3 data-i18n="notificationChannels">Notification channels</h3><p id="alert-channels" class="role-note"></p></div></div></section>
             <div id="alert-events" class="alert-list" style="margin-bottom:12px"></div>
             <div class="data-table-wrap"><table class="data-table"><thead><tr><th data-i18n="name">Name</th><th data-i18n="alertMetric">Metric</th><th data-i18n="threshold">Threshold</th><th data-i18n="alertTarget">Target</th><th data-i18n="severity">Severity</th><th data-i18n="notificationChannels">Channels</th><th data-i18n="status">Status</th><th data-i18n="actions">Actions</th></tr></thead><tbody id="alert-rules"></tbody></table></div>
           </section>
 
           <section id="activity-view" class="view-panel hidden">
-            <div class="section-heading"><div><h2 data-i18n="activity">Activity</h2><p data-i18n="activitySubtitle">Filter and inspect administrator, policy and tunnel events.</p></div></div>
             <div class="activity-toolbar"><label class="sr-only" for="audit-search" data-i18n="search">Search</label><input id="audit-search" type="search" data-placeholder="searchActivity" /><label class="sr-only" for="audit-category" data-i18n="category">Category</label><select id="audit-category"><option value="all" data-i18n="allCategories">All categories</option><option value="management" data-i18n="categoryManagement">Management</option><option value="policy" data-i18n="categoryPolicy">Policies</option><option value="client" data-i18n="categoryClient">Clients</option><option value="p2p" data-i18n="categoryP2p">P2P</option><option value="certificate" data-i18n="categoryCertificate">Certificates</option></select><span id="audit-count" class="time-pill">0</span><button id="export-audit" class="soft-button" type="button" data-i18n="exportCsv">Export CSV</button></div>
             <div id="audit-list" class="audit-list"></div><button id="audit-load-more" class="soft-button load-more" type="button" data-i18n="loadMore">Load more</button>
           </section>
@@ -653,6 +719,84 @@
         }
       };
 
+      Object.assign(WORDS.en, {
+        more: 'More',
+        moreActions: 'More actions',
+        visualStyle: 'Visual style',
+        styleAurora: 'Aurora',
+        styleAuroraHelp: 'Layered glass and lake light',
+        styleMinimal: 'Minimal',
+        styleMinimalHelp: 'Flat, precise and information dense',
+        stylePaper: 'Paper',
+        stylePaperHelp: 'Soft surfaces and clear boundaries',
+        styleNeon: 'Neon',
+        styleNeonHelp: 'Deep space and restrained glow',
+        styleContrast: 'High contrast',
+        styleContrastHelp: 'Strong borders and accessible contrast',
+        protocolTrend: 'Protocol trend',
+        protocolTrendHelp: 'Traffic, activity and errors for the selected protocol.',
+        policyStatusChart: 'Policy status',
+        policyStatusChartHelp: 'Current availability and workload distribution.',
+        clientStatusOverview: 'Client status overview',
+        clientStatusOverviewHelp: 'Availability and configuration state for the filtered clients.',
+        clientPlatformChart: 'Platform and configuration',
+        clientPlatformChartHelp: 'Platform and managed configuration distribution.',
+        loadingHistory: 'Loading history…',
+        workload: 'Workload',
+        errors: 'Errors',
+        platforms: 'Platforms',
+        justNow: 'Just now',
+        neverSeen: 'Never connected',
+        seenAgo: '{time} ago',
+        other: 'Other',
+        trafficTrendChartLabel: 'Inbound and outbound traffic trend',
+        protocolActivityChartLabel: 'Protocol activity bar chart',
+        failureOverviewChartLabel: 'Failure overview bar chart',
+        protocolTrendChartLabel: 'Protocol traffic, workload and error trend',
+        policyStatusChartLabel: 'Policy availability and workload chart',
+        clientStatusChartLabel: 'Client availability chart',
+        clientPlatformChartLabel: 'Client platform and configuration chart'
+      });
+
+      Object.assign(WORDS.zh, {
+        more: '更多',
+        moreActions: '更多操作',
+        visualStyle: '视觉风格',
+        styleAurora: '极光湖面',
+        styleAuroraHelp: '分层玻璃质感与湖面光晕',
+        styleMinimal: '极简海洋',
+        styleMinimalHelp: '扁平、精准且信息密度更高',
+        stylePaper: '翡翠纸面',
+        stylePaperHelp: '柔和表面与清晰边界',
+        styleNeon: '霓虹深空',
+        styleNeonHelp: '深色空间与克制辉光',
+        styleContrast: '高对比度',
+        styleContrastHelp: '强化边框与无障碍对比度',
+        protocolTrend: '协议趋势',
+        protocolTrendHelp: '展示当前协议的流量、活跃负载与错误趋势。',
+        policyStatusChart: '策略状态',
+        policyStatusChartHelp: '展示当前可用性与工作负载分布。',
+        clientStatusOverview: '客户端状态总览',
+        clientStatusOverviewHelp: '展示筛选结果中的可用性与配置状态。',
+        clientPlatformChart: '平台与配置',
+        clientPlatformChartHelp: '展示平台及服务端托管配置的分布。',
+        loadingHistory: '正在加载历史指标…',
+        workload: '活跃负载',
+        errors: '错误',
+        platforms: '平台数',
+        justNow: '刚刚在线',
+        neverSeen: '从未连接',
+        seenAgo: '{time}前',
+        other: '其他',
+        trafficTrendChartLabel: '入站与出站流量趋势图',
+        protocolActivityChartLabel: '协议活跃度条形图',
+        failureOverviewChartLabel: '故障概览条形图',
+        protocolTrendChartLabel: '协议流量、负载与错误趋势图',
+        policyStatusChartLabel: '策略可用性与负载图',
+        clientStatusChartLabel: '客户端可用性图',
+        clientPlatformChartLabel: '客户端平台与配置图'
+      });
+
       const POLICY_TYPES = {
         tcp: {
           resource: 'tcp-tunnels', dataKey: 'tcpPolicies', titleKey: 'tcpTitle', subtitleKey: 'tcpSubtitle', createKey: 'createTcp', editKey: 'editTcp',
@@ -758,12 +902,22 @@
         refreshTimer: null,
         loading: false,
         pendingLoad: false,
+        pendingForceHistory: false,
         trafficHistory: [],
         trendRange: '1h',
+        serviceTrafficHistory: [],
+        serviceHistoryMeta: null,
+        serviceTrendRange: '1h',
+        serviceHistoryProtocol: 'total',
+        historyCache: new Map(),
+        historyRequestGeneration: 0,
+        historyActiveKey: null,
+        historyPromise: null,
         lastTrafficTotals: null,
         drawer: { open: false, type: null, id: null, dirty: false, values: null },
         serviceSearch: '',
         serviceStatus: 'all',
+        visibleServicePolicies: [],
         selectedPolicies: new Set(),
         auditLimit: 20,
         auditSearch: '',
@@ -773,6 +927,7 @@
         userRole: 'all',
         clientSearch: '',
         clientStatus: 'all',
+        visibleClients: [],
         clientEditorId: null,
         globalSearchTimer: null,
         users: [],
@@ -789,11 +944,11 @@
       };
 
       const elements = Object.fromEntries([
-        'theme-color', 'appearance-button', 'appearance-popover', 'language', 'utility-session', 'account-shell', 'global-search-shell', 'global-search', 'global-search-results', 'login-shell', 'login', 'username', 'password', 'login-totp-label', 'login-totp', 'initial-password-form', 'initial-new-password', 'initial-confirm-password', 'workspace', 'workspace-title', 'workspace-subtitle', 'last-refresh', 'refresh', 'account-button', 'account-avatar', 'account-name', 'account-menu', 'account-menu-name', 'account-menu-role', 'account-menu-expiry', 'account-password', 'account-security', 'logout',
-        'overview-view', 'overview-kpis', 'traffic-chart', 'traffic-tooltip', 'traffic-chart-summary', 'export-metrics', 'service-health-summary', 'overview-alert-panel', 'overview-alerts',
+        'theme-color', 'appearance-button', 'appearance-popover', 'language', 'utility-session', 'account-shell', 'global-search-shell', 'global-search', 'global-search-results', 'login-shell', 'login', 'username', 'password', 'login-totp-label', 'login-totp', 'initial-password-form', 'initial-new-password', 'initial-confirm-password', 'workspace', 'workspace-title', 'workspace-subtitle', 'workspace-service-actions', 'workspace-fleet-actions', 'workspace-user-actions', 'workspace-alert-actions', 'last-refresh', 'refresh', 'account-button', 'account-avatar', 'account-name', 'account-menu', 'account-menu-name', 'account-menu-role', 'account-menu-expiry', 'account-password', 'account-security', 'logout',
+        'overview-view', 'overview-kpis', 'traffic-chart', 'traffic-tooltip', 'traffic-chart-summary', 'export-metrics', 'service-health-summary', 'overview-alert-panel', 'overview-alerts', 'overview-alert-more',
         'metrics-view', 'metrics-kpis', 'activity-chart', 'failure-chart', 'tcp-metric-panel', 'udp-metric-panel', 'proxy-metric-panel', 'web-metric-panel', 'network-health-panel', 'system-metric-panel',
-        'services-view', 'service-title', 'service-subtitle', 'new-policy', 'export-policies', 'import-policies', 'import-policies-file', 'service-toolbar', 'service-search', 'service-status-filter', 'service-count', 'service-bulk-toolbar', 'select-visible-policies', 'selected-policy-count', 'bulk-enable-policies', 'bulk-disable-policies', 'bulk-client-target', 'bulk-migrate-policies', 'bulk-delete-policies', 'service-list', 'acme-page',
-        'p2p-view', 'p2p-list', 'fleet-view', 'new-fleet-peer', 'preview-fleet-sync', 'apply-fleet-sync', 'fleet-summary', 'fleet-conflicts', 'fleet-list', 'clients-view', 'client-search', 'client-status-filter', 'client-count', 'clients-list', 'users-view', 'new-user', 'user-search', 'user-role-filter', 'user-count', 'users-list', 'sessions-view', 'totp-status', 'totp-action', 'new-api-token', 'api-tokens-list', 'sessions-list', 'alerts-view', 'new-alert-rule', 'alert-channels', 'alert-events', 'alert-rules', 'activity-view', 'audit-search', 'audit-category', 'audit-count', 'audit-list', 'audit-load-more', 'export-audit',
+        'services-view', 'service-insights', 'service-trend-title', 'service-insight-kpis', 'service-trend-chart', 'service-status-chart', 'new-policy', 'export-policies', 'import-policies', 'import-policies-file', 'service-toolbar', 'service-search', 'service-status-filter', 'service-count', 'service-bulk-toolbar', 'select-visible-policies', 'selected-policy-count', 'bulk-enable-policies', 'bulk-disable-policies', 'bulk-client-target', 'bulk-migrate-policies', 'bulk-delete-policies', 'service-list', 'acme-page',
+        'p2p-view', 'p2p-list', 'fleet-view', 'new-fleet-peer', 'preview-fleet-sync', 'apply-fleet-sync', 'fleet-summary', 'fleet-conflicts', 'fleet-list', 'clients-view', 'client-insight-kpis', 'client-status-chart', 'client-platform-chart', 'client-search', 'client-status-filter', 'client-count', 'clients-list', 'users-view', 'new-user', 'user-search', 'user-role-filter', 'user-count', 'users-list', 'sessions-view', 'totp-status', 'totp-action', 'new-api-token', 'api-tokens-list', 'sessions-list', 'alerts-view', 'new-alert-rule', 'alert-channels', 'alert-events', 'alert-rules', 'activity-view', 'audit-search', 'audit-category', 'audit-count', 'audit-list', 'audit-load-more', 'export-audit',
         'drawer-backdrop', 'policy-drawer', 'drawer-title', 'drawer-subtitle', 'drawer-close', 'drawer-cancel', 'policy-form', 'policy-fields', 'drawer-submit',
         'password-modal', 'password-modal-close', 'password-form', 'account-new-password', 'account-confirm-password', 'password-cancel',
         'user-modal', 'user-modal-title', 'user-modal-help', 'user-modal-close', 'user-form', 'user-username', 'user-display-name', 'user-role', 'user-password-label', 'user-password', 'user-enabled-label', 'user-enabled', 'user-force-change-label', 'user-force-change', 'user-cancel',
@@ -820,8 +975,10 @@
         document.documentElement.lang = state.language === 'zh' ? 'zh-CN' : 'en';
         document.title = t('title');
         elements.language.textContent = state.language === 'zh' ? 'EN' : 'ZH';
+        elements.language.setAttribute('aria-label', t('language'));
         document.querySelectorAll('[data-i18n]').forEach(node => { node.textContent = t(node.dataset.i18n); });
         document.querySelectorAll('[data-placeholder]').forEach(node => { node.placeholder = t(node.dataset.placeholder); });
+        document.querySelectorAll('[data-i18n-aria-label]').forEach(node => { node.setAttribute('aria-label', t(node.dataset.i18nAriaLabel)); });
         updateIdentityUi();
         renderRoute();
         if (state.drawer.open) refreshDrawerLanguage();
@@ -988,6 +1145,10 @@
         elements.workspace_subtitle.textContent = subtitle;
         const views = { overview: elements.overview_view, metrics: elements.metrics_view, services: elements.services_view, clients: elements.clients_view, p2p: elements.p2p_view, fleet: elements.fleet_view, users: elements.users_view, sessions: elements.sessions_view, alerts: elements.alerts_view, activity: elements.activity_view };
         Object.entries(views).forEach(([name, element]) => element.classList.toggle('hidden', name !== state.route.view));
+        elements.workspace_service_actions.classList.toggle('hidden', state.route.view !== 'services' || state.route.service === 'acme');
+        elements.workspace_fleet_actions.classList.toggle('hidden', state.route.view !== 'fleet');
+        elements.workspace_user_actions.classList.toggle('hidden', state.route.view !== 'users');
+        elements.workspace_alert_actions.classList.toggle('hidden', state.route.view !== 'alerts' || state.identity?.role === 'auditor');
         document.querySelectorAll('[data-route-prefix]').forEach(link => link.classList.toggle('active', link.dataset.routePrefix === state.route.view));
         document.querySelectorAll('[data-service-route]').forEach(link => link.classList.toggle('active', state.route.view === 'services' && link.dataset.serviceRoute === state.route.service));
         if (!state.dashboard) return;
@@ -1030,6 +1191,15 @@
           small.textContent = detail;
           card.append(small);
         }
+        return card;
+      }
+
+      function createInsightKpi(value, label) {
+        const card = document.createElement('article');
+        card.className = 'insight-kpi';
+        const strong = document.createElement('strong'); strong.textContent = value;
+        const span = document.createElement('span'); span.textContent = label;
+        card.append(strong, span);
         return card;
       }
 
@@ -1112,11 +1282,14 @@
         ];
         elements.service_health_summary.replaceChildren(...protocolGroups.map(([name, list]) => createHealthSummary(name, list)));
 
-        const alertValues = (dashboard.alertEvents || []).map(event => `${alertSeverityText(event.severity)} · ${event.rule_name} · ${event.subject}: ${event.message}`);
+        const alertValues = [...(dashboard.alertEvents || [])]
+          .sort((left, right) => Number(right.updated_unix_seconds || 0) - Number(left.updated_unix_seconds || 0))
+          .map(event => `${alertSeverityText(event.severity)} · ${event.rule_name} · ${event.subject}: ${event.message}`);
         if (configIssues) alertValues.push(t('configIssueAlert', { count: configIssues }));
         elements.overview_alerts.replaceChildren();
         elements.overview_alert_panel.classList.toggle('hidden', !alertValues.length);
-        alertValues.forEach(value => {
+        elements.overview_alert_more.classList.remove('hidden');
+        alertValues.slice(0, 5).forEach(value => {
           const alert = document.createElement('div');
           alert.className = 'alert-item';
           alert.textContent = value;
@@ -1227,6 +1400,77 @@
         elements.traffic_chart_summary.textContent = points.length > 1 ? `${t('inbound')}: ${formatRate(latest.inbound_bps)}. ${t('outbound')}: ${formatRate(latest.outbound_bps)}.` : t('noTrendData');
       }
 
+      function drawServiceTrendChart() {
+        const setup = canvasSetup(elements.service_trend_chart);
+        if (!setup) return;
+        const { context, width, height } = setup;
+        const points = state.serviceTrafficHistory;
+        const left = 48, right = 14, top = 25, bottom = 26;
+        const plotWidth = Math.max(1, width - left - right);
+        const plotHeight = Math.max(1, height - top - bottom);
+        const trafficHeight = plotHeight * .63;
+        const activityTop = top + trafficHeight + 18;
+        const activityHeight = Math.max(18, plotHeight - trafficHeight - 18);
+        const grid = cssColor('--chart-grid');
+        const label = cssColor('--chart-label');
+        const colors = [cssColor('--accent'), cssColor('--primary'), cssColor('--success'), cssColor('--danger')];
+        context.font = '10px "Segoe UI", sans-serif';
+        context.lineWidth = 1;
+        context.strokeStyle = grid;
+        context.fillStyle = label;
+        if (points.length < 2) {
+          context.beginPath(); context.moveTo(left, top + trafficHeight); context.lineTo(width - right, top + trafficHeight); context.stroke();
+          const message = t('noTrendData');
+          context.fillText(message, Math.max(left, left + plotWidth / 2 - context.measureText(message).width / 2), top + trafficHeight / 2);
+          return;
+        }
+        const start = Number(points[0].timestamp_unix_seconds);
+        const end = Number(points.at(-1).timestamp_unix_seconds);
+        const trafficMaximum = niceMaximum(Math.max(0, ...points.flatMap(point => [Number(point.inbound_bps) || 0, Number(point.outbound_bps) || 0])));
+        const activityMaximum = niceMaximum(Math.max(0, ...points.flatMap(point => [Number(point.active_connections || 0) + Number(point.active_sessions || 0), Number(point.errors_per_second) || 0])));
+        for (let index = 0; index <= 3; index += 1) {
+          const y = top + trafficHeight * index / 3;
+          context.beginPath(); context.moveTo(left, y); context.lineTo(width - right, y); context.stroke();
+          context.fillText(formatRate(trafficMaximum * (1 - index / 3)), 2, y + 3);
+        }
+        context.beginPath(); context.moveTo(left, activityTop + activityHeight); context.lineTo(width - right, activityTop + activityHeight); context.stroke();
+        const expectedStep = Number(state.serviceHistoryMeta?.step_seconds || state.serviceHistoryMeta?.sample_interval_seconds || 5);
+        const drawSeries = (valueForPoint, color, areaTop, areaHeight, maximum, dashed = false) => {
+          context.beginPath();
+          context.strokeStyle = color;
+          context.lineWidth = 2;
+          context.setLineDash(dashed ? [5, 4] : []);
+          points.forEach((point, index) => {
+            const timestamp = Number(point.timestamp_unix_seconds);
+            const x = left + plotWidth * (timestamp - start) / Math.max(1, end - start);
+            const value = Math.max(0, Number(valueForPoint(point)) || 0);
+            const y = areaTop + areaHeight * (1 - Math.min(maximum, value) / Math.max(1, maximum));
+            const previousTimestamp = index ? Number(points[index - 1].timestamp_unix_seconds) : timestamp;
+            if (!index || timestamp - previousTimestamp > expectedStep * 2.5) context.moveTo(x, y); else context.lineTo(x, y);
+          });
+          context.stroke();
+          context.setLineDash([]);
+        };
+        drawSeries(point => point.inbound_bps, colors[0], top, trafficHeight, trafficMaximum);
+        drawSeries(point => point.outbound_bps, colors[1], top, trafficHeight, trafficMaximum);
+        drawSeries(point => Number(point.active_connections || 0) + Number(point.active_sessions || 0), colors[2], activityTop, activityHeight, activityMaximum);
+        drawSeries(point => point.errors_per_second, colors[3], activityTop, activityHeight, activityMaximum, true);
+        [0, .5, 1].forEach(fraction => {
+          const timestamp = start + (end - start) * fraction;
+          const text = new Date(timestamp * 1000).toLocaleString(state.language === 'zh' ? 'zh-CN' : 'en', state.serviceTrendRange === '1h' || state.serviceTrendRange === '12h' ? { hour: '2-digit', minute: '2-digit' } : { month: '2-digit', day: '2-digit' });
+          const x = left + plotWidth * fraction;
+          context.fillStyle = label;
+          context.fillText(text, Math.max(left, Math.min(width - right - context.measureText(text).width, x - context.measureText(text).width / 2)), height - 7);
+        });
+        const legends = [[t('inbound'), colors[0]], [t('outbound'), colors[1]], [t('workload'), colors[2]], [t('errors'), colors[3]]];
+        let legendX = left;
+        legends.forEach(([text, color]) => {
+          context.fillStyle = color; context.fillRect(legendX, 7, 11, 3);
+          context.fillStyle = label; context.fillText(text, legendX + 15, 12);
+          legendX += 24 + context.measureText(text).width;
+        });
+      }
+
       function drawBarChart(canvas, items, horizontal = false, semanticFailure = false) {
         const setup = canvasSetup(canvas);
         if (!setup) return;
@@ -1239,6 +1483,11 @@
         const warning = cssColor('--warning');
         context.font = '10px "Segoe UI", sans-serif';
         context.fillStyle = labelColor;
+        if (!items.length) {
+          const message = t('noClients');
+          context.fillText(message, Math.max(8, width / 2 - context.measureText(message).width / 2), height / 2);
+          return;
+        }
         if (horizontal) {
           const left = 100, right = 28, top = 12, bottom = 10;
           const rowHeight = (height - top - bottom) / Math.max(1, items.length);
@@ -1251,9 +1500,12 @@
             context.fillStyle = gridColor;
             context.fillRect(left, y, width - left - right, barHeight);
             const barWidth = (width - left - right) * (Number(item.value) || 0) / maximum;
-            const gradient = context.createLinearGradient(left, 0, width - right, 0);
-            gradient.addColorStop(0, semanticFailure ? warning : accent); gradient.addColorStop(1, semanticFailure ? danger : primary);
-            context.fillStyle = gradient;
+            if (item.color) context.fillStyle = item.color.startsWith('--') ? cssColor(item.color) : item.color;
+            else {
+              const gradient = context.createLinearGradient(left, 0, width - right, 0);
+              gradient.addColorStop(0, semanticFailure ? warning : accent); gradient.addColorStop(1, semanticFailure ? danger : primary);
+              context.fillStyle = gradient;
+            }
             context.fillRect(left, y, barWidth, barHeight);
             context.fillStyle = labelColor;
             context.fillText(String(item.value), width - right + 5, y + barHeight - 1);
@@ -1271,9 +1523,12 @@
           const barHeight = plotHeight * (Number(item.value) || 0) / maximum;
           context.fillStyle = gridColor;
           context.fillRect(x, top, barWidth, plotHeight);
-          const gradient = context.createLinearGradient(0, top + plotHeight, 0, top);
-          gradient.addColorStop(0, semanticFailure ? warning : accent); gradient.addColorStop(1, semanticFailure ? danger : primary);
-          context.fillStyle = gradient;
+          if (item.color) context.fillStyle = item.color.startsWith('--') ? cssColor(item.color) : item.color;
+          else {
+            const gradient = context.createLinearGradient(0, top + plotHeight, 0, top);
+            gradient.addColorStop(0, semanticFailure ? warning : accent); gradient.addColorStop(1, semanticFailure ? danger : primary);
+            context.fillStyle = gradient;
+          }
           context.fillRect(x, top + plotHeight - barHeight, barWidth, barHeight);
           context.fillStyle = labelColor;
           const shortLabel = item.label.length > 8 ? item.label.slice(0, 7) + '…' : item.label;
@@ -1281,6 +1536,46 @@
           context.fillText(shortLabel, x + barWidth / 2 - textWidth / 2, height - 12);
           const number = String(item.value);
           context.fillText(number, x + barWidth / 2 - context.measureText(number).width / 2, Math.max(10, top + plotHeight - barHeight - 5));
+        });
+      }
+
+      function drawGroupedHorizontalChart(canvas, groups) {
+        const setup = canvasSetup(canvas);
+        if (!setup) return;
+        const { context, width, height } = setup;
+        const rows = groups.flatMap(group => group.items);
+        const labelColor = cssColor('--chart-label');
+        const gridColor = cssColor('--chart-grid');
+        const colors = [cssColor('--accent'), cssColor('--primary')];
+        context.font = '9px "Segoe UI", sans-serif';
+        if (!rows.length) {
+          const message = t('noClients');
+          context.fillStyle = labelColor;
+          context.fillText(message, Math.max(8, width / 2 - context.measureText(message).width / 2), height / 2);
+          return;
+        }
+        const left = 112, right = 28, top = 8, headingHeight = 17;
+        const rowHeight = Math.max(17, (height - top - groups.length * headingHeight - 5) / Math.max(1, rows.length));
+        const maximum = Math.max(1, ...rows.map(item => Number(item.value) || 0));
+        let y = top;
+        groups.forEach((group, groupIndex) => {
+          context.fillStyle = colors[groupIndex % colors.length];
+          context.font = '700 9px "Segoe UI", sans-serif';
+          context.fillText(group.label, 2, y + 9);
+          y += headingHeight;
+          context.font = '9px "Segoe UI", sans-serif';
+          group.items.forEach(item => {
+            const barHeight = Math.max(7, rowHeight * .42);
+            context.fillStyle = labelColor;
+            context.fillText(item.label, 10, y + barHeight - 1);
+            context.fillStyle = gridColor;
+            context.fillRect(left, y, Math.max(1, width - left - right), barHeight);
+            context.fillStyle = colors[groupIndex % colors.length];
+            context.fillRect(left, y, Math.max(0, width - left - right) * (Number(item.value) || 0) / maximum, barHeight);
+            context.fillStyle = labelColor;
+            context.fillText(String(item.value), width - right + 6, y + barHeight - 1);
+            y += rowHeight;
+          });
         });
       }
 
@@ -1484,6 +1779,67 @@
         return [[t('active'), policy.active_connections], [t('requestsTotal'), policy.requests_total], ['CONNECT', policy.connect_requests], [t('failed'), policy.authentication_failures + policy.malformed_requests + policy.connect_failures]];
       }
 
+      function policyWorkload(type, policy) {
+        if (type === 'udp') return Number(policy.active_sessions || 0);
+        if (type === 'ports') return Number(policy.active_connections || 0) + Number(policy.active_sessions || 0);
+        if (type === 'socks5') return Number(policy.active_connections || 0) + Number(policy.udp_active_associations || 0);
+        return Number(policy.active_connections || 0);
+      }
+
+      function policyErrorTotal(type, policy) {
+        if (type === 'tcp') return Number(policy.rejected_connections || 0) + Number(policy.failed_connections || 0);
+        if (type === 'udp') return Number(policy.dropped_packets || 0) + Number(policy.attach_timeouts || 0);
+        if (type === 'ports') return Number(policy.failed_connections || 0) + Number(policy.dropped_packets || 0);
+        if (type === 'http') return Number(policy.failed_requests || 0);
+        if (type === 'sni') return Number(policy.unknown_sni || 0);
+        if (type === 'secret') return Number(policy.rejected_connections || 0) + Number(policy.failed_connections || 0);
+        return Number(policy.authentication_failures || 0) + Number(policy.connect_failures || 0) + Number(policy.malformed_requests || 0);
+      }
+
+      function policyTrafficBytes(type, policy) {
+        if (type === 'secret') return Number(policy.bytes_from_visitor || 0) + Number(policy.bytes_to_visitor || 0);
+        return Number(policy.bytes_from_public || 0) + Number(policy.bytes_to_public || 0);
+      }
+
+      function drawServiceStatusChart() {
+        const policies = state.visibleServicePolicies || [];
+        const enabled = policies.filter(policy => policy.enabled).length;
+        const online = policies.filter(isPolicyOnline).length;
+        drawBarChart(elements.service_status_chart, [
+          { label: t('online'), value: online, color: '--success' },
+          { label: t('offline'), value: Math.max(0, enabled - online), color: '--warning' },
+          { label: t('disabled'), value: Math.max(0, policies.length - enabled), color: '--faint' },
+          { label: t('workload'), value: policies.reduce((total, policy) => total + policyWorkload(state.route.service, policy), 0), color: '--primary' }
+        ], true);
+      }
+
+      function renderServiceInsights(type, visiblePolicies) {
+        state.visibleServicePolicies = visiblePolicies;
+        const protocol = serviceHistoryProtocol(type);
+        if (state.serviceHistoryProtocol !== protocol) {
+          state.serviceHistoryProtocol = protocol;
+          const cached = state.historyCache.get(historyCacheKey(state.serviceTrendRange, protocol));
+          state.serviceTrafficHistory = cached && Date.now() - cached.fetchedAt < 45000 && Array.isArray(cached.payload.points) ? cached.payload.points : [];
+          state.serviceHistoryMeta = cached?.payload || null;
+        }
+        elements.service_insights.classList.remove('hidden');
+        elements.service_trend_title.textContent = `${t(POLICY_TYPES[type].titleKey)} · ${t('protocolTrend')}`;
+        const online = visiblePolicies.filter(isPolicyOnline).length;
+        const workload = visiblePolicies.reduce((total, policy) => total + policyWorkload(type, policy), 0);
+        const errors = visiblePolicies.reduce((total, policy) => total + policyErrorTotal(type, policy), 0);
+        const traffic = visiblePolicies.reduce((total, policy) => total + policyTrafficBytes(type, policy), 0);
+        elements.service_insight_kpis.replaceChildren(
+          createInsightKpi(String(visiblePolicies.length), t('forwardingServices')),
+          createInsightKpi(String(online), t('online')),
+          createInsightKpi(String(workload), t('workload')),
+          createInsightKpi(String(errors), t('errors')),
+          createInsightKpi(formatBytes(traffic), t('totalTraffic'))
+        );
+        document.querySelectorAll('[data-service-range]').forEach(button => button.classList.toggle('active', button.dataset.serviceRange === state.serviceTrendRange));
+        drawServiceTrendChart();
+        drawServiceStatusChart();
+      }
+
       function tlsStatusText(status) {
         const map = { disabled: 'certificateDisabled', pending: 'certificatePending', issuing: 'certificateIssuing', active: 'certificateActive', renewing: 'certificateRenewing', error: 'certificateError', expired: 'certificateExpired' };
         return t(map[status] || 'unknown');
@@ -1564,14 +1920,25 @@
         if (state.identity.role !== 'auditor') {
           actions.append(
             actionButton(t('editPolicy'), () => beginPolicyEdit(type, policy), 'soft-button', 'edit-policy'),
-            actionButton(t('duplicate'), () => duplicatePolicy(type, policy), 'soft-button', 'duplicate-policy'),
             actionButton(policy.enabled ? t('disable') : t('enable'), () => setPolicyEnabled(type, policy), 'soft-button', 'toggle-policy')
           );
+          const menu = document.createElement('details');
+          menu.className = 'action-menu';
+          const summary = document.createElement('summary');
+          summary.textContent = '•••';
+          summary.title = t('moreActions');
+          summary.setAttribute('aria-label', t('moreActions'));
+          const popover = document.createElement('div');
+          popover.className = 'action-menu-popover';
+          popover.append(actionButton(t('duplicate'), () => duplicatePolicy(type, policy), 'soft-button', 'duplicate-policy'));
           if (state.identity.role === 'administrator' && ['tcp', 'udp', 'ports', 'http', 'sni', 'socks5', 'http-proxy'].includes(type)) {
-            actions.append(actionButton(t('trafficControl'), () => openTrafficControl(type, policy), 'soft-button'));
+            popover.append(actionButton(t('trafficControl'), () => openTrafficControl(type, policy), 'soft-button'));
           }
-          if (type === 'http') appendHttpCertificateActions(actions, policy);
-          actions.append(actionButton(t('delete'), () => deletePolicy(type, policy), 'danger-button', 'delete-policy'));
+          if (type === 'http') appendHttpCertificateActions(popover, policy);
+          popover.append(actionButton(t('delete'), () => deletePolicy(type, policy), 'danger-button', 'delete-policy'));
+          popover.addEventListener('click', event => { if (event.target.closest('button')) menu.removeAttribute('open'); });
+          menu.append(summary, popover);
+          actions.append(menu);
         }
         card.append(content, actions);
         return card;
@@ -1591,20 +1958,21 @@
       function renderServices() {
         const type = state.route.service;
         const isAcme = type === 'acme';
-        elements.service_title.textContent = isAcme ? t('acmeTitle') : t(POLICY_TYPES[type].titleKey);
-        elements.service_subtitle.textContent = isAcme ? t('acmeSubtitle') : t(POLICY_TYPES[type].subtitleKey);
+        elements.workspace_service_actions.classList.toggle('hidden', isAcme);
         elements.new_policy.classList.toggle('hidden', isAcme || state.identity.role === 'auditor');
         elements.export_policies.classList.toggle('hidden', isAcme);
         elements.import_policies.classList.toggle('hidden', isAcme || state.identity.role === 'auditor');
         elements.service_toolbar.classList.toggle('hidden', isAcme);
         elements.service_bulk_toolbar.classList.toggle('hidden', isAcme || state.identity.role === 'auditor');
         elements.service_list.classList.toggle('hidden', isAcme);
+        elements.service_insights.classList.toggle('hidden', isAcme);
         elements.acme_page.classList.toggle('hidden', !isAcme);
         if (isAcme) return renderAcme();
         const schema = POLICY_TYPES[type];
         if (state.drawer.open) return;
         const policies = state.dashboard[schema.dataKey] || [];
         const visible = policies.filter(policy => matchesPolicyFilter(type, policy));
+        renderServiceInsights(type, visible);
         elements.service_count.textContent = t('policyCount', { visible: visible.length, total: policies.length });
         elements.service_list.replaceChildren();
         if (!visible.length) {
@@ -1909,6 +2277,58 @@
         await loadManagementData({ forceHistory: false });
       }
 
+      function clientLastSeenRelative(client) {
+        const lastSeen = Number(client.last_seen_unix_seconds || 0);
+        if (!lastSeen) return t('neverSeen');
+        const elapsed = Math.max(0, Date.now() / 1000 - lastSeen);
+        if (elapsed <= 120) return t('justNow');
+        return t('seenAgo', { time: formatDuration(elapsed) });
+      }
+
+      function drawClientInsightCharts(visibleClients = state.visibleClients || []) {
+        const enabled = visibleClients.filter(client => client.enabled).length;
+        const online = visibleClients.filter(clientIsOnline).length;
+        drawBarChart(elements.client_status_chart, [
+          { label: t('online'), value: online, color: '--success' },
+          { label: t('offline'), value: Math.max(0, enabled - online), color: '--warning' },
+          { label: t('disabled'), value: Math.max(0, visibleClients.length - enabled), color: '--faint' }
+        ], true);
+        const platformCounts = new Map();
+        visibleClients.forEach(client => {
+          const platform = client.platform || t('unknown');
+          platformCounts.set(platform, (platformCounts.get(platform) || 0) + 1);
+        });
+        const sortedPlatforms = [...platformCounts.entries()].sort((left, right) => right[1] - left[1]);
+        const platformItems = sortedPlatforms.slice(0, 3).map(([label, value]) => ({ label, value }));
+        const otherPlatforms = sortedPlatforms.slice(3).reduce((total, [, value]) => total + value, 0);
+        if (otherPlatforms) platformItems.push({ label: t('other'), value: otherPlatforms });
+        const configModes = [
+          { label: t('managedConfig'), value: visibleClients.filter(client => client.config_mode === 'server_managed').length },
+          { label: t('reportOnlyConfig'), value: visibleClients.filter(client => client.config_mode === 'report_only').length },
+          { label: t('localConfig'), value: visibleClients.filter(client => !client.config_mode || client.config_mode === 'local').length }
+        ];
+        drawGroupedHorizontalChart(elements.client_platform_chart, [
+          { label: t('platform'), items: platformItems },
+          { label: t('configStatus'), items: configModes }
+        ]);
+      }
+
+      function renderClientInsights(visibleClients) {
+        state.visibleClients = visibleClients;
+        const enabled = visibleClients.filter(client => client.enabled).length;
+        const online = visibleClients.filter(clientIsOnline).length;
+        const issues = visibleClients.filter(client => client.config_sync_status === 'conflict' || client.config_sync_status === 'apply_failed').length;
+        const platforms = new Set(visibleClients.map(client => client.platform || t('unknown')));
+        elements.client_insight_kpis.replaceChildren(
+          createInsightKpi(String(visibleClients.length), t('clients')),
+          createInsightKpi(String(online), t('online')),
+          createInsightKpi(String(Math.max(0, enabled - online)), t('offline')),
+          createInsightKpi(String(issues), t('configIssues')),
+          createInsightKpi(String(platforms.size), t('platforms'))
+        );
+        drawClientInsightCharts(visibleClients);
+      }
+
       function renderClients() {
         const clients = state.dashboard.clients || [];
         const query = state.clientSearch.trim().toLowerCase();
@@ -1921,15 +2341,31 @@
           const text = [client.name, client.client_id, client.platform, client.group_name, ...(client.tags || []), client.notes].filter(Boolean).join(' ').toLowerCase();
           return !query || text.includes(query);
         });
+        renderClientInsights(visible);
         elements.client_count.textContent = t('clientCount', { visible: visible.length, total: clients.length });
         elements.clients_list.replaceChildren();
         visible.forEach(client => {
           const row = document.createElement('tr');
           const online = clientIsOnline(client);
           const status = !client.enabled ? t('disabled') : online ? t('online') : t('offline');
-          [client.name, client.group_name || '—', (client.tags || []).join(', ') || '—', client.platform, status, formatTimestamp(client.last_seen_unix_seconds), clientConfigText(client)].forEach(value => {
+          [client.name, client.group_name || '—', (client.tags || []).join(', ') || '—', client.platform].forEach(value => {
             const cell = document.createElement('td'); cell.textContent = value; row.append(cell);
           });
+          const statusCell = document.createElement('td');
+          const presence = document.createElement('span');
+          presence.className = `client-presence ${!client.enabled ? 'disabled' : online ? 'online' : 'offline'}`;
+          const presenceLabel = document.createElement('strong');
+          const presenceDot = document.createElement('i'); presenceDot.setAttribute('aria-hidden', 'true');
+          presenceLabel.append(presenceDot, document.createTextNode(status));
+          presence.append(presenceLabel);
+          statusCell.append(presence);
+          const lastSeenCell = document.createElement('td');
+          lastSeenCell.className = 'cell-stack';
+          const lastSeenValue = document.createElement('span'); lastSeenValue.textContent = formatTimestamp(client.last_seen_unix_seconds);
+          const lastSeenRelative = document.createElement('small'); lastSeenRelative.textContent = clientLastSeenRelative(client);
+          lastSeenCell.append(lastSeenValue, lastSeenRelative);
+          const configCell = document.createElement('td'); configCell.textContent = clientConfigText(client);
+          row.append(statusCell, lastSeenCell, configCell);
           const actions = document.createElement('td'); actions.className = 'table-actions';
           if (state.identity.role !== 'auditor') {
             const edit = actionButton(t('editClient'), () => openClientModal(client));
@@ -2585,6 +3021,11 @@
         if (!state.dashboard) return;
         if (state.route.view === 'overview') drawTrafficChart();
         if (state.route.view === 'metrics') renderMetrics();
+        if (state.route.view === 'services' && state.route.service !== 'acme') {
+          drawServiceTrendChart();
+          drawServiceStatusChart();
+        }
+        if (state.route.view === 'clients') drawClientInsightCharts();
       }
 
       function policyInitialValues(type, policy = null) {
@@ -2936,9 +3377,17 @@
         state.refreshTimer = null;
         state.loading = false;
         state.pendingLoad = false;
+        state.pendingForceHistory = false;
         state.loadPromise = null;
         state.dashboard = null;
         state.trafficHistory = [];
+        state.serviceTrafficHistory = [];
+        state.historyMeta = null;
+        state.serviceHistoryMeta = null;
+        state.historyCache.clear();
+        state.historyRequestGeneration += 1;
+        state.historyActiveKey = null;
+        state.historyPromise = null;
         cancelEdit(true);
         togglePopover(elements.account_menu, elements.account_button, false);
         showLogin(messageKey);
@@ -3036,10 +3485,96 @@
         if (show) requestAnimationFrame(() => elements.account_new_password.focus());
       }
 
-      function historyQuery() {
-        const range = state.trendRange;
+      function historyQuery(range = state.trendRange, protocol = 'total') {
         const steps = { '1h': 15, '12h': 150, '1d': 300, '7d': 2100, '30d': 9000 };
-        return `/api/v1/metrics/history?range=${encodeURIComponent(range)}&step=${steps[range] || 15}&protocol=total`;
+        return `/api/v1/metrics/history?range=${encodeURIComponent(range)}&step=${steps[range] || 15}&protocol=${encodeURIComponent(protocol)}`;
+      }
+
+      function historyCacheKey(range, protocol) { return `${protocol}:${range}`; }
+
+      function serviceHistoryProtocol(type = state.route.service) {
+        if (type === 'tcp') return 'tcp';
+        if (type === 'udp') return 'udp';
+        if (type === 'http' || type === 'sni') return 'web';
+        if (type === 'socks5' || type === 'http-proxy') return 'proxy';
+        if (type === 'secret') return 'secret';
+        if (type === 'ports') {
+          const protocols = new Set((state.dashboard?.portGroups || []).map(policy => policy.protocol).filter(Boolean));
+          return protocols.size === 1 ? [...protocols][0] : 'total';
+        }
+        return 'total';
+      }
+
+      function setHistoryLoading(target, loading) {
+        const canvas = target === 'service' ? elements.service_trend_chart : elements.traffic_chart;
+        const panel = canvas?.closest('.chart-panel');
+        if (!panel) return;
+        panel.dataset.loadingLabel = t('loadingHistory');
+        panel.classList.toggle('is-loading', loading);
+      }
+
+      function applyHistoryPayload(target, range, protocol, payload) {
+        if (target === 'service') {
+          if (state.route.view !== 'services' || state.route.service === 'acme' || state.serviceTrendRange !== range || serviceHistoryProtocol() !== protocol) return;
+          state.serviceHistoryProtocol = protocol;
+          state.serviceTrafficHistory = Array.isArray(payload.points) ? payload.points : [];
+          state.serviceHistoryMeta = payload;
+          drawServiceTrendChart();
+          return;
+        }
+        if (state.route.view !== 'overview' || state.trendRange !== range || protocol !== 'total') return;
+        state.trafficHistory = Array.isArray(payload.points) ? payload.points : [];
+        state.historyMeta = payload;
+        drawTrafficChart();
+      }
+
+      function loadHistory(range, protocol, { force = false, target = 'overview' } = {}) {
+        const key = historyCacheKey(range, protocol);
+        const cached = state.historyCache.get(key);
+        const cacheFresh = cached && Date.now() - cached.fetchedAt < 45000;
+        if (cached) applyHistoryPayload(target, range, protocol, cached.payload);
+        if (!force && cacheFresh) return Promise.resolve(cached.payload);
+        if (!force && state.historyActiveKey === key && state.historyPromise) return state.historyPromise;
+        state.historyRequestGeneration += 1;
+        const generation = state.historyRequestGeneration;
+        abortActiveRequests('history');
+        setHistoryLoading(target, true);
+        const request = (async () => {
+          try {
+            const response = await apiFetch(historyQuery(range, protocol), { headers: { Accept: 'application/json' }, scope: 'history' });
+            if (generation !== state.historyRequestGeneration || response.status === 401) return null;
+            if (!response.ok) return null;
+            const payload = await response.json();
+            if (generation !== state.historyRequestGeneration) return null;
+            state.historyCache.set(key, { payload, fetchedAt: Date.now() });
+            if (state.historyCache.size > 30) state.historyCache.delete(state.historyCache.keys().next().value);
+            applyHistoryPayload(target, range, protocol, payload);
+            return payload;
+          } catch (error) {
+            if (error?.name !== 'AbortError' && generation === state.historyRequestGeneration && !cached) showToast(t('statusFailed'), true);
+            return null;
+          } finally {
+            if (generation === state.historyRequestGeneration) {
+              setHistoryLoading(target, false);
+              state.historyActiveKey = null;
+              state.historyPromise = null;
+            }
+          }
+        })();
+        state.historyActiveKey = key;
+        state.historyPromise = request;
+        return request;
+      }
+
+      function loadRouteHistory({ force = false } = {}) {
+        if (!state.identity || !state.dashboard) return Promise.resolve(null);
+        if (state.route.view === 'overview') return loadHistory(state.trendRange, 'total', { force, target: 'overview' });
+        if (state.route.view === 'services' && state.route.service !== 'acme') {
+          const protocol = serviceHistoryProtocol();
+          state.serviceHistoryProtocol = protocol;
+          return loadHistory(state.serviceTrendRange, protocol, { force, target: 'service' });
+        }
+        return Promise.resolve(null);
       }
 
       function captureFallbackHistory(metrics, status) {
@@ -3060,12 +3595,15 @@
         return { status: {}, metrics, events: [], users: [], sessions: [], apiTokens: [], fleetOverview: { peers: [], conflicts: [], failover_order: [] }, alertRules: [], alertEvents: [], alertChannels: {}, tcpPolicies: [], udpPolicies: [], portGroups: [], httpRoutes: [], sniRoutes: [], secretPolicies: [], socks5Policies: [], httpProxyPolicies: [], clients: [], p2pNodes: [], publicPortPolicy: { tcp_allowed: '32000-32999', udp_allowed: '32000-32999', tcp_reserved: '', udp_reserved: '' }, acme: { enabled: false, environment: 'staging', directory_url: acmeDirectories.staging, contact_email: '', terms_accepted: false, renew_before_days: 30, account_registered: false } };
       }
 
-      function managementRequestPlan() {
+      function managementRequestPlan({ includeHistory = false } = {}) {
         const common = [{ key: 'status', url: '/api/v1/status' }, { key: 'publicPortPolicy', url: '/api/v1/public-port-policy' }];
-        if (state.route.view === 'overview') return [...common,
-          { key: 'metrics', url: '/api/v1/metrics' }, { key: 'tcpPolicies', url: '/api/v1/tcp-tunnels' }, { key: 'udpPolicies', url: '/api/v1/udp-tunnels' }, { key: 'portGroups', url: '/api/v1/port-groups' }, { key: 'httpRoutes', url: '/api/v1/http-routes' }, { key: 'sniRoutes', url: '/api/v1/sni-routes' }, { key: 'secretPolicies', url: '/api/v1/secret-tunnels' }, { key: 'socks5Policies', url: '/api/v1/socks5-proxies' }, { key: 'httpProxyPolicies', url: '/api/v1/http-proxies' }, { key: 'clients', url: '/api/v1/clients' }, { key: 'alertEvents', url: '/api/v1/alerts/events?active=true&limit=20', optional: true }, { key: 'history', url: historyQuery(), optional: true }
-        ];
-        if (state.route.view === 'metrics') return [...common, { key: 'metrics', url: '/api/v1/metrics' }, { key: 'history', url: historyQuery(), optional: true }];
+        if (state.route.view === 'overview') {
+          const plan = [...common,
+            { key: 'metrics', url: '/api/v1/metrics' }, { key: 'tcpPolicies', url: '/api/v1/tcp-tunnels' }, { key: 'udpPolicies', url: '/api/v1/udp-tunnels' }, { key: 'portGroups', url: '/api/v1/port-groups' }, { key: 'httpRoutes', url: '/api/v1/http-routes' }, { key: 'sniRoutes', url: '/api/v1/sni-routes' }, { key: 'secretPolicies', url: '/api/v1/secret-tunnels' }, { key: 'socks5Policies', url: '/api/v1/socks5-proxies' }, { key: 'httpProxyPolicies', url: '/api/v1/http-proxies' }, { key: 'clients', url: '/api/v1/clients' }, { key: 'alertEvents', url: '/api/v1/alerts/events?active=true&limit=100', optional: true }
+          ];
+          return includeHistory ? [...plan, { key: 'history', url: historyQuery(), optional: true }] : plan;
+        }
+        if (state.route.view === 'metrics') return [...common, { key: 'metrics', url: '/api/v1/metrics' }];
         if (state.route.view === 'p2p') return [...common, { key: 'clients', url: '/api/v1/clients' }, { key: 'p2pNodes', url: '/api/v1/p2p/nodes' }];
         if (state.route.view === 'fleet') return [...common, { key: 'fleetOverview', url: '/api/v1/fleet/overview' }];
         if (state.route.view === 'clients') return [...common, { key: 'clients', url: '/api/v1/clients' }];
@@ -3080,12 +3618,16 @@
 
       async function loadManagementData({ forceHistory = false } = {}) {
         if (!state.identity) return;
-        if (state.loading && state.loadPromise) { state.pendingLoad = true; return state.loadPromise; }
+        if (state.loading && state.loadPromise) {
+          state.pendingLoad = true;
+          state.pendingForceHistory ||= forceHistory;
+          return state.loadPromise;
+        }
         const generation = state.sessionGeneration;
         const routeGeneration = state.routeGeneration;
         state.loading = true;
         state.loadPromise = (async () => {
-          const plan = managementRequestPlan();
+          const plan = managementRequestPlan({ includeHistory: false });
           let responses;
           try { responses = await Promise.all(plan.map(item => apiFetch(item.url, { headers: { Accept: 'application/json' }, scope: 'management' }))); }
           catch (_) { if (generation === state.sessionGeneration && routeGeneration === state.routeGeneration) showToast(t('statusFailed'), true); return; }
@@ -3103,16 +3645,19 @@
             } else if (key === 'metrics') state.dashboard.metrics = new Proxy(value, { get(target, property) { return property in target ? target[property] : 0; } });
             else state.dashboard[key] = value;
           });
-          if (!parsed.some(([key, value]) => key === 'history' && value) && parsed.some(([key]) => key === 'metrics')) captureFallbackHistory(state.dashboard.metrics, state.dashboard.status);
+          if (!state.trafficHistory.length && parsed.some(([key]) => key === 'metrics')) captureFallbackHistory(state.dashboard.metrics, state.dashboard.status);
           elements.last_refresh.textContent = `${t('refreshed')}: ${new Date().toLocaleTimeString(state.language === 'zh' ? 'zh-CN' : 'en')}`;
           renderRoute();
+          loadRouteHistory({ force: forceHistory }).catch(() => {});
         })().finally(() => {
           if (generation === state.sessionGeneration && routeGeneration === state.routeGeneration) {
             state.loading = false;
             state.loadPromise = null;
             if (state.pendingLoad) {
               state.pendingLoad = false;
-              queueMicrotask(() => loadManagementData({ forceHistory: true }));
+              const pendingForceHistory = state.pendingForceHistory;
+              state.pendingForceHistory = false;
+              queueMicrotask(() => loadManagementData({ forceHistory: pendingForceHistory }));
             }
           }
         });
@@ -3208,6 +3753,7 @@
           if (!elements.appearance_popover.contains(event.target) && !elements.appearance_button.contains(event.target)) togglePopover(elements.appearance_popover, elements.appearance_button, false);
           if (!elements.account_menu.contains(event.target) && !elements.account_button.contains(event.target)) togglePopover(elements.account_menu, elements.account_button, false);
           if (!elements.global_search_shell.contains(event.target)) elements.global_search_results.classList.add('hidden');
+          document.querySelectorAll('details.action-menu[open]').forEach(menu => { if (!menu.contains(event.target)) menu.removeAttribute('open'); });
         });
         elements.login.addEventListener('submit', login);
         elements.initial_password_form.addEventListener('submit', submitInitialPassword);
@@ -3264,6 +3810,7 @@
         elements.alert_rule_cancel.addEventListener('click', closeAlertRuleModal);
         elements.alert_rule_modal.addEventListener('click', event => { if (event.target === elements.alert_rule_modal) closeAlertRuleModal(); });
         elements.refresh.addEventListener('click', () => loadManagementData({ forceHistory: true }));
+        elements.overview_alert_more.addEventListener('click', () => { location.hash = '#/alerts'; });
         elements.export_metrics.addEventListener('click', () => { window.location.href = `/api/v1/metrics/history/export?range=${encodeURIComponent(state.trendRange)}&protocol=total&format=csv`; });
         elements.export_audit.addEventListener('click', () => { window.location.href = '/api/v1/audit/export?format=csv'; });
         document.querySelectorAll('a[href^="#/"]').forEach(link => link.addEventListener('click', event => {
@@ -3275,7 +3822,11 @@
           if (state.drawer.open) cancelEdit(true);
           state.selectedPolicies.clear();
           state.routeGeneration += 1;
+          state.historyRequestGeneration += 1;
           abortActiveRequests('management');
+          abortActiveRequests('history');
+          state.historyActiveKey = null;
+          state.historyPromise = null;
           state.loading = false;
           state.loadPromise = null;
           state.pendingLoad = false;
@@ -3285,7 +3836,12 @@
         document.querySelectorAll('[data-trend-range]').forEach(button => button.addEventListener('click', () => {
           state.trendRange = button.dataset.trendRange;
           document.querySelectorAll('[data-trend-range]').forEach(item => item.classList.toggle('active', item === button));
-          loadManagementData({ forceHistory: true });
+          loadHistory(state.trendRange, 'total', { target: 'overview' }).catch(() => {});
+        }));
+        document.querySelectorAll('[data-service-range]').forEach(button => button.addEventListener('click', () => {
+          state.serviceTrendRange = button.dataset.serviceRange;
+          document.querySelectorAll('[data-service-range]').forEach(item => item.classList.toggle('active', item === button));
+          loadHistory(state.serviceTrendRange, serviceHistoryProtocol(), { target: 'service' }).catch(() => {});
         }));
         elements.new_policy.addEventListener('click', () => openPolicyDrawer(state.route.service));
         elements.service_search.addEventListener('input', () => { state.serviceSearch = elements.service_search.value; renderServices(); });
@@ -3335,9 +3891,14 @@
             else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
           }
         });
-        let resizeTimer = null;
-        window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(drawCharts, 100); });
-        document.addEventListener('visibilitychange', () => { if (!document.hidden && state.identity) loadManagementData({ forceHistory: true }); });
+        let resizeFrame = null;
+        window.addEventListener('resize', () => {
+          if (resizeFrame) cancelAnimationFrame(resizeFrame);
+          resizeFrame = requestAnimationFrame(() => { resizeFrame = null; drawCharts(); });
+        });
+        document.addEventListener('visibilitychange', () => {
+          if (!document.hidden && state.identity) loadManagementData({ forceHistory: false }).catch(() => {});
+        });
         setupTrafficTooltip();
       }
 
@@ -3351,6 +3912,7 @@
       state.loadPromise = null;
       state.historyMeta = null;
       state.trendRange = '1h';
+      state.serviceTrendRange = '1h';
       state.language = safeStorageGet('linklake-language', state.language);
       bindEvents();
       applyTheme(document.documentElement.dataset.themeMode, document.documentElement.dataset.palette, false);

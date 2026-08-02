@@ -20,7 +20,7 @@ class ServerProfileStore {
     final file = File(_path());
     if (!await file.exists()) {
       return const [
-        ServerProfile(name: 'LinkLake', url: 'https://linklake.odelake.com'),
+        ServerProfile(name: 'LinkLake', url: 'https://link.odelake.com'),
       ];
     }
     try {

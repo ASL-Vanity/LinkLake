@@ -10,6 +10,7 @@
 .env.*
 !.env.example
 /.tmp-tls-test/
+/.tmp-webui-smoke-data/
 /linklake-client.toml
 /deploy/linklake.env
 /deploy/secrets/

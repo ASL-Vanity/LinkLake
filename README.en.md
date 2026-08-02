@@ -1,4 +1,4 @@
-# LinkLake v2
+# LinkLake
 
 [中文](README.md) | English
 
@@ -263,6 +263,28 @@ linklake-client check-update --channel prerelease
 
 The JSON result contains the current version, resolved channel, latest version, update availability, and release URL. The network request has a 15-second timeout.
 
+### Secure automatic update and rollback
+
+The client can continue from an update check to trusted download, atomic installation, and rollback:
+
+```powershell
+linklake-client update download
+linklake-client update apply --yes
+linklake-client update status
+linklake-client update rollback --yes
+```
+
+- `download` downloads and verifies an update without changing the installed program.
+- `apply` downloads the latest compatible release, creates a backup, and starts a detached helper to replace the client. Replacing a system installation normally requires administrator/root privileges.
+- `status` reports the last `scheduled/installing/succeeded/rolled_back/failed` state.
+- `rollback` selects the newest valid backup that differs from the current installation. Explicit downgrade downloads additionally require `--allow-downgrade`.
+- Automatic installation targets must support `linklake-client --version`, so packages older than 0.7.0-rc.1 are not installed automatically; a verified legacy client can still be restored from backup.
+- The default state directory is under the current user's local state directory and can be overridden with `--state-dir`.
+
+The verification chain covers HTTPS and repository-path restrictions, GitHub's asset SHA-256, the independent `.sha256` asset, download size, safe ZIP/TAR entries, the `release.json` product/version/platform, the staged binary digest, a hashed helper plan, the pre-install target digest, the installed `--version`, and service recovery. Only `linklake-client` is replaced; configuration, managed state, certificates, and logs are preserved. Any installation or service verification failure restores the backup automatically.
+
+The trust root is the configured GitHub repository, GitHub HTTPS, and its release asset digests. SHA-256 cannot protect against a compromised publisher account or repository permissions, so strong GitHub authentication, least privilege, and protected releases remain required. Independent release signatures can be added after code-signing infrastructure is available.
+
 ## Management and metrics
 
 - Public health endpoint: `GET /api/v1/health`
@@ -302,7 +324,7 @@ The JSON result contains the current version, resolved channel, latest version, 
 - Metrics and policy views cover P2P freshness/direct/fallback paths, TLS SNI ClientHello/unknown-host/connection/traffic events, secret connections and traffic, SOCKS5 requests/authentication/connections/traffic, HTTP proxy requests/CONNECT/authentication/malformed messages/traffic, UDP sessions/packets/traffic/drops/timeouts, HTTP/HTTPS route traffic and failures, TLS handshake failures, managed/expiring/expired certificates, ACME orders, renewals, and HTTP-01 challenges
 - `LINKLAKE_MANAGEMENT_TOKEN` is an optional automation Bearer token, not a Web login credential
 - The Web UI supports administrator, operator, and auditor roles. Administrators have full access, operators manage clients and forwarding policies, and auditors are read-only. The current user and the last enabled administrator are protected.
-- Lake, ocean, jade, and violet are complete light/dark themes. System mode changes only the light/dark scheme and preserves the selected palette.
+- Aurora, minimal ocean, jade paper, restrained neon, and high contrast are complete visual styles. Each style defines its own background, material, radius, border, shadow, and chart treatment, while system mode switches the light/dark scheme automatically.
 
 Set logs with `LINKLAKE_LOG_DIR`. The server defaults to `LINKLAKE_DATA_DIR/logs`; the client writes to the console when unset, while service installers configure a rotating log directory.
 

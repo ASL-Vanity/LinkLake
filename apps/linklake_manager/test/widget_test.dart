@@ -36,4 +36,12 @@ void main() {
     expect(selectLatestReleaseTag(releases, '0.6.0'), 'v0.6.0');
     expect(selectLatestReleaseTag(releases, '0.6.0-rc.2'), 'v0.8.0-rc.1');
   });
+
+  test('client update actions use the safe updater command contract', () {
+    expect(clientUpdateArguments('check'), ['check-update']);
+    expect(clientUpdateArguments('download'), ['update', 'download']);
+    expect(clientUpdateArguments('apply'), ['update', 'apply', '--yes']);
+    expect(clientUpdateArguments('rollback'), ['update', 'rollback', '--yes']);
+    expect(clientUpdateArguments('status'), ['update', 'status']);
+  });
 }

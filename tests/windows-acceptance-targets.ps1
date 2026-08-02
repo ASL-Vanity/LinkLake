@@ -3,7 +3,7 @@ param(
     [int[]]$UdpPorts = @(19091, 19092, 19093),
     [int]$HttpPort = 18082,
     [int]$TlsPort = 18443,
-    [string]$TlsHostname = 'sni.linklake.odelake.com',
+    [string]$TlsHostname = 'sni.link.odelake.com',
     [string]$InstallDirectory = "$env:ProgramData\LinkLake\acceptance-targets",
     [string]$StatePath = "$env:ProgramData\LinkLake\acceptance-targets.json"
 )

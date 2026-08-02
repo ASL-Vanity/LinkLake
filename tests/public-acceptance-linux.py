@@ -14,8 +14,8 @@ from pathlib import Path
 
 
 SERVER_IP = "43.160.209.67"
-HTTPS_HOSTNAME = "secure.linklake.odelake.com"
-SNI_HOSTNAME = "sni.linklake.odelake.com"
+HTTPS_HOSTNAME = "secure.link.odelake.com"
+SNI_HOSTNAME = "sni.link.odelake.com"
 TIMEOUT = 20
 
 

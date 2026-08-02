@@ -91,6 +91,9 @@ try {
   await page.locator('#global-search').fill('');
 
   await openRoute('#/clients');
+  assert(await page.locator('#clients-view canvas').count() === 2, '客户端页面缺少状态和平台配置图表');
+  assert(await page.locator('#client-insight-kpis .insight-kpi').count() === 5, '客户端状态摘要不是五项');
+  assert(await page.locator('#clients-view > .section-heading').count() === 0, '客户端页面仍重复显示页面标题');
   const managedClientRow = page.locator('#clients-list tr').filter({ hasText: 'smoke-client' });
   await managedClientRow.waitFor({ timeout: 15_000 });
   await managedClientRow.getByRole('button', { name: /Edit client|编辑客户端/ }).click();
@@ -112,20 +115,33 @@ try {
   await page.locator('#clients-list tr').filter({ hasText: 'unused-client' }).getByRole('button', { name: /Delete|删除/ }).click();
   await page.waitForFunction(() => !document.querySelector('#clients-list')?.textContent?.includes('unused-client'));
 
-  // 验证主题模式与配色持久化。
+  // 验证五套完整视觉风格、明暗模式和持久化。
   await page.locator('#appearance-button').click();
   await page.locator('[data-theme-choice="light"]').click();
-  await page.locator('[data-palette-choice="lake"]').click();
-  const lakeTheme = await page.evaluate(() => {
-    const style = getComputedStyle(document.documentElement);
-    return ['--bg', '--surface', '--line'].map(name => style.getPropertyValue(name).trim());
-  });
+  const visualStyles = [];
+  for (const palette of ['lake', 'ocean', 'jade', 'violet', 'contrast']) {
+    await page.locator(`[data-palette-choice="${palette}"]`).click();
+    visualStyles.push(await page.evaluate(() => {
+      const rootStyle = getComputedStyle(document.documentElement);
+      const panelStyle = getComputedStyle(document.querySelector('.chart-panel'));
+      return {
+        palette: document.documentElement.dataset.palette,
+        background: rootStyle.getPropertyValue('--bg').trim(),
+        surface: rootStyle.getPropertyValue('--surface').trim(),
+        line: rootStyle.getPropertyValue('--line').trim(),
+        radius: panelStyle.borderRadius,
+        shadow: panelStyle.boxShadow,
+      };
+    }));
+  }
+  assert(new Set(visualStyles.map(style => style.background)).size === 5, '五套视觉风格没有分别改变页面背景');
+  assert(new Set(visualStyles.map(style => style.radius)).size >= 4, '视觉风格仍只是换色，没有改变结构质感');
+  await page.locator('[data-theme-choice="dark"]').click();
+  await page.waitForTimeout(250);
+  const contrastOnPrimary = await page.locator('.nav-link.active').evaluate(node => ({ color: getComputedStyle(node).color, background: getComputedStyle(node).backgroundColor }));
+  assert(contrastOnPrimary.color === 'rgb(0, 0, 0)' && contrastOnPrimary.background === 'rgb(255, 230, 0)', `高对比深色主题主色文字不可读：${JSON.stringify(contrastOnPrimary)}`);
+  await page.locator('[data-theme-choice="light"]').click();
   await page.locator('[data-palette-choice="violet"]').click();
-  const violetTheme = await page.evaluate(() => {
-    const style = getComputedStyle(document.documentElement);
-    return ['--bg', '--surface', '--line'].map(name => style.getPropertyValue(name).trim());
-  });
-  assert(lakeTheme.every((value, index) => value !== violetTheme[index]), '配色切换没有同时改变背景、表面和边框');
   assert(await page.evaluate(() => document.documentElement.dataset.scheme === 'light'), '浅色主题未生效');
   assert(await page.evaluate(() => document.documentElement.dataset.palette === 'violet'), '紫罗兰配色未生效');
   await page.reload({ waitUntil: 'domcontentloaded' });
@@ -139,6 +155,8 @@ try {
   assert(await page.locator('[data-trend-range]').evaluateAll(nodes => nodes.map(node => node.dataset.trendRange).join(',')) === '1h,12h,1d,7d,30d', '流量范围不是 1h/12h/1d/7d/30d');
   assert(await page.locator('[data-trend-range="1h"]').evaluate(node => node.classList.contains('active')), '流量范围默认值不是 1h');
   assert(await page.locator('#service-health-summary').textContent().then(text => !/\d+\s*\/\s*\d+/.test(text)), '服务健康仍使用含义不清的分数表达');
+  assert(await page.locator('#overview-alerts .alert-item').count() <= 5, '总览告警超过最近五条');
+  assert(await page.locator('#overview-alert-more').isVisible(), '总览缺少告警“更多”入口');
   await page.screenshot({ path: path.join(outputDir, 'overview-desktop.png'), fullPage: true });
 
   await openRoute('#/metrics');
@@ -159,6 +177,11 @@ try {
   for (const [route, editedName] of policies) await editPolicy(route, editedName);
 
   await openRoute('#/services/tcp');
+  assert(await page.locator('#services-view canvas').count() === 2, 'TCP 页面缺少协议趋势或策略状态图');
+  assert(await page.locator('#service-insight-kpis .insight-kpi').count() === 5, 'TCP 页面摘要不是五项');
+  assert(await page.locator('#service-list details.action-menu').count() > 0, '策略低频操作没有收纳到更多菜单');
+  assert(await page.locator('#workspace-service-actions:not(.hidden)').count() === 1, '策略操作没有并入页面顶部标题栏');
+  assert(await page.locator('#services-view h2').count() === 0, '协议页仍重复显示页面标题');
   await page.locator('#service-list .policy-select input').first().check();
   assert(!(await page.locator('#bulk-disable-policies').isDisabled()), '选择策略后批量操作仍被禁用');
   await page.locator('#bulk-disable-policies').click();
@@ -168,12 +191,14 @@ try {
 
   await openRoute('#/fleet');
   await page.locator('#fleet-view:not(.hidden)').waitFor();
+  assert(await page.locator('#workspace-fleet-actions:not(.hidden)').count() === 1, '多云操作没有并入页面顶部标题栏');
   await page.locator('#preview-fleet-sync').click();
   await page.waitForTimeout(250);
   assert(pageErrors.length === 0, `多云同步预览触发页面错误：${pageErrors.join('; ')}`);
 
   // 管理员通过真实界面创建、编辑、重置和撤销用户会话。
   await openRoute('#/users');
+  assert(await page.locator('#workspace-user-actions:not(.hidden)').count() === 1, '用户操作没有并入页面顶部标题栏');
   await page.locator('#new-user').click();
   await page.locator('#user-username').fill('smoke_operator');
   await page.locator('#user-display-name').fill('Smoke Operator');
@@ -229,12 +254,12 @@ try {
   await page.waitForFunction(() => location.hash === '#/overview');
 
   // 宽屏、普通桌面与移动端都不能出现横向溢出。
-  await page.setViewportSize({ width: 2048, height: 1152 });
+  await page.setViewportSize({ width: 2560, height: 1440 });
   await openRoute('#/overview');
   const wideLayout = await page.locator('#workspace').evaluate(node => ({ width: node.getBoundingClientRect().width, columns: getComputedStyle(node).gridTemplateColumns }));
-  assert(wideLayout.width > 1900, `宽屏布局仍留有过多空白：${JSON.stringify(wideLayout)}`);
+  assert(wideLayout.width > 2450, `超宽屏布局仍留有过多空白：${JSON.stringify(wideLayout)}`);
   assert((await page.locator('#overview-kpis .kpi-card').count()) === 5, '宽屏 KPI 数量异常');
-  await page.screenshot({ path: path.join(outputDir, 'overview-wide-2048.png'), fullPage: true });
+  await page.screenshot({ path: path.join(outputDir, 'overview-wide-2560.png'), fullPage: true });
 
   await page.setViewportSize({ width: 390, height: 844 });
   await openRoute('#/overview');
@@ -256,8 +281,15 @@ try {
   assert(userOverflow.html === 0 && userOverflow.body === 0, `用户管理移动端横向溢出：${JSON.stringify(userOverflow)}`);
   await page.screenshot({ path: path.join(outputDir, 'users-mobile-390.png'), fullPage: true });
 
+  await openRoute('#/services/tcp');
+  const serviceOverflow = await page.evaluate(() => ({
+    html: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    body: document.body.scrollWidth - document.body.clientWidth,
+  }));
+  assert(serviceOverflow.html === 0 && serviceOverflow.body === 0, `协议页移动端横向溢出：${JSON.stringify(serviceOverflow)}`);
+
   assert(pageErrors.length === 0, `浏览器出现脚本异常：${pageErrors.join(' | ')}`);
-  console.log(JSON.stringify({ ok: true, editedPolicies: policies.length, rbac: true, themeSurfaces: true, pageErrors, overflow, userOverflow, wideLayout }, null, 2));
+  console.log(JSON.stringify({ ok: true, editedPolicies: policies.length, rbac: true, themeSurfaces: true, visualStyles, pageErrors, overflow, userOverflow, serviceOverflow, wideLayout }, null, 2));
 } finally {
   await browser.close();
 }

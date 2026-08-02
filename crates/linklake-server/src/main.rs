@@ -10116,6 +10116,114 @@ mod tests {
         assert!(MANAGEMENT_UI.contains("method: editingId ? 'PUT' : 'POST'"));
         assert!(MANAGEMENT_UI.contains("cancelEdit"));
         assert!(MANAGEMENT_UI.contains("beginPolicyEdit"));
+        assert!(MANAGEMENT_UI.contains("'edit-policy'"));
+        assert!(MANAGEMENT_UI.contains("actionButton(t('editPolicy')"));
+        assert!(MANAGEMENT_UI.contains("beginPolicyEdit(type, policy)"));
+    }
+
+    #[test]
+    fn web_ui_registers_visualizations_and_complete_themes() {
+        let registry_start = MANAGEMENT_UI
+            .find("const elements = Object.fromEntries([")
+            .expect("Web UI element registry should exist");
+        let registry_end = MANAGEMENT_UI[registry_start..]
+            .find("].map(id =>")
+            .map(|offset| registry_start + offset)
+            .expect("Web UI element registry should have an end");
+        let registry = &MANAGEMENT_UI[registry_start..registry_end];
+        for id in [
+            "overview-alert-more",
+            "service-insights",
+            "service-trend-title",
+            "service-insight-kpis",
+            "service-trend-chart",
+            "service-status-chart",
+            "client-insight-kpis",
+            "client-status-chart",
+            "client-platform-chart",
+        ] {
+            assert!(
+                registry.contains(&format!("'{id}'")),
+                "Web UI does not register element {id}"
+            );
+        }
+        for marker in [
+            "data-palette-choice=\"contrast\"",
+            "html[data-scheme=\"dark\"][data-palette=\"contrast\"]",
+            "html[data-scheme=\"light\"][data-palette=\"contrast\"]",
+            "['lake', 'ocean', 'jade', 'violet', 'contrast']",
+            "--on-primary:#000",
+        ] {
+            assert!(
+                MANAGEMENT_UI.contains(marker),
+                "Web UI is missing complete theme marker {marker}"
+            );
+        }
+        assert!(MANAGEMENT_UI.contains("renderServiceInsights(type, visible)"));
+        assert!(MANAGEMENT_UI.contains("renderClientInsights(visible)"));
+        assert!(MANAGEMENT_UI.contains("drawServiceTrendChart()"));
+        assert!(MANAGEMENT_UI.contains("drawClientInsightCharts()"));
+        assert!(MANAGEMENT_UI.contains("drawGroupedHorizontalChart"));
+        assert!(MANAGEMENT_UI.contains("data-i18n-aria-label"));
+        assert!(MANAGEMENT_UI
+            .contains("requestAnimationFrame(() => { resizeFrame = null; drawCharts(); })"));
+        assert!(!MANAGEMENT_UI.contains("resizeTimer = setTimeout(drawCharts"));
+        for id in [
+            "workspace-service-actions",
+            "workspace-fleet-actions",
+            "workspace-user-actions",
+            "workspace-alert-actions",
+        ] {
+            assert!(MANAGEMENT_UI.contains(&format!("id=\"{id}\"")));
+        }
+    }
+
+    #[test]
+    fn web_ui_limits_overview_alerts_and_links_to_alert_management() {
+        let overview_start = MANAGEMENT_UI
+            .find("function renderOverview()")
+            .expect("overview renderer should exist");
+        let overview_end = MANAGEMENT_UI[overview_start..]
+            .find("function canvasSetup")
+            .map(|offset| overview_start + offset)
+            .expect("overview renderer should have an end");
+        let overview = &MANAGEMENT_UI[overview_start..overview_end];
+        assert!(overview.contains("updated_unix_seconds"));
+        assert!(overview.contains(".slice(0, 5).forEach"));
+        assert!(!overview.contains("alertValues.forEach"));
+        assert!(MANAGEMENT_UI.contains("id=\"overview-alert-more\""));
+        assert!(MANAGEMENT_UI.contains("elements.overview_alert_more.addEventListener"));
+        assert!(MANAGEMENT_UI.contains("location.hash = '#/alerts'"));
+    }
+
+    #[test]
+    fn web_ui_history_switching_is_cached_and_cancels_stale_requests() {
+        for marker in [
+            "historyCache: new Map()",
+            "historyRequestGeneration",
+            "historyActiveKey",
+            "function loadHistory(",
+            "abortActiveRequests('history')",
+            "scope: 'history'",
+            "state.historyCache.get(key)",
+            "state.historyCache.set(key",
+            "generation !== state.historyRequestGeneration",
+        ] {
+            assert!(
+                MANAGEMENT_UI.contains(marker),
+                "Web UI history loader is missing {marker}"
+            );
+        }
+        let range_start = MANAGEMENT_UI
+            .find("document.querySelectorAll('[data-trend-range]')")
+            .expect("traffic range handler should exist");
+        let range_end = MANAGEMENT_UI[range_start..]
+            .find("document.querySelectorAll('[data-service-range]')")
+            .map(|offset| range_start + offset)
+            .expect("service range handler should follow traffic range handler");
+        let range_handler = &MANAGEMENT_UI[range_start..range_end];
+        assert!(range_handler.contains("loadHistory("));
+        assert!(!range_handler.contains("loadManagementData("));
     }
 
     #[test]

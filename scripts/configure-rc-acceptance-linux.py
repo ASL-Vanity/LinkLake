@@ -209,7 +209,7 @@ def main() -> int:
         {
             "client_id": provider_id,
             "name": f"{ACCEPTANCE_PREFIX}https",
-            "hostname": "secure.linklake.odelake.com",
+            "hostname": "secure.link.odelake.com",
             "target_addr": "127.0.0.1:18082",
             "max_connections": 16,
         },
@@ -221,7 +221,7 @@ def main() -> int:
         {
             "client_id": provider_id,
             "name": f"{ACCEPTANCE_PREFIX}sni",
-            "hostname": "sni.linklake.odelake.com",
+            "hostname": "sni.link.odelake.com",
             "target_addr": "127.0.0.1:18443",
             "max_connections": 16,
             "bandwidth_limit_bps": None,

@@ -16,12 +16,17 @@ source_date_epoch="${SOURCE_DATE_EPOCH:-$(git -C "$project_root" log -1 --format
 flutter_bin="${FLUTTER:-flutter}"
 
 cd "$manager_root"
+cargo build --release -p linklake-client --locked --manifest-path "$project_root/Cargo.toml"
 "$flutter_bin" pub get
 "$flutter_bin" build macos --release \
   --dart-define="LINKLAKE_MANAGER_VERSION=$manager_version" \
   --dart-define="LINKLAKE_RELEASE_VERSION=$version"
 bundle="$(find "$manager_root/build/macos/Build/Products/Release" -maxdepth 1 -type d -name '*.app' -print | head -n 1)"
 test -n "$bundle"
+cp "$project_root/target/release/linklake-client" "$bundle/Contents/Resources/linklake-client"
+chmod 0755 "$bundle/Contents/Resources/linklake-client"
+codesign --force --deep --sign - "$bundle"
+codesign --verify --deep --strict "$bundle"
 
 rm -rf -- "$stage"
 rm -f -- "$archive" "$archive.sha256"

@@ -9,8 +9,9 @@ LinkLake Manager 是 LinkLake 的 Flutter 跨平台管理客户端，目前提�
 - 多云服务端健康、优先级、权重、策略同步预览与执行；
 - 本地客户端配置诊断、日志查看、系统服务安装与启停；
 - 当前版本、GitHub 候选版本和更新可用性诊断。
+- 客户端更新包的下载校验、原子安装、状态查看和备份回滚。
 
-LinkLake Manager is the Flutter cross-platform administration client for LinkLake. It supports multi-server profiles, password/TOTP sign-in, persistent metrics, complete policy administration, alerts and notification status, API tokens, fleet synchronization, local client diagnostics, service control, logs, and release update diagnostics.
+LinkLake Manager is the Flutter cross-platform administration client for LinkLake. It supports multi-server profiles, password/TOTP sign-in, persistent metrics, complete policy administration, alerts and notification status, API tokens, fleet synchronization, local client diagnostics, service control, logs, and verified client download/install/rollback workflows.
 
 ## 验证 / Verification
 

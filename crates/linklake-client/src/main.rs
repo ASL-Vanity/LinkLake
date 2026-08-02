@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use linklake_core::port_mapping::{parse_port_mappings, MAX_PORT_MAPPINGS};
 use linklake_core::target_pool::{parse_target_pool, select_weighted_target, WeightedTarget};
 use linklake_core::{
@@ -8,7 +8,6 @@ use linklake_core::{
     ManagedSecretTunnel, ManagedSocks5Proxy, ManagedTcpTunnel, ManagedTlsRoute, ManagedUdpTunnel,
     PRODUCT_NAME,
 };
-use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -39,6 +38,9 @@ mod p2p_iroh;
 mod p2p_noise;
 mod socks5_udp_agent;
 mod udp_agent;
+mod updater;
+
+use updater::UpdateChannel;
 
 const CONTROL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const CONTROL_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -51,7 +53,11 @@ fn default_true() -> bool {
 }
 
 #[derive(Parser)]
-#[command(name = "linklake-client", about = "LinkLake client control utility")]
+#[command(
+    name = "linklake-client",
+    about = "LinkLake client control utility",
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -176,6 +182,18 @@ enum Command {
         #[arg(long, value_enum, default_value_t = UpdateChannel::Auto)]
         channel: UpdateChannel,
     },
+    /// 下载、验证、应用或回滚 LinkLake 客户端更新。
+    Update {
+        #[command(subcommand)]
+        action: UpdateAction,
+    },
+    #[command(name = "__update-helper", hide = true)]
+    UpdateHelper {
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long)]
+        plan_sha256: String,
+    },
     /// 安装、卸载或控制本机 LinkLake 客户端系统服务。
     Service {
         #[command(subcommand)]
@@ -201,22 +219,44 @@ enum ServiceAction {
     Status,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, ValueEnum, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum UpdateChannel {
-    Auto,
-    Stable,
-    Prerelease,
-}
-
-impl UpdateChannel {
-    fn resolve(self, current: &Version) -> Self {
-        match self {
-            Self::Auto if current.pre.is_empty() => Self::Stable,
-            Self::Auto => Self::Prerelease,
-            value => value,
-        }
-    }
+#[derive(Subcommand)]
+enum UpdateAction {
+    /// 下载并完成双重 SHA-256、平台、版本和归档内容校验，但不替换程序。
+    Download {
+        #[arg(long, default_value = "ASL-Vanity/LinkLake")]
+        repository: String,
+        #[arg(long, value_enum, default_value_t = UpdateChannel::Auto)]
+        channel: UpdateChannel,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long)]
+        allow_downgrade: bool,
+    },
+    /// 下载并校验更新，然后由独立帮助进程原子替换客户端并恢复服务。
+    Apply {
+        #[arg(long, default_value = "ASL-Vanity/LinkLake")]
+        repository: String,
+        #[arg(long, value_enum, default_value_t = UpdateChannel::Auto)]
+        channel: UpdateChannel,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long)]
+        allow_downgrade: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// 查看最后一次下载、升级或回滚状态。
+    Status {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    /// 使用最后一份有效备份回滚客户端二进制。
+    Rollback {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Deserialize)]
@@ -603,9 +643,49 @@ async fn run_cli() -> anyhow::Result<()> {
             repository,
             channel,
         } => {
-            let result = check_for_update(&repository, channel).await?;
+            let result = updater::check(&repository, channel).await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
+        Command::Update { action } => match action {
+            UpdateAction::Download {
+                repository,
+                channel,
+                state_dir,
+                allow_downgrade,
+            } => {
+                let directory = state_dir.unwrap_or_else(updater::default_state_directory);
+                let result =
+                    updater::download(&repository, channel, &directory, allow_downgrade).await?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            }
+            UpdateAction::Apply {
+                repository,
+                channel,
+                state_dir,
+                allow_downgrade,
+                yes,
+            } => {
+                let directory = state_dir.unwrap_or_else(updater::default_state_directory);
+                let result =
+                    updater::apply(&repository, channel, &directory, allow_downgrade, yes).await?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            }
+            UpdateAction::Status { state_dir } => {
+                let directory = state_dir.unwrap_or_else(updater::default_state_directory);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&updater::status(&directory)?)?
+                );
+            }
+            UpdateAction::Rollback { state_dir, yes } => {
+                let directory = state_dir.unwrap_or_else(updater::default_state_directory);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&updater::rollback(&directory, yes)?)?
+                );
+            }
+        },
+        Command::UpdateHelper { plan, plan_sha256 } => updater::run_helper(&plan, &plan_sha256)?,
         Command::Service { action } => control_client_service(action)?,
     }
     Ok(())
@@ -2042,80 +2122,6 @@ fn default_client_log_directory() -> PathBuf {
     }
 }
 
-#[derive(Serialize)]
-struct UpdateCheck {
-    current_version: String,
-    latest_version: String,
-    update_available: bool,
-    channel: UpdateChannel,
-    release_url: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct GithubRelease {
-    tag_name: String,
-    html_url: Option<String>,
-    draft: bool,
-    prerelease: bool,
-}
-
-async fn check_for_update(
-    repository: &str,
-    requested_channel: UpdateChannel,
-) -> anyhow::Result<UpdateCheck> {
-    anyhow::ensure!(
-        repository
-            .split_once('/')
-            .is_some_and(|(owner, name)| !owner.is_empty() && !name.is_empty()),
-        "repository must use owner/name format"
-    );
-    let response = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()?
-        .get(format!(
-            "https://api.github.com/repos/{repository}/releases?per_page=30"
-        ))
-        .header(
-            "User-Agent",
-            format!("LinkLake-Client/{}", env!("CARGO_PKG_VERSION")),
-        )
-        .send()
-        .await?
-        .error_for_status()?;
-    let releases: Vec<GithubRelease> = response.json().await?;
-    let current = Version::parse(env!("CARGO_PKG_VERSION"))?;
-    let channel = requested_channel.resolve(&current);
-    let (release, latest) = select_latest_release(&releases, channel).ok_or_else(|| {
-        anyhow::anyhow!("no valid release exists for the selected update channel")
-    })?;
-    let update_available = latest > current;
-    Ok(UpdateCheck {
-        current_version: current.to_string(),
-        latest_version: release.tag_name.clone(),
-        update_available,
-        channel,
-        release_url: release.html_url.clone(),
-    })
-}
-
-fn select_latest_release(
-    releases: &[GithubRelease],
-    channel: UpdateChannel,
-) -> Option<(&GithubRelease, Version)> {
-    releases
-        .iter()
-        .filter(|release| !release.draft)
-        .filter_map(|release| {
-            Version::parse(release.tag_name.trim_start_matches('v'))
-                .ok()
-                .map(|version| (release, version))
-        })
-        .filter(|(release, version)| {
-            channel == UpdateChannel::Prerelease || (!release.prerelease && version.pre.is_empty())
-        })
-        .max_by(|(_, left), (_, right)| left.cmp(right))
-}
-
 #[cfg(windows)]
 fn control_client_service(action: ServiceAction) -> anyhow::Result<()> {
     control_windows_service(action)
@@ -2401,8 +2407,7 @@ mod tests {
     use super::{
         load_managed_config, local_managed_config, managed_config_path, migrate_client_config,
         p2p_candidates, parse_client_config, persist_managed_config, run_configured_agents,
-        select_latest_release, validate_managed_config, GithubRelease, UpdateChannel,
-        CURRENT_CLIENT_CONFIG_VERSION,
+        validate_managed_config, CURRENT_CLIENT_CONFIG_VERSION,
     };
     use linklake_core::{
         managed_config_revision, read_control_frame, write_control_frame, ControlFrame,
@@ -2410,45 +2415,6 @@ mod tests {
         ManagedSocks5Proxy, ManagedTcpTunnel, ManagedTlsRoute,
     };
     use uuid::Uuid;
-
-    fn github_release(tag: &str, prerelease: bool) -> GithubRelease {
-        GithubRelease {
-            tag_name: tag.to_owned(),
-            html_url: Some(format!("https://example.test/{tag}")),
-            draft: false,
-            prerelease,
-        }
-    }
-
-    #[test]
-    fn update_channels_follow_semantic_version_precedence() {
-        let releases = vec![
-            github_release("v0.8.0-rc.1", false),
-            github_release("v0.7.0-rc.2", true),
-            github_release("v0.6.0", false),
-            github_release("not-a-version", false),
-        ];
-        let (_, stable) = select_latest_release(&releases, UpdateChannel::Stable).unwrap();
-        let (_, prerelease) = select_latest_release(&releases, UpdateChannel::Prerelease).unwrap();
-        assert_eq!(stable.to_string(), "0.6.0");
-        assert_eq!(prerelease.to_string(), "0.8.0-rc.1");
-        assert!(
-            semver::Version::parse("0.6.0").unwrap()
-                > semver::Version::parse("0.6.0-rc.2").unwrap()
-        );
-    }
-
-    #[test]
-    fn automatic_update_channel_matches_the_current_release_kind() {
-        assert_eq!(
-            UpdateChannel::Auto.resolve(&semver::Version::parse("1.0.0").unwrap()),
-            UpdateChannel::Stable
-        );
-        assert_eq!(
-            UpdateChannel::Auto.resolve(&semver::Version::parse("1.0.0-rc.1").unwrap()),
-            UpdateChannel::Prerelease
-        );
-    }
 
     #[test]
     fn parses_tcp_tunnel_configuration() {

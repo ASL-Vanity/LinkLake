@@ -51,9 +51,9 @@ visitor = secrets["visitor"]
 content = f'''config_version = 2
 
 [client]
-control = "control.linklake.odelake.com:32101"
+control = "control.link.odelake.com:32101"
 control_ca_cert = "/etc/linklake/control-ca.pem"
-control_server_name = "control.linklake.odelake.com"
+control_server_name = "control.link.odelake.com"
 client_id = "{visitor['client_id']}"
 client_token = "{visitor['client_token']}"
 config_mode = "local"
