@@ -2174,7 +2174,7 @@ dependencies = [
 
 [[package]]
 name = "linklake-client"
-version = "0.7.0-rc.1"
+version = "0.8.0-rc.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2182,6 +2182,7 @@ dependencies = [
  "flate2",
  "iroh",
  "linklake-core",
+ "linklake-update",
  "quinn",
  "reqwest",
  "rustls",
@@ -2205,7 +2206,7 @@ dependencies = [
 
 [[package]]
 name = "linklake-core"
-version = "0.7.0-rc.1"
+version = "0.8.0-rc.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2217,7 +2218,7 @@ dependencies = [
 
 [[package]]
 name = "linklake-server"
-version = "0.7.0-rc.1"
+version = "0.8.0-rc.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2226,6 +2227,7 @@ dependencies = [
  "axum-server",
  "base64",
  "bytes",
+ "clap",
  "getrandom 0.4.3",
  "hmac",
  "http-body-util",
@@ -2233,6 +2235,7 @@ dependencies = [
  "hyper-util",
  "instant-acme",
  "linklake-core",
+ "linklake-update",
  "quinn",
  "rcgen",
  "reqwest",
@@ -2253,6 +2256,28 @@ dependencies = [
  "uuid",
  "windows-service",
  "x509-parser",
+]
+
+[[package]]
+name = "linklake-update"
+version = "0.8.0-rc.1"
+dependencies = [
+ "anyhow",
+ "base64",
+ "clap",
+ "ed25519-dalek",
+ "flate2",
+ "libc",
+ "reqwest",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+ "uuid",
+ "windows-sys 0.61.2",
+ "zip",
 ]
 
 [[package]]
@@ -4084,6 +4109,19 @@ dependencies = [
  "filetime",
  "libc",
  "xattr",
+]
+
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom 0.4.3",
+ "once_cell",
+ "rustix",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

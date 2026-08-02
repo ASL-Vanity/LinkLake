@@ -45,6 +45,24 @@ try {
 finally {
     $zip.Dispose()
 }
+$verifyRoot = Join-Path $env:TEMP "linklake-package-verify-$([guid]::NewGuid().ToString('N'))"
+try {
+    Expand-Archive -LiteralPath $archive -DestinationPath $verifyRoot
+    $serverVersion = (& (Join-Path $verifyRoot 'bin\linklake-server.exe') --version).Trim()
+    $clientVersion = (& (Join-Path $verifyRoot 'bin\linklake-client.exe') --version).Trim()
+    foreach ($value in @($serverVersion, $clientVersion)) {
+        if ($value -notmatch [regex]::Escape($version) -or $value -notmatch 'target=windows-x86_64') {
+            throw "Invalid build information: $value"
+        }
+    }
+    $release = Get-Content -Raw -LiteralPath (Join-Path $verifyRoot 'release.json') | ConvertFrom-Json
+    if ($release.product -ne 'LinkLake' -or $release.version -ne $version -or -not $release.commit) {
+        throw 'release.json build identity is incomplete.'
+    }
+}
+finally {
+    if (Test-Path -LiteralPath $verifyRoot) { Remove-Item -LiteralPath $verifyRoot -Recurse -Force }
+}
 
 Write-Host "Verified $archive"
 Write-Host "SHA256 $actualHash"

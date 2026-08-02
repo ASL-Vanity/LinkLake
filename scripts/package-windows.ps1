@@ -21,6 +21,8 @@ else {
     if ($LASTEXITCODE -eq 0 -and $gitTimestamp) { [long]$gitTimestamp } else { [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
 }
 $archiveTimestamp = [DateTimeOffset]::FromUnixTimeSeconds($sourceDateEpoch)
+$commit = (& git -C $projectRoot rev-parse --short=12 HEAD).Trim()
+$env:LINKLAKE_GIT_COMMIT = $commit
 
 & cargo build --release --workspace --locked
 if ($LASTEXITCODE -ne 0) { throw 'Release build failed.' }
@@ -45,6 +47,7 @@ $manifestData = [ordered]@{
     version = $version
     target = 'windows-x86_64'
     built_unix_seconds = $sourceDateEpoch
+    commit = $commit
 } | ConvertTo-Json
 [IO.File]::WriteAllText(
     (Join-Path $stage 'release.json'),

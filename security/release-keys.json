@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "keys": [
+    {
+      "key_id": "linklake-development-rfc8032-1",
+      "public_key_base64": "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=",
+      "purpose": "development",
+      "not_before_version": "0.8.0-rc.1",
+      "not_after_version": "0.8.99"
+    }
+  ]
+}

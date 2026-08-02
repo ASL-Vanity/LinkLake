@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use linklake_core::port_mapping::{parse_port_mappings, MAX_PORT_MAPPINGS};
 use linklake_core::target_pool::{parse_target_pool, select_weighted_target, WeightedTarget};
 use linklake_core::{
-    managed_config_revision, read_control_frame, write_control_frame, BoxedIo,
+    managed_config_revision, read_control_frame, write_control_frame, BoxedIo, BuildInfo,
     ClientEnrollmentRequest, ClientEnrollmentResponse, ControlFrame, ManagedClientConfig,
     ManagedConfigMode, ManagedConfigStatus, ManagedHttpProxy, ManagedHttpRoute,
     ManagedSecretTunnel, ManagedSocks5Proxy, ManagedTcpTunnel, ManagedTlsRoute, ManagedUdpTunnel,
@@ -38,9 +38,8 @@ mod p2p_iroh;
 mod p2p_noise;
 mod socks5_udp_agent;
 mod udp_agent;
-mod updater;
-
-use updater::UpdateChannel;
+use linklake_update as updater;
+use linklake_update::{SignaturePolicy, UpdateChannel, UpdateProduct};
 
 const CONTROL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const CONTROL_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -181,14 +180,29 @@ enum Command {
         /// 更新通道。auto 会让候选版本继续接收候选版本，稳定版只接收稳定版。
         #[arg(long, value_enum, default_value_t = UpdateChannel::Auto)]
         channel: UpdateChannel,
+        /// Explicitly trust repository development/test signing keys. Never use for production.
+        #[arg(long)]
+        development_signature: bool,
     },
     /// 下载、验证、应用或回滚 LinkLake 客户端更新。
     Update {
         #[command(subcommand)]
         action: UpdateAction,
     },
+    /// Stable JSON/CLI contract used by LinkLake Manager for self-update.
+    ManagerUpdate {
+        #[command(subcommand)]
+        action: ManagerUpdateAction,
+    },
     #[command(name = "__update-helper", hide = true)]
     UpdateHelper {
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long)]
+        plan_sha256: String,
+    },
+    #[command(name = "__manager-update-helper", hide = true)]
+    ManagerUpdateHelper {
         #[arg(long)]
         plan: PathBuf,
         #[arg(long)]
@@ -231,6 +245,8 @@ enum UpdateAction {
         state_dir: Option<PathBuf>,
         #[arg(long)]
         allow_downgrade: bool,
+        #[arg(long)]
+        development_signature: bool,
     },
     /// 下载并校验更新，然后由独立帮助进程原子替换客户端并恢复服务。
     Apply {
@@ -243,6 +259,8 @@ enum UpdateAction {
         #[arg(long)]
         allow_downgrade: bool,
         #[arg(long)]
+        development_signature: bool,
+        #[arg(long)]
         yes: bool,
     },
     /// 查看最后一次下载、升级或回滚状态。
@@ -252,6 +270,46 @@ enum UpdateAction {
     },
     /// 使用最后一份有效备份回滚客户端二进制。
     Rollback {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ManagerUpdateAction {
+    Download {
+        #[arg(long, default_value = "ASL-Vanity/LinkLake")]
+        repository: String,
+        #[arg(long, value_enum, default_value_t = UpdateChannel::Auto)]
+        channel: UpdateChannel,
+        #[arg(long)]
+        current_version: String,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long)]
+        development_signature: bool,
+    },
+    Apply {
+        #[arg(long)]
+        install_dir: PathBuf,
+        #[arg(long)]
+        manager_pid: u32,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long)]
+        yes: bool,
+    },
+    Status {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    Rollback {
+        #[arg(long)]
+        install_dir: PathBuf,
+        #[arg(long)]
+        manager_pid: u32,
         #[arg(long)]
         state_dir: Option<PathBuf>,
         #[arg(long)]
@@ -479,6 +537,9 @@ struct RunningAgent {
 }
 
 fn main() -> anyhow::Result<()> {
+    if print_version_if_requested("LinkLake Client")? {
+        return Ok(());
+    }
     let _ = rustls::crypto::ring::default_provider().install_default();
     let _log_guard = init_logging()?;
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--windows-service")) {
@@ -494,6 +555,19 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("--windows-service is available only on Windows");
     }
     tokio::runtime::Runtime::new()?.block_on(run_cli())
+}
+
+fn print_version_if_requested(product: &'static str) -> anyhow::Result<bool> {
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if arguments.iter().any(|value| value == "--version-json") {
+        println!("{}", serde_json::to_string(&BuildInfo::current(product))?);
+        return Ok(true);
+    }
+    if arguments.iter().any(|value| value == "--version") {
+        println!("{}", BuildInfo::current(product).display_line());
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 async fn run_cli() -> anyhow::Result<()> {
@@ -642,8 +716,15 @@ async fn run_cli() -> anyhow::Result<()> {
         Command::CheckUpdate {
             repository,
             channel,
+            development_signature,
         } => {
-            let result = updater::check(&repository, channel).await?;
+            let result = updater::check(
+                UpdateProduct::Client,
+                &repository,
+                channel,
+                signature_policy(development_signature),
+            )
+            .await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::Update { action } => match action {
@@ -652,10 +733,19 @@ async fn run_cli() -> anyhow::Result<()> {
                 channel,
                 state_dir,
                 allow_downgrade,
+                development_signature,
             } => {
-                let directory = state_dir.unwrap_or_else(updater::default_state_directory);
-                let result =
-                    updater::download(&repository, channel, &directory, allow_downgrade).await?;
+                let directory = state_dir
+                    .unwrap_or_else(|| updater::default_state_directory(UpdateProduct::Client));
+                let result = updater::download(
+                    UpdateProduct::Client,
+                    &repository,
+                    channel,
+                    &directory,
+                    allow_downgrade,
+                    signature_policy(development_signature),
+                )
+                .await?;
                 println!("{}", serde_json::to_string_pretty(&result)?);
             }
             UpdateAction::Apply {
@@ -663,32 +753,119 @@ async fn run_cli() -> anyhow::Result<()> {
                 channel,
                 state_dir,
                 allow_downgrade,
+                development_signature,
                 yes,
             } => {
-                let directory = state_dir.unwrap_or_else(updater::default_state_directory);
-                let result =
-                    updater::apply(&repository, channel, &directory, allow_downgrade, yes).await?;
+                let directory = state_dir
+                    .unwrap_or_else(|| updater::default_state_directory(UpdateProduct::Client));
+                let result = updater::apply(
+                    UpdateProduct::Client,
+                    &repository,
+                    channel,
+                    &directory,
+                    allow_downgrade,
+                    yes,
+                    signature_policy(development_signature),
+                )
+                .await?;
                 println!("{}", serde_json::to_string_pretty(&result)?);
             }
             UpdateAction::Status { state_dir } => {
-                let directory = state_dir.unwrap_or_else(updater::default_state_directory);
+                let directory = state_dir
+                    .unwrap_or_else(|| updater::default_state_directory(UpdateProduct::Client));
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&updater::status(&directory)?)?
+                    serde_json::to_string_pretty(&updater::status(
+                        UpdateProduct::Client,
+                        &directory
+                    )?)?
                 );
             }
             UpdateAction::Rollback { state_dir, yes } => {
-                let directory = state_dir.unwrap_or_else(updater::default_state_directory);
+                let directory = state_dir
+                    .unwrap_or_else(|| updater::default_state_directory(UpdateProduct::Client));
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&updater::rollback(&directory, yes)?)?
+                    serde_json::to_string_pretty(&updater::rollback(
+                        UpdateProduct::Client,
+                        &directory,
+                        yes
+                    )?)?
                 );
             }
         },
+        Command::ManagerUpdate { action } => {
+            let default_state = || updater::default_state_directory(UpdateProduct::Manager);
+            match action {
+                ManagerUpdateAction::Download {
+                    repository,
+                    channel,
+                    current_version,
+                    state_dir,
+                    development_signature,
+                } => {
+                    let current = semver::Version::parse(current_version.trim_start_matches('v'))?;
+                    let result = updater::manager_download(
+                        &repository,
+                        channel,
+                        &current,
+                        &state_dir.unwrap_or_else(default_state),
+                        signature_policy(development_signature),
+                    )
+                    .await?;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                }
+                ManagerUpdateAction::Apply {
+                    install_dir,
+                    manager_pid,
+                    state_dir,
+                    yes,
+                } => {
+                    let result = updater::manager_apply(
+                        &state_dir.unwrap_or_else(default_state),
+                        &install_dir,
+                        manager_pid,
+                        yes,
+                    )?;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                }
+                ManagerUpdateAction::Status { state_dir } => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&updater::manager_status(
+                        &state_dir.unwrap_or_else(default_state),
+                    )?)?
+                ),
+                ManagerUpdateAction::Rollback {
+                    install_dir,
+                    manager_pid,
+                    state_dir,
+                    yes,
+                } => {
+                    let result = updater::manager_rollback(
+                        &state_dir.unwrap_or_else(default_state),
+                        &install_dir,
+                        manager_pid,
+                        yes,
+                    )?;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                }
+            }
+        }
         Command::UpdateHelper { plan, plan_sha256 } => updater::run_helper(&plan, &plan_sha256)?,
+        Command::ManagerUpdateHelper { plan, plan_sha256 } => {
+            updater::run_manager_helper(&plan, &plan_sha256)?
+        }
         Command::Service { action } => control_client_service(action)?,
     }
     Ok(())
+}
+
+fn signature_policy(development: bool) -> SignaturePolicy {
+    if development {
+        SignaturePolicy::Development
+    } else {
+        SignaturePolicy::Production
+    }
 }
 
 async fn run_configured_agents(

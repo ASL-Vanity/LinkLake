@@ -20,6 +20,36 @@ pub const PRODUCT_NAME: &str = "LinkLake";
 pub const UDP_DATA_PLANE_PROTOCOL_VERSION: u16 = 1;
 pub const UDP_DATA_PLANE_ALPN: &[u8] = b"linklake-udp/1";
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BuildInfo {
+    pub product: &'static str,
+    pub version: &'static str,
+    pub target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit: Option<&'static str>,
+}
+
+impl BuildInfo {
+    pub fn current(product: &'static str) -> Self {
+        Self {
+            product,
+            version: env!("CARGO_PKG_VERSION"),
+            target: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            commit: option_env!("LINKLAKE_GIT_COMMIT").filter(|value| !value.trim().is_empty()),
+        }
+    }
+
+    pub fn display_line(&self) -> String {
+        match self.commit {
+            Some(commit) => format!(
+                "{} {} target={} commit={}",
+                self.product, self.version, self.target, commit
+            ),
+            None => format!("{} {} target={}", self.product, self.version, self.target),
+        }
+    }
+}
+
 pub trait AsyncIo: AsyncRead + AsyncWrite + Unpin + Send {}
 
 impl<T> AsyncIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}

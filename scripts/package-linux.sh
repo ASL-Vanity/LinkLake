@@ -16,6 +16,8 @@ if [ -z "$source_date_epoch" ]; then
   source_date_epoch="$(git -C "$project_root" log -1 --format=%ct 2>/dev/null || date +%s)"
 fi
 cargo_bin="${CARGO:-cargo}"
+commit="$(git -C "$project_root" rev-parse --short=12 HEAD)"
+export LINKLAKE_GIT_COMMIT="$commit"
 if [ -x "$HOME/.cargo/bin/cargo" ]; then
   cargo_bin="$HOME/.cargo/bin/cargo"
 fi
@@ -39,7 +41,7 @@ install -m 0755 packaging/iroh-relay/install.sh "$stage/iroh-relay/"
 cp examples/* "$stage/examples/"
 cp README.md README.en.md CHANGELOG.md LICENSE NOTICE THIRD_PARTY_NOTICES.md THIRD_PARTY_LICENSES.html TRADEMARKS.md "$stage/"
 cat >"$stage/release.json" <<EOF
-{"product":"LinkLake","version":"$version","target":"linux-x86_64","built_unix_seconds":$source_date_epoch}
+{"product":"LinkLake","version":"$version","target":"linux-x86_64","built_unix_seconds":$source_date_epoch,"commit":"$commit"}
 EOF
 find "$stage" -exec touch -d "@$source_date_epoch" {} +
 tar --sort=name --mtime="@$source_date_epoch" --owner=0 --group=0 --numeric-owner \

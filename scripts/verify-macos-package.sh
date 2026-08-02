@@ -11,4 +11,11 @@ entries="$(tar -tzf "$archive" | sed 's#^[^/]*/##')"
 for entry in bin/linklake-server bin/linklake-client launchd/com.linklake.server.plist launchd/com.linklake.client.plist launchd/install-macos.sh README.md README.en.md CHANGELOG.md LICENSE NOTICE THIRD_PARTY_NOTICES.md THIRD_PARTY_LICENSES.html TRADEMARKS.md release.json; do
   printf '%s\n' "$entries" | grep -Fx "$entry" >/dev/null || { echo "Missing archive entry: $entry" >&2; exit 1; }
 done
+verify_root="$(mktemp -d)"
+trap 'rm -rf -- "$verify_root"' EXIT
+tar -xzf "$archive" -C "$verify_root"
+package_root="$(find "$verify_root" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+"$package_root/bin/linklake-server" --version | grep -F "$version" | grep -F 'target=macos-' >/dev/null
+"$package_root/bin/linklake-client" --version | grep -F "$version" | grep -F 'target=macos-' >/dev/null
+grep -F '"commit"' "$package_root/release.json" >/dev/null
 echo "Verified $archive"
