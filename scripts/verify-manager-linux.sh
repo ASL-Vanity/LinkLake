@@ -14,4 +14,10 @@ for entry in linklake_manager linklake-client lib/libflutter_linux_gtk.so data/i
   printf '%s\n' "$entries" | grep -Fx "$entry" >/dev/null || { echo "Missing archive entry: $entry" >&2; exit 1; }
 done
 printf '%s\n' "$entries" | grep -Fx 'linklake-client' >/dev/null
+verify_root="$(mktemp -d)"
+trap 'rm -rf -- "$verify_root"' EXIT
+tar -xzf "$archive" -C "$verify_root"
+package_root="$(find "$verify_root" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+"$package_root/linklake-client" --version | grep -F "$version" | grep -F 'target=linux-x86_64' >/dev/null
+grep -F '"commit"' "$package_root/release.json" >/dev/null
 echo "Verified $archive"

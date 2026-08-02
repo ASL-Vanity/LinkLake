@@ -63,6 +63,28 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Run unit tests
         run: cargo test --workspace --locked
+      - name: Verify development release-signing fixture
+        run: |
+          set -eu
+          fixture=target/release-signing-fixture
+          version=0.8.0-rc.1
+          mkdir -p "$fixture"
+          printf 'core package fixture\n' >"$fixture/linklake-$version-linux-x86_64.tar.gz"
+          printf 'manager package fixture\n' >"$fixture/linklake-manager-$version-linux-x86_64.tar.gz"
+          export LINKLAKE_TEST_SIGNING_KEY_B64="$(jq -r .seed_base64 security/test-fixtures/development-signing-key.json)"
+          cargo run --locked -p linklake-update --bin linklake-release-sign -- \
+            generate --dist "$fixture" --version "$version" \
+            --key-id linklake-development-rfc8032-1 \
+            --signing-key-env LINKLAKE_TEST_SIGNING_KEY_B64 \
+            --minimum-updater-version 0.8.0-rc.1 \
+            --allow-development-key
+          cargo run --locked -p linklake-update --bin linklake-release-sign -- \
+            verify --dist "$fixture" --allow-development-key
+          if cargo run --locked -p linklake-update --bin linklake-release-sign -- \
+            verify --dist "$fixture"; then
+            echo 'production policy unexpectedly accepted the development key' >&2
+            exit 1
+          fi
       - name: Check shell scripts
         run: find packaging scripts -name '*.sh' -print0 | xargs -0 -n1 bash -n
 
@@ -107,7 +129,11 @@ jobs:
         run: cargo test --workspace --locked
       - name: Run updater replacement and rollback end-to-end tests
         shell: pwsh
-        run: ./tests/update-e2e.ps1
+        run: |
+          ./tests/version-contract.ps1 -SkipBuild
+          ./tests/update-e2e.ps1 -Product client
+          ./tests/update-e2e.ps1 -Product server
+          ./tests/manager-update-e2e.ps1 -SkipBuild
       - name: Run TCP end-to-end tests
         shell: powershell
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\tcp-e2e.ps1

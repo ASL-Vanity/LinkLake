@@ -11,6 +11,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  LINKLAKE_GIT_COMMIT: ${{ github.sha }}
 
 jobs:
   windows-package:
@@ -152,10 +153,29 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v6
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Select pinned Rust toolchain
+        run: rustup default 1.88.0
       - uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true
+      - name: Create and verify production Ed25519 release manifest
+        env:
+          LINKLAKE_RELEASE_SIGNING_KEY_B64: ${{ secrets.LINKLAKE_RELEASE_SIGNING_KEY_B64 }}
+          LINKLAKE_RELEASE_SIGNING_KEY_ID: ${{ secrets.LINKLAKE_RELEASE_SIGNING_KEY_ID }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          test -n "$LINKLAKE_RELEASE_SIGNING_KEY_B64" || { echo "production signing key secret is required" >&2; exit 1; }
+          test -n "$LINKLAKE_RELEASE_SIGNING_KEY_ID" || { echo "production signing key ID secret is required" >&2; exit 1; }
+          version="${TAG#v}"
+          cargo run --locked -p linklake-update --bin linklake-release-sign -- \
+            generate --dist dist --version "$version" \
+            --key-id "$LINKLAKE_RELEASE_SIGNING_KEY_ID" \
+            --minimum-updater-version 0.8.0-rc.1
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}

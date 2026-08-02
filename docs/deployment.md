@@ -29,6 +29,23 @@ Compose 健康检查通过 `linklake-client check --ca-cert` 严格校验管理�
 
 `scripts/package-native-linux.sh` 在 Debian/Ubuntu 生成 `.deb`，在安装 `rpmbuild` 的环境生成 `.rpm`。包内包含服务端、客户端、systemd 单元和环境变量示例。
 
+## 安全更新与回滚
+
+生产更新前先确认 `linklake-server --version-json` 或 `linklake-client --version-json` 中的产品、版本、目标平台和提交号。服务更新需要拥有停止/启动对应 systemd 或 Windows service 的权限。
+
+```bash
+sudo linklake-server update download
+sudo linklake-server update apply --yes
+sudo linklake-server update status
+sudo linklake-server update rollback --yes
+```
+
+更新器只替换 `/usr/local/bin/linklake-server` 或 `/usr/local/bin/linklake-client`（Windows 为安装目录中的对应 `.exe`），不会改动 `/etc/linklake`、`/var/lib/linklake`、ProgramData 中的数据/证书/配置或日志。服务原先运行时，替换后必须恢复并稳定运行；否则自动恢复旧二进制。人工回滚使用最后一份摘要与目标路径均匹配的备份。
+
+正式 Release 必须包含 Ed25519 清单和签名。没有生产 CI signing secret 时禁止发布；开发验证可以使用 RFC 测试夹具和 `--development-signature`，但不得把这种状态部署为生产更新。
+
 ---
 
 The same rules apply in English: enable trusted TLS for management and control listeners, inject secrets at runtime, preserve Host for ACME HTTP-01, use layer-4 pass-through when LinkLake terminates business TLS, and use DNS-only records for arbitrary TCP/UDP unless an appropriate Cloudflare proxy product is configured.
+
+For upgrades, verify `--version-json`, then use `update download/apply/status/rollback` with service-control privileges. The updater replaces only the selected executable and leaves `/etc/linklake`, `/var/lib/linklake`, ProgramData configuration/databases/certificates, and logs unchanged. A previously running service must become stably active or the old executable is restored automatically. Formal releases require the Ed25519 manifest and signature; the development signature path must never be treated as production.

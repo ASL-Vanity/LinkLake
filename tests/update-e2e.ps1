@@ -1,5 +1,7 @@
 param(
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [ValidateSet('client', 'server')]
+    [string]$Product = 'client'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -14,7 +16,8 @@ $buildRoot = Join-Path $projectRoot 'target'
 $stateRoot = Join-Path $root 'state'
 $installRoot = Join-Path $root 'install'
 $helperRoot = Join-Path $root 'helper'
-$binaryName = if ($env:OS -eq 'Windows_NT') { 'linklake-client.exe' } else { 'linklake-client' }
+$binaryBaseName = "linklake-$Product"
+$binaryName = if ($env:OS -eq 'Windows_NT') { "$binaryBaseName.exe" } else { $binaryBaseName }
 $builtClient = Join-Path $buildRoot "debug\$binaryName"
 $releaseClient = Join-Path $buildRoot "release\$binaryName"
 $targetClient = Join-Path $installRoot $binaryName
@@ -36,8 +39,9 @@ function Write-Plan {
     New-Item -ItemType Directory -Force -Path $plans | Out-Null
     $planPath = Join-Path $plans "$Name.json"
     $json = [ordered]@{
-        schema_version = 1
+        schema_version = 2
         operation = 'apply'
+        product = $Product
         state_directory = $stateRoot
         target_executable = $targetClient
         staged_executable = $StagedClient
@@ -86,9 +90,9 @@ function Wait-UpdateState {
 }
 
 if (-not $SkipBuild) {
-    & cargo build -p linklake-client
+    & cargo build -p $binaryBaseName
     if ($LASTEXITCODE -ne 0) { throw 'Could not build the updater E2E client.' }
-    & cargo build -p linklake-client --release
+    & cargo build -p $binaryBaseName --release
     if ($LASTEXITCODE -ne 0) { throw 'Could not build the updater E2E release client.' }
 }
 if (-not (Test-Path -LiteralPath $builtClient)) { throw "Missing client binary: $builtClient" }
@@ -109,7 +113,8 @@ foreach ($path in @($stateRoot, $installRoot, $helperRoot)) {
 Copy-Item -LiteralPath $builtClient -Destination $targetClient
 Copy-Item -LiteralPath $builtClient -Destination $helperClient
 $versionOutput = (& $targetClient --version).Trim()
-$version = ($versionOutput -split '\s+')[-1]
+$versionMatch = [regex]::Match($versionOutput, '\b\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?\b')
+$version = if ($versionMatch.Success) { $versionMatch.Value } else { $null }
 if (-not $version) { throw 'The client did not report a version.' }
 $originalHash = Get-Sha256 $targetClient
 
@@ -122,7 +127,7 @@ if ($releaseHash -eq $originalHash) { throw 'Debug and release clients unexpecte
 $successPlan = Write-Plan -Name 'success' -StagedClient $successClient `
     -StagedHash $releaseHash -FromVersion $version -ToVersion $version
 Invoke-Helper -PlanPath $successPlan
-    $successStatus = Get-Content -Raw -LiteralPath (Join-Path $stateRoot 'status.json') | ConvertFrom-Json
+$successStatus = Get-Content -Raw -LiteralPath (Join-Path $stateRoot 'status.json') | ConvertFrom-Json
 if ($successStatus.state -ne 'succeeded') { throw "Unexpected success status: $($successStatus.state)" }
 if ((Get-Sha256 $targetClient) -ne $releaseHash) { throw 'Successful replacement did not install the release binary.' }
 
@@ -130,6 +135,53 @@ if ((Get-Sha256 $targetClient) -ne $releaseHash) { throw 'Successful replacement
 if ($LASTEXITCODE -ne 0) { throw 'The manual rollback command could not be scheduled.' }
 $null = Wait-UpdateState -ExpectedState 'rolled_back' -ExpectedOperation 'rollback'
 if ((Get-Sha256 $targetClient) -ne $originalHash) { throw 'Manual rollback did not restore the debug client.' }
+
+$tamperStage = Join-Path $stateRoot 'staging\tampered'
+New-Item -ItemType Directory -Force -Path $tamperStage | Out-Null
+$tamperClient = Join-Path $tamperStage $binaryName
+Copy-Item -LiteralPath $releaseClient -Destination $tamperClient
+$tamperPlan = Write-Plan -Name 'tampered-staged' -StagedClient $tamperClient `
+    -StagedHash (Get-Sha256 $tamperClient) -FromVersion $version -ToVersion $version
+[IO.File]::AppendAllText($tamperClient, 'tampered')
+Invoke-Helper -PlanPath $tamperPlan -ExpectFailure
+$tamperStatus = Get-Content -Raw -LiteralPath (Join-Path $stateRoot 'status.json') | ConvertFrom-Json
+if ($tamperStatus.state -ne 'failed' -or $tamperStatus.error -notmatch 'staged binary digest changed') {
+    throw 'Staged binary tampering was not rejected with a stable failure status.'
+}
+if ((Get-Sha256 $targetClient) -ne $originalHash) { throw 'Staged tampering changed the installed binary.' }
+
+$concurrentStage = Join-Path $stateRoot 'staging\concurrent'
+New-Item -ItemType Directory -Force -Path $concurrentStage | Out-Null
+$concurrentClient = Join-Path $concurrentStage $binaryName
+Copy-Item -LiteralPath $releaseClient -Destination $concurrentClient
+$concurrentPlan = Write-Plan -Name 'concurrent-target' -StagedClient $concurrentClient `
+    -StagedHash (Get-Sha256 $concurrentClient) -FromVersion $version -ToVersion $version
+Copy-Item -LiteralPath $releaseClient -Destination $targetClient -Force
+Invoke-Helper -PlanPath $concurrentPlan -ExpectFailure
+$concurrentStatus = Get-Content -Raw -LiteralPath (Join-Path $stateRoot 'status.json') | ConvertFrom-Json
+if ($concurrentStatus.state -ne 'failed' -or $concurrentStatus.error -notmatch 'installed binary changed') {
+    throw 'Concurrent target changes were not rejected.'
+}
+Copy-Item -LiteralPath $builtClient -Destination $targetClient -Force
+
+$serviceStage = Join-Path $stateRoot 'staging\service-failure'
+New-Item -ItemType Directory -Force -Path $serviceStage | Out-Null
+$serviceClient = Join-Path $serviceStage $binaryName
+Copy-Item -LiteralPath $releaseClient -Destination $serviceClient
+$servicePlan = Write-Plan -Name 'service-failure' -StagedClient $serviceClient `
+    -StagedHash (Get-Sha256 $serviceClient) -FromVersion $version -ToVersion $version
+$env:LINKLAKE_UPDATE_TEST_FAIL_SERVICE_RECOVERY = '1'
+try {
+    Invoke-Helper -PlanPath $servicePlan -ExpectFailure
+}
+finally {
+    Remove-Item Env:LINKLAKE_UPDATE_TEST_FAIL_SERVICE_RECOVERY -ErrorAction SilentlyContinue
+}
+$serviceStatus = Get-Content -Raw -LiteralPath (Join-Path $stateRoot 'status.json') | ConvertFrom-Json
+if ($serviceStatus.state -ne 'rolled_back' -or $serviceStatus.error -notmatch 'service recovery failure') {
+    throw 'Service recovery failure did not trigger automatic rollback.'
+}
+if ((Get-Sha256 $targetClient) -ne $originalHash) { throw 'Service failure rollback did not restore the original binary.' }
 
 $failureStage = Join-Path $stateRoot 'staging\failure'
 New-Item -ItemType Directory -Force -Path $failureStage | Out-Null
@@ -146,10 +198,14 @@ if ((& $targetClient --version).Trim() -ne $versionOutput) { throw 'Restored cli
 
 [ordered]@{
     ok = $true
+    product = $Product
     version = $version
     successful_replace = $true
     manual_rollback = $true
     automatic_rollback = $true
+    staged_tamper_rejected = $true
+    concurrent_target_change_rejected = $true
+    service_failure_rollback = $true
     backup_count = @(Get-ChildItem -LiteralPath (Join-Path $stateRoot 'backups') -Directory).Count
     status_file = Join-Path $stateRoot 'status.json'
 } | ConvertTo-Json

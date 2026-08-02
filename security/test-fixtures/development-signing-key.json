@@ -1,0 +1,5 @@
+{
+  "warning": "RFC 8032 public test vector. Development tests only. Never use for a release.",
+  "key_id": "linklake-development-rfc8032-1",
+  "seed_base64": "nWGxne/9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A="
+}
