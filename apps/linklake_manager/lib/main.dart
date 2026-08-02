@@ -1,15 +1,38 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
 import 'api_client.dart';
+import 'desktop_lifecycle.dart';
+import 'manager_settings.dart';
+import 'policy_pages.dart';
+import 'rbac.dart';
 import 'server_profiles.dart';
 import 'version.dart';
 
-void main() {
-  runApp(const LinkLakeManagerApp());
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  final repository = ManagerSettingsStore();
+  var settings = await repository.load();
+  final lifecycle = DesktopLifecycleController(
+    adapter: NativeDesktopPlatformAdapter(),
+    repository: repository,
+  );
+  try {
+    settings = await lifecycle.initialize(settings);
+  } catch (error) {
+    stderr.writeln('Desktop lifecycle initialization failed: $error');
+  }
+  runApp(
+    LinkLakeManagerApp(
+      initialSettings: settings,
+      settingsRepository: repository,
+      desktopLifecycle: lifecycle,
+    ),
+  );
 }
 
 // 集中维护客户端更新命令，避免界面按钮与命令行协议发生偏差。
@@ -22,15 +45,42 @@ List<String> clientUpdateArguments(String action) => switch (action) {
 };
 
 class LinkLakeManagerApp extends StatefulWidget {
-  const LinkLakeManagerApp({super.key});
+  const LinkLakeManagerApp({
+    super.key,
+    this.initialSettings = const ManagerSettings(),
+    this.settingsRepository,
+    this.desktopLifecycle,
+  });
+
+  final ManagerSettings initialSettings;
+  final ManagerSettingsRepository? settingsRepository;
+  final DesktopLifecycleController? desktopLifecycle;
 
   @override
   State<LinkLakeManagerApp> createState() => _LinkLakeManagerAppState();
 }
 
 class _LinkLakeManagerAppState extends State<LinkLakeManagerApp> {
-  bool _chinese = true;
-  ThemeMode _themeMode = ThemeMode.system;
+  late ManagerSettings _settings;
+  late ManagerSettingsRepository _repository;
+
+  @override
+  void initState() {
+    super.initState();
+    _settings = widget.initialSettings;
+    _repository =
+        widget.settingsRepository ?? MemoryManagerSettingsStore(_settings);
+  }
+
+  Future<void> _updateSettings(ManagerSettings value) async {
+    var saved = value;
+    if (widget.desktopLifecycle != null) {
+      saved = await widget.desktopLifecycle!.updateSettings(value);
+    } else {
+      await _repository.save(value);
+    }
+    if (mounted) setState(() => _settings = saved);
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -54,12 +104,20 @@ class _LinkLakeManagerAppState extends State<LinkLakeManagerApp> {
         scaffoldBackgroundColor: const Color(0xFF06131D),
         cardTheme: const CardThemeData(elevation: 0, margin: EdgeInsets.zero),
       ),
-      themeMode: _themeMode,
+      themeMode: _settings.themeMode,
       home: LoginPage(
-        chinese: _chinese,
-        onLanguageChanged: (value) => setState(() => _chinese = value),
-        themeMode: _themeMode,
-        onThemeChanged: (value) => setState(() => _themeMode = value),
+        chinese: _settings.chinese,
+        onLanguageChanged: (value) =>
+            _updateSettings(_settings.copyWith(chinese: value)),
+        themeMode: _settings.themeMode,
+        onThemeChanged: (value) =>
+            _updateSettings(_settings.copyWith(themeMode: value)),
+        initialServerUrl: _settings.lastServerUrl,
+        onServerChanged: (value) =>
+            _updateSettings(_settings.copyWith(lastServerUrl: value)),
+        settings: _settings,
+        onSettingsChanged: _updateSettings,
+        desktopLifecycle: widget.desktopLifecycle,
       ),
     );
   }
@@ -72,19 +130,29 @@ class LoginPage extends StatefulWidget {
     required this.onLanguageChanged,
     required this.themeMode,
     required this.onThemeChanged,
+    this.initialServerUrl = 'https://link.odelake.com',
+    this.onServerChanged,
+    this.settings = const ManagerSettings(),
+    this.onSettingsChanged,
+    this.desktopLifecycle,
   });
 
   final bool chinese;
   final ValueChanged<bool> onLanguageChanged;
   final ThemeMode themeMode;
   final ValueChanged<ThemeMode> onThemeChanged;
+  final String initialServerUrl;
+  final ValueChanged<String>? onServerChanged;
+  final ManagerSettings settings;
+  final Future<void> Function(ManagerSettings)? onSettingsChanged;
+  final DesktopLifecycleController? desktopLifecycle;
 
   @override
   State<LoginPage> createState() => _LoginPageState();
 }
 
 class _LoginPageState extends State<LoginPage> {
-  final _server = TextEditingController(text: 'https://link.odelake.com');
+  late final TextEditingController _server;
   final _username = TextEditingController(text: 'admin');
   final _password = TextEditingController();
   final _totp = TextEditingController();
@@ -96,6 +164,7 @@ class _LoginPageState extends State<LoginPage> {
   @override
   void initState() {
     super.initState();
+    _server = TextEditingController(text: widget.initialServerUrl);
     _loadProfiles();
   }
 
@@ -103,7 +172,9 @@ class _LoginPageState extends State<LoginPage> {
     final profiles = await ServerProfileStore.load();
     if (!mounted) return;
     setState(() => _profiles = profiles);
-    if (profiles.isNotEmpty) _server.text = profiles.first.url;
+    if (profiles.isNotEmpty && _server.text.trim().isEmpty) {
+      _server.text = profiles.first.url;
+    }
   }
 
   Future<void> _manageProfiles() async {
@@ -194,7 +265,9 @@ class _LoginPageState extends State<LoginPage> {
       _busy = true;
       _error = null;
     });
-    final api = LinkLakeApiClient(_server.text.trim());
+    final serverUrl = _server.text.trim().replaceAll(RegExp(r'/+$'), '');
+    widget.onServerChanged?.call(serverUrl);
+    final api = LinkLakeApiClient(serverUrl);
     try {
       final result = await api.login(
         _username.text.trim(),
@@ -218,6 +291,10 @@ class _LoginPageState extends State<LoginPage> {
             onLanguageChanged: widget.onLanguageChanged,
             themeMode: widget.themeMode,
             onThemeChanged: widget.onThemeChanged,
+            initialIdentity: result,
+            settings: widget.settings.copyWith(lastServerUrl: serverUrl),
+            onSettingsChanged: widget.onSettingsChanged,
+            desktopLifecycle: widget.desktopLifecycle,
           ),
         ),
       );
@@ -462,22 +539,32 @@ class DashboardPage extends StatefulWidget {
     required this.onLanguageChanged,
     required this.themeMode,
     required this.onThemeChanged,
+    this.initialIdentity = const {},
+    this.settings = const ManagerSettings(),
+    this.onSettingsChanged,
+    this.desktopLifecycle,
   });
 
-  final LinkLakeApiClient api;
+  final LinkLakeApi api;
   final bool chinese;
   final ValueChanged<bool> onLanguageChanged;
   final ThemeMode themeMode;
   final ValueChanged<ThemeMode> onThemeChanged;
+  final Map<String, dynamic> initialIdentity;
+  final ManagerSettings settings;
+  final Future<void> Function(ManagerSettings)? onSettingsChanged;
+  final DesktopLifecycleController? desktopLifecycle;
 
   @override
   State<DashboardPage> createState() => _DashboardPageState();
 }
 
 class _DashboardPageState extends State<DashboardPage> {
-  int _page = 0;
+  String _page = 'overview';
   late bool _chinese;
+  late ManagerSettings _settings;
   bool _busy = true;
+  bool _refreshing = false;
   String? _error;
   Timer? _timer;
   Map<String, dynamic> _status = {};
@@ -500,16 +587,26 @@ class _DashboardPageState extends State<DashboardPage> {
 
   bool get zh => _chinese;
   String t(String chinese, String english) => zh ? chinese : english;
+  ManagementRole get _role => ManagementRole.parse(_identity['role']);
+  RoleCapabilities get _capabilities => RoleCapabilities(_role);
 
   @override
   void initState() {
     super.initState();
     _chinese = widget.chinese;
+    _settings = widget.settings;
+    _identity = Map<String, dynamic>.from(widget.initialIdentity);
     _refresh();
     _timer = Timer.periodic(
       const Duration(seconds: 10),
       (_) => _refresh(silent: true),
     );
+  }
+
+  @override
+  void didUpdateWidget(covariant DashboardPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.settings != widget.settings) _settings = widget.settings;
   }
 
   @override
@@ -520,59 +617,102 @@ class _DashboardPageState extends State<DashboardPage> {
   }
 
   Future<void> _refresh({bool silent = false}) async {
+    if (_refreshing) return;
+    _refreshing = true;
     if (!silent) setState(() => _busy = true);
     try {
-      final values = await Future.wait<dynamic>([
-        widget.api.getObject('/api/v1/status'),
-        widget.api.getObject('/api/v1/metrics'),
-        widget.api.getList('/api/v1/clients'),
-        widget.api.getList('/api/v1/p2p/nodes'),
-        widget.api.getList('/api/v1/audit?limit=50'),
-        widget.api.getList('/api/v1/tcp-tunnels'),
-        widget.api.getList('/api/v1/udp-tunnels'),
-        widget.api.getList('/api/v1/http-routes'),
-        widget.api.getList('/api/v1/sni-routes'),
-        widget.api.getList('/api/v1/secret-tunnels'),
-        widget.api.getList('/api/v1/socks5-proxies'),
-        widget.api.getList('/api/v1/http-proxies'),
-        widget.api.getList('/api/v1/port-groups'),
-        widget.api.getList('/api/v1/alerts/events?active=true&limit=100'),
-        widget.api.getList('/api/v1/alerts/rules'),
-        widget.api.getList('/api/v1/users'),
-        widget.api.getList('/api/v1/sessions'),
-        widget.api.getObject('/api/v1/auth/me'),
-        widget.api.getList('/api/v1/api-tokens'),
-        widget.api.getObject('/api/v1/fleet/overview'),
-      ]);
+      final identity = await widget.api.getObject('/api/v1/auth/me');
+      final role = ManagementRole.parse(identity['role']);
+      final results = await Future.wait(
+        dashboardRequestPlan(role).map((request) async {
+          try {
+            final value = request.object
+                ? await widget.api.getObject(request.path)
+                : await widget.api.getList(request.path);
+            return (request.key, value, null as Object?);
+          } on LinkLakeApiException catch (error) {
+            if (error.statusCode == 403) {
+              final unavailable = request.object
+                  ? <String, dynamic>{}
+                  : <dynamic>[];
+              return (request.key, unavailable, null as Object?);
+            }
+            return (request.key, null, error as Object?);
+          } catch (error) {
+            return (request.key, null, error as Object?);
+          }
+        }),
+      );
       if (!mounted) return;
+      final failures = results
+          .where((result) => result.$3 != null)
+          .map((result) => '${result.$1}: ${result.$3}')
+          .toList();
       setState(() {
-        _status = values[0];
-        _metrics = values[1];
-        _clients = values[2];
-        _p2p = values[3];
-        _audit = values[4];
-        _resources
-          ..['tcp'] = values[5]
-          ..['udp'] = values[6]
-          ..['http'] = values[7]
-          ..['sni'] = values[8]
-          ..['secret'] = values[9]
-          ..['socks5'] = values[10]
-          ..['proxy'] = values[11]
-          ..['group'] = values[12];
-        _alerts = values[13];
-        _alertRules = values[14];
-        _users = values[15];
-        _sessions = values[16];
-        _identity = values[17];
-        _apiTokens = values[18];
-        _fleet = values[19];
-        _error = null;
+        _identity = identity;
+        if (role != ManagementRole.administrator) {
+          _users = [];
+          _sessions = [];
+          _apiTokens = [];
+          _fleet = {};
+        }
+        if (!visibleDestinationIds(role).contains(_page)) _page = 'overview';
+        for (final result in results) {
+          if (result.$2 != null) _applyDashboardValue(result.$1, result.$2!);
+        }
+        _error = failures.isEmpty
+            ? null
+            : '${t('部分数据刷新失败', 'Some data could not be refreshed')}: ${failures.join('; ')}';
       });
     } catch (error) {
-      if (mounted) setState(() => _error = error.toString());
+      if (mounted) setState(() => _error = _refreshError(error));
     } finally {
+      _refreshing = false;
       if (mounted && !silent) setState(() => _busy = false);
+    }
+  }
+
+  String _refreshError(Object error) {
+    if (error is LinkLakeApiException) {
+      if (error.statusCode == 401) {
+        return t(
+          '登录已失效，请退出后重新登录。',
+          'Your session expired. Sign out and sign in again.',
+        );
+      }
+      if (error.statusCode == 403) {
+        return t('当前角色无法刷新此页面。', 'Your role cannot refresh this page.');
+      }
+    }
+    return error.toString();
+  }
+
+  void _applyDashboardValue(String key, Object value) {
+    switch (key) {
+      case 'status':
+        _status = Map<String, dynamic>.from(value as Map);
+      case 'metrics':
+        _metrics = Map<String, dynamic>.from(value as Map);
+      case 'clients':
+        _clients = value as List<dynamic>;
+      case 'p2p':
+        _p2p = value as List<dynamic>;
+      case 'audit':
+        _audit = value as List<dynamic>;
+      case 'alerts':
+        _alerts = value as List<dynamic>;
+      case 'alertRules':
+        _alertRules = value as List<dynamic>;
+      case 'users':
+        _users = value as List<dynamic>;
+      case 'sessions':
+        _sessions = value as List<dynamic>;
+      case 'apiTokens':
+        _apiTokens = value as List<dynamic>;
+      case 'fleet':
+        _fleet = Map<String, dynamic>.from(value as Map);
+      default:
+        _resources[key] = value as List<dynamic>;
     }
   }
 
@@ -584,131 +724,429 @@ class _DashboardPageState extends State<DashboardPage> {
         builder: (_) => LoginPage(
           chinese: zh,
           onLanguageChanged: widget.onLanguageChanged,
-          themeMode: widget.themeMode,
+          themeMode: _settings.themeMode,
           onThemeChanged: widget.onThemeChanged,
+          initialServerUrl: _settings.lastServerUrl,
+          settings: _settings,
+          onSettingsChanged: widget.onSettingsChanged,
+          desktopLifecycle: widget.desktopLifecycle,
         ),
       ),
     );
+  }
+
+  Future<void> _toggleLanguage() async {
+    final updated = _settings.copyWith(chinese: !zh);
+    await _applyDashboardSettings(updated);
+  }
+
+  Future<void> _changeTheme(ThemeMode value) async {
+    final updated = _settings.copyWith(themeMode: value);
+    await _applyDashboardSettings(updated);
+  }
+
+  Future<void> _applyDashboardSettings(ManagerSettings updated) async {
+    try {
+      if (widget.onSettingsChanged case final onChanged?) {
+        await onChanged(updated);
+      } else {
+        if (updated.chinese != _settings.chinese) {
+          widget.onLanguageChanged(updated.chinese);
+        }
+        if (updated.themeMode != _settings.themeMode) {
+          widget.onThemeChanged(updated.themeMode);
+        }
+      }
+      if (!mounted) return;
+      setState(() {
+        _settings = updated;
+        _chinese = updated.chinese;
+      });
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(error.toString())));
+      }
+    }
+  }
+
+  Future<void> _showManagerSettings() async {
+    final desktopCapabilities =
+        widget.desktopLifecycle?.capabilities ??
+        const DesktopCapabilities.none();
+    var language = _settings.chinese;
+    var theme = _settings.themeMode;
+    var closeToTray = desktopCapabilities.tray && _settings.closeToTray;
+    var launchAtStartup =
+        desktopCapabilities.launchAtStartup && _settings.launchAtStartup;
+    var rememberWindow =
+        desktopCapabilities.windowLifecycle && _settings.rememberWindow;
+    final updated = await showDialog<ManagerSettings>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: Text(t('Manager 设置', 'Manager settings')),
+          content: SizedBox(
+            width: math.min(MediaQuery.sizeOf(context).width - 48, 540),
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  DropdownButtonFormField<bool>(
+                    initialValue: language,
+                    decoration: InputDecoration(labelText: t('语言', 'Language')),
+                    items: const [
+                      DropdownMenuItem(value: true, child: Text('中文')),
+                      DropdownMenuItem(value: false, child: Text('English')),
+                    ],
+                    onChanged: (value) =>
+                        setDialogState(() => language = value ?? true),
+                  ),
+                  const SizedBox(height: 12),
+                  DropdownButtonFormField<ThemeMode>(
+                    initialValue: theme,
+                    decoration: InputDecoration(labelText: t('主题', 'Theme')),
+                    items: [
+                      DropdownMenuItem(
+                        value: ThemeMode.system,
+                        child: Text(t('跟随系统', 'System')),
+                      ),
+                      DropdownMenuItem(
+                        value: ThemeMode.light,
+                        child: Text(t('浅色', 'Light')),
+                      ),
+                      DropdownMenuItem(
+                        value: ThemeMode.dark,
+                        child: Text(t('深色', 'Dark')),
+                      ),
+                    ],
+                    onChanged: (value) =>
+                        setDialogState(() => theme = value ?? ThemeMode.system),
+                  ),
+                  const SizedBox(height: 12),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    value: closeToTray,
+                    onChanged: desktopCapabilities.tray
+                        ? (value) => setDialogState(() => closeToTray = value)
+                        : null,
+                    title: Text(
+                      t('关闭窗口后驻留托盘', 'Keep running in tray when closed'),
+                    ),
+                    subtitle: Text(
+                      desktopCapabilities.tray
+                          ? t(
+                              '托盘左键恢复窗口，右键菜单可退出',
+                              'Left-click restores; use the tray menu to exit',
+                            )
+                          : t(
+                              '当前平台或运行环境不支持系统托盘',
+                              'The system tray is unavailable on this platform or runtime',
+                            ),
+                    ),
+                  ),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    value: rememberWindow,
+                    onChanged: desktopCapabilities.windowLifecycle
+                        ? (value) =>
+                              setDialogState(() => rememberWindow = value)
+                        : null,
+                    title: Text(
+                      t('记住窗口位置和大小', 'Remember window position and size'),
+                    ),
+                  ),
+                  SwitchListTile(
+                    key: const Key('launch-at-startup'),
+                    contentPadding: EdgeInsets.zero,
+                    value: launchAtStartup,
+                    onChanged: desktopCapabilities.launchAtStartup
+                        ? (value) =>
+                              setDialogState(() => launchAtStartup = value)
+                        : null,
+                    title: Text(t('开机自启动', 'Launch at startup')),
+                    subtitle: Text(
+                      !desktopCapabilities.launchAtStartup
+                          ? t(
+                              Platform.isMacOS
+                                  ? '当前 macOS 工程未集成 LaunchAtLogin，功能已禁用'
+                                  : '当前平台不支持开机自启',
+                              Platform.isMacOS
+                                  ? 'This macOS build does not integrate LaunchAtLogin, so the setting is disabled'
+                                  : 'Launch at startup is unavailable on this platform',
+                            )
+                          : Platform.isLinux
+                          ? t(
+                              '取决于桌面环境的自启动和托盘支持',
+                              'Depends on desktop autostart and tray support',
+                            )
+                          : t(
+                              '登录 Windows 后自动启动',
+                              'Start automatically after Windows sign-in',
+                            ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: SelectableText(
+                      '${t('当前服务端', 'Current server')}: ${_settings.lastServerUrl}',
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: Text(t('取消', 'Cancel')),
+            ),
+            FilledButton(
+              key: const Key('save-manager-settings'),
+              onPressed: () => Navigator.pop(
+                dialogContext,
+                _settings.copyWith(
+                  chinese: language,
+                  themeMode: theme,
+                  closeToTray: closeToTray,
+                  launchAtStartup: launchAtStartup,
+                  rememberWindow: rememberWindow,
+                ),
+              ),
+              child: Text(t('保存', 'Save')),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (updated == null || !mounted) return;
+    await _applyDashboardSettings(updated);
   }
 
   @override
   Widget build(BuildContext context) {
-    final destinations = [
-      (Icons.dashboard_outlined, t('概览', 'Overview')),
-      (Icons.devices_outlined, t('客户端', 'Clients')),
-      (Icons.swap_horiz, t('服务', 'Services')),
-      (Icons.hub_outlined, 'P2P'),
-      (Icons.cloud_sync_outlined, t('多云', 'Multi-cloud')),
-      (Icons.warning_amber_outlined, t('告警', 'Alerts')),
-      (Icons.manage_accounts_outlined, t('用户', 'Users')),
-      (Icons.build_outlined, t('诊断', 'Diagnostics')),
-      (Icons.receipt_long_outlined, t('审计', 'Audit')),
-    ];
-    return Scaffold(
-      appBar: AppBar(
-        title: Row(
-          children: [
-            const _BrandMark(size: 34),
-            const SizedBox(width: 10),
-            const Text('LinkLake Manager'),
-            const SizedBox(width: 12),
-            if (_status['instance_id'] != null)
-              Text(
-                _status['instance_id'].toString().substring(0, 8),
-                style: Theme.of(context).textTheme.labelSmall,
-              ),
-          ],
-        ),
-        actions: [
-          IconButton(
-            onPressed: _refresh,
-            tooltip: t('刷新', 'Refresh'),
-            icon: const Icon(Icons.refresh),
-          ),
-          TextButton.icon(
-            onPressed: () {
-              setState(() => _chinese = !_chinese);
-              widget.onLanguageChanged(_chinese);
-            },
-            icon: const Icon(Icons.language),
-            label: Text(zh ? 'English' : '中文'),
-          ),
-          PopupMenuButton<ThemeMode>(
-            tooltip: t('外观', 'Appearance'),
-            initialValue: widget.themeMode,
-            onSelected: widget.onThemeChanged,
-            itemBuilder: (_) => [
-              PopupMenuItem(
-                value: ThemeMode.system,
-                child: Text(t('跟随系统', 'System')),
-              ),
-              PopupMenuItem(
-                value: ThemeMode.light,
-                child: Text(t('浅色', 'Light')),
-              ),
-              PopupMenuItem(
-                value: ThemeMode.dark,
-                child: Text(t('深色', 'Dark')),
-              ),
-            ],
-            icon: const Icon(Icons.palette_outlined),
-          ),
-          IconButton(
-            onPressed: _logout,
-            tooltip: t('退出', 'Sign out'),
-            icon: const Icon(Icons.logout),
-          ),
-          const SizedBox(width: 8),
-        ],
-      ),
-      body: Row(
-        children: [
-          NavigationRail(
-            selectedIndex: _page,
-            labelType: NavigationRailLabelType.all,
-            onDestinationSelected: (value) => setState(() => _page = value),
-            destinations: [
-              for (final item in destinations)
-                NavigationRailDestination(
-                  icon: Icon(item.$1),
-                  label: Text(item.$2),
-                ),
-            ],
-          ),
-          const VerticalDivider(width: 1),
-          Expanded(
-            child: _busy
-                ? const Center(child: CircularProgressIndicator())
-                : Column(
-                    children: [
-                      if (_error != null)
-                        MaterialBanner(
-                          content: Text(_error!),
-                          actions: [
-                            TextButton(
-                              onPressed: _refresh,
-                              child: Text(t('重试', 'Retry')),
-                            ),
-                          ],
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final narrow = constraints.maxWidth < 900;
+        final destinations = _dashboardDestinations();
+        final selectedIndex = math.max(
+          0,
+          destinations.indexWhere((item) => item.$1 == _page),
+        );
+        final content = _busy
+            ? const Center(child: CircularProgressIndicator())
+            : Column(
+                children: [
+                  if (_error != null)
+                    MaterialBanner(
+                      content: Text(_error!),
+                      actions: [
+                        TextButton(
+                          onPressed: _refresh,
+                          child: Text(t('重试', 'Retry')),
                         ),
-                      Expanded(child: _currentPage()),
-                    ],
+                      ],
+                    ),
+                  Expanded(child: _currentPage()),
+                ],
+              );
+        return Scaffold(
+          drawer: narrow
+              ? Drawer(
+                  child: SafeArea(
+                    child: ListView(
+                      children: [
+                        const DrawerHeader(
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              _BrandMark(size: 54),
+                              SizedBox(height: 8),
+                              Text('LinkLake Manager'),
+                            ],
+                          ),
+                        ),
+                        for (final destination in destinations)
+                          ListTile(
+                            key: Key('nav-${destination.$1}'),
+                            selected: destination.$1 == _page,
+                            leading: Icon(destination.$2),
+                            title: Text(destination.$3),
+                            onTap: () {
+                              setState(() => _page = destination.$1);
+                              Navigator.pop(context);
+                            },
+                          ),
+                      ],
+                    ),
                   ),
+                )
+              : null,
+          appBar: AppBar(
+            title: Row(
+              children: [
+                const _BrandMark(size: 34),
+                const SizedBox(width: 10),
+                Flexible(child: Text(narrow ? 'LinkLake' : 'LinkLake Manager')),
+                if (!narrow && _status['instance_id'] != null) ...[
+                  const SizedBox(width: 12),
+                  Text(
+                    _status['instance_id'].toString().substring(0, 8),
+                    style: Theme.of(context).textTheme.labelSmall,
+                  ),
+                ],
+              ],
+            ),
+            actions: [
+              IconButton(
+                onPressed: _refresh,
+                tooltip: t('刷新', 'Refresh'),
+                icon: const Icon(Icons.refresh),
+              ),
+              if (!narrow)
+                TextButton.icon(
+                  onPressed: _toggleLanguage,
+                  icon: const Icon(Icons.language),
+                  label: Text(zh ? 'English' : '中文'),
+                ),
+              if (!narrow)
+                PopupMenuButton<ThemeMode>(
+                  tooltip: t('外观', 'Appearance'),
+                  initialValue: _settings.themeMode,
+                  onSelected: _changeTheme,
+                  itemBuilder: (_) => [
+                    PopupMenuItem(
+                      value: ThemeMode.system,
+                      child: Text(t('跟随系统', 'System')),
+                    ),
+                    PopupMenuItem(
+                      value: ThemeMode.light,
+                      child: Text(t('浅色', 'Light')),
+                    ),
+                    PopupMenuItem(
+                      value: ThemeMode.dark,
+                      child: Text(t('深色', 'Dark')),
+                    ),
+                  ],
+                  icon: const Icon(Icons.palette_outlined),
+                ),
+              IconButton(
+                key: const Key('manager-settings'),
+                onPressed: _showManagerSettings,
+                tooltip: t('设置', 'Settings'),
+                icon: const Icon(Icons.settings_outlined),
+              ),
+              if (narrow)
+                PopupMenuButton<String>(
+                  onSelected: (value) {
+                    if (value == 'language') _toggleLanguage();
+                    if (value == 'theme') {
+                      _changeTheme(
+                        _settings.themeMode == ThemeMode.dark
+                            ? ThemeMode.light
+                            : ThemeMode.dark,
+                      );
+                    }
+                    if (value == 'logout') _logout();
+                  },
+                  itemBuilder: (_) => [
+                    PopupMenuItem(
+                      value: 'language',
+                      child: Text(zh ? 'English' : '中文'),
+                    ),
+                    PopupMenuItem(
+                      value: 'theme',
+                      child: Text(t('切换明暗主题', 'Toggle light/dark')),
+                    ),
+                    PopupMenuItem(
+                      value: 'logout',
+                      child: Text(t('退出登录', 'Sign out')),
+                    ),
+                  ],
+                )
+              else
+                IconButton(
+                  onPressed: _logout,
+                  tooltip: t('退出', 'Sign out'),
+                  icon: const Icon(Icons.logout),
+                ),
+              const SizedBox(width: 4),
+            ],
           ),
-        ],
-      ),
+          body: Row(
+            children: [
+              if (!narrow) ...[
+                SizedBox(
+                  width: 176,
+                  child: ListView.builder(
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                    itemCount: destinations.length,
+                    itemBuilder: (context, index) {
+                      final item = destinations[index];
+                      return ListTile(
+                        key: Key('nav-${item.$1}'),
+                        dense: true,
+                        selected: index == selectedIndex,
+                        leading: Icon(item.$2),
+                        title: Text(item.$3),
+                        onTap: () => setState(() => _page = item.$1),
+                      );
+                    },
+                  ),
+                ),
+                const VerticalDivider(width: 1),
+              ],
+              Expanded(child: content),
+            ],
+          ),
+        );
+      },
     );
   }
 
+  List<(String, IconData, String)> _dashboardDestinations() {
+    final labels = <String, (IconData, String)>{
+      'overview': (Icons.dashboard_outlined, t('概览', 'Overview')),
+      'clients': (Icons.devices_outlined, t('客户端', 'Clients')),
+      'tcp': (Icons.swap_horiz, 'TCP'),
+      'udp': (Icons.bolt_outlined, 'UDP'),
+      'group': (Icons.view_week_outlined, t('端口组', 'Port Groups')),
+      'http': (Icons.http, 'HTTP/HTTPS'),
+      'sni': (Icons.lock_outline, 'TLS SNI'),
+      'secret': (Icons.key_outlined, 'Secret'),
+      'socks5': (Icons.route_outlined, 'SOCKS5'),
+      'proxy': (Icons.language_outlined, 'HTTP Proxy'),
+      'p2p': (Icons.hub_outlined, 'P2P'),
+      'fleet': (Icons.cloud_sync_outlined, t('多云', 'Multi-cloud')),
+      'alerts': (Icons.warning_amber_outlined, t('告警', 'Alerts')),
+      'users': (Icons.manage_accounts_outlined, t('用户', 'Users')),
+      'diagnostics': (Icons.build_outlined, t('诊断', 'Diagnostics')),
+      'audit': (Icons.receipt_long_outlined, t('审计', 'Audit')),
+    };
+    return [
+      for (final id in visibleDestinationIds(_role))
+        (id, labels[id]!.$1, labels[id]!.$2),
+    ];
+  }
+
   Widget _currentPage() => switch (_page) {
-    0 => _overview(),
-    1 => _clientsPage(),
-    2 => _servicesPage(),
-    3 => _p2pPage(),
-    4 => _fleetPage(),
-    5 => _alertsPage(),
-    6 => _usersPage(),
-    7 => _diagnosticsPage(),
+    'overview' => _overview(),
+    'clients' => _clientsPage(),
+    'tcp' => _policyPage(PolicyKind.tcp),
+    'udp' => _policyPage(PolicyKind.udp),
+    'group' => _policyPage(PolicyKind.group),
+    'http' => _policyPage(PolicyKind.http),
+    'sni' => _policyPage(PolicyKind.sni),
+    'secret' => _policyPage(PolicyKind.secret),
+    'socks5' => _policyPage(PolicyKind.socks5),
+    'proxy' => _policyPage(PolicyKind.proxy),
+    'p2p' => _p2pPage(),
+    'fleet' when _capabilities.canViewFleet => _fleetPage(),
+    'alerts' => _alertsPage(),
+    'users' when _capabilities.canManageUsers => _usersPage(),
+    'diagnostics' => _diagnosticsPage(),
     _ => _auditPage(),
   };
 
@@ -802,71 +1240,17 @@ class _DashboardPageState extends State<DashboardPage> {
     ),
   );
 
-  Widget _servicesPage() {
-    const labels = {
-      'tcp': 'TCP',
-      'udp': 'UDP',
-      'http': 'HTTP/HTTPS',
-      'sni': 'TLS SNI',
-      'secret': 'Secret',
-      'socks5': 'SOCKS5',
-      'proxy': 'HTTP Proxy',
-      'group': 'Port Group',
-    };
-    return _pagePadding(
-      ListView(
-        children: [
-          Row(
-            children: [
-              Expanded(
-                child: _pageTitle(
-                  t('服务与转发策略', 'Services and forwarding policies'),
-                  t(
-                    '查看全部协议；可新建 TCP/UDP 策略',
-                    'Inspect every protocol and create TCP/UDP policies',
-                  ),
-                ),
-              ),
-              FilledButton.icon(
-                onPressed: _clients.isEmpty ? null : _showCreateTunnel,
-                icon: const Icon(Icons.add),
-                label: Text(t('新建 TCP/UDP', 'New TCP/UDP')),
-              ),
-            ],
-          ),
-          const SizedBox(height: 16),
-          for (final entry in labels.entries) ...[
-            Text(entry.value, style: Theme.of(context).textTheme.titleMedium),
-            const SizedBox(height: 8),
-            if ((_resources[entry.key] ?? []).isEmpty)
-              _emptyCard(t('暂无策略', 'No policies'))
-            else
-              for (final raw in _resources[entry.key]!)
-                _recordCard(
-                  raw as Map<String, dynamic>,
-                  titleKeys: const ['name', 'hostname', 'id'],
-                  stateKey: 'online',
-                  trailing:
-                      _identity['role']?.toString() == 'administrator' &&
-                          raw['id'] != null
-                      ? IconButton(
-                          tooltip: t('流量控制', 'Traffic control'),
-                          onPressed: () =>
-                              _showTrafficControl(switch (entry.key) {
-                                'proxy' => 'http_proxy',
-                                'group' => 'port_group',
-                                _ => entry.key,
-                              }, raw),
-                          icon: const Icon(Icons.security_outlined),
-                        )
-                      : null,
-                ),
-            const SizedBox(height: 18),
-          ],
-        ],
-      ),
-    );
-  }
+  Widget _policyPage(PolicyKind kind) => PolicyPage(
+    key: ValueKey('policy-page-${kind.key}'),
+    kind: kind,
+    api: widget.api,
+    policies: _resources[kind.key] ?? const [],
+    clients: _clients,
+    capabilities: _capabilities,
+    chinese: zh,
+    onRefresh: () => _refresh(silent: true),
+    onTrafficControl: _showTrafficControl,
+  );
 
   Widget _p2pPage() => _pagePadding(
     ListView(
@@ -899,11 +1283,12 @@ class _DashboardPageState extends State<DashboardPage> {
                 ),
               ),
             ),
-            FilledButton.icon(
-              onPressed: () => _showAlertRule(),
-              icon: const Icon(Icons.add),
-              label: Text(t('新建规则', 'New rule')),
-            ),
+            if (_capabilities.canManageAlerts)
+              FilledButton.icon(
+                onPressed: () => _showAlertRule(),
+                icon: const Icon(Icons.add),
+                label: Text(t('新建规则', 'New rule')),
+              ),
           ],
         ),
         const SizedBox(height: 16),
@@ -939,19 +1324,21 @@ class _DashboardPageState extends State<DashboardPage> {
               subtitle: Text(
                 '${raw['comparator']} ${raw['threshold']} · ${raw['evaluation_window_seconds']}s · ${raw['target'] ?? '*'}',
               ),
-              trailing: Wrap(
-                spacing: 4,
-                children: [
-                  IconButton(
-                    onPressed: () => _showAlertRule(raw),
-                    icon: const Icon(Icons.edit_outlined),
-                  ),
-                  IconButton(
-                    onPressed: () => _deleteAlertRule(raw),
-                    icon: const Icon(Icons.delete_outline),
-                  ),
-                ],
-              ),
+              trailing: _capabilities.canManageAlerts
+                  ? Wrap(
+                      spacing: 4,
+                      children: [
+                        IconButton(
+                          onPressed: () => _showAlertRule(raw),
+                          icon: const Icon(Icons.edit_outlined),
+                        ),
+                        IconButton(
+                          onPressed: () => _deleteAlertRule(raw),
+                          icon: const Icon(Icons.delete_outline),
+                        ),
+                      ],
+                    )
+                  : null,
             ),
           ),
       ],
@@ -959,6 +1346,7 @@ class _DashboardPageState extends State<DashboardPage> {
   );
 
   Future<void> _showAlertRule([Map<String, dynamic>? rule]) async {
+    if (!_capabilities.canManageAlerts) return;
     final name = TextEditingController(text: rule?['name']?.toString() ?? '');
     final threshold = TextEditingController(
       text: rule?['threshold']?.toString() ?? '1',
@@ -1194,8 +1582,17 @@ class _DashboardPageState extends State<DashboardPage> {
   }
 
   Future<void> _deleteAlertRule(Map<String, dynamic> rule) async {
-    await widget.api.delete('/api/v1/alerts/rules/${rule['id']}');
-    await _refresh(silent: true);
+    if (!_capabilities.canManageAlerts) return;
+    final confirmed = await _confirmDestructive(
+      t('删除告警规则？', 'Delete alert rule?'),
+    );
+    if (!confirmed) return;
+    try {
+      await widget.api.delete('/api/v1/alerts/rules/${rule['id']}');
+      await _refresh(silent: true);
+    } catch (error) {
+      if (mounted) setState(() => _error = error.toString());
+    }
   }
 
   Widget _usersPage() => _pagePadding(
@@ -1304,6 +1701,7 @@ class _DashboardPageState extends State<DashboardPage> {
   );
 
   Future<void> _manageTotp() async {
+    if (!_capabilities.canManageTotp) return;
     final enabled = _identity['totp_enabled'] == true;
     final code = TextEditingController();
     String? secret;
@@ -1389,6 +1787,7 @@ class _DashboardPageState extends State<DashboardPage> {
   }
 
   Future<void> _createApiToken() async {
+    if (!_capabilities.canManageApiTokens) return;
     final name = TextEditingController();
     final days = TextEditingController();
     var scope = 'read';
@@ -1494,11 +1893,21 @@ class _DashboardPageState extends State<DashboardPage> {
   }
 
   Future<void> _revokeApiToken(Map<String, dynamic> token) async {
-    await widget.api.delete('/api/v1/api-tokens/${token['id']}');
-    await _refresh(silent: true);
+    if (!_capabilities.canManageApiTokens) return;
+    final confirmed = await _confirmDestructive(
+      t('撤销 API 令牌？', 'Revoke API token?'),
+    );
+    if (!confirmed) return;
+    try {
+      await widget.api.delete('/api/v1/api-tokens/${token['id']}');
+      await _refresh(silent: true);
+    } catch (error) {
+      if (mounted) setState(() => _error = error.toString());
+    }
   }
 
   Future<void> _showCreateUser() async {
+    if (!_capabilities.canManageUsers) return;
     final username = TextEditingController();
     final displayName = TextEditingController();
     final password = TextEditingController();
@@ -1847,6 +2256,7 @@ class _DashboardPageState extends State<DashboardPage> {
   }
 
   Future<void> _showFleetPeer([Map<String, dynamic>? peer]) async {
+    if (!_capabilities.canManageFleet) return;
     final name = TextEditingController(text: peer?['name']?.toString() ?? '');
     final url = TextEditingController(
       text: peer?['url']?.toString() ?? 'https://',
@@ -1987,9 +2397,38 @@ class _DashboardPageState extends State<DashboardPage> {
   }
 
   Future<void> _deleteFleetPeer(Map<String, dynamic> peer) async {
-    await widget.api.delete('/api/v1/fleet/peers/${peer['id']}');
-    await _refresh(silent: true);
+    if (!_capabilities.canManageFleet) return;
+    final confirmed = await _confirmDestructive(
+      t('删除多云节点？', 'Delete fleet peer?'),
+    );
+    if (!confirmed) return;
+    try {
+      await widget.api.delete('/api/v1/fleet/peers/${peer['id']}');
+      await _refresh(silent: true);
+    } catch (error) {
+      if (mounted) setState(() => _error = error.toString());
+    }
   }
+
+  Future<bool> _confirmDestructive(String title) async =>
+      await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: Text(title),
+          content: Text(t('此操作无法撤销。', 'This action cannot be undone.')),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: Text(t('取消', 'Cancel')),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: Text(t('确认', 'Confirm')),
+            ),
+          ],
+        ),
+      ) ??
+      false;
 
   String _clientBinary() {
     final directory = File(Platform.resolvedExecutable).parent.path;
@@ -2195,6 +2634,9 @@ class _DashboardPageState extends State<DashboardPage> {
     ),
   );
 
+  // Kept for compatibility with older integration tests; the v0.8 UI uses
+  // the schema-driven protocol editors in policy_pages.dart.
+  // ignore: unused_element
   Future<void> _showCreateTunnel() async {
     String protocol = 'tcp';
     String clientId = (_clients.first as Map<String, dynamic>)['client_id']
@@ -2315,6 +2757,7 @@ class _DashboardPageState extends State<DashboardPage> {
     String kind,
     Map<String, dynamic> policy,
   ) async {
+    if (!_capabilities.canManageTrafficControl) return;
     final path = '/api/v1/traffic-controls/$kind/${policy['id']}';
     Map<String, dynamic>? current;
     try {
