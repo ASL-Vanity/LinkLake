@@ -1,8 +1,12 @@
-﻿param(
+param(
     [string]$ServerExe = "",
     [int]$ManagementPort = 39210,
     [int]$ControlPort = 39211,
     [int]$UdpRelayPort = 39212,
+    [ValidateSet('chromium', 'firefox', 'webkit')][string]$BrowserEngine = 'chromium',
+    [string]$BrowserPath = 'C:\Program Files\Google\Chrome\Application\chrome.exe',
+    [string]$BrowserLabel = 'Chrome',
+    [ValidatePattern('^[A-Za-z0-9._-]+$')][string]$OutputName = 'webui-smoke',
     [switch]$KeepData,
     [switch]$KeepServer
 )
@@ -14,7 +18,7 @@ if ([string]::IsNullOrWhiteSpace($ServerExe)) {
 }
 $ServerExe = (Resolve-Path -LiteralPath $ServerExe).Path
 $dataDir = Join-Path $projectRoot '.tmp-webui-smoke-data'
-$outputDir = Join-Path $projectRoot 'target\webui-smoke'
+$outputDir = Join-Path $projectRoot "target\$OutputName"
 $serverLog = Join-Path $outputDir 'server.log'
 $baseUrl = "http://127.0.0.1:$ManagementPort"
 $adminUsername = 'admin'
@@ -40,6 +44,17 @@ function Remove-SmokeData {
     Remove-Item -LiteralPath $resolved -Recurse -Force
 }
 
+function Reset-SmokeOutput {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $resolved = (Resolve-Path -LiteralPath $Path).Path
+    $expectedParent = [System.IO.Path]::GetFullPath((Join-Path $projectRoot 'target'))
+    if ((Split-Path -Parent $resolved) -ne $expectedParent -or (Split-Path -Leaf $resolved) -ne $OutputName) {
+        throw "拒绝删除意外的 WebUI 输出路径：$resolved"
+    }
+    Remove-Item -LiteralPath $resolved -Recurse -Force
+}
+
 function Invoke-LinkLakeJson {
     param(
         [Parameter(Mandatory = $true)][string]$Method,
@@ -50,6 +65,7 @@ function Invoke-LinkLakeJson {
     Invoke-RestMethod -Method $Method -Uri "$baseUrl$Path" -Headers $Headers -ContentType 'application/json' -Body ($Body | ConvertTo-Json -Depth 8 -Compress)
 }
 
+Reset-SmokeOutput -Path $outputDir
 New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
 Remove-SmokeData -Path $dataDir
 New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
@@ -126,11 +142,17 @@ try {
     $env:LINKLAKE_SMOKE_BASE_URL = $baseUrl
     $env:LINKLAKE_SMOKE_USERNAME = $adminUsername
     $env:LINKLAKE_SMOKE_PASSWORD = $adminPassword
-    $env:LINKLAKE_SMOKE_CHROME = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
+    $env:LINKLAKE_SMOKE_BROWSER_ENGINE = $BrowserEngine
+    $env:LINKLAKE_SMOKE_BROWSER_LABEL = $BrowserLabel
+    if ([string]::IsNullOrWhiteSpace($BrowserPath)) {
+        Remove-Item Env:LINKLAKE_SMOKE_CHROME -ErrorAction SilentlyContinue
+    } else {
+        $env:LINKLAKE_SMOKE_CHROME = (Resolve-Path -LiteralPath $BrowserPath).Path
+    }
     $env:LINKLAKE_SMOKE_OUTPUT = $outputDir
     $node = 'C:\Users\Laker\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe'
     & $node (Join-Path $PSScriptRoot 'webui-smoke.mjs')
-    if ($LASTEXITCODE -ne 0) { throw "WebUI Chrome 冒烟测试失败，退出码 $LASTEXITCODE" }
+    if ($LASTEXITCODE -ne 0) { throw "WebUI $BrowserLabel 冒烟测试失败，退出码 $LASTEXITCODE" }
 } finally {
     if (-not $KeepServer -and $serverProcess -and -not $serverProcess.HasExited) {
         $serverProcess.Kill()
