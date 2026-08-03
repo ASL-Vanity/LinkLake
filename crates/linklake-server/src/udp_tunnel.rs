@@ -747,6 +747,10 @@ async fn run_tunnel_loop(
                         session.last_activity = now;
                         (session.session_id, false)
                     } else {
+                        if !state.lifecycle.accepts_new_work() {
+                            statistics.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
                         let decision = state.traffic_controls
                             .lock()
                             .expect("traffic control catalog lock poisoned")

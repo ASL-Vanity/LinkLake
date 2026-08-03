@@ -317,7 +317,10 @@ Manager UI 不直接替换自身文件。`linklake-client manager-update downloa
 
 ## 管理与指标
 
-- 健康检查：`GET /api/v1/health`
+- 兼容健康检查：`GET /api/v1/health`
+- 公共探针：`GET /livez|readyz|startupz`，等价 API 路径为 `GET /api/v1/health/live|ready|startup`
+- 生命周期状态：`GET /api/v1/lifecycle`；返回阶段、是否接受新工作、活跃 TCP、待配对连接、活跃 UDP、待处理 P2P 会话、排空截止时间和是否已排空
+- 管理员排空与恢复：`POST /api/v1/lifecycle/drain`（可选 JSON `{"timeout_seconds":30}`）和 `POST /api/v1/lifecycle/resume`
 - 登录后指标：`GET /api/v1/metrics`
 - 历史指标：`GET /api/v1/metrics/history?range=1h|12h|1d|7d|30d`；12 小时内保留 5 秒样本，长期历史按分钟归档并最多保留 30 天
 - 用户管理：`GET/POST /api/v1/users`、`PUT/DELETE /api/v1/users/:username`

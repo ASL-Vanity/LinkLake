@@ -48,6 +48,29 @@ const MAX_PUBLIC_HTTP_CONNECTIONS: usize = 2048;
 static PUBLIC_HTTP_CONNECTION_PERMITS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(MAX_PUBLIC_HTTP_CONNECTIONS)));
 
+struct PublicHttpConnectionActivity {
+    state: Arc<AppState>,
+}
+
+impl PublicHttpConnectionActivity {
+    fn begin(state: Arc<AppState>) -> Self {
+        state
+            .metrics
+            .public_http_active_connections
+            .fetch_add(1, Ordering::Relaxed);
+        Self { state }
+    }
+}
+
+impl Drop for PublicHttpConnectionActivity {
+    fn drop(&mut self) {
+        self.state
+            .metrics
+            .public_http_active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 type BoxError = Box<dyn Error + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
 
@@ -266,6 +289,10 @@ pub(crate) async fn run_http_listener(
         };
         match accepted {
             Ok((stream, peer)) => {
+                if !state.lifecycle.accepts_new_work() {
+                    drop(stream);
+                    continue;
+                }
                 let Ok(connection_permit) =
                     PUBLIC_HTTP_CONNECTION_PERMITS.clone().try_acquire_owned()
                 else {
@@ -276,6 +303,7 @@ pub(crate) async fn run_http_listener(
                 let state = state.clone();
                 tokio::spawn(async move {
                     let _connection_permit = connection_permit;
+                    let _activity = PublicHttpConnectionActivity::begin(state.clone());
                     serve_http_connection(state, stream, peer, PublicScheme::Http, None).await;
                 });
             }
@@ -297,6 +325,10 @@ pub(crate) async fn run_https_listener(
         };
         match accepted {
             Ok((stream, peer)) => {
+                if !state.lifecycle.accepts_new_work() {
+                    drop(stream);
+                    continue;
+                }
                 let Ok(connection_permit) =
                     PUBLIC_HTTP_CONNECTION_PERMITS.clone().try_acquire_owned()
                 else {
@@ -308,6 +340,7 @@ pub(crate) async fn run_https_listener(
                 let acceptor = acceptor.clone();
                 tokio::spawn(async move {
                     let _connection_permit = connection_permit;
+                    let _activity = PublicHttpConnectionActivity::begin(state.clone());
                     let tls_stream =
                         match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
                             Ok(Ok(stream)) => stream,

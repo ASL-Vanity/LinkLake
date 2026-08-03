@@ -178,6 +178,14 @@ pub(crate) async fn handle_connection(
             return;
         }
     };
+    if starts_new_work(&frame) && !state.lifecycle.accepts_new_work() {
+        state
+            .metrics
+            .registration_rejections_total
+            .fetch_add(1, Ordering::Relaxed);
+        send_error(&mut stream, "server is draining and not accepting new work").await;
+        return;
+    }
     match frame {
         ControlFrame::RequestManagedConfig {
             client_id,
@@ -403,6 +411,22 @@ pub(crate) async fn handle_connection(
             .await;
         }
     }
+}
+
+fn starts_new_work(frame: &ControlFrame) -> bool {
+    matches!(
+        frame,
+        ControlFrame::RegisterTcpTunnel { .. }
+            | ControlFrame::RegisterSecretTunnel { .. }
+            | ControlFrame::ConnectSecretTunnel { .. }
+            | ControlFrame::RegisterSocks5Proxy { .. }
+            | ControlFrame::RegisterHttpProxy { .. }
+            | ControlFrame::RegisterHttpRoute { .. }
+            | ControlFrame::RegisterTlsRoute { .. }
+            | ControlFrame::RegisterP2pNode { .. }
+            | ControlFrame::RequestP2pSession { .. }
+            | ControlFrame::RegisterUdpTunnel { .. }
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -697,6 +721,11 @@ async fn accept_public_connections(
             _ = stop.changed() => break,
             accepted = listener.accept() => match accepted {
                 Ok((external, source)) => {
+                    if !context.state.lifecycle.accepts_new_work() {
+                        context.statistics.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                        drop(external);
+                        continue;
+                    }
                     let decision = context.state.traffic_controls
                         .lock()
                         .expect("traffic control catalog lock poisoned")
@@ -1033,13 +1062,15 @@ async fn send_error(stream: &mut BoxedIo, message: &str) {
 
 #[cfg(test)]
 mod bandwidth_limiter_tests {
-    use super::{copy_direction, BandwidthLimiter};
+    use super::{copy_direction, starts_new_work, BandwidthLimiter};
+    use linklake_core::ControlFrame;
     use std::{
         io,
         pin::Pin,
         task::{Context, Poll},
     };
     use tokio::io::{duplex, AsyncRead, AsyncReadExt, ReadBuf};
+    use uuid::Uuid;
 
     struct UnexpectedEofReader {
         bytes: &'static [u8],
@@ -1096,5 +1127,22 @@ mod bandwidth_limiter_tests {
             .expect("forwarded bytes should remain readable");
         assert_eq!(copied, actual.len() as u64);
         assert_eq!(actual, b"linklake-data");
+    }
+
+    #[test]
+    fn draining_rejects_registration_but_allows_pending_data_pairing() {
+        let client_id = Uuid::new_v4();
+        assert!(starts_new_work(&ControlFrame::RegisterTcpTunnel {
+            client_id,
+            client_token: "token".to_owned(),
+            name: "tcp".to_owned(),
+            public_port: 32_000,
+            target_addr: "127.0.0.1:80".to_owned(),
+        }));
+        assert!(!starts_new_work(&ControlFrame::TcpDataConnection {
+            client_id,
+            client_token: "token".to_owned(),
+            connection_id: Uuid::new_v4(),
+        }));
     }
 }

@@ -236,6 +236,15 @@ fn purge_expired_sessions(sessions: &mut HashMap<Uuid, PendingP2pSession>, now: 
     sessions.retain(|_, session| session.expires_unix_seconds > now);
 }
 
+pub(crate) fn pending_session_count(state: &AppState, now: u64) -> usize {
+    let mut sessions = state
+        .p2p_sessions
+        .lock()
+        .expect("P2P session registry lock poisoned");
+    purge_expired_sessions(&mut sessions, now);
+    sessions.len()
+}
+
 fn consume_session(
     sessions: &mut HashMap<Uuid, PendingP2pSession>,
     session_id: Uuid,
