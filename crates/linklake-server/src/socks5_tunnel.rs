@@ -446,7 +446,11 @@ async fn run_udp_runtime(
                 if !accept_socks5_udp_datagram(encoded, &statistics) {
                     continue;
                 }
-                let Some(session_id) = association_for_source(&context.associations, source) else {
+                let Some(session_id) = association_for_source(
+                    &context.associations,
+                    source,
+                    context.state.lifecycle.accepts_new_work(),
+                ) else {
                     statistics.udp_dropped_datagrams.fetch_add(1, Ordering::Relaxed);
                     continue;
                 };
@@ -580,6 +584,7 @@ async fn run_udp_runtime(
 fn association_for_source(
     associations: &Mutex<HashMap<Uuid, UdpAssociation>>,
     source: PublicUdpEndpoint,
+    allow_new_binding: bool,
 ) -> Option<Uuid> {
     let mut associations = associations
         .lock()
@@ -589,6 +594,9 @@ fn association_for_source(
         .find(|(_, association)| association.public_endpoint == Some(source))
     {
         return Some(*id);
+    }
+    if !allow_new_binding {
+        return None;
     }
     let candidates = associations
         .iter()
@@ -628,6 +636,11 @@ async fn accept_public_connections(
             _ = stop.changed() => break,
             accepted = listener.accept() => match accepted {
                 Ok((stream, source)) => {
+                    if !context.state.lifecycle.accepts_new_work() {
+                        context.statistics.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                        drop(stream);
+                        continue;
+                    }
                     let decision = context.state.traffic_controls.lock().expect("traffic control catalog lock poisoned").authorize(TrafficPolicyKind::Socks5, context.policy_id, source.ip(), crate::unix_seconds());
                     if !matches!(decision, Ok(TrafficDecision::Allowed)) {
                         context.statistics.rejected_connections.fetch_add(1, Ordering::Relaxed);
@@ -1266,7 +1279,10 @@ mod tests {
         let endpoint = PublicUdpEndpoint::from(source);
         let associations = Mutex::new(HashMap::from([(id, association(source.ip(), None))]));
 
-        assert_eq!(association_for_source(&associations, endpoint), Some(id));
+        assert_eq!(
+            association_for_source(&associations, endpoint, true),
+            Some(id)
+        );
         assert_eq!(
             associations
                 .lock()
@@ -1276,7 +1292,10 @@ mod tests {
                 .public_endpoint,
             Some(endpoint)
         );
-        assert_eq!(association_for_source(&associations, endpoint), Some(id));
+        assert_eq!(
+            association_for_source(&associations, endpoint, true),
+            Some(id)
+        );
     }
 
     #[test]
@@ -1287,7 +1306,10 @@ mod tests {
             (Uuid::new_v4(), association(source.ip(), None)),
         ]));
 
-        assert_eq!(association_for_source(&associations, source.into()), None);
+        assert_eq!(
+            association_for_source(&associations, source.into(), true),
+            None
+        );
         assert!(associations
             .lock()
             .unwrap()
@@ -1311,11 +1333,11 @@ mod tests {
         )]));
 
         assert_eq!(
-            association_for_source(&associations, SocketAddr::new(peer_ip, 40_001).into(),),
+            association_for_source(&associations, SocketAddr::new(peer_ip, 40_001).into(), true,),
             None
         );
         assert_eq!(
-            association_for_source(&associations, SocketAddr::new(peer_ip, 40_000).into(),),
+            association_for_source(&associations, SocketAddr::new(peer_ip, 40_000).into(), true,),
             Some(id)
         );
     }
@@ -1340,6 +1362,7 @@ mod tests {
             association_for_source(
                 &associations,
                 SocketAddr::new(requested_ip, requested_port).into(),
+                true,
             ),
             Some(id)
         );
@@ -1355,11 +1378,30 @@ mod tests {
             association_for_source(
                 &associations,
                 SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 40_000).into(),
+                true,
             ),
             None
         );
         assert_eq!(
-            association_for_source(&associations, SocketAddr::new(peer_ip, 40_000).into(),),
+            association_for_source(&associations, SocketAddr::new(peer_ip, 40_000).into(), true,),
+            Some(id)
+        );
+    }
+
+    #[test]
+    fn draining_keeps_existing_udp_source_but_rejects_a_new_binding() {
+        let id = Uuid::new_v4();
+        let source = SocketAddr::from(([192, 0, 2, 10], 40_000));
+        let endpoint = PublicUdpEndpoint::from(source);
+        let associations = Mutex::new(HashMap::from([(id, association(source.ip(), None))]));
+
+        assert_eq!(association_for_source(&associations, endpoint, false), None);
+        assert_eq!(
+            association_for_source(&associations, endpoint, true),
+            Some(id)
+        );
+        assert_eq!(
+            association_for_source(&associations, endpoint, false),
             Some(id)
         );
     }

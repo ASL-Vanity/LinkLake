@@ -14,6 +14,7 @@ pub mod http_backend_pool;
 mod http_proxy_tunnel;
 mod http_route_catalog;
 mod http_tunnel;
+mod lifecycle;
 mod notifications;
 mod p2p_control;
 mod p2p_node_catalog;
@@ -62,6 +63,7 @@ use http_route_catalog::{
     CreateHttpRouteError, CreateHttpRoutePolicy, HttpRouteCatalog, HttpRoutePolicy,
     UpdateHttpRoutePolicy,
 };
+use lifecycle::{LifecycleController, LifecyclePhase, LifecycleSnapshot, LifecycleTransitionError};
 use linklake_core::{
     managed_config_revision, BoxedIo, BuildInfo, ClientEnrollmentRequest, ClientEnrollmentResponse,
     ManagedClientConfig, ManagedHttpProxy, ManagedHttpRoute, ManagedSecretTunnel,
@@ -134,6 +136,8 @@ const LOGIN_HASH_CONCURRENCY: usize = 1;
 const LOGIN_FAILURE_BASE_DELAY_MILLIS: u64 = 250;
 const LOGIN_FAILURE_MAX_DELAY_SECONDS: u64 = 30;
 const LOGIN_THROTTLE_MAX_IDENTITIES: usize = 1_024;
+const DEFAULT_DRAIN_TIMEOUT_SECONDS: u64 = 30;
+const MAX_DRAIN_TIMEOUT_SECONDS: u64 = 60 * 60;
 
 pub(crate) fn managed_config_for_client(
     state: &AppState,
@@ -300,6 +304,7 @@ struct AppState {
     _database: Database,
     started_at: Instant,
     instance_id: String,
+    lifecycle: LifecycleController,
     enrollment_token: String,
     management_token: Option<String>,
     admin_auth: Mutex<AdminAuth>,
@@ -359,6 +364,7 @@ struct ServerCounters {
     tunnel_reconnects_total: AtomicU64,
     registration_rejections_total: AtomicU64,
     authentication_failures_total: AtomicU64,
+    public_http_active_connections: AtomicU64,
     https_active_connections: AtomicU64,
     https_requests_total: AtomicU64,
     https_handshake_failures_total: AtomicU64,
@@ -729,6 +735,38 @@ struct HealthResponse {
     product: &'static str,
     api_version: &'static str,
     status: &'static str,
+}
+
+#[derive(Serialize)]
+struct ProbeResponse {
+    product: &'static str,
+    api_version: &'static str,
+    status: &'static str,
+    phase: LifecyclePhase,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DrainRequest {
+    #[serde(default = "default_drain_timeout_seconds")]
+    timeout_seconds: u64,
+}
+
+fn default_drain_timeout_seconds() -> u64 {
+    DEFAULT_DRAIN_TIMEOUT_SECONDS
+}
+
+#[derive(Serialize)]
+struct LifecycleResponse {
+    #[serde(flatten)]
+    lifecycle: LifecycleSnapshot,
+    accepting_new_work: bool,
+    active_tcp_connections: usize,
+    pending_connection_pairings: usize,
+    active_udp_sessions: usize,
+    pending_p2p_sessions: usize,
+    drained: bool,
+    drain_deadline_reached: bool,
 }
 
 #[derive(Serialize)]
@@ -1959,6 +1997,7 @@ async fn run_server(
         _database: database.clone(),
         started_at: Instant::now(),
         instance_id: uuid::Uuid::new_v4().to_string(),
+        lifecycle: LifecycleController::new(unix_seconds()),
         enrollment_token,
         management_token: configured_management_token,
         admin_auth: Mutex::new(AdminAuth::open_with_database(&database, bootstrap_admin)?),
@@ -2022,6 +2061,15 @@ async fn run_server(
     let app = Router::new()
         .route("/", get(management_ui))
         .route("/api/v1/health", get(health))
+        .route("/livez", get(live_probe))
+        .route("/readyz", get(ready_probe))
+        .route("/startupz", get(startup_probe))
+        .route("/api/v1/health/live", get(live_probe))
+        .route("/api/v1/health/ready", get(ready_probe))
+        .route("/api/v1/health/startup", get(startup_probe))
+        .route("/api/v1/lifecycle", get(get_lifecycle))
+        .route("/api/v1/lifecycle/drain", post(drain_lifecycle))
+        .route("/api/v1/lifecycle/resume", post(resume_lifecycle))
         .route("/api/v1/auth/login", post(login))
         .route("/api/v1/auth/me", get(auth_me))
         .route("/api/v1/auth/logout", post(logout))
@@ -2228,6 +2276,46 @@ async fn run_server(
         .layer(middleware::from_fn(cache_control_headers))
         .layer(middleware::from_fn(security_headers));
 
+    // 先绑定所有由环境变量配置的静态监听器，任何一个失败都保持 Starting 并让启动失败。
+    let control_listener = TcpListener::bind(control_address).await?;
+    let http_listener = match http_address {
+        Some(http_address) => Some((http_address, TcpListener::bind(http_address).await?)),
+        None => None,
+    };
+    let https_listener = match https_address {
+        Some(https_address) => {
+            let certificate_manager = state
+                .certificate_manager
+                .as_ref()
+                .expect("HTTPS requires a certificate manager");
+            Some((
+                https_address,
+                TcpListener::bind(https_address).await?,
+                TlsAcceptor::from(certificate_manager.tls_config()),
+            ))
+        }
+        None => None,
+    };
+    let sni_listener = match sni_address {
+        Some(sni_address) => Some((sni_address, TcpListener::bind(sni_address).await?)),
+        None => None,
+    };
+    let management_tls_listener = if management_tls.is_some() {
+        let listener = std::net::TcpListener::bind(address)?;
+        listener.set_nonblocking(true)?;
+        Some(listener)
+    } else {
+        None
+    };
+    let management_http_listener = if management_tls.is_none() {
+        Some(TcpListener::bind(address).await?)
+    } else {
+        None
+    };
+
+    state.lifecycle.mark_ready(unix_seconds());
+    tracing::info!("{PRODUCT_NAME} startup completed; lifecycle is ready");
+
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     record_metrics_history_sample(&state);
     tokio::spawn(run_metrics_history_sampler(
@@ -2247,6 +2335,7 @@ async fn run_server(
             }
             None => wait_for_os_shutdown().await,
         }
+        shutdown_state.lifecycle.begin_stopping(unix_seconds());
         tracing::info!(
             "LinkLake received a shutdown signal; closing tunnels and draining requests."
         );
@@ -2259,7 +2348,6 @@ async fn run_server(
         http_proxy_tunnel::stop_all(&shutdown_state);
         let _ = shutdown_tx.send(true);
     });
-    let control_listener = TcpListener::bind(control_address).await?;
     if let Some(acceptor) = control_tls {
         tracing::info!("{PRODUCT_NAME} TLS TCP control listening on {control_address}");
         tokio::spawn(tcp_tunnel::run_tls_control_listener(
@@ -2276,8 +2364,7 @@ async fn run_server(
             shutdown_rx.clone(),
         ));
     }
-    if let Some(http_address) = http_address {
-        let http_listener = TcpListener::bind(http_address).await?;
+    if let Some((http_address, http_listener)) = http_listener {
         tracing::info!("{PRODUCT_NAME} HTTP route listener active on {http_address}");
         tokio::spawn(http_tunnel::run_http_listener(
             state.clone(),
@@ -2285,22 +2372,16 @@ async fn run_server(
             shutdown_rx.clone(),
         ));
     }
-    if let Some(https_address) = https_address {
-        let certificate_manager = state
-            .certificate_manager
-            .as_ref()
-            .expect("HTTPS requires a certificate manager");
-        let https_listener = TcpListener::bind(https_address).await?;
+    if let Some((https_address, https_listener, acceptor)) = https_listener {
         tracing::info!("{PRODUCT_NAME} HTTPS route listener active on {https_address}");
         tokio::spawn(http_tunnel::run_https_listener(
             state.clone(),
             https_listener,
-            TlsAcceptor::from(certificate_manager.tls_config()),
+            acceptor,
             shutdown_rx.clone(),
         ));
     }
-    if let Some(sni_address) = sni_address {
-        let sni_listener = TcpListener::bind(sni_address).await?;
+    if let Some((sni_address, sni_listener)) = sni_listener {
         tracing::info!("{PRODUCT_NAME} TLS SNI pass-through listener active on {sni_address}");
         tokio::spawn(sni_tunnel::run_listener(
             state.clone(),
@@ -2309,6 +2390,7 @@ async fn run_server(
         ));
     }
     if let Some(config) = management_tls {
+        let listener = management_tls_listener.expect("TLS management listener must be bound");
         tracing::info!("{PRODUCT_NAME} HTTPS management listening on https://{address}");
         let handle = axum_server::Handle::new();
         let shutdown_handle = handle.clone();
@@ -2317,12 +2399,12 @@ async fn run_server(
             wait_for_shutdown(management_shutdown).await;
             shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
         });
-        axum_server::bind_rustls(address, config)
+        axum_server::from_tcp_rustls(listener, config)
             .handle(handle)
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await?;
     } else {
-        let listener = TcpListener::bind(address).await?;
+        let listener = management_http_listener.expect("HTTP management listener must be bound");
         tracing::info!("{PRODUCT_NAME} development HTTP management listening on http://{address}");
         axum::serve(
             listener,
@@ -2449,12 +2531,222 @@ async fn management_ui() -> impl IntoResponse {
     )
 }
 
-async fn health() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        product: PRODUCT_NAME,
-        api_version: API_VERSION,
-        status: "ok",
-    })
+async fn health(State(state): State<Arc<AppState>>) -> Response {
+    let healthy = state.lifecycle.is_live();
+    (
+        if healthy {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(HealthResponse {
+            product: PRODUCT_NAME,
+            api_version: API_VERSION,
+            status: if healthy { "ok" } else { "stopping" },
+        }),
+    )
+        .into_response()
+}
+
+async fn live_probe(State(state): State<Arc<AppState>>) -> Response {
+    lifecycle_probe(&state, state.lifecycle.is_live(), "ok", "not_live")
+}
+
+async fn ready_probe(State(state): State<Arc<AppState>>) -> Response {
+    lifecycle_probe(&state, state.lifecycle.is_ready(), "ready", "not_ready")
+}
+
+async fn startup_probe(State(state): State<Arc<AppState>>) -> Response {
+    lifecycle_probe(
+        &state,
+        state.lifecycle.startup_complete(),
+        "started",
+        "starting",
+    )
+}
+
+fn lifecycle_probe(
+    state: &AppState,
+    healthy: bool,
+    healthy_status: &'static str,
+    unhealthy_status: &'static str,
+) -> Response {
+    (
+        if healthy {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(ProbeResponse {
+            product: PRODUCT_NAME,
+            api_version: API_VERSION,
+            status: if healthy {
+                healthy_status
+            } else {
+                unhealthy_status
+            },
+            phase: state.lifecycle.snapshot().phase,
+        }),
+    )
+        .into_response()
+}
+
+async fn get_lifecycle(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<LifecycleResponse>, ApiError> {
+    authorize_management(&state, &headers)?;
+    Ok(Json(lifecycle_response(&state).await))
+}
+
+async fn drain_lifecycle(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    request: Option<Json<DrainRequest>>,
+) -> Result<Json<LifecycleResponse>, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    let timeout_seconds = request
+        .map(|Json(request)| request.timeout_seconds)
+        .unwrap_or(DEFAULT_DRAIN_TIMEOUT_SECONDS);
+    if timeout_seconds == 0 || timeout_seconds > MAX_DRAIN_TIMEOUT_SECONDS {
+        return Err(CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_drain_timeout",
+            "timeout_seconds must be between 1 and 3600",
+        ));
+    }
+    let now = unix_seconds();
+    state
+        .lifecycle
+        .begin_drain(now, Duration::from_secs(timeout_seconds))
+        .map_err(lifecycle_transition_error)?;
+    record_audit(
+        &state,
+        "lifecycle.drain",
+        &principal.username,
+        &format!(
+            "timeout_seconds={timeout_seconds}; deadline_unix_seconds={}",
+            now.saturating_add(timeout_seconds)
+        ),
+    );
+    Ok(Json(lifecycle_response(&state).await))
+}
+
+async fn resume_lifecycle(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<LifecycleResponse>, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    state
+        .lifecycle
+        .resume(unix_seconds())
+        .map_err(lifecycle_transition_error)?;
+    record_audit(
+        &state,
+        "lifecycle.resume",
+        &principal.username,
+        "new work admission resumed",
+    );
+    Ok(Json(lifecycle_response(&state).await))
+}
+
+fn lifecycle_transition_error(error: LifecycleTransitionError) -> CodedApiError {
+    CodedApiError(
+        StatusCode::CONFLICT,
+        "lifecycle_transition_rejected",
+        match error {
+            LifecycleTransitionError::StartupIncomplete => "server startup is not complete",
+            LifecycleTransitionError::Stopping => "server is stopping",
+        },
+    )
+}
+
+async fn lifecycle_response(state: &AppState) -> LifecycleResponse {
+    let lifecycle = state.lifecycle.snapshot();
+    let active_tcp_connections = state
+        .tunnel_statistics
+        .lock()
+        .expect("tunnel statistics lock poisoned")
+        .values()
+        .map(|statistics| statistics.active_connections.load(Ordering::Relaxed))
+        .sum::<usize>()
+        .saturating_add(
+            state
+                .sni_route_statistics
+                .lock()
+                .expect("SNI route statistics lock poisoned")
+                .values()
+                .map(|statistics| statistics.active_connections.load(Ordering::Relaxed))
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            state
+                .secret_tunnel_statistics
+                .lock()
+                .expect("secret tunnel statistics lock poisoned")
+                .values()
+                .map(|statistics| statistics.active_connections.load(Ordering::Relaxed))
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            state
+                .socks5_proxy_statistics
+                .lock()
+                .expect("SOCKS5 statistics lock poisoned")
+                .values()
+                .map(|statistics| statistics.active_connections.load(Ordering::Relaxed))
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            state
+                .http_proxy_statistics
+                .lock()
+                .expect("HTTP proxy statistics lock poisoned")
+                .values()
+                .map(|statistics| statistics.active_connections.load(Ordering::Relaxed))
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            state
+                .metrics
+                .public_http_active_connections
+                .load(Ordering::Relaxed) as usize,
+        );
+    let pending_connection_pairings = state.pending_connections.lock().await.len();
+    let active_udp_sessions = state
+        .udp_tunnel_statistics
+        .lock()
+        .expect("UDP tunnel statistics lock poisoned")
+        .values()
+        .map(|statistics| statistics.active_sessions.load(Ordering::Relaxed))
+        .sum::<usize>()
+        .saturating_add(
+            state
+                .socks5_proxy_statistics
+                .lock()
+                .expect("SOCKS5 statistics lock poisoned")
+                .values()
+                .map(|statistics| statistics.udp_active_associations.load(Ordering::Relaxed))
+                .sum::<usize>(),
+        );
+    let pending_p2p_sessions = p2p_control::pending_session_count(state, unix_seconds());
+    let drained = active_tcp_connections == 0
+        && pending_connection_pairings == 0
+        && active_udp_sessions == 0
+        && pending_p2p_sessions == 0;
+    let now = unix_seconds();
+    LifecycleResponse {
+        lifecycle,
+        accepting_new_work: state.lifecycle.accepts_new_work(),
+        active_tcp_connections,
+        pending_connection_pairings,
+        active_udp_sessions,
+        pending_p2p_sessions,
+        drained,
+        drain_deadline_reached: lifecycle
+            .drain_deadline_unix_seconds
+            .is_some_and(|deadline| now >= deadline),
+    }
 }
 
 async fn get_public_port_policy(
@@ -8586,6 +8878,12 @@ async fn enroll_client(
     headers: HeaderMap,
     Json(request): Json<ClientEnrollmentRequest>,
 ) -> Result<Json<ClientEnrollmentResponse>, ApiError> {
+    if !state.lifecycle.accepts_new_work() {
+        return Err(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server is not accepting new client enrollments",
+        ));
+    }
     authorize(&headers, &state.enrollment_token)?;
     request
         .validate()
@@ -9409,6 +9707,12 @@ async fn enforce_management_role(
     let path = request.uri().path();
     let public = path == "/"
         || path == "/api/v1/health"
+        || path == "/livez"
+        || path == "/readyz"
+        || path == "/startupz"
+        || path == "/api/v1/health/live"
+        || path == "/api/v1/health/ready"
+        || path == "/api/v1/health/startup"
         || path == "/api/v1/auth/login"
         || path == "/api/v1/auth/me"
         || path == "/api/v1/auth/logout"

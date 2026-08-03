@@ -270,6 +270,11 @@ async fn accept_public_connections(
             _ = stop.changed() => break,
             accepted = listener.accept() => match accepted {
                 Ok((stream, source)) => {
+                    if !context.state.lifecycle.accepts_new_work() {
+                        context.statistics.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                        drop(stream);
+                        continue;
+                    }
                     let decision = context.state.traffic_controls.lock().expect("traffic control catalog lock poisoned").authorize(TrafficPolicyKind::HttpProxy, context.policy_id, source.ip(), crate::unix_seconds());
                     if !matches!(decision, Ok(TrafficDecision::Allowed)) {
                         context.statistics.rejected_connections.fetch_add(1, Ordering::Relaxed);

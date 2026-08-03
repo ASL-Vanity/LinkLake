@@ -311,7 +311,10 @@ Manager never replaces its own files from Flutter. `linklake-client manager-upda
 
 ## Management and metrics
 
-- Public health endpoint: `GET /api/v1/health`
+- Compatibility health endpoint: `GET /api/v1/health`
+- Public probes: `GET /livez|readyz|startupz`, also available as `GET /api/v1/health/live|ready|startup`
+- Lifecycle status: `GET /api/v1/lifecycle`, including phase, new-work admission, active TCP, pending pairings, active UDP, pending P2P sessions, drain deadline, and drained state
+- Administrator drain and resume: `POST /api/v1/lifecycle/drain` with optional JSON `{"timeout_seconds":30}`, and `POST /api/v1/lifecycle/resume`
 - Authenticated metrics endpoint: `GET /api/v1/metrics`
 - Metrics history: `GET /api/v1/metrics/history?range=1h|12h|1d|7d|30d`; 5-second samples are retained for 12 hours and minute archives for up to 30 days
 - User management: `GET/POST /api/v1/users` and `PUT/DELETE /api/v1/users/:username`

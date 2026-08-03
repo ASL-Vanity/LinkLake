@@ -108,6 +108,10 @@ pub(crate) async fn run_listener(
         };
         match accepted {
             Ok((stream, peer)) => {
+                if !state.lifecycle.accepts_new_work() {
+                    drop(stream);
+                    continue;
+                }
                 let state = state.clone();
                 tokio::spawn(async move {
                     if let Err(error) = serve_connection(state, stream, peer).await {
