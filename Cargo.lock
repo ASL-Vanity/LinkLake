@@ -2269,6 +2269,7 @@ dependencies = [
  "uuid",
  "windows-service",
  "x509-parser",
+ "zeroize",
 ]
 
 [[package]]

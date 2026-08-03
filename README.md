@@ -171,16 +171,20 @@ HTTP 正向代理、SOCKS5 和普通 TCP 隧道共享 TCP 公网端口命名空�
 - HTTP/HTTPS 路由策略使用 SQLite 持久化，支持创建、启停、删除和在线状态展示
 - 每条路由可配置最大并发连接数，并统计请求数、失败数、流量和配对超时
 - 服务端原生终止 TLS，按精确 SNI 选择证书，并拒绝无 SNI、未知 SNI 以及 SNI 与 Host 不一致的请求
-- ACME 支持 Let's Encrypt 生产环境、测试环境和自定义目录，通过 HTTP-01 自动签发和续期证书
+- ACME 支持 Let's Encrypt 生产环境、测试环境和自定义目录，可选择保持兼容的 HTTP-01，或使用 Cloudflare DNS-01 自动签发和续期证书
+- DNS-01 支持 `certificate_identifier=*.example.com` 通配符证书；通配符必须覆盖路由域名且不会在 HTTP-01 模式下被接受
+- Cloudflare Token 仅从 `LINKLAKE_CLOUDFLARE_API_TOKEN` 或 `LINKLAKE_CLOUDFLARE_API_TOKEN_FILE` 读取；管理 API、SQLite、审计事件和状态响应都不接收或回显原始 Token
 - Web UI 提供中英文 ACME 设置、路由 TLS 开关、立即签发/续期、证书状态和错误展示
 - 可在证书生效后使用 `308` 将 HTTP 跳转到 HTTPS；HTTP-01 挑战路径始终保持明文可达
 - 公网明文入口自动识别 HTTP/1.1 和 HTTP/2 prior knowledge；原生 HTTPS 通过 ALPN 优先协商 `h2`，并保留 `http/1.1` 回退
 - 普通 HTTP/2 请求会转换为 HTTP/1.1 后端请求以兼容现有网站；`Content-Type: application/grpc` 的原生 gRPC 请求使用持久化 h2c 后端连接池
 - gRPC 支持长流、双向流、trailers、取消、连接复用、GOAWAY 排空与后续连接恢复；策略并发限制按 HTTP/2 流生效
 - 当前 gRPC 本地目标必须提供明文 HTTP/2 prior knowledge（h2c），暂不支持 h2c Upgrade 或本地目标 TLS；详细边界见 [HTTP/2 与 gRPC 指南](docs/http2-grpc.md)
-- WebSocket/WSS 继续使用 HTTP/1.1 Upgrade；不支持需要 DNS-01 的通配符证书
+- WebSocket/WSS 继续使用 HTTP/1.1 Upgrade；Cloudflare DNS-01 与通配符证书已支持，HTTP-01 与 DNS-01 均沿用现有路由和证书生命周期
 
 使用前需要把路由域名的 DNS 记录指向 LinkLake 服务端。HTTP-01 要求公网 80 端口能够按原始 Host 到达 `LINKLAKE_HTTP_BIND`；业务 HTTPS 的公网 443 端口必须把 TLS 原样送到 `LINKLAKE_HTTPS_BIND`，由 LinkLake 完成 SNI 选证书和 TLS 终止。
+
+DNS-01 不要求公网 80 端口可达。Cloudflare Token 应至少限制到目标 Zone 的读取与 DNS 编辑权限，推荐通过权限为 `0600` 的 secret file 注入。服务端只读返回 `cloudflare_token_configured`；切勿把 Token 放入 ACME API 请求、命令行参数、仓库或数据库。
 
 如果前置 Nginx 已在 443 终止业务 TLS，LinkLake 托管的证书不会被使用。应让 LinkLake 直接监听 443，或使用 Nginx `stream` 按 SNI 做 TCP 透传；管理界面可以继续使用独立的管理 TLS 入口。80 端口可以普通反向代理到 LinkLake，但不得重写 Host 或拦截 `/.well-known/acme-challenge/`。
 
@@ -446,13 +450,13 @@ sh scripts/package-manager-linux.sh
 sh scripts/verify-manager-linux.sh
 ```
 
-TCP 端到端测试覆盖真实二进制回显、限速、连接限制、重连、策略生命周期、配对超时和指标。UDP 端到端测试覆盖同一业务端口的 IPv4/IPv6 双栈回显、`0` 到 `65507` 字节真实数据报回显、多会话、限速丢包、空闲回收、分片重组、策略生命周期、重连、TCP/UDP 同数值端口、TCP/UDP 连续端口组的全部映射及指标；生产验收还覆盖独立公网服务器、Linux 服务端和 Windows 客户端。TLS SNI E2E 使用真实自签名目标和 .NET `SslStream`，覆盖原始 ClientHello 透传、真实 TLS 握手/回显、未知 SNI 拒绝、启停恢复、删除和指标。Secret E2E 覆盖托管目标端、一次性密钥隔离、访问客户端白名单、错误密钥、连接限制、启停恢复、删除失效、统计、两个独立客户端之间的真实 P2P 直连、不可达候选下的显式中继回退，以及服务端无公网业务监听。SOCKS5 E2E 覆盖托管出口、一次性密码隔离、强制认证、错误密码、域名/IPv4 CONNECT、IPv4/IPv6 公网传输下的真实 UDP ASSOCIATE 回显、UDP 分片拒绝、TCP 控制连接生命周期、BIND 拒绝、连接限制、策略恢复和指标。HTTP E2E 同时覆盖 Host 路由以及正向代理的一次性密码、强制/错误认证、absolute-form 改写、凭据隔离、GET/POST 请求体、请求走私拒绝、真实 CONNECT 隧道、连接限制、客户端重连、策略生命周期和指标。HTTPS/ACME 测试在 Linux CI 中使用本地 Pebble 服务，覆盖 HTTP-01、SNI、证书签发与续期、HTTPS 转发、跳转、持久化、失败恢复和证书指标，不访问公网证书机构。
+TCP 端到端测试覆盖真实二进制回显、限速、连接限制、重连、策略生命周期、配对超时和指标。UDP 端到端测试覆盖同一业务端口的 IPv4/IPv6 双栈回显、`0` 到 `65507` 字节真实数据报回显、多会话、限速丢包、空闲回收、分片重组、策略生命周期、重连、TCP/UDP 同数值端口、TCP/UDP 连续端口组的全部映射及指标；生产验收还覆盖独立公网服务器、Linux 服务端和 Windows 客户端。TLS SNI E2E 使用真实自签名目标和 .NET `SslStream`，覆盖原始 ClientHello 透传、真实 TLS 握手/回显、未知 SNI 拒绝、启停恢复、删除和指标。Secret E2E 覆盖托管目标端、一次性密钥隔离、访问客户端白名单、错误密钥、连接限制、启停恢复、删除失效、统计、两个独立客户端之间的真实 P2P 直连、不可达候选下的显式中继回退，以及服务端无公网业务监听。SOCKS5 E2E 覆盖托管出口、一次性密码隔离、强制认证、错误密码、域名/IPv4 CONNECT、IPv4/IPv6 公网传输下的真实 UDP ASSOCIATE 回显、UDP 分片拒绝、TCP 控制连接生命周期、BIND 拒绝、连接限制、策略恢复和指标。HTTP E2E 同时覆盖 Host 路由以及正向代理的一次性密码、强制/错误认证、absolute-form 改写、凭据隔离、GET/POST 请求体、请求走私拒绝、真实 CONNECT 隧道、连接限制、客户端重连、策略生命周期和指标。HTTPS/ACME 测试在 Linux CI 中使用本地 Pebble 与 Cloudflare/DoH Mock，覆盖 HTTP-01、DNS-01、通配符 SNI、TXT 生命周期、证书签发与续期、HTTPS 转发、跳转、持久化、失败恢复和证书指标，不访问公网证书机构或真实 Cloudflare API。
 
 macOS 使用 `scripts/package-macos.sh`、`scripts/verify-macos-package.sh`、`scripts/package-manager-macos.sh` 和 `scripts/verify-manager-macos.sh` 构建并校验核心服务与 Flutter 管理客户端。
 
 打包脚本支持 `SOURCE_DATE_EPOCH`。设置相同时间戳并使用相同源码、工具链、目标平台和锁定依赖时，归档内的文件顺序、时间和发布清单保持稳定。Windows 生成 ZIP 和 SHA-256，Linux/macOS 生成 tar.gz 和 SHA-256；三个平台均同时生成 LinkLake 核心包和 LinkLake Manager 包。
 
-`.github/workflows/ci.yml` 会在推送和拉取请求中执行格式、Clippy、单元测试、脚本语法检查、Windows TCP/UDP/HTTP/TLS SNI/Secret-P2P/SOCKS5 E2E、Linux Pebble HTTPS/ACME E2E，以及 Flutter Manager 的 Windows/Linux/macOS 分析、测试和 Release 构建。`.github/workflows/soak.yml` 每周或手动运行长稳、弱网、崩溃、重启、并发与吞吐矩阵。`.github/workflows/release.yml` 会构建三个平台的核心包和管理客户端包；正式标签发布还会校验全部 SHA-256 旁车文件，生成 SPDX SBOM，并为同一组发布资产创建 GitHub build provenance 与 SBOM 证明，最后才生成 LinkLake Ed25519 清单并上传 Release。全部 GitHub Actions 都固定到完整提交 SHA，发布任务只恢复缓存且不写入缓存，checkout 不保留 Git 凭据。完整说明见 [`docs/release-supply-chain.zh-CN.md`](docs/release-supply-chain.zh-CN.md)。
+`.github/workflows/ci.yml` 会在推送和拉取请求中执行格式、Clippy、单元测试、脚本语法检查、Windows TCP/UDP/HTTP/TLS SNI/Secret-P2P/SOCKS5 E2E、Linux Pebble HTTP-01/Cloudflare DNS-01 E2E，以及 Flutter Manager 的 Windows/Linux/macOS 分析、测试和 Release 构建。`.github/workflows/soak.yml` 每周或手动运行长稳、弱网、崩溃、重启、并发与吞吐矩阵。`.github/workflows/release.yml` 会构建三个平台的核心包和管理客户端包；正式标签发布还会校验全部 SHA-256 旁车文件，生成 SPDX SBOM，并为同一组发布资产创建 GitHub build provenance 与 SBOM 证明，最后才生成 LinkLake Ed25519 清单并上传 Release。全部 GitHub Actions 都固定到完整提交 SHA，发布任务只恢复缓存且不写入缓存，checkout 不保留 Git 凭据。完整说明见 [`docs/release-supply-chain.zh-CN.md`](docs/release-supply-chain.zh-CN.md)。
 
 ## 后续路线
 
