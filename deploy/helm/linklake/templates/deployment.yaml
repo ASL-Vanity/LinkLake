@@ -1,0 +1,211 @@
+{{- $authSecret := required "auth.existingSecret is required" .Values.auth.existingSecret -}}
+{{- $managementSecret := required "tls.managementSecret is required" .Values.tls.managementSecret -}}
+{{- $controlSecret := required "tls.controlSecret is required" .Values.tls.controlSecret -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "linklake.fullname" . }}
+  labels:
+    {{- include "linklake.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "linklake.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "linklake.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "linklake.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: linklake-server
+          image: "{{ .Values.image.repository }}:{{ default .Chart.AppVersion .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - name: LINKLAKE_BIND
+              value: "0.0.0.0:{{ .Values.server.managementPort }}"
+            - name: LINKLAKE_CONTROL_BIND
+              value: "0.0.0.0:{{ .Values.server.controlPort }}"
+            - name: LINKLAKE_DATA_DIR
+              value: /var/lib/linklake
+            - name: LINKLAKE_LOG_DIR
+              value: /var/log/linklake
+            - name: LINKLAKE_PUBLIC_PORT_RANGES
+              value: {{ .Values.server.publicPortRanges | quote }}
+            - name: LINKLAKE_RESERVED_TCP_PORTS
+              value: {{ .Values.server.reservedTcpPorts | quote }}
+            - name: LINKLAKE_RESERVED_UDP_PORTS
+              value: {{ .Values.server.reservedUdpPorts | quote }}
+            - name: LINKLAKE_UDP_PUBLIC_BIND_MODE
+              value: {{ .Values.server.udpPublicBindMode | quote }}
+            - name: LINKLAKE_MANAGEMENT_CERT_PATH
+              value: /etc/linklake/management/tls.crt
+            - name: LINKLAKE_MANAGEMENT_KEY_PATH
+              value: /etc/linklake/management/tls.key
+            - name: LINKLAKE_CONTROL_CERT_PATH
+              value: /etc/linklake/control/tls.crt
+            - name: LINKLAKE_CONTROL_KEY_PATH
+              value: /etc/linklake/control/tls.key
+            - name: LINKLAKE_ENROLLMENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $authSecret }}
+                  key: {{ .Values.auth.enrollmentTokenKey }}
+            - name: LINKLAKE_ADMIN_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $authSecret }}
+                  key: {{ .Values.auth.adminUsernameKey }}
+            - name: LINKLAKE_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $authSecret }}
+                  key: {{ .Values.auth.adminPasswordKey }}
+            - name: LINKLAKE_MANAGEMENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $authSecret }}
+                  key: {{ .Values.auth.managementTokenKey }}
+                  optional: true
+            {{- if .Values.server.http.enabled }}
+            - name: LINKLAKE_HTTP_BIND
+              value: "0.0.0.0:{{ .Values.server.http.port }}"
+            {{- end }}
+            {{- if .Values.server.https.enabled }}
+            - name: LINKLAKE_HTTPS_BIND
+              value: "0.0.0.0:{{ .Values.server.https.port }}"
+            {{- end }}
+            {{- if .Values.server.sni.enabled }}
+            - name: LINKLAKE_TLS_PASSTHROUGH_BIND
+              value: "0.0.0.0:{{ .Values.server.sni.port }}"
+            {{- end }}
+            {{- if .Values.server.udpRelay.enabled }}
+            - name: LINKLAKE_UDP_RELAY_BIND
+              value: "0.0.0.0:{{ .Values.server.udpRelay.port }}"
+            - name: LINKLAKE_UDP_RELAY_ENDPOINT
+              value: {{ required "server.udpRelay.advertisedEndpoint is required when UDP relay is enabled" .Values.server.udpRelay.advertisedEndpoint | quote }}
+            - name: LINKLAKE_UDP_RELAY_SERVER_NAME
+              value: {{ required "server.udpRelay.serverName is required when UDP relay is enabled" .Values.server.udpRelay.serverName | quote }}
+            {{- end }}
+            {{- with .Values.server.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: management
+              containerPort: {{ .Values.server.managementPort }}
+              protocol: TCP
+            - name: control
+              containerPort: {{ .Values.server.controlPort }}
+              protocol: TCP
+            {{- if .Values.server.http.enabled }}
+            - name: http
+              containerPort: {{ .Values.server.http.port }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.server.https.enabled }}
+            - name: https
+              containerPort: {{ .Values.server.https.port }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.server.udpRelay.enabled }}
+            - name: udp-relay
+              containerPort: {{ .Values.server.udpRelay.port }}
+              protocol: UDP
+            {{- end }}
+            {{- if .Values.server.sni.enabled }}
+            - name: sni
+              containerPort: {{ .Values.server.sni.port }}
+              protocol: TCP
+            {{- end }}
+          startupProbe:
+            httpGet:
+              path: /startupz
+              port: management
+              scheme: HTTPS
+            {{- toYaml .Values.probes.startup | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: management
+              scheme: HTTPS
+            {{- toYaml .Values.probes.readiness | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: management
+              scheme: HTTPS
+            {{- toYaml .Values.probes.liveness | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/linklake
+            - name: logs
+              mountPath: /var/log/linklake
+            - name: tmp
+              mountPath: /tmp
+            - name: management-tls
+              mountPath: /etc/linklake/management
+              readOnly: true
+            - name: control-tls
+              mountPath: /etc/linklake/control
+              readOnly: true
+      volumes:
+        - name: data
+          {{- if .Values.persistence.data.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "linklake.dataClaimName" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: logs
+          {{- if .Values.persistence.logs.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "linklake.logsClaimName" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: tmp
+          emptyDir: {}
+        - name: management-tls
+          secret:
+            secretName: {{ $managementSecret }}
+        - name: control-tls
+          secret:
+            secretName: {{ $controlSecret }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

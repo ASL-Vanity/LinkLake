@@ -1,0 +1,61 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "linklake.fullname" . }}-data
+  labels:
+    {{- include "linklake.labels" . | nindent 4 }}
+  {{- with .Values.services.data.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.services.data.type }}
+  {{- if and (eq .Values.services.data.type "LoadBalancer") .Values.services.data.loadBalancerIP }}
+  loadBalancerIP: {{ .Values.services.data.loadBalancerIP }}
+  {{- end }}
+  {{- if or (eq .Values.services.data.type "LoadBalancer") (eq .Values.services.data.type "NodePort") }}
+  externalTrafficPolicy: {{ .Values.services.data.externalTrafficPolicy }}
+  {{- end }}
+  selector:
+    {{- include "linklake.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: control
+      port: {{ .Values.server.controlPort }}
+      targetPort: control
+      protocol: TCP
+    {{- if .Values.server.http.enabled }}
+    - name: http
+      port: {{ .Values.server.http.port }}
+      targetPort: http
+      protocol: TCP
+    {{- end }}
+    {{- if .Values.server.https.enabled }}
+    - name: https
+      port: {{ .Values.server.https.port }}
+      targetPort: https
+      protocol: TCP
+    {{- end }}
+    {{- if .Values.server.udpRelay.enabled }}
+    - name: udp-relay
+      port: {{ .Values.server.udpRelay.port }}
+      targetPort: udp-relay
+      protocol: UDP
+    {{- end }}
+    {{- if .Values.server.sni.enabled }}
+    - name: sni
+      port: {{ .Values.server.sni.port }}
+      targetPort: sni
+      protocol: TCP
+    {{- end }}
+    {{- range .Values.services.data.publicTcpPorts }}
+    - name: tcp-{{ . }}
+      port: {{ . }}
+      targetPort: {{ . }}
+      protocol: TCP
+    {{- end }}
+    {{- range .Values.services.data.publicUdpPorts }}
+    - name: udp-{{ . }}
+      port: {{ . }}
+      targetPort: {{ . }}
+      protocol: UDP
+    {{- end }}

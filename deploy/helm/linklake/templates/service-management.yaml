@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "linklake.fullname" . }}-management
+  labels:
+    {{- include "linklake.labels" . | nindent 4 }}
+  {{- with .Values.services.management.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.services.management.type }}
+  selector:
+    {{- include "linklake.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: management
+      port: {{ .Values.server.managementPort }}
+      targetPort: management
+      protocol: TCP

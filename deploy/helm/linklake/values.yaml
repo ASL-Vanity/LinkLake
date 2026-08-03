@@ -1,0 +1,132 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/asl-vanity/linklake
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+auth:
+  # 该 Secret 必须由部署方预先创建，Chart 不接受或渲染明文凭据。
+  existingSecret: ""
+  enrollmentTokenKey: enrollment-token
+  adminUsernameKey: admin-username
+  adminPasswordKey: admin-password
+  managementTokenKey: management-token
+
+tls:
+  # 两个 Secret 均使用标准 kubernetes.io/tls 的 tls.crt / tls.key。
+  managementSecret: ""
+  controlSecret: ""
+
+server:
+  managementPort: 32100
+  controlPort: 32101
+  http:
+    enabled: true
+    port: 32102
+  https:
+    enabled: true
+    port: 32103
+  udpRelay:
+    enabled: true
+    port: 32104
+    advertisedEndpoint: relay.example.com:32104
+    serverName: relay.example.com
+  sni:
+    enabled: true
+    port: 32105
+  publicPortRanges: 1024-65535
+  reservedTcpPorts: 22,32100-32105
+  reservedUdpPorts: 53,32104
+  udpPublicBindMode: auto
+  extraEnv: []
+
+services:
+  management:
+    type: ClusterIP
+    annotations: {}
+  data:
+    type: LoadBalancer
+    annotations: {}
+    externalTrafficPolicy: Local
+    loadBalancerIP: ""
+    publicTcpPorts: []
+    publicUdpPorts: []
+
+persistence:
+  data:
+    enabled: true
+    existingClaim: ""
+    storageClass: ""
+    accessModes: [ReadWriteOnce]
+    size: 10Gi
+  logs:
+    enabled: true
+    existingClaim: ""
+    storageClass: ""
+    accessModes: [ReadWriteOnce]
+    size: 5Gi
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "2"
+    memory: 1Gi
+
+probes:
+  startup:
+    failureThreshold: 60
+    periodSeconds: 2
+    timeoutSeconds: 2
+  readiness:
+    failureThreshold: 3
+    periodSeconds: 5
+    timeoutSeconds: 2
+  liveness:
+    failureThreshold: 3
+    periodSeconds: 10
+    timeoutSeconds: 2
+
+terminationGracePeriodSeconds: 60
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+networkPolicy:
+  enabled: false
+  managementFrom: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
