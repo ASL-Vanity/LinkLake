@@ -20,6 +20,7 @@ mod lifecycle;
 mod notifications;
 mod p2p_control;
 mod p2p_node_catalog;
+mod policy_service;
 mod public_port_policy;
 mod secret_tunnel;
 mod secret_tunnel_catalog;
@@ -61,6 +62,7 @@ use clap::{Parser, Subcommand};
 use client_registry::{Authentication, ClientRegistry, UpdateClient};
 use database::Database;
 use dual_stack_udp::{DualStackUdpSocket, PublicUdpBindMode};
+use ed25519_dalek::{Signature, VerifyingKey};
 use fleet::{FleetCatalog, FleetImportResult, FleetPeer, FleetPolicyBundle, UpsertFleetPeer};
 use http_route_catalog::{
     CreateHttpRouteError, CreateHttpRoutePolicy, HttpRouteCatalog, HttpRoutePolicy,
@@ -68,13 +70,17 @@ use http_route_catalog::{
 };
 use lifecycle::{LifecycleController, LifecyclePhase, LifecycleSnapshot, LifecycleTransitionError};
 use linklake_core::{
-    managed_config_revision, BoxedIo, BuildInfo, ClientEnrollmentRequest, ClientEnrollmentResponse,
-    ManagedClientConfig, ManagedHttpProxy, ManagedHttpRoute, ManagedSecretTunnel,
-    ManagedSocks5Proxy, ManagedTcpTunnel, ManagedTlsRoute, ManagedUdpTunnel, API_VERSION,
-    PRODUCT_NAME,
+    agent_enrollment_message, agent_instance_id_from_public_key, managed_config_revision, BoxedIo,
+    BuildInfo, ClientEnrollmentRequest, ClientEnrollmentResponse, ManagedClientConfig,
+    ManagedHttpProxy, ManagedHttpRoute, ManagedSecretTunnel, ManagedSocks5Proxy, ManagedTcpTunnel,
+    ManagedTlsRoute, ManagedUdpTunnel, API_VERSION, PRODUCT_NAME,
 };
 use linklake_update::{SignaturePolicy, UpdateChannel, UpdateProduct};
 use p2p_node_catalog::{P2pNodeCatalog, P2pNodeRecord};
+use policy_service::{
+    BindFleetCredential, FleetCredentialBinding, FleetPolicyKind, FleetReconcileRequest,
+    FleetReconcileResult, FleetRuntimeInvalidation, FleetSourceStatus, PolicyService,
+};
 use public_port_policy::{PublicPortPolicy, PublicPortPolicyView};
 use rusqlite::{params, Connection};
 use secret_tunnel_catalog::{
@@ -317,6 +323,8 @@ struct AppState {
     audit: Mutex<AuditLog>,
     alerts: Mutex<AlertCatalog>,
     fleet: Mutex<FleetCatalog>,
+    policy_service: PolicyService,
+    policy_mutation_lock: AsyncMutex<()>,
     traffic_controls: Mutex<TrafficControlCatalog>,
     management_cookies_secure: bool,
     public_port_policy: PublicPortPolicy,
@@ -386,6 +394,11 @@ struct ServerCounters {
     udp_public_ipv6_bind_successes_total: AtomicU64,
     udp_public_ipv6_bind_fallbacks_total: AtomicU64,
     udp_public_bind_failures_total: AtomicU64,
+    fleet_reconcile_attempts_total: AtomicU64,
+    fleet_reconcile_successes_total: AtomicU64,
+    fleet_reconcile_failures_total: AtomicU64,
+    fleet_reconcile_conflicts_total: AtomicU64,
+    fleet_reconcile_replays_total: AtomicU64,
 }
 
 #[derive(Clone, Copy)]
@@ -861,6 +874,11 @@ struct MetricsResponse {
     registration_rejections_total: u64,
     authentication_failures_total: u64,
     http_transport_capabilities: HttpTransportCapabilitiesView,
+    fleet_reconcile_attempts_total: u64,
+    fleet_reconcile_successes_total: u64,
+    fleet_reconcile_failures_total: u64,
+    fleet_reconcile_conflicts_total: u64,
+    fleet_reconcile_replays_total: u64,
     http_active_connections: usize,
     http_requests_total: u64,
     http_failed_requests: u64,
@@ -1065,7 +1083,12 @@ struct FleetPeerSyncResult {
     peer_id: Uuid,
     peer_name: String,
     created: usize,
+    updated: usize,
+    deleted: usize,
     unchanged: usize,
+    generation: Option<u64>,
+    revision: Option<String>,
+    idempotent: bool,
     conflicts: Vec<String>,
     error: Option<String>,
 }
@@ -2118,15 +2141,20 @@ async fn run_server(
             );
         }
     }
+    if let Some(plan) = migration_plan {
+        plan.finish()?;
+    }
     let certificate_manager = data_dir
         .as_ref()
         .map(|data_dir| CertificateManager::new(data_dir.clone()))
         .transpose()?;
     let management_cookies_secure = management_tls.is_some();
+    let policy_service = PolicyService::open_with_database(&database, public_port_policy.clone())?;
+    let instance_id = policy_service.local_instance_id()?.to_string();
     let state = Arc::new(AppState {
         _database: database.clone(),
         started_at: Instant::now(),
-        instance_id: uuid::Uuid::new_v4().to_string(),
+        instance_id,
         lifecycle: LifecycleController::new(unix_seconds()),
         enrollment_token,
         management_token: configured_management_token,
@@ -2137,6 +2165,8 @@ async fn run_server(
         audit: Mutex::new(AuditLog::open_with_database(&database)?),
         alerts: Mutex::new(AlertCatalog::open_with_database(&database)?),
         fleet: Mutex::new(FleetCatalog::open_with_database(&database)?),
+        policy_service,
+        policy_mutation_lock: AsyncMutex::new(()),
         traffic_controls: Mutex::new(TrafficControlCatalog::open_with_database(&database)?),
         management_cookies_secure,
         public_port_policy: public_port_policy.clone(),
@@ -2184,9 +2214,6 @@ async fn run_server(
             METRICS_HISTORY_ARCHIVE_CAPACITY,
         )?),
     });
-    if let Some(plan) = migration_plan {
-        plan.finish()?;
-    }
     restore_managed_certificates(&state)?;
     let app = Router::new()
         .route("/", get(management_ui))
@@ -2283,6 +2310,24 @@ async fn run_server(
         .route("/api/v1/fleet/overview", get(fleet_overview))
         .route("/api/v1/fleet/import", post(import_fleet_policies))
         .route("/api/v1/fleet/sync", post(sync_fleet_policies))
+        .route("/api/v1/fleet/v2/bundle", post(export_fleet_bundle_v2))
+        .route(
+            "/api/v1/fleet/v2/reconcile",
+            post(reconcile_fleet_bundle_v2),
+        )
+        .route("/api/v1/fleet/v2/sources", get(list_fleet_sources_v2))
+        .route(
+            "/api/v1/fleet/v2/sources/:source_instance_id",
+            axum::routing::delete(reset_fleet_source_v2),
+        )
+        .route(
+            "/api/v1/fleet/v2/credentials",
+            get(list_fleet_credential_bindings).put(bind_fleet_credential),
+        )
+        .route(
+            "/api/v1/fleet/v2/credentials/:source_instance_id/:kind/:credential_ref",
+            axum::routing::delete(delete_fleet_credential_binding),
+        )
         .route(
             "/api/v1/traffic-controls/:kind/:policy_id",
             get(get_traffic_control)
@@ -2398,6 +2443,10 @@ async fn run_server(
         .route("/api/v1/clients/enroll", post(enroll_client))
         .route("/api/v1/clients/:client_id/heartbeat", post(heartbeat))
         .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            enforce_fleet_ownership,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             enforce_management_role,
@@ -3288,6 +3337,26 @@ async fn metrics(
             .authentication_failures_total
             .load(Ordering::Relaxed),
         http_transport_capabilities: HttpTransportCapabilitiesView::default(),
+        fleet_reconcile_attempts_total: state
+            .metrics
+            .fleet_reconcile_attempts_total
+            .load(Ordering::Relaxed),
+        fleet_reconcile_successes_total: state
+            .metrics
+            .fleet_reconcile_successes_total
+            .load(Ordering::Relaxed),
+        fleet_reconcile_failures_total: state
+            .metrics
+            .fleet_reconcile_failures_total
+            .load(Ordering::Relaxed),
+        fleet_reconcile_conflicts_total: state
+            .metrics
+            .fleet_reconcile_conflicts_total
+            .load(Ordering::Relaxed),
+        fleet_reconcile_replays_total: state
+            .metrics
+            .fleet_reconcile_replays_total
+            .load(Ordering::Relaxed),
         http_active_connections: http_statistics
             .values()
             .map(|statistics| statistics.active_connections.load(Ordering::Relaxed))
@@ -6206,6 +6275,13 @@ async fn rotate_client_token(
             "unknown_client",
             "client does not exist",
         ))?;
+    let agent_instance_id = state
+        .clients
+        .lock()
+        .expect("client registry lock poisoned")
+        .summary_by_id(client_id)
+        .expect("rotated client still exists")
+        .agent_instance_id;
     record_audit(
         &state,
         "client.token.rotated",
@@ -6214,6 +6290,7 @@ async fn rotate_client_token(
     );
     Ok(Json(ClientEnrollmentResponse {
         client_id,
+        agent_instance_id: Some(agent_instance_id),
         client_token,
     }))
 }
@@ -6735,6 +6812,237 @@ async fn fleet_overview(
     }))
 }
 
+async fn export_fleet_bundle_v2(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<linklake_core::fleet_protocol::FleetBundleV2>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    state
+        .policy_service
+        .export_bundle(unix_seconds())
+        .map(Json)
+        .map_err(coded_policy_service_error)
+}
+
+async fn reconcile_fleet_bundle_v2(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<FleetReconcileRequest>,
+) -> Result<Json<FleetReconcileResult>, CodedApiError> {
+    let source_instance_id = request.bundle.source_instance_id;
+    let principal = require_fleet_source(&state, &headers, source_instance_id)?;
+    // 与普通策略写入串行化，避免 ownership 检查和实际 CRUD 之间出现竞态窗口。
+    let _mutation_guard = state.policy_mutation_lock.lock().await;
+    state
+        .metrics
+        .fleet_reconcile_attempts_total
+        .fetch_add(1, Ordering::Relaxed);
+    let result = match state.policy_service.reconcile(request, unix_seconds()) {
+        Ok(result) => result,
+        Err(error) => {
+            state
+                .metrics
+                .fleet_reconcile_failures_total
+                .fetch_add(1, Ordering::Relaxed);
+            record_audit(
+                &state,
+                "fleet.v2.reconcile.failed",
+                &source_instance_id.to_string(),
+                &format!("actor={}; {}", principal.username, error),
+            );
+            return Err(coded_policy_service_error(error));
+        }
+    };
+    if !result.conflicts.is_empty() {
+        state
+            .metrics
+            .fleet_reconcile_conflicts_total
+            .fetch_add(result.conflicts.len() as u64, Ordering::Relaxed);
+        record_audit(
+            &state,
+            "fleet.v2.reconcile.conflicted",
+            &result.source_instance_id.to_string(),
+            &format!(
+                "generation={}; revision={}; conflicts={}; dry_run={}",
+                result.generation,
+                result.revision,
+                result.conflicts.len(),
+                result.dry_run
+            ),
+        );
+    } else if result.idempotent {
+        state
+            .metrics
+            .fleet_reconcile_replays_total
+            .fetch_add(1, Ordering::Relaxed);
+    } else if result.applied {
+        apply_fleet_runtime_invalidations(&state, &result.runtime_invalidations);
+        state
+            .traffic_controls
+            .lock()
+            .expect("traffic control catalog lock poisoned")
+            .reset_runtime_state();
+        state
+            .metrics
+            .fleet_reconcile_successes_total
+            .fetch_add(1, Ordering::Relaxed);
+        record_audit(
+            &state,
+            "fleet.v2.reconcile.applied",
+            &result.source_instance_id.to_string(),
+            &format!(
+                "generation={}; revision={}; created={}; updated={}; deleted={}; unchanged={}",
+                result.generation,
+                result.revision,
+                result.created,
+                result.updated,
+                result.deleted,
+                result.unchanged
+            ),
+        );
+    }
+    Ok(Json(result))
+}
+
+async fn list_fleet_sources_v2(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<FleetSourceStatus>>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    state
+        .policy_service
+        .list_sources()
+        .map(Json)
+        .map_err(coded_policy_service_error)
+}
+
+async fn reset_fleet_source_v2(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(source_instance_id): Path<Uuid>,
+) -> Result<StatusCode, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    if !state
+        .policy_service
+        .reset_source_state(source_instance_id)
+        .map_err(coded_policy_service_error)?
+    {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "fleet_source_not_found",
+            "Fleet source state does not exist",
+        ));
+    }
+    record_audit(
+        &state,
+        "fleet.v2.source.reset",
+        &source_instance_id.to_string(),
+        &format!(
+            "actor={}; ownership retained; the next authorized bundle establishes generation again",
+            principal.username
+        ),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_fleet_credential_bindings(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<FleetCredentialBinding>>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    state
+        .policy_service
+        .list_credential_bindings()
+        .map(Json)
+        .map_err(coded_policy_service_error)
+}
+
+async fn bind_fleet_credential(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<BindFleetCredential>,
+) -> Result<Json<FleetCredentialBinding>, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    let binding = state
+        .policy_service
+        .bind_credential(request, unix_seconds())
+        .map_err(coded_policy_service_error)?;
+    record_audit(
+        &state,
+        "fleet.v2.credential.bound",
+        &binding.credential_ref.to_string(),
+        &format!(
+            "actor={}; source={}; kind={}; policy_id={}",
+            principal.username,
+            binding.source_instance_id,
+            binding.kind.as_str(),
+            binding.policy_id
+        ),
+    );
+    Ok(Json(binding))
+}
+
+async fn delete_fleet_credential_binding(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((source_instance_id, kind, credential_ref)): Path<(Uuid, String, Uuid)>,
+) -> Result<StatusCode, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    let kind = FleetPolicyKind::parse(&kind).map_err(coded_policy_service_error)?;
+    if !state
+        .policy_service
+        .delete_credential_binding(source_instance_id, kind, credential_ref)
+        .map_err(coded_policy_service_error)?
+    {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "fleet_credential_binding_not_found",
+            "Fleet credential binding does not exist",
+        ));
+    }
+    record_audit(
+        &state,
+        "fleet.v2.credential.unbound",
+        &credential_ref.to_string(),
+        &format!(
+            "actor={}; source={}; kind={}",
+            principal.username,
+            source_instance_id,
+            kind.as_str()
+        ),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn apply_fleet_runtime_invalidations(state: &AppState, invalidations: &[FleetRuntimeInvalidation]) {
+    let mut seen = HashSet::new();
+    for invalidation in invalidations {
+        let key = format!("{invalidation:?}");
+        if !seen.insert(key) {
+            continue;
+        }
+        match invalidation {
+            FleetRuntimeInvalidation::TcpPort(port) => tcp_tunnel::stop_public_port(state, *port),
+            FleetRuntimeInvalidation::UdpPort(port) => udp_tunnel::stop_public_port(state, *port),
+            FleetRuntimeInvalidation::HttpHostname(hostname) => {
+                http_tunnel::stop_hostname(state, hostname)
+            }
+            FleetRuntimeInvalidation::SniHostname(hostname) => {
+                sni_tunnel::stop_hostname(state, hostname)
+            }
+            FleetRuntimeInvalidation::SecretTunnel(policy_id) => {
+                secret_tunnel::stop_policy(state, *policy_id)
+            }
+            FleetRuntimeInvalidation::Socks5Proxy(policy_id) => {
+                socks5_tunnel::stop_policy(state, *policy_id)
+            }
+            FleetRuntimeInvalidation::HttpProxy(policy_id) => {
+                http_proxy_tunnel::stop_policy(state, *policy_id)
+            }
+        }
+    }
+}
+
 async fn import_fleet_policies(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -6786,7 +7094,7 @@ async fn sync_fleet_policies(
         .lock()
         .expect("client registry lock poisoned")
         .summaries();
-    let bundle = fleet::export_policy_bundle(
+    let legacy_bundle = fleet::export_policy_bundle(
         &clients,
         &state
             .tunnel_catalog
@@ -6794,6 +7102,10 @@ async fn sync_fleet_policies(
             .expect("tunnel catalog lock poisoned"),
     )
     .map_err(coded_fleet_error)?;
+    let bundle = state
+        .policy_service
+        .export_bundle(unix_seconds())
+        .map_err(coded_policy_service_error)?;
     let peers = state
         .fleet
         .lock()
@@ -6818,39 +7130,130 @@ async fn sync_fleet_policies(
                 peer_id: peer.id,
                 peer_name: peer.name,
                 created: 0,
+                updated: 0,
+                deleted: 0,
                 unchanged: 0,
+                generation: None,
+                revision: None,
+                idempotent: false,
                 conflicts: Vec::new(),
                 error: Some("management token environment variable is not configured".to_owned()),
             });
             continue;
         };
         let response = client
-            .post(format!("{}/api/v1/fleet/import", peer.url))
-            .bearer_auth(token)
-            .json(&FleetImportRequest {
+            .post(format!("{}/api/v1/fleet/v2/reconcile", peer.url))
+            .bearer_auth(&token)
+            .json(&FleetReconcileRequest {
                 bundle: bundle.clone(),
                 dry_run: request.dry_run,
+                expected_generation: None,
+                expected_revision: None,
             })
             .send()
             .await;
         match response {
             Ok(response) if response.status().is_success() => {
-                match response.json::<FleetImportResult>().await {
-                    Ok(imported) => results.push(FleetPeerSyncResult {
+                match response.json::<FleetReconcileResult>().await {
+                    Ok(reconciled) => results.push(FleetPeerSyncResult {
                         peer_id: peer.id,
                         peer_name: peer.name,
-                        created: imported.created,
-                        unchanged: imported.unchanged,
-                        conflicts: imported.conflicts,
+                        created: reconciled.created,
+                        updated: reconciled.updated,
+                        deleted: reconciled.deleted,
+                        unchanged: reconciled.unchanged,
+                        generation: Some(reconciled.generation),
+                        revision: Some(reconciled.revision),
+                        idempotent: reconciled.idempotent,
+                        conflicts: reconciled
+                            .conflicts
+                            .into_iter()
+                            .map(|conflict| conflict.message)
+                            .collect(),
                         error: None,
                     }),
                     Err(error) => results.push(FleetPeerSyncResult {
                         peer_id: peer.id,
                         peer_name: peer.name,
                         created: 0,
+                        updated: 0,
+                        deleted: 0,
                         unchanged: 0,
+                        generation: None,
+                        revision: None,
+                        idempotent: false,
                         conflicts: Vec::new(),
                         error: Some(format!("invalid peer response: {error}")),
+                    }),
+                }
+            }
+            Ok(response) if response.status() == StatusCode::NOT_FOUND => {
+                // 旧 RC 节点没有 v2 路由时，仅回退到原 TCP/UDP 导入；不会把任何秘密塞进兼容负载。
+                let legacy = client
+                    .post(format!("{}/api/v1/fleet/import", peer.url))
+                    .bearer_auth(&token)
+                    .json(&FleetImportRequest {
+                        bundle: legacy_bundle.clone(),
+                        dry_run: request.dry_run,
+                    })
+                    .send()
+                    .await;
+                match legacy {
+                    Ok(response) if response.status().is_success() => {
+                        match response.json::<FleetImportResult>().await {
+                            Ok(imported) => results.push(FleetPeerSyncResult {
+                                peer_id: peer.id,
+                                peer_name: peer.name,
+                                created: imported.created,
+                                updated: 0,
+                                deleted: 0,
+                                unchanged: imported.unchanged,
+                                generation: None,
+                                revision: None,
+                                idempotent: false,
+                                conflicts: imported.conflicts,
+                                error: None,
+                            }),
+                            Err(error) => results.push(FleetPeerSyncResult {
+                                peer_id: peer.id,
+                                peer_name: peer.name,
+                                created: 0,
+                                updated: 0,
+                                deleted: 0,
+                                unchanged: 0,
+                                generation: None,
+                                revision: None,
+                                idempotent: false,
+                                conflicts: Vec::new(),
+                                error: Some(format!("invalid legacy peer response: {error}")),
+                            }),
+                        }
+                    }
+                    Ok(response) => results.push(FleetPeerSyncResult {
+                        peer_id: peer.id,
+                        peer_name: peer.name,
+                        created: 0,
+                        updated: 0,
+                        deleted: 0,
+                        unchanged: 0,
+                        generation: None,
+                        revision: None,
+                        idempotent: false,
+                        conflicts: Vec::new(),
+                        error: Some(format!("legacy peer returned HTTP {}", response.status())),
+                    }),
+                    Err(error) => results.push(FleetPeerSyncResult {
+                        peer_id: peer.id,
+                        peer_name: peer.name,
+                        created: 0,
+                        updated: 0,
+                        deleted: 0,
+                        unchanged: 0,
+                        generation: None,
+                        revision: None,
+                        idempotent: false,
+                        conflicts: Vec::new(),
+                        error: Some(error.to_string()),
                     }),
                 }
             }
@@ -6858,7 +7261,12 @@ async fn sync_fleet_policies(
                 peer_id: peer.id,
                 peer_name: peer.name,
                 created: 0,
+                updated: 0,
+                deleted: 0,
                 unchanged: 0,
+                generation: None,
+                revision: None,
+                idempotent: false,
                 conflicts: Vec::new(),
                 error: Some(format!("peer returned HTTP {}", response.status())),
             }),
@@ -6866,7 +7274,12 @@ async fn sync_fleet_policies(
                 peer_id: peer.id,
                 peer_name: peer.name,
                 created: 0,
+                updated: 0,
+                deleted: 0,
                 unchanged: 0,
+                generation: None,
+                revision: None,
+                idempotent: false,
                 conflicts: Vec::new(),
                 error: Some(error.to_string()),
             }),
@@ -9404,25 +9817,102 @@ async fn enroll_client(
     request
         .validate()
         .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid client registration"))?;
+    let verified_public_key = verify_agent_enrollment_identity(&request)?;
 
     let client_name = request.name.clone();
     let platform = request.platform.clone();
-    let (client_id, client_token) = state
+    let (client_id, agent_instance_id, client_token) = state
         .clients
         .lock()
         .expect("client registry lock poisoned")
-        .enroll(request.name, request.platform)
+        .enroll_with_identity(
+            request.name,
+            request.platform,
+            request.agent_instance_id,
+            verified_public_key.clone(),
+        )
         .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "could not store client"))?;
     record_audit(
         &state,
         "client.enrolled",
         &client_id.to_string(),
-        &format!("name={client_name}; platform={platform}"),
+        &format!(
+            "name={client_name}; platform={platform}; identity_verified={}",
+            verified_public_key.is_some()
+        ),
     );
     Ok(Json(ClientEnrollmentResponse {
         client_id,
+        agent_instance_id: Some(agent_instance_id),
         client_token,
     }))
+}
+
+fn verify_agent_enrollment_identity(
+    request: &ClientEnrollmentRequest,
+) -> Result<Option<String>, ApiError> {
+    let (Some(agent_instance_id), Some(public_key_hex), Some(signature_hex)) = (
+        request.agent_instance_id,
+        request.agent_identity_public_key.as_deref(),
+        request.agent_identity_signature.as_deref(),
+    ) else {
+        if request.agent_identity_public_key.is_none() && request.agent_identity_signature.is_none()
+        {
+            return Ok(None);
+        }
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "incomplete agent identity proof",
+        ));
+    };
+    if !is_lower_hex(public_key_hex, 32) || !is_lower_hex(signature_hex, 64) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid agent identity proof encoding",
+        ));
+    }
+    let public_key = decode_fixed_hex::<32>(public_key_hex)
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid agent identity public key"))?;
+    if agent_instance_id != agent_instance_id_from_public_key(&public_key) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "agent instance ID does not match its public key",
+        ));
+    }
+    let signature = Signature::from_bytes(
+        &decode_fixed_hex::<64>(signature_hex)
+            .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid agent identity signature"))?,
+    );
+    let verifying_key = VerifyingKey::from_bytes(&public_key)
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid agent identity public key"))?;
+    verifying_key
+        .verify_strict(
+            &agent_enrollment_message(
+                agent_instance_id,
+                public_key_hex,
+                &request.name,
+                &request.platform,
+            ),
+            &signature,
+        )
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid agent identity signature"))?;
+    Ok(Some(public_key_hex.to_owned()))
+}
+
+fn is_lower_hex(value: &str, bytes: usize) -> bool {
+    value.len() == bytes * 2
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn decode_fixed_hex<const N: usize>(value: &str) -> anyhow::Result<[u8; N]> {
+    anyhow::ensure!(value.len() == N * 2, "invalid hexadecimal length");
+    let mut decoded = [0_u8; N];
+    for (index, output) in decoded.iter_mut().enumerate() {
+        *output = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)?;
+    }
+    Ok(decoded)
 }
 
 async fn login(
@@ -10107,6 +10597,7 @@ struct ManagementPrincipal {
     username: String,
     role: UserRole,
     session_id: Option<Uuid>,
+    fleet_source_instance_id: Option<Uuid>,
 }
 
 fn management_principal(
@@ -10122,6 +10613,7 @@ fn management_principal(
             username: "management-token".to_owned(),
             role: UserRole::Administrator,
             session_id: None,
+            fleet_source_instance_id: None,
         });
     }
     if let Some(token) = bearer_token(headers) {
@@ -10146,6 +10638,7 @@ fn management_principal(
                 username: format!("api-token:{}", record.name),
                 role,
                 session_id: None,
+                fleet_source_instance_id: record.fleet_source_instance_id,
             });
         }
     }
@@ -10182,7 +10675,39 @@ fn management_principal(
         username: identity.username,
         role: identity.role,
         session_id: Some(identity.session_id),
+        fleet_source_instance_id: None,
     })
+}
+
+fn require_fleet_source(
+    state: &AppState,
+    headers: &HeaderMap,
+    source_instance_id: Uuid,
+) -> Result<ManagementPrincipal, CodedApiError> {
+    let principal = management_principal(state, headers).map_err(coded_management_error)?;
+    validate_fleet_source_binding(&principal, source_instance_id)?;
+    Ok(principal)
+}
+
+fn validate_fleet_source_binding(
+    principal: &ManagementPrincipal,
+    source_instance_id: Uuid,
+) -> Result<(), CodedApiError> {
+    let Some(bound_source) = principal.fleet_source_instance_id else {
+        return Err(CodedApiError(
+            StatusCode::FORBIDDEN,
+            "fleet_source_binding_required",
+            "Fleet reconcile requires an API token bound to one source instance",
+        ));
+    };
+    if bound_source != source_instance_id {
+        return Err(CodedApiError(
+            StatusCode::FORBIDDEN,
+            "fleet_source_binding_mismatch",
+            "Fleet API token is not authorized for this source instance",
+        ));
+    }
+    Ok(())
 }
 
 fn require_administrator(
@@ -10282,6 +10807,83 @@ async fn enforce_management_role(
     next.run(request).await
 }
 
+async fn enforce_fleet_ownership(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some((kind, policy_id)) = fleet_mutation_target(request.method(), request.uri().path())
+    else {
+        return next.run(request).await;
+    };
+    // 持锁直到处理器完成，使 ownership 检查与随后写入成为进程内原子序列。
+    let _mutation_guard = state.policy_mutation_lock.lock().await;
+    match state.policy_service.is_policy_managed(kind, policy_id) {
+        Ok(false) => next.run(request).await,
+        Ok(true) => CodedApiError(
+            StatusCode::CONFLICT,
+            "fleet_managed_policy",
+            "Fleet-managed policies must be changed by their owning source bundle",
+        )
+        .into_response(),
+        Err(error) => {
+            tracing::error!(%error, %policy_id, kind = kind.as_str(), "could not verify Fleet policy ownership");
+            CodedApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "fleet_ownership_check_failed",
+                "could not verify Fleet policy ownership",
+            )
+            .into_response()
+        }
+    }
+}
+
+fn fleet_mutation_target(method: &Method, path: &str) -> Option<(FleetPolicyKind, Uuid)> {
+    if !matches!(*method, Method::PUT | Method::DELETE | Method::POST) {
+        return None;
+    }
+    let segments = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    if segments.len() >= 5
+        && segments[..3] == ["api", "v1", "traffic-controls"]
+        && matches!(*method, Method::PUT | Method::DELETE)
+    {
+        let kind = match segments[3] {
+            "tcp" => FleetPolicyKind::Tcp,
+            "udp" => FleetPolicyKind::Udp,
+            "port_group" | "ports" => FleetPolicyKind::PortGroup,
+            "http" => FleetPolicyKind::HttpRoute,
+            "sni" => FleetPolicyKind::SniRoute,
+            "secret" => FleetPolicyKind::SecretTunnel,
+            "socks5" => FleetPolicyKind::Socks5Proxy,
+            "http_proxy" | "http-proxy" => FleetPolicyKind::HttpProxy,
+            _ => return None,
+        };
+        let policy_id = Uuid::parse_str(segments[4]).ok()?;
+        return Some((kind, policy_id));
+    }
+    if segments.len() < 4 || segments[..2] != ["api", "v1"] {
+        return None;
+    }
+    let kind = match segments[2] {
+        "tcp-tunnels" => FleetPolicyKind::Tcp,
+        "udp-tunnels" => FleetPolicyKind::Udp,
+        "port-groups" => FleetPolicyKind::PortGroup,
+        "http-routes" => FleetPolicyKind::HttpRoute,
+        "sni-routes" => FleetPolicyKind::SniRoute,
+        "secret-tunnels" => FleetPolicyKind::SecretTunnel,
+        "socks5-proxies" => FleetPolicyKind::Socks5Proxy,
+        "http-proxies" => FleetPolicyKind::HttpProxy,
+        _ => return None,
+    };
+    let direct_mutation = segments.len() == 4 && matches!(*method, Method::PUT | Method::DELETE);
+    let enable_mutation =
+        segments.len() == 5 && segments[4] == "enabled" && *method == Method::POST;
+    if !direct_mutation && !enable_mutation {
+        return None;
+    }
+    Some((kind, Uuid::parse_str(segments[3]).ok()?))
+}
+
 fn authorize_management(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
     management_principal(state, headers).map(|_| ())
 }
@@ -10373,6 +10975,44 @@ fn coded_fleet_error(error: anyhow::Error) -> CodedApiError {
             StatusCode::INTERNAL_SERVER_ERROR,
             "fleet_storage_error",
             "fleet catalog operation failed",
+        )
+    }
+}
+
+fn coded_policy_service_error(error: anyhow::Error) -> CodedApiError {
+    let message = error.to_string();
+    if message.contains("stale")
+        || message.contains("expected generation")
+        || message.contains("expected revision")
+        || message.contains("already used")
+        || message.contains("generation advances too far")
+        || message.contains("initial generation is unreasonably high")
+        || message.contains("generation exceeds the persistent database range")
+    {
+        CodedApiError(
+            StatusCode::CONFLICT,
+            "fleet_revision_conflict",
+            "Fleet generation or revision precondition failed",
+        )
+    } else if message.contains("not enrolled")
+        || message.contains("disabled")
+        || message.contains("credential")
+        || message.contains("nil ID")
+        || message.contains("does not exist")
+        || message.contains("invalid")
+        || message.contains("identity")
+    {
+        CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_fleet_bundle",
+            "Fleet bundle or credential binding is invalid",
+        )
+    } else {
+        tracing::error!("Fleet policy service operation failed: {message}");
+        CodedApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "fleet_policy_storage_error",
+            "Fleet policy operation failed",
         )
     }
 }
@@ -10615,14 +11255,16 @@ mod tests {
     use super::{
         apply_cache_control, auth_me_response, build_metrics_history_response,
         certificate_target_matches, coded_http_route_creation_error, coded_tcp_policy_error,
-        login_throttle_identity, management_session_cookie, normalize_metrics_history_step,
-        parse_metrics_history_range, release_certificate_job_slot, render_prometheus_metrics,
-        reserve_certificate_job_slot, resolve_certificate_identifier_update,
-        select_certificate_maintenance_operation, session_cookie_header, tcp_history_error_total,
-        udp_history_error_total, udp_metrics_response, CertificateOperation, HistoryCounters,
-        HttpTransportCapabilitiesView, LoginResponse, LoginThrottle, MetricsHistory,
-        MetricsHistoryProtocol, MetricsHistorySample, Socks5CapabilitiesView, UserRole,
-        LOGIN_THROTTLE_MAX_IDENTITIES, MANAGEMENT_UI, METRICS_HISTORY_ARCHIVE_CAPACITY,
+        fleet_mutation_target, login_throttle_identity, management_session_cookie,
+        normalize_metrics_history_step, parse_metrics_history_range, release_certificate_job_slot,
+        render_prometheus_metrics, reserve_certificate_job_slot,
+        resolve_certificate_identifier_update, select_certificate_maintenance_operation,
+        session_cookie_header, tcp_history_error_total, udp_history_error_total,
+        udp_metrics_response, validate_fleet_source_binding, verify_agent_enrollment_identity,
+        CertificateOperation, FleetPolicyKind, HistoryCounters, HttpTransportCapabilitiesView,
+        LoginResponse, LoginThrottle, ManagementPrincipal, MetricsHistory, MetricsHistoryProtocol,
+        MetricsHistorySample, Socks5CapabilitiesView, UserRole, LOGIN_THROTTLE_MAX_IDENTITIES,
+        MANAGEMENT_UI, METRICS_HISTORY_ARCHIVE_CAPACITY,
         METRICS_HISTORY_ARCHIVE_SAMPLE_INTERVAL_SECONDS, METRICS_HISTORY_CAPACITY,
         METRICS_HISTORY_RECENT_RETENTION_SECONDS, METRICS_HISTORY_RETENTION_SECONDS,
         METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS,
@@ -10635,6 +11277,10 @@ mod tests {
         udp_tunnel::UdpTunnelStatisticsSnapshot,
     };
     use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+    use ed25519_dalek::{Signer, SigningKey};
+    use linklake_core::{
+        agent_enrollment_message, agent_instance_id_from_public_key, ClientEnrollmentRequest,
+    };
     use std::{
         collections::HashMap,
         fs,
@@ -10653,6 +11299,116 @@ mod tests {
             max_connections: 64,
             enabled,
         }
+    }
+
+    #[test]
+    fn fleet_policy_mutation_paths_are_fail_closed_for_every_owned_kind() {
+        let id = Uuid::new_v4();
+        for (path, kind) in [
+            (format!("/api/v1/tcp-tunnels/{id}"), FleetPolicyKind::Tcp),
+            (format!("/api/v1/udp-tunnels/{id}"), FleetPolicyKind::Udp),
+            (
+                format!("/api/v1/port-groups/{id}"),
+                FleetPolicyKind::PortGroup,
+            ),
+            (
+                format!("/api/v1/http-routes/{id}"),
+                FleetPolicyKind::HttpRoute,
+            ),
+            (
+                format!("/api/v1/sni-routes/{id}"),
+                FleetPolicyKind::SniRoute,
+            ),
+            (
+                format!("/api/v1/secret-tunnels/{id}"),
+                FleetPolicyKind::SecretTunnel,
+            ),
+            (
+                format!("/api/v1/socks5-proxies/{id}"),
+                FleetPolicyKind::Socks5Proxy,
+            ),
+            (
+                format!("/api/v1/http-proxies/{id}"),
+                FleetPolicyKind::HttpProxy,
+            ),
+        ] {
+            assert_eq!(
+                fleet_mutation_target(&axum::http::Method::PUT, &path),
+                Some((kind, id))
+            );
+            assert_eq!(
+                fleet_mutation_target(&axum::http::Method::DELETE, &path),
+                Some((kind, id))
+            );
+            assert_eq!(
+                fleet_mutation_target(&axum::http::Method::POST, &format!("{path}/enabled")),
+                Some((kind, id))
+            );
+        }
+        assert!(fleet_mutation_target(
+            &axum::http::Method::PUT,
+            &format!("/api/v1/http-routes/{id}/tls")
+        )
+        .is_none());
+        assert_eq!(
+            fleet_mutation_target(
+                &axum::http::Method::PUT,
+                &format!("/api/v1/traffic-controls/http/{id}")
+            ),
+            Some((FleetPolicyKind::HttpRoute, id))
+        );
+    }
+
+    #[test]
+    fn enrollment_identity_proof_binds_id_key_and_request_fields() {
+        let signing_key = SigningKey::from_bytes(&[9_u8; 32]);
+        let public_key = signing_key.verifying_key().to_bytes();
+        let public_key_hex = public_key
+            .iter()
+            .map(|value| format!("{value:02x}"))
+            .collect::<String>();
+        let agent_instance_id = agent_instance_id_from_public_key(&public_key);
+        let signature = signing_key.sign(&agent_enrollment_message(
+            agent_instance_id,
+            &public_key_hex,
+            "agent",
+            "windows",
+        ));
+        let signature_hex = signature
+            .to_bytes()
+            .iter()
+            .map(|value| format!("{value:02x}"))
+            .collect::<String>();
+        let request = ClientEnrollmentRequest {
+            name: "agent".into(),
+            platform: "windows".into(),
+            agent_instance_id: Some(agent_instance_id),
+            agent_identity_public_key: Some(public_key_hex),
+            agent_identity_signature: Some(signature_hex),
+        };
+        assert!(matches!(
+            verify_agent_enrollment_identity(&request),
+            Ok(Some(_))
+        ));
+        let mut tampered = request;
+        tampered.name = "other-agent".into();
+        assert!(verify_agent_enrollment_identity(&tampered).is_err());
+    }
+
+    #[test]
+    fn fleet_source_binding_rejects_unbound_and_mismatched_tokens() {
+        let source = Uuid::new_v4();
+        let mut principal = ManagementPrincipal {
+            username: "api-token:fleet".into(),
+            role: UserRole::Operator,
+            session_id: None,
+            fleet_source_instance_id: None,
+        };
+        assert!(validate_fleet_source_binding(&principal, source).is_err());
+        principal.fleet_source_instance_id = Some(Uuid::new_v4());
+        assert!(validate_fleet_source_binding(&principal, source).is_err());
+        principal.fleet_source_instance_id = Some(source);
+        assert!(validate_fleet_source_binding(&principal, source).is_ok());
     }
 
     fn certificate_state(
