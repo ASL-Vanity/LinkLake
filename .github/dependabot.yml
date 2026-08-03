@@ -1,0 +1,78 @@
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:00"
+      timezone: Asia/Shanghai
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    rebase-strategy: auto
+    labels:
+      - dependencies
+      - security
+    groups:
+      rust-dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:20"
+      timezone: Asia/Shanghai
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 3
+    rebase-strategy: auto
+    labels:
+      - dependencies
+      - security
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: pub
+    directory: /apps/linklake_manager
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:40"
+      timezone: Asia/Shanghai
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 3
+    rebase-strategy: auto
+    labels:
+      - dependencies
+      - security
+    groups:
+      flutter-dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:00"
+      timezone: Asia/Shanghai
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 3
+    rebase-strategy: auto
+    labels:
+      - dependencies
+      - security
+    groups:
+      container-dependencies:
+        patterns:
+          - "*"

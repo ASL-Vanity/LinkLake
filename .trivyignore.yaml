@@ -1,0 +1,8 @@
+vulnerabilities:
+  - id: GHSA-3v94-mw7p-v465
+    paths:
+      - Cargo.lock
+    purls:
+      - pkg:cargo/hickory-proto@0.25.2
+    statement: Transitive through iroh 0.92.0 -> hickory-resolver 0.25.2; no compatible stable patched release is available, so the iroh/hickory upgrade must be tracked upstream.
+    expired_at: 2026-09-03
