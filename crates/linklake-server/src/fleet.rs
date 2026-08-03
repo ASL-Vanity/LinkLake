@@ -466,6 +466,7 @@ mod tests {
     fn client(name: &str) -> ClientSummary {
         ClientSummary {
             client_id: Uuid::new_v4(),
+            agent_instance_id: Uuid::new_v4(),
             name: name.to_owned(),
             platform: "linux".to_owned(),
             group_name: None,

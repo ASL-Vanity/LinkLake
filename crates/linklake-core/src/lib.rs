@@ -83,11 +83,17 @@ pub struct TunnelSpec {
 pub struct ClientEnrollmentRequest {
     pub name: String,
     pub platform: String,
+    /// 跨服务端稳定的本机实例 ID。旧客户端可以省略，由服务端首次注册时生成。
+    #[serde(default)]
+    pub agent_instance_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ClientEnrollmentResponse {
     pub client_id: Uuid,
+    /// 客户端应持久化并在注册其他 Fleet 节点时复用该 ID。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_instance_id: Option<Uuid>,
     /// 仅在客户端注册时返回，必须作为密钥安全保存。
     pub client_token: String,
 }
@@ -95,6 +101,7 @@ pub struct ClientEnrollmentResponse {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ClientSummary {
     pub client_id: Uuid,
+    pub agent_instance_id: Uuid,
     pub name: String,
     pub platform: String,
     pub group_name: Option<String>,
@@ -219,6 +226,8 @@ pub enum CoreError {
     EmptyClientName,
     #[error("client platform must not be blank")]
     EmptyClientPlatform,
+    #[error("agent instance ID must not be nil")]
+    InvalidAgentInstanceId,
 }
 
 impl ClientEnrollmentRequest {
@@ -228,6 +237,9 @@ impl ClientEnrollmentRequest {
         }
         if self.platform.trim().is_empty() {
             return Err(CoreError::EmptyClientPlatform);
+        }
+        if self.agent_instance_id.is_some_and(|value| value.is_nil()) {
+            return Err(CoreError::InvalidAgentInstanceId);
         }
         Ok(())
     }
@@ -540,19 +552,22 @@ mod tests {
     fn enrollment_requires_name_and_platform() {
         assert!(ClientEnrollmentRequest {
             name: "".to_owned(),
-            platform: "linux".to_owned()
+            platform: "linux".to_owned(),
+            agent_instance_id: None,
         }
         .validate()
         .is_err());
         assert!(ClientEnrollmentRequest {
             name: "node-1".to_owned(),
-            platform: "".to_owned()
+            platform: "".to_owned(),
+            agent_instance_id: None,
         }
         .validate()
         .is_err());
         assert!(ClientEnrollmentRequest {
             name: "node-1".to_owned(),
-            platform: "linux".to_owned()
+            platform: "linux".to_owned(),
+            agent_instance_id: Some(Uuid::new_v4()),
         }
         .validate()
         .is_ok());

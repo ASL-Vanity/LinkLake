@@ -5,7 +5,7 @@ use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 10;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 11;
 
 const MIGRATION_V10_NAME: &str = "shared_database_foundation";
 const MIGRATION_V10_SQL: &str = "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -14,6 +14,49 @@ const MIGRATION_V10_SQL: &str = "CREATE TABLE IF NOT EXISTS schema_migrations (
     checksum_sha256 TEXT NOT NULL,
     applied_unix_seconds INTEGER NOT NULL
 );";
+
+const MIGRATION_V11_NAME: &str = "fleet_policy_service";
+const MIGRATION_V11_CLIENT_CONTRACT: &str = "CREATE TABLE IF NOT EXISTS clients (... agent_instance_id TEXT NOT NULL UNIQUE ...);
+-- Existing clients table only: ALTER TABLE clients ADD COLUMN agent_instance_id TEXT;
+UPDATE clients SET agent_instance_id = client_id WHERE agent_instance_id IS NULL OR TRIM(agent_instance_id) = '';
+CREATE UNIQUE INDEX IF NOT EXISTS clients_agent_instance_id ON clients(agent_instance_id);";
+
+/// Fleet v2 的持久化元数据。内存数据库也复用同一份 DDL，避免测试与生产漂移。
+pub(crate) const FLEET_V11_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS fleet_local_state (
+    singleton_id INTEGER PRIMARY KEY NOT NULL CHECK(singleton_id = 1),
+    source_instance_id TEXT NOT NULL UNIQUE,
+    generation INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS fleet_source_states (
+    source_instance_id TEXT PRIMARY KEY NOT NULL,
+    generation INTEGER NOT NULL,
+    revision TEXT NOT NULL,
+    applied_unix_seconds INTEGER NOT NULL,
+    resource_count INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS fleet_resource_ownership (
+    source_instance_id TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    policy_id TEXT NOT NULL,
+    resource_sha256 TEXT NOT NULL,
+    credential_ref TEXT,
+    PRIMARY KEY(source_instance_id, resource_id),
+    UNIQUE(kind, policy_id)
+);
+CREATE INDEX IF NOT EXISTS fleet_resource_ownership_policy
+    ON fleet_resource_ownership(kind, policy_id);
+CREATE TABLE IF NOT EXISTS fleet_credential_bindings (
+    source_instance_id TEXT NOT NULL,
+    credential_ref TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    policy_id TEXT NOT NULL,
+    created_unix_seconds INTEGER NOT NULL,
+    PRIMARY KEY(source_instance_id, credential_ref, kind),
+    UNIQUE(kind, policy_id)
+);
+"#;
 
 pub(crate) struct MigrationPlan {
     database: Database,
@@ -38,36 +81,82 @@ impl MigrationPlan {
             self.from_version < CURRENT_SCHEMA_VERSION,
             "database migration plan has an invalid source version"
         );
-        let checksum = migration_checksum(MIGRATION_V10_SQL);
         self.database.with_transaction(|transaction| {
             transaction.execute_batch(MIGRATION_V10_SQL)?;
-            let existing = transaction
-                .query_row(
-                    "SELECT name, checksum_sha256 FROM schema_migrations WHERE version = ?1",
-                    [CURRENT_SCHEMA_VERSION],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                )
-                .optional()?;
-            anyhow::ensure!(
-                existing.is_none(),
-                "database migration ledger already contains schema version {CURRENT_SCHEMA_VERSION} while PRAGMA user_version is {}",
-                self.from_version
-            );
-            transaction.execute(
-                "INSERT INTO schema_migrations (version, name, checksum_sha256, applied_unix_seconds) VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    CURRENT_SCHEMA_VERSION,
-                    MIGRATION_V10_NAME,
-                    checksum,
-                    crate::unix_seconds() as i64,
-                ],
-            )?;
-            transaction.execute_batch(&format!(
-                "PRAGMA user_version = {CURRENT_SCHEMA_VERSION};"
-            ))?;
+            for version in 10.max(self.from_version.saturating_add(1))..=CURRENT_SCHEMA_VERSION {
+                let existing: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = ?1)",
+                    [version],
+                    |row| row.get(0),
+                )?;
+                anyhow::ensure!(
+                    !existing,
+                    "database migration ledger already contains schema version {version} while PRAGMA user_version is {}",
+                    self.from_version
+                );
+                let (name, checksum) = match version {
+                    10 => {
+                        transaction.execute_batch(MIGRATION_V10_SQL)?;
+                        (MIGRATION_V10_NAME, migration_checksum(MIGRATION_V10_SQL))
+                    }
+                    11 => {
+                        apply_v11(transaction)?;
+                        (MIGRATION_V11_NAME, migration_v11_checksum())
+                    }
+                    _ => anyhow::bail!("unsupported database migration version {version}"),
+                };
+                transaction.execute(
+                    "INSERT INTO schema_migrations (version, name, checksum_sha256, applied_unix_seconds) VALUES (?1, ?2, ?3, ?4)",
+                    params![version, name, checksum, crate::unix_seconds() as i64],
+                )?;
+                transaction.execute_batch(&format!("PRAGMA user_version = {version};"))?;
+            }
             Ok(())
         })
     }
+}
+
+fn apply_v11(transaction: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
+    // 新数据库先得到完整 clients 表；旧数据库则只补稳定实例 ID 列。
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS clients (
+            client_id TEXT PRIMARY KEY NOT NULL,
+            agent_instance_id TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            group_name TEXT,
+            tags_json TEXT NOT NULL DEFAULT '[]',
+            notes TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_unix_seconds INTEGER NOT NULL DEFAULT 0,
+            token_rotated_unix_seconds INTEGER,
+            access_token_hash TEXT NOT NULL,
+            last_seen_unix_seconds INTEGER NOT NULL,
+            config_mode TEXT NOT NULL DEFAULT 'local',
+            config_sync_status TEXT NOT NULL DEFAULT 'unknown',
+            applied_config_revision TEXT,
+            config_sync_error TEXT,
+            config_checked_unix_seconds INTEGER
+        );",
+    )?;
+    let agent_column_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('clients') WHERE name = 'agent_instance_id')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !agent_column_exists {
+        transaction.execute("ALTER TABLE clients ADD COLUMN agent_instance_id TEXT", [])?;
+    }
+    transaction.execute(
+        "UPDATE clients SET agent_instance_id = client_id WHERE agent_instance_id IS NULL OR TRIM(agent_instance_id) = ''",
+        [],
+    )?;
+    transaction.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS clients_agent_instance_id ON clients(agent_instance_id)",
+        [],
+    )?;
+    transaction.execute_batch(FLEET_V11_SCHEMA_SQL)?;
+    Ok(())
 }
 
 pub(crate) fn prepare(database: &Database) -> anyhow::Result<MigrationPlan> {
@@ -130,7 +219,7 @@ fn verify_migration_ledger(
         [],
         |row| row.get(0),
     )?;
-    if user_version < CURRENT_SCHEMA_VERSION {
+    if user_version < 10 {
         if table_exists {
             let rows: i64 =
                 connection.query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
@@ -147,28 +236,51 @@ fn verify_migration_ledger(
         table_exists,
         "database schema version {user_version} is missing its migration ledger"
     );
-    let expected_checksum = migration_checksum(MIGRATION_V10_SQL);
-    let record = connection
-        .query_row(
-            "SELECT name, checksum_sha256 FROM schema_migrations WHERE version = ?1",
-            [CURRENT_SCHEMA_VERSION],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()?;
-    let Some((name, checksum)) = record else {
-        anyhow::bail!(
-            "database migration ledger is missing schema version {CURRENT_SCHEMA_VERSION}"
+    for version in 10..=user_version {
+        let (expected_name, expected_checksum) = match version {
+            10 => (MIGRATION_V10_NAME, migration_checksum(MIGRATION_V10_SQL)),
+            11 => (MIGRATION_V11_NAME, migration_v11_checksum()),
+            _ => anyhow::bail!("unsupported database migration version {version}"),
+        };
+        let record = connection
+            .query_row(
+                "SELECT name, checksum_sha256 FROM schema_migrations WHERE version = ?1",
+                [version],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((name, checksum)) = record else {
+            anyhow::bail!("database migration ledger is missing schema version {version}");
+        };
+        anyhow::ensure!(
+            name == expected_name && checksum == expected_checksum,
+            "database migration checksum mismatch for schema version {version}"
         );
-    };
+    }
+    let ledger_rows: u32 =
+        connection.query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })?;
     anyhow::ensure!(
-        name == MIGRATION_V10_NAME && checksum == expected_checksum,
-        "database migration checksum mismatch for schema version {CURRENT_SCHEMA_VERSION}"
+        ledger_rows == user_version.saturating_sub(9),
+        "database migration ledger contains unexpected versions"
     );
     Ok(())
 }
 
 fn migration_checksum(sql: &str) -> String {
     Sha256::digest(sql.as_bytes())
+        .iter()
+        .map(|value| format!("{value:02x}"))
+        .collect()
+}
+
+fn migration_v11_checksum() -> String {
+    let mut digest = Sha256::new();
+    digest.update(MIGRATION_V11_CLIENT_CONTRACT.as_bytes());
+    digest.update(FLEET_V11_SCHEMA_SQL.as_bytes());
+    digest
+        .finalize()
         .iter()
         .map(|value| format!("{value:02x}"))
         .collect()

@@ -82,6 +82,9 @@ enum Command {
         name: String,
         #[arg(long, default_value = std::env::consts::OS)]
         platform: String,
+        /// 跨多个 LinkLake 服务端复用的稳定本机实例 ID；首次省略时自动生成并输出。
+        #[arg(long)]
+        agent_instance_id: Option<Uuid>,
     },
     /// 向已注册客户端发送控制平面心跳。
     Heartbeat {
@@ -601,9 +604,15 @@ async fn run_cli() -> anyhow::Result<()> {
             token,
             name,
             platform,
+            agent_instance_id,
         } => {
             let endpoint = format!("{}/api/v1/clients/enroll", server.trim_end_matches('/'));
-            let registration = ClientEnrollmentRequest { name, platform };
+            let requested_agent_instance_id = agent_instance_id.unwrap_or_else(Uuid::new_v4);
+            let registration = ClientEnrollmentRequest {
+                name,
+                platform,
+                agent_instance_id: Some(requested_agent_instance_id),
+            };
             let response: ClientEnrollmentResponse = reqwest::Client::new()
                 .post(endpoint)
                 .bearer_auth(token)
@@ -614,6 +623,12 @@ async fn run_cli() -> anyhow::Result<()> {
                 .json()
                 .await?;
             println!("client_id={}", response.client_id);
+            println!(
+                "agent_instance_id={}",
+                response
+                    .agent_instance_id
+                    .unwrap_or(requested_agent_instance_id)
+            );
             println!("client_token={}", response.client_token);
             println!("Store client_token securely; it will not be returned again.");
         }
