@@ -1,17 +1,19 @@
 use clap::{Parser, Subcommand};
+use ed25519_dalek::{Signer, SigningKey};
+use getrandom::fill as random_fill;
 use linklake_core::port_mapping::{parse_port_mappings, MAX_PORT_MAPPINGS};
 use linklake_core::target_pool::{parse_target_pool, select_weighted_target, WeightedTarget};
 use linklake_core::{
-    managed_config_revision, read_control_frame, write_control_frame, BoxedIo, BuildInfo,
-    ClientEnrollmentRequest, ClientEnrollmentResponse, ControlFrame, ManagedClientConfig,
-    ManagedConfigMode, ManagedConfigStatus, ManagedHttpProxy, ManagedHttpRoute,
-    ManagedSecretTunnel, ManagedSocks5Proxy, ManagedTcpTunnel, ManagedTlsRoute, ManagedUdpTunnel,
-    PRODUCT_NAME,
+    agent_enrollment_message, agent_instance_id_from_public_key, managed_config_revision,
+    read_control_frame, write_control_frame, BoxedIo, BuildInfo, ClientEnrollmentRequest,
+    ClientEnrollmentResponse, ControlFrame, ManagedClientConfig, ManagedConfigMode,
+    ManagedConfigStatus, ManagedHttpProxy, ManagedHttpRoute, ManagedSecretTunnel,
+    ManagedSocks5Proxy, ManagedTcpTunnel, ManagedTlsRoute, ManagedUdpTunnel, PRODUCT_NAME,
 };
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    fs::{read_to_string, File, OpenOptions},
+    fs::{self, read_to_string, File, OpenOptions},
     io::{BufReader, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -46,9 +48,185 @@ const CONTROL_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
 const TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MANAGED_CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const CURRENT_CLIENT_CONFIG_VERSION: u32 = 2;
+const AGENT_IDENTITY_SCHEMA_VERSION: u32 = 1;
 
 fn default_true() -> bool {
     true
+}
+
+fn environment_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AgentIdentityState {
+    schema_version: u32,
+    agent_instance_id: Uuid,
+    signing_key_hex: String,
+    public_key_hex: String,
+}
+
+fn default_agent_identity_path() -> anyhow::Result<PathBuf> {
+    if let Some(path) = environment_path("LINKLAKE_AGENT_IDENTITY_PATH") {
+        return Ok(path);
+    }
+    #[cfg(windows)]
+    let state_directory = environment_path("LOCALAPPDATA")
+        .ok_or_else(|| {
+            anyhow::anyhow!("LOCALAPPDATA is required for the default agent identity path")
+        })?
+        .join("LinkLake")
+        .join("updates")
+        .join(UpdateProduct::Client.component());
+    #[cfg(target_os = "macos")]
+    let state_directory = environment_path("HOME")
+        .ok_or_else(|| anyhow::anyhow!("HOME is required for the default agent identity path"))?
+        .join("Library")
+        .join("Application Support")
+        .join("LinkLake")
+        .join("updates")
+        .join(UpdateProduct::Client.component());
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let state_directory = if let Some(path) = environment_path("XDG_STATE_HOME") {
+        path
+    } else {
+        environment_path("HOME")
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "HOME or XDG_STATE_HOME is required for the default agent identity path"
+                )
+            })?
+            .join(".local")
+            .join("state")
+    }
+    .join("linklake")
+    .join("updates")
+    .join(UpdateProduct::Client.component());
+    #[cfg(not(any(windows, unix)))]
+    let state_directory = updater::default_state_directory(UpdateProduct::Client);
+    Ok(state_directory.join("agent-identity.json"))
+}
+
+fn load_or_create_agent_identity(path: &Path) -> anyhow::Result<AgentIdentityState> {
+    match load_agent_identity(path) {
+        Ok(identity) => return Ok(identity),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) => {}
+        Err(error) => return Err(error),
+    }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    let mut seed = [0_u8; 32];
+    random_fill(&mut seed)?;
+    let signing_key = SigningKey::from_bytes(&seed);
+    let public_key = signing_key.verifying_key().to_bytes();
+    let identity = AgentIdentityState {
+        schema_version: AGENT_IDENTITY_SCHEMA_VERSION,
+        agent_instance_id: agent_instance_id_from_public_key(&public_key),
+        signing_key_hex: encode_hex(&seed),
+        public_key_hex: encode_hex(&public_key),
+    };
+    validate_agent_identity(&identity)?;
+    persist_new_agent_identity(path, &identity)?;
+    load_agent_identity(path)
+}
+
+fn load_agent_identity(path: &Path) -> anyhow::Result<AgentIdentityState> {
+    let bytes = fs::read(path)?;
+    let identity: AgentIdentityState = serde_json::from_slice(&bytes)?;
+    validate_agent_identity(&identity)?;
+    Ok(identity)
+}
+
+fn validate_agent_identity(identity: &AgentIdentityState) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        identity.schema_version == AGENT_IDENTITY_SCHEMA_VERSION,
+        "unsupported agent identity schema version"
+    );
+    let seed = decode_hex::<32>(&identity.signing_key_hex)?;
+    let public_key = decode_hex::<32>(&identity.public_key_hex)?;
+    let signing_key = SigningKey::from_bytes(&seed);
+    anyhow::ensure!(
+        signing_key.verifying_key().to_bytes() == public_key,
+        "agent identity public key does not match its private key"
+    );
+    anyhow::ensure!(
+        identity.agent_instance_id == agent_instance_id_from_public_key(&public_key),
+        "agent identity instance ID does not match its public key"
+    );
+    Ok(())
+}
+
+fn persist_new_agent_identity(path: &Path, identity: &AgentIdentityState) -> anyhow::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    let temporary = path.with_extension(format!("{}.tmp", Uuid::new_v4().simple()));
+    let bytes = serde_json::to_vec_pretty(identity)?;
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    match fs::hard_link(&temporary, path) {
+        Ok(()) => {
+            fs::remove_file(&temporary)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            fs::remove_file(&temporary)?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(anyhow::anyhow!(
+                "could not atomically persist agent identity {}: {error}",
+                path.display()
+            ))
+        }
+    }
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|value| format!("{value:02x}")).collect()
+}
+
+fn decode_hex<const N: usize>(value: &str) -> anyhow::Result<[u8; N]> {
+    let encoded = value.as_bytes();
+    anyhow::ensure!(encoded.len() == N * 2, "invalid hexadecimal length");
+    let mut decoded = [0_u8; N];
+    for (pair, output) in encoded.chunks_exact(2).zip(decoded.iter_mut()) {
+        *output = (decode_hex_nibble(pair[0])? << 4) | decode_hex_nibble(pair[1])?;
+    }
+    Ok(decoded)
+}
+
+fn decode_hex_nibble(value: u8) -> anyhow::Result<u8> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        _ => anyhow::bail!("invalid lowercase hexadecimal character"),
+    }
 }
 
 #[derive(Parser)]
@@ -82,9 +260,12 @@ enum Command {
         name: String,
         #[arg(long, default_value = std::env::consts::OS)]
         platform: String,
-        /// 跨多个 LinkLake 服务端复用的稳定本机实例 ID；首次省略时自动生成并输出。
+        /// 校验持久化身份文件中的稳定实例 ID；不能用于任意指定新身份。
         #[arg(long)]
         agent_instance_id: Option<Uuid>,
+        /// 持久化机器级 Ed25519 身份；默认位于 LinkLake 客户端状态目录。
+        #[arg(long)]
+        identity_file: Option<PathBuf>,
     },
     /// 向已注册客户端发送控制平面心跳。
     Heartbeat {
@@ -605,14 +786,35 @@ async fn run_cli() -> anyhow::Result<()> {
             name,
             platform,
             agent_instance_id,
+            identity_file,
         } => {
             let endpoint = format!("{}/api/v1/clients/enroll", server.trim_end_matches('/'));
-            let requested_agent_instance_id = agent_instance_id.unwrap_or_else(Uuid::new_v4);
+            let identity_path = match identity_file {
+                Some(path) => path,
+                None => default_agent_identity_path()?,
+            };
+            let identity = load_or_create_agent_identity(&identity_path)?;
+            if let Some(expected) = agent_instance_id {
+                anyhow::ensure!(
+                    expected == identity.agent_instance_id,
+                    "--agent-instance-id does not match the persisted machine identity"
+                );
+            }
+            let signing_key = SigningKey::from_bytes(&decode_hex(&identity.signing_key_hex)?);
+            let signature = signing_key.sign(&agent_enrollment_message(
+                identity.agent_instance_id,
+                &identity.public_key_hex,
+                &name,
+                &platform,
+            ));
             let registration = ClientEnrollmentRequest {
                 name,
                 platform,
-                agent_instance_id: Some(requested_agent_instance_id),
+                agent_instance_id: Some(identity.agent_instance_id),
+                agent_identity_public_key: Some(identity.public_key_hex.clone()),
+                agent_identity_signature: Some(encode_hex(&signature.to_bytes())),
             };
+            registration.validate()?;
             let response: ClientEnrollmentResponse = reqwest::Client::new()
                 .post(endpoint)
                 .bearer_auth(token)
@@ -627,8 +829,9 @@ async fn run_cli() -> anyhow::Result<()> {
                 "agent_instance_id={}",
                 response
                     .agent_instance_id
-                    .unwrap_or(requested_agent_instance_id)
+                    .unwrap_or(identity.agent_instance_id)
             );
+            println!("agent_identity_file={}", identity_path.display());
             println!("client_token={}", response.client_token);
             println!("Store client_token securely; it will not be returned again.");
         }
@@ -2597,9 +2800,10 @@ fn valid_port_group_target_host(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        load_managed_config, local_managed_config, managed_config_path, migrate_client_config,
-        p2p_candidates, parse_client_config, persist_managed_config, run_configured_agents,
-        validate_managed_config, CURRENT_CLIENT_CONFIG_VERSION,
+        decode_hex, load_managed_config, load_or_create_agent_identity, local_managed_config,
+        managed_config_path, migrate_client_config, p2p_candidates, parse_client_config,
+        persist_managed_config, run_configured_agents, validate_managed_config,
+        CURRENT_CLIENT_CONFIG_VERSION,
     };
     use linklake_core::{
         managed_config_revision, read_control_frame, write_control_frame, ControlFrame,
@@ -2607,6 +2811,50 @@ mod tests {
         ManagedSocks5Proxy, ManagedTcpTunnel, ManagedTlsRoute,
     };
     use uuid::Uuid;
+
+    #[test]
+    fn machine_identity_is_atomically_persisted_and_reused() {
+        let root = std::env::temp_dir().join(format!("linklake-agent-identity-{}", Uuid::new_v4()));
+        let path = root.join("agent-identity.json");
+        let first = load_or_create_agent_identity(&path).unwrap();
+        let second = load_or_create_agent_identity(&path).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap().count(),
+            1,
+            "atomic identity creation must not leave temporary files"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn machine_identity_hex_rejects_non_ascii_without_panicking() {
+        assert!(decode_hex::<32>(&"é".repeat(32)).is_err());
+        assert!(decode_hex::<32>(&"AA".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn corrupt_machine_identity_fails_closed_without_replacement() {
+        let root = std::env::temp_dir().join(format!("linklake-agent-identity-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("agent-identity.json");
+        std::fs::write(&path, b"not-json").unwrap();
+        assert!(load_or_create_agent_identity(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"not-json");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn parses_tcp_tunnel_configuration() {

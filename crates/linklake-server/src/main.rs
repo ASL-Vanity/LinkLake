@@ -58,16 +58,17 @@ use clap::{Parser, Subcommand};
 use client_registry::{Authentication, ClientRegistry, UpdateClient};
 use database::Database;
 use dual_stack_udp::{DualStackUdpSocket, PublicUdpBindMode};
+use ed25519_dalek::{Signature, VerifyingKey};
 use fleet::{FleetCatalog, FleetImportResult, FleetPeer, FleetPolicyBundle, UpsertFleetPeer};
 use http_route_catalog::{
     CreateHttpRouteError, CreateHttpRoutePolicy, HttpRouteCatalog, HttpRoutePolicy,
     UpdateHttpRoutePolicy,
 };
 use linklake_core::{
-    managed_config_revision, BoxedIo, BuildInfo, ClientEnrollmentRequest, ClientEnrollmentResponse,
-    ManagedClientConfig, ManagedHttpProxy, ManagedHttpRoute, ManagedSecretTunnel,
-    ManagedSocks5Proxy, ManagedTcpTunnel, ManagedTlsRoute, ManagedUdpTunnel, API_VERSION,
-    PRODUCT_NAME,
+    agent_enrollment_message, agent_instance_id_from_public_key, managed_config_revision, BoxedIo,
+    BuildInfo, ClientEnrollmentRequest, ClientEnrollmentResponse, ManagedClientConfig,
+    ManagedHttpProxy, ManagedHttpRoute, ManagedSecretTunnel, ManagedSocks5Proxy, ManagedTcpTunnel,
+    ManagedTlsRoute, ManagedUdpTunnel, API_VERSION, PRODUCT_NAME,
 };
 use linklake_update::{SignaturePolicy, UpdateChannel, UpdateProduct};
 use p2p_node_catalog::{P2pNodeCatalog, P2pNodeRecord};
@@ -315,6 +316,7 @@ struct AppState {
     alerts: Mutex<AlertCatalog>,
     fleet: Mutex<FleetCatalog>,
     policy_service: PolicyService,
+    policy_mutation_lock: AsyncMutex<()>,
     traffic_controls: Mutex<TrafficControlCatalog>,
     management_cookies_secure: bool,
     public_port_policy: PublicPortPolicy,
@@ -1971,6 +1973,9 @@ async fn run_server(
             );
         }
     }
+    if let Some(plan) = migration_plan {
+        plan.finish()?;
+    }
     let certificate_manager = data_dir
         .as_ref()
         .map(|data_dir| CertificateManager::new(data_dir.clone()))
@@ -1992,6 +1997,7 @@ async fn run_server(
         alerts: Mutex::new(AlertCatalog::open_with_database(&database)?),
         fleet: Mutex::new(FleetCatalog::open_with_database(&database)?),
         policy_service,
+        policy_mutation_lock: AsyncMutex::new(()),
         traffic_controls: Mutex::new(TrafficControlCatalog::open_with_database(&database)?),
         management_cookies_secure,
         public_port_policy: public_port_policy.clone(),
@@ -2039,9 +2045,6 @@ async fn run_server(
             METRICS_HISTORY_ARCHIVE_CAPACITY,
         )?),
     });
-    if let Some(plan) = migration_plan {
-        plan.finish()?;
-    }
     restore_managed_certificates(&state)?;
     let app = Router::new()
         .route("/", get(management_ui))
@@ -2135,6 +2138,10 @@ async fn run_server(
             post(reconcile_fleet_bundle_v2),
         )
         .route("/api/v1/fleet/v2/sources", get(list_fleet_sources_v2))
+        .route(
+            "/api/v1/fleet/v2/sources/:source_instance_id",
+            axum::routing::delete(reset_fleet_source_v2),
+        )
         .route(
             "/api/v1/fleet/v2/credentials",
             get(list_fleet_credential_bindings).put(bind_fleet_credential),
@@ -2258,6 +2265,10 @@ async fn run_server(
         .route("/api/v1/clients/enroll", post(enroll_client))
         .route("/api/v1/clients/:client_id/heartbeat", post(heartbeat))
         .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            enforce_fleet_ownership,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             enforce_management_role,
@@ -6094,7 +6105,10 @@ async fn reconcile_fleet_bundle_v2(
     headers: HeaderMap,
     Json(request): Json<FleetReconcileRequest>,
 ) -> Result<Json<FleetReconcileResult>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let source_instance_id = request.bundle.source_instance_id;
+    let principal = require_fleet_source(&state, &headers, source_instance_id)?;
+    // 与普通策略写入串行化，避免 ownership 检查和实际 CRUD 之间出现竞态窗口。
+    let _mutation_guard = state.policy_mutation_lock.lock().await;
     state
         .metrics
         .fleet_reconcile_attempts_total
@@ -6109,8 +6123,8 @@ async fn reconcile_fleet_bundle_v2(
             record_audit(
                 &state,
                 "fleet.v2.reconcile.failed",
-                "fleet",
-                &error.to_string(),
+                &source_instance_id.to_string(),
+                &format!("actor={}; {}", principal.username, error),
             );
             return Err(coded_policy_service_error(error));
         }
@@ -6176,6 +6190,35 @@ async fn list_fleet_sources_v2(
         .list_sources()
         .map(Json)
         .map_err(coded_policy_service_error)
+}
+
+async fn reset_fleet_source_v2(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(source_instance_id): Path<Uuid>,
+) -> Result<StatusCode, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    if !state
+        .policy_service
+        .reset_source_state(source_instance_id)
+        .map_err(coded_policy_service_error)?
+    {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "fleet_source_not_found",
+            "Fleet source state does not exist",
+        ));
+    }
+    record_audit(
+        &state,
+        "fleet.v2.source.reset",
+        &source_instance_id.to_string(),
+        &format!(
+            "actor={}; ownership retained; the next authorized bundle establishes generation again",
+            principal.username
+        ),
+    );
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn list_fleet_credential_bindings(
@@ -8960,6 +9003,7 @@ async fn enroll_client(
     request
         .validate()
         .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid client registration"))?;
+    let verified_public_key = verify_agent_enrollment_identity(&request)?;
 
     let client_name = request.name.clone();
     let platform = request.platform.clone();
@@ -8967,19 +9011,94 @@ async fn enroll_client(
         .clients
         .lock()
         .expect("client registry lock poisoned")
-        .enroll(request.name, request.platform, request.agent_instance_id)
+        .enroll_with_identity(
+            request.name,
+            request.platform,
+            request.agent_instance_id,
+            verified_public_key.clone(),
+        )
         .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "could not store client"))?;
     record_audit(
         &state,
         "client.enrolled",
         &client_id.to_string(),
-        &format!("name={client_name}; platform={platform}"),
+        &format!(
+            "name={client_name}; platform={platform}; identity_verified={}",
+            verified_public_key.is_some()
+        ),
     );
     Ok(Json(ClientEnrollmentResponse {
         client_id,
         agent_instance_id: Some(agent_instance_id),
         client_token,
     }))
+}
+
+fn verify_agent_enrollment_identity(
+    request: &ClientEnrollmentRequest,
+) -> Result<Option<String>, ApiError> {
+    let (Some(agent_instance_id), Some(public_key_hex), Some(signature_hex)) = (
+        request.agent_instance_id,
+        request.agent_identity_public_key.as_deref(),
+        request.agent_identity_signature.as_deref(),
+    ) else {
+        if request.agent_identity_public_key.is_none() && request.agent_identity_signature.is_none()
+        {
+            return Ok(None);
+        }
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "incomplete agent identity proof",
+        ));
+    };
+    if !is_lower_hex(public_key_hex, 32) || !is_lower_hex(signature_hex, 64) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid agent identity proof encoding",
+        ));
+    }
+    let public_key = decode_fixed_hex::<32>(public_key_hex)
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid agent identity public key"))?;
+    if agent_instance_id != agent_instance_id_from_public_key(&public_key) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "agent instance ID does not match its public key",
+        ));
+    }
+    let signature = Signature::from_bytes(
+        &decode_fixed_hex::<64>(signature_hex)
+            .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid agent identity signature"))?,
+    );
+    let verifying_key = VerifyingKey::from_bytes(&public_key)
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid agent identity public key"))?;
+    verifying_key
+        .verify_strict(
+            &agent_enrollment_message(
+                agent_instance_id,
+                public_key_hex,
+                &request.name,
+                &request.platform,
+            ),
+            &signature,
+        )
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid agent identity signature"))?;
+    Ok(Some(public_key_hex.to_owned()))
+}
+
+fn is_lower_hex(value: &str, bytes: usize) -> bool {
+    value.len() == bytes * 2
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn decode_fixed_hex<const N: usize>(value: &str) -> anyhow::Result<[u8; N]> {
+    anyhow::ensure!(value.len() == N * 2, "invalid hexadecimal length");
+    let mut decoded = [0_u8; N];
+    for (index, output) in decoded.iter_mut().enumerate() {
+        *output = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)?;
+    }
+    Ok(decoded)
 }
 
 async fn login(
@@ -9664,6 +9783,7 @@ struct ManagementPrincipal {
     username: String,
     role: UserRole,
     session_id: Option<Uuid>,
+    fleet_source_instance_id: Option<Uuid>,
 }
 
 fn management_principal(
@@ -9679,6 +9799,7 @@ fn management_principal(
             username: "management-token".to_owned(),
             role: UserRole::Administrator,
             session_id: None,
+            fleet_source_instance_id: None,
         });
     }
     if let Some(token) = bearer_token(headers) {
@@ -9703,6 +9824,7 @@ fn management_principal(
                 username: format!("api-token:{}", record.name),
                 role,
                 session_id: None,
+                fleet_source_instance_id: record.fleet_source_instance_id,
             });
         }
     }
@@ -9739,7 +9861,39 @@ fn management_principal(
         username: identity.username,
         role: identity.role,
         session_id: Some(identity.session_id),
+        fleet_source_instance_id: None,
     })
+}
+
+fn require_fleet_source(
+    state: &AppState,
+    headers: &HeaderMap,
+    source_instance_id: Uuid,
+) -> Result<ManagementPrincipal, CodedApiError> {
+    let principal = management_principal(state, headers).map_err(coded_management_error)?;
+    validate_fleet_source_binding(&principal, source_instance_id)?;
+    Ok(principal)
+}
+
+fn validate_fleet_source_binding(
+    principal: &ManagementPrincipal,
+    source_instance_id: Uuid,
+) -> Result<(), CodedApiError> {
+    let Some(bound_source) = principal.fleet_source_instance_id else {
+        return Err(CodedApiError(
+            StatusCode::FORBIDDEN,
+            "fleet_source_binding_required",
+            "Fleet reconcile requires an API token bound to one source instance",
+        ));
+    };
+    if bound_source != source_instance_id {
+        return Err(CodedApiError(
+            StatusCode::FORBIDDEN,
+            "fleet_source_binding_mismatch",
+            "Fleet API token is not authorized for this source instance",
+        ));
+    }
+    Ok(())
 }
 
 fn require_administrator(
@@ -9831,6 +9985,83 @@ async fn enforce_management_role(
         }
     }
     next.run(request).await
+}
+
+async fn enforce_fleet_ownership(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some((kind, policy_id)) = fleet_mutation_target(request.method(), request.uri().path())
+    else {
+        return next.run(request).await;
+    };
+    // 持锁直到处理器完成，使 ownership 检查与随后写入成为进程内原子序列。
+    let _mutation_guard = state.policy_mutation_lock.lock().await;
+    match state.policy_service.is_policy_managed(kind, policy_id) {
+        Ok(false) => next.run(request).await,
+        Ok(true) => CodedApiError(
+            StatusCode::CONFLICT,
+            "fleet_managed_policy",
+            "Fleet-managed policies must be changed by their owning source bundle",
+        )
+        .into_response(),
+        Err(error) => {
+            tracing::error!(%error, %policy_id, kind = kind.as_str(), "could not verify Fleet policy ownership");
+            CodedApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "fleet_ownership_check_failed",
+                "could not verify Fleet policy ownership",
+            )
+            .into_response()
+        }
+    }
+}
+
+fn fleet_mutation_target(method: &Method, path: &str) -> Option<(FleetPolicyKind, Uuid)> {
+    if !matches!(*method, Method::PUT | Method::DELETE | Method::POST) {
+        return None;
+    }
+    let segments = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    if segments.len() >= 5
+        && segments[..3] == ["api", "v1", "traffic-controls"]
+        && matches!(*method, Method::PUT | Method::DELETE)
+    {
+        let kind = match segments[3] {
+            "tcp" => FleetPolicyKind::Tcp,
+            "udp" => FleetPolicyKind::Udp,
+            "port_group" | "ports" => FleetPolicyKind::PortGroup,
+            "http" => FleetPolicyKind::HttpRoute,
+            "sni" => FleetPolicyKind::SniRoute,
+            "secret" => FleetPolicyKind::SecretTunnel,
+            "socks5" => FleetPolicyKind::Socks5Proxy,
+            "http_proxy" | "http-proxy" => FleetPolicyKind::HttpProxy,
+            _ => return None,
+        };
+        let policy_id = Uuid::parse_str(segments[4]).ok()?;
+        return Some((kind, policy_id));
+    }
+    if segments.len() < 4 || segments[..2] != ["api", "v1"] {
+        return None;
+    }
+    let kind = match segments[2] {
+        "tcp-tunnels" => FleetPolicyKind::Tcp,
+        "udp-tunnels" => FleetPolicyKind::Udp,
+        "port-groups" => FleetPolicyKind::PortGroup,
+        "http-routes" => FleetPolicyKind::HttpRoute,
+        "sni-routes" => FleetPolicyKind::SniRoute,
+        "secret-tunnels" => FleetPolicyKind::SecretTunnel,
+        "socks5-proxies" => FleetPolicyKind::Socks5Proxy,
+        "http-proxies" => FleetPolicyKind::HttpProxy,
+        _ => return None,
+    };
+    let direct_mutation = segments.len() == 4 && matches!(*method, Method::PUT | Method::DELETE);
+    let enable_mutation =
+        segments.len() == 5 && segments[4] == "enabled" && *method == Method::POST;
+    if !direct_mutation && !enable_mutation {
+        return None;
+    }
+    Some((kind, Uuid::parse_str(segments[3]).ok()?))
 }
 
 fn authorize_management(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
@@ -9934,6 +10165,9 @@ fn coded_policy_service_error(error: anyhow::Error) -> CodedApiError {
         || message.contains("expected generation")
         || message.contains("expected revision")
         || message.contains("already used")
+        || message.contains("generation advances too far")
+        || message.contains("initial generation is unreasonably high")
+        || message.contains("generation exceeds the persistent database range")
     {
         CodedApiError(
             StatusCode::CONFLICT,
@@ -9946,6 +10180,7 @@ fn coded_policy_service_error(error: anyhow::Error) -> CodedApiError {
         || message.contains("nil ID")
         || message.contains("does not exist")
         || message.contains("invalid")
+        || message.contains("identity")
     {
         CodedApiError(
             StatusCode::BAD_REQUEST,
@@ -10200,13 +10435,15 @@ mod tests {
     use super::{
         apply_cache_control, auth_me_response, build_metrics_history_response,
         certificate_target_matches, coded_http_route_creation_error, coded_tcp_policy_error,
-        login_throttle_identity, management_session_cookie, normalize_metrics_history_step,
-        parse_metrics_history_range, release_certificate_job_slot, render_prometheus_metrics,
-        reserve_certificate_job_slot, select_certificate_maintenance_operation,
-        session_cookie_header, tcp_history_error_total, udp_history_error_total,
-        udp_metrics_response, CertificateOperation, HistoryCounters, LoginResponse, LoginThrottle,
-        MetricsHistory, MetricsHistoryProtocol, MetricsHistorySample, Socks5CapabilitiesView,
-        UserRole, LOGIN_THROTTLE_MAX_IDENTITIES, MANAGEMENT_UI, METRICS_HISTORY_ARCHIVE_CAPACITY,
+        fleet_mutation_target, login_throttle_identity, management_session_cookie,
+        normalize_metrics_history_step, parse_metrics_history_range, release_certificate_job_slot,
+        render_prometheus_metrics, reserve_certificate_job_slot,
+        select_certificate_maintenance_operation, session_cookie_header, tcp_history_error_total,
+        udp_history_error_total, udp_metrics_response, validate_fleet_source_binding,
+        verify_agent_enrollment_identity, CertificateOperation, FleetPolicyKind, HistoryCounters,
+        LoginResponse, LoginThrottle, ManagementPrincipal, MetricsHistory, MetricsHistoryProtocol,
+        MetricsHistorySample, Socks5CapabilitiesView, UserRole, LOGIN_THROTTLE_MAX_IDENTITIES,
+        MANAGEMENT_UI, METRICS_HISTORY_ARCHIVE_CAPACITY,
         METRICS_HISTORY_ARCHIVE_SAMPLE_INTERVAL_SECONDS, METRICS_HISTORY_CAPACITY,
         METRICS_HISTORY_RECENT_RETENTION_SECONDS, METRICS_HISTORY_RETENTION_SECONDS,
         METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS,
@@ -10219,6 +10456,10 @@ mod tests {
         udp_tunnel::UdpTunnelStatisticsSnapshot,
     };
     use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+    use ed25519_dalek::{Signer, SigningKey};
+    use linklake_core::{
+        agent_enrollment_message, agent_instance_id_from_public_key, ClientEnrollmentRequest,
+    };
     use std::{
         collections::HashMap,
         fs,
@@ -10237,6 +10478,116 @@ mod tests {
             max_connections: 64,
             enabled,
         }
+    }
+
+    #[test]
+    fn fleet_policy_mutation_paths_are_fail_closed_for_every_owned_kind() {
+        let id = Uuid::new_v4();
+        for (path, kind) in [
+            (format!("/api/v1/tcp-tunnels/{id}"), FleetPolicyKind::Tcp),
+            (format!("/api/v1/udp-tunnels/{id}"), FleetPolicyKind::Udp),
+            (
+                format!("/api/v1/port-groups/{id}"),
+                FleetPolicyKind::PortGroup,
+            ),
+            (
+                format!("/api/v1/http-routes/{id}"),
+                FleetPolicyKind::HttpRoute,
+            ),
+            (
+                format!("/api/v1/sni-routes/{id}"),
+                FleetPolicyKind::SniRoute,
+            ),
+            (
+                format!("/api/v1/secret-tunnels/{id}"),
+                FleetPolicyKind::SecretTunnel,
+            ),
+            (
+                format!("/api/v1/socks5-proxies/{id}"),
+                FleetPolicyKind::Socks5Proxy,
+            ),
+            (
+                format!("/api/v1/http-proxies/{id}"),
+                FleetPolicyKind::HttpProxy,
+            ),
+        ] {
+            assert_eq!(
+                fleet_mutation_target(&axum::http::Method::PUT, &path),
+                Some((kind, id))
+            );
+            assert_eq!(
+                fleet_mutation_target(&axum::http::Method::DELETE, &path),
+                Some((kind, id))
+            );
+            assert_eq!(
+                fleet_mutation_target(&axum::http::Method::POST, &format!("{path}/enabled")),
+                Some((kind, id))
+            );
+        }
+        assert!(fleet_mutation_target(
+            &axum::http::Method::PUT,
+            &format!("/api/v1/http-routes/{id}/tls")
+        )
+        .is_none());
+        assert_eq!(
+            fleet_mutation_target(
+                &axum::http::Method::PUT,
+                &format!("/api/v1/traffic-controls/http/{id}")
+            ),
+            Some((FleetPolicyKind::HttpRoute, id))
+        );
+    }
+
+    #[test]
+    fn enrollment_identity_proof_binds_id_key_and_request_fields() {
+        let signing_key = SigningKey::from_bytes(&[9_u8; 32]);
+        let public_key = signing_key.verifying_key().to_bytes();
+        let public_key_hex = public_key
+            .iter()
+            .map(|value| format!("{value:02x}"))
+            .collect::<String>();
+        let agent_instance_id = agent_instance_id_from_public_key(&public_key);
+        let signature = signing_key.sign(&agent_enrollment_message(
+            agent_instance_id,
+            &public_key_hex,
+            "agent",
+            "windows",
+        ));
+        let signature_hex = signature
+            .to_bytes()
+            .iter()
+            .map(|value| format!("{value:02x}"))
+            .collect::<String>();
+        let request = ClientEnrollmentRequest {
+            name: "agent".into(),
+            platform: "windows".into(),
+            agent_instance_id: Some(agent_instance_id),
+            agent_identity_public_key: Some(public_key_hex),
+            agent_identity_signature: Some(signature_hex),
+        };
+        assert!(matches!(
+            verify_agent_enrollment_identity(&request),
+            Ok(Some(_))
+        ));
+        let mut tampered = request;
+        tampered.name = "other-agent".into();
+        assert!(verify_agent_enrollment_identity(&tampered).is_err());
+    }
+
+    #[test]
+    fn fleet_source_binding_rejects_unbound_and_mismatched_tokens() {
+        let source = Uuid::new_v4();
+        let mut principal = ManagementPrincipal {
+            username: "api-token:fleet".into(),
+            role: UserRole::Operator,
+            session_id: None,
+            fleet_source_instance_id: None,
+        };
+        assert!(validate_fleet_source_binding(&principal, source).is_err());
+        principal.fleet_source_instance_id = Some(Uuid::new_v4());
+        assert!(validate_fleet_source_binding(&principal, source).is_err());
+        principal.fleet_source_instance_id = Some(source);
+        assert!(validate_fleet_source_binding(&principal, source).is_ok());
     }
 
     fn certificate_state(

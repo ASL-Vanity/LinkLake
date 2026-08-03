@@ -47,6 +47,8 @@ pub(crate) struct ApiTokenRecord {
     pub(crate) created_unix_seconds: u64,
     pub(crate) expires_unix_seconds: Option<u64>,
     pub(crate) last_used_unix_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) fleet_source_instance_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +56,8 @@ pub(crate) struct CreateApiToken {
     pub(crate) name: String,
     pub(crate) scope: ApiTokenScope,
     pub(crate) expires_unix_seconds: Option<u64>,
+    #[serde(default)]
+    pub(crate) fleet_source_instance_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize)]
@@ -71,17 +75,33 @@ impl ApiTokenCatalog {
     #[allow(dead_code)]
     pub(crate) fn open(data_dir: Option<&Path>) -> anyhow::Result<Self> {
         let database = Database::open(data_dir)?;
+        if database.is_persistent() {
+            crate::database_migrations::prepare(&database)?.finish()?;
+        }
         Self::open_with_database(&database)
     }
 
     pub(crate) fn open_with_database(database: &Database) -> anyhow::Result<Self> {
+        let persistent = database.is_persistent();
         let database = database.connect()?;
-        database.execute_batch("CREATE TABLE IF NOT EXISTS management_api_tokens (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL UNIQUE, scope TEXT NOT NULL, token_hash BLOB NOT NULL UNIQUE, created_unix_seconds INTEGER NOT NULL, expires_unix_seconds INTEGER, last_used_unix_seconds INTEGER); CREATE INDEX IF NOT EXISTS management_api_tokens_expiry ON management_api_tokens(expires_unix_seconds);")?;
+        if persistent {
+            let schema_ready: bool = database.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('management_api_tokens') WHERE name = 'fleet_source_instance_id')",
+                [],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(
+                schema_ready,
+                "management API token schema is missing after database migration"
+            );
+        } else {
+            database.execute_batch("CREATE TABLE IF NOT EXISTS management_api_tokens (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL UNIQUE, scope TEXT NOT NULL, token_hash BLOB NOT NULL UNIQUE, created_unix_seconds INTEGER NOT NULL, expires_unix_seconds INTEGER, last_used_unix_seconds INTEGER, fleet_source_instance_id TEXT); CREATE INDEX IF NOT EXISTS management_api_tokens_expiry ON management_api_tokens(expires_unix_seconds);")?;
+        }
         Ok(Self { database })
     }
 
     pub(crate) fn list(&self) -> anyhow::Result<Vec<ApiTokenRecord>> {
-        let mut statement = self.database.prepare("SELECT id, name, scope, created_unix_seconds, expires_unix_seconds, last_used_unix_seconds FROM management_api_tokens ORDER BY name")?;
+        let mut statement = self.database.prepare("SELECT id, name, scope, created_unix_seconds, expires_unix_seconds, last_used_unix_seconds, fleet_source_instance_id FROM management_api_tokens ORDER BY name")?;
         let records = statement
             .query_map([], read_record)?
             .collect::<Result<Vec<_>, _>>()?;
@@ -104,6 +124,16 @@ impl ApiTokenCatalog {
                 .is_none_or(|expires| expires > now),
             "API token expiry is invalid"
         );
+        anyhow::ensure!(
+            request
+                .fleet_source_instance_id
+                .is_none_or(|source| !source.is_nil()),
+            "Fleet source instance ID is invalid"
+        );
+        anyhow::ensure!(
+            request.fleet_source_instance_id.is_none() || request.scope != ApiTokenScope::Read,
+            "read-only API tokens cannot be bound as Fleet writers"
+        );
         let mut random = [0_u8; 32];
         random_fill(&mut random)?;
         let token = format!("llapi_{}", hex(&random));
@@ -114,8 +144,9 @@ impl ApiTokenCatalog {
             created_unix_seconds: now,
             expires_unix_seconds: request.expires_unix_seconds,
             last_used_unix_seconds: None,
+            fleet_source_instance_id: request.fleet_source_instance_id,
         };
-        self.database.execute("INSERT INTO management_api_tokens (id, name, scope, token_hash, created_unix_seconds, expires_unix_seconds) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![record.id.to_string(), record.name, record.scope.to_string(), token_hash(&token).to_vec(), now as i64, record.expires_unix_seconds.map(|value| value as i64)])?;
+        self.database.execute("INSERT INTO management_api_tokens (id, name, scope, token_hash, created_unix_seconds, expires_unix_seconds, fleet_source_instance_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![record.id.to_string(), record.name, record.scope.to_string(), token_hash(&token).to_vec(), now as i64, record.expires_unix_seconds.map(|value| value as i64), record.fleet_source_instance_id.map(|value| value.to_string())])?;
         Ok(CreatedApiToken { record, token })
     }
 
@@ -135,7 +166,7 @@ impl ApiTokenCatalog {
             return Ok(None);
         }
         let hash = token_hash(token);
-        let record = self.database.query_row("SELECT id, name, scope, created_unix_seconds, expires_unix_seconds, last_used_unix_seconds FROM management_api_tokens WHERE token_hash = ?1", [hash.to_vec()], read_record).optional()?;
+        let record = self.database.query_row("SELECT id, name, scope, created_unix_seconds, expires_unix_seconds, last_used_unix_seconds, fleet_source_instance_id FROM management_api_tokens WHERE token_hash = ?1", [hash.to_vec()], read_record).optional()?;
         let Some(mut record) = record else {
             return Ok(None);
         };
@@ -183,6 +214,17 @@ fn read_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiTokenRecord> {
         last_used_unix_seconds: row
             .get::<_, Option<i64>>(5)?
             .map(|value| value.max(0) as u64),
+        fleet_source_instance_id: row
+            .get::<_, Option<String>>(6)?
+            .map(|value| Uuid::parse_str(&value))
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
     })
 }
 
@@ -198,12 +240,28 @@ mod tests {
                     name: "automation".into(),
                     scope: ApiTokenScope::Write,
                     expires_unix_seconds: Some(200),
+                    fleet_source_instance_id: Some(Uuid::new_v4()),
                 },
                 100,
             )
             .unwrap();
-        assert!(catalog.authenticate(&created.token, 150).unwrap().is_some());
+        let authenticated = catalog.authenticate(&created.token, 150).unwrap().unwrap();
+        assert_eq!(
+            authenticated.fleet_source_instance_id,
+            created.record.fleet_source_instance_id
+        );
         assert!(catalog.authenticate(&created.token, 201).unwrap().is_none());
         assert!(catalog.revoke(created.record.id).unwrap());
+        assert!(catalog
+            .create(
+                CreateApiToken {
+                    name: "invalid-read-fleet".into(),
+                    scope: ApiTokenScope::Read,
+                    expires_unix_seconds: None,
+                    fleet_source_instance_id: Some(Uuid::new_v4()),
+                },
+                100,
+            )
+            .is_err());
     }
 }

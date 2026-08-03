@@ -19,6 +19,8 @@ use std::{
 };
 use uuid::Uuid;
 
+const MAX_FLEET_GENERATION_ADVANCE: u64 = 1_000_000;
+
 const FLEET_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS fleet_local_state (
     singleton_id INTEGER PRIMARY KEY NOT NULL CHECK(singleton_id = 1),
@@ -217,6 +219,7 @@ struct PlannedResource {
     policy_id: Uuid,
     resource_sha256: String,
     credential_hash: Option<String>,
+    write_required: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -233,7 +236,26 @@ impl PolicyService {
     ) -> anyhow::Result<Self> {
         let source_instance_id = Uuid::new_v4();
         database.with_connection(|connection| {
-            connection.execute_batch(FLEET_SCHEMA_SQL)?;
+            if database.is_persistent() {
+                for table in [
+                    "fleet_local_state",
+                    "fleet_source_states",
+                    "fleet_resource_ownership",
+                    "fleet_credential_bindings",
+                ] {
+                    let exists: bool = connection.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                        [table],
+                        |row| row.get(0),
+                    )?;
+                    anyhow::ensure!(
+                        exists,
+                        "Fleet schema is missing after database migration: {table}"
+                    );
+                }
+            } else {
+                connection.execute_batch(FLEET_SCHEMA_SQL)?;
+            }
             connection.execute(
                 "INSERT OR IGNORE INTO fleet_local_state (singleton_id, source_instance_id, generation) VALUES (1, ?1, 0)",
                 [source_instance_id.to_string()],
@@ -367,14 +389,62 @@ impl PolicyService {
         kind: FleetPolicyKind,
         credential_ref: Uuid,
     ) -> anyhow::Result<bool> {
-        self.database.with_connection(|connection| {
-            Ok(connection.execute(
+        self.database.with_transaction(|transaction| {
+            let policy_id: Option<String> = transaction
+                .query_row(
+                    "SELECT policy_id FROM fleet_credential_bindings WHERE source_instance_id = ?1 AND credential_ref = ?2 AND kind = ?3",
+                    params![
+                        source_instance_id.to_string(),
+                        credential_ref.to_string(),
+                        kind.as_str(),
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(policy_id) = policy_id else {
+                return Ok(false);
+            };
+            transaction.execute(
                 "DELETE FROM fleet_credential_bindings WHERE source_instance_id = ?1 AND credential_ref = ?2 AND kind = ?3",
                 params![
                     source_instance_id.to_string(),
                     credential_ref.to_string(),
                     kind.as_str(),
                 ],
+            )?;
+            // 解绑后把策略留在本地，但立即解除远端 ownership；后续 bundle 必须重新显式绑定。
+            transaction.execute(
+                "DELETE FROM fleet_resource_ownership WHERE source_instance_id = ?1 AND kind = ?2 AND policy_id = ?3 AND credential_ref = ?4",
+                params![
+                    source_instance_id.to_string(),
+                    kind.as_str(),
+                    policy_id,
+                    credential_ref.to_string(),
+                ],
+            )?;
+            Ok(true)
+        })
+    }
+
+    pub(crate) fn is_policy_managed(
+        &self,
+        kind: FleetPolicyKind,
+        policy_id: Uuid,
+    ) -> anyhow::Result<bool> {
+        self.database.with_connection(|connection| {
+            Ok(connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM fleet_resource_ownership WHERE kind = ?1 AND policy_id = ?2)",
+                params![kind.as_str(), policy_id.to_string()],
+                |row| row.get(0),
+            )?)
+        })
+    }
+
+    pub(crate) fn reset_source_state(&self, source_instance_id: Uuid) -> anyhow::Result<bool> {
+        self.database.with_connection(|connection| {
+            Ok(connection.execute(
+                "DELETE FROM fleet_source_states WHERE source_instance_id = ?1",
+                [source_instance_id.to_string()],
             )? > 0)
         })
     }
@@ -387,12 +457,17 @@ impl PolicyService {
                 .iter()
                 .map(|client| (client.0, client.1.agent_instance_id))
                 .collect::<HashMap<_, _>>();
+            let excluded = excluded_local_policies(transaction)?;
+            let resources = export_resources(transaction, &agent_by_client, &excluded)?;
+            let referenced_clients = resources
+                .iter()
+                .flat_map(referenced_agent_ids)
+                .collect::<HashSet<_>>();
             let client_refs = clients
                 .into_iter()
                 .map(|(_, client)| client)
+                .filter(|client| referenced_clients.contains(&client.agent_instance_id))
                 .collect::<Vec<_>>();
-            let excluded = excluded_local_policies(transaction)?;
-            let resources = export_resources(transaction, &agent_by_client, &excluded)?;
             let traffic_controls = export_traffic_controls(transaction, &resources)?;
             Ok(FleetBundleV2::new(
                 source_instance_id,
@@ -416,6 +491,10 @@ impl PolicyService {
         let revision = request.bundle.revision.clone();
         let public_port_policy = self.public_port_policy.clone();
         self.database.with_transaction(|transaction| {
+            anyhow::ensure!(
+                generation <= i64::MAX as u64,
+                "Fleet bundle generation exceeds the persistent database range"
+            );
             let current = read_source_status(transaction, source_instance_id)?;
             let previous_generation = current.as_ref().map_or(0, |state| state.generation);
             let previous_revision = current.as_ref().map(|state| state.revision.clone());
@@ -431,35 +510,30 @@ impl PolicyService {
                     "Fleet expected revision does not match current state"
                 );
             }
-            if let Some(current) = &current {
+            let same_revision_replay = if let Some(current) = &current {
                 anyhow::ensure!(
                     generation >= current.generation,
                     "Fleet bundle generation is stale"
+                );
+                anyhow::ensure!(
+                    generation.saturating_sub(current.generation)
+                        <= MAX_FLEET_GENERATION_ADVANCE,
+                    "Fleet bundle generation advances too far"
                 );
                 if generation == current.generation {
                     anyhow::ensure!(
                         revision == current.revision,
                         "Fleet generation was already used by another revision"
                     );
-                    return Ok(FleetReconcileResult {
-                        source_instance_id,
-                        generation,
-                        revision,
-                        previous_generation,
-                        previous_revision,
-                        dry_run: request.dry_run,
-                        applied: false,
-                        idempotent: true,
-                        created: 0,
-                        updated: 0,
-                        deleted: 0,
-                        unchanged: request.bundle.resources.len(),
-                        traffic_controls: request.bundle.traffic_controls.len(),
-                        conflicts: Vec::new(),
-                        runtime_invalidations: Vec::new(),
-                    });
                 }
-            }
+                generation == current.generation
+            } else {
+                anyhow::ensure!(
+                    generation <= MAX_FLEET_GENERATION_ADVANCE,
+                    "Fleet bundle initial generation is unreasonably high"
+                );
+                false
+            };
 
             let clients = resolve_bundle_clients(transaction, &request.bundle)?;
             let existing = load_owned_resources(transaction, source_instance_id)?;
@@ -471,6 +545,7 @@ impl PolicyService {
                     source_instance_id,
                     resource,
                     existing.get(&resource.resource_id),
+                    &clients,
                 ) {
                     Ok(planned) => plan.push(planned),
                     Err(error) => conflicts.push(FleetConflict {
@@ -525,12 +600,40 @@ impl PolicyService {
             let updated = plan
                 .iter()
                 .filter(|resource| {
-                    existing
-                        .get(&resource.resource.resource_id)
-                        .is_some_and(|old| old.resource_sha256 != resource.resource_sha256)
+                    existing.contains_key(&resource.resource.resource_id)
+                        && resource.write_required
                 })
                 .count();
             let unchanged = plan.len().saturating_sub(created + updated);
+            let traffic_controls_unchanged = traffic_controls_match(
+                transaction,
+                &request.bundle.traffic_controls,
+                &plan,
+            )?;
+            if same_revision_replay
+                && created == 0
+                && updated == 0
+                && obsolete.is_empty()
+                && traffic_controls_unchanged
+            {
+                return Ok(FleetReconcileResult {
+                    source_instance_id,
+                    generation,
+                    revision,
+                    previous_generation,
+                    previous_revision,
+                    dry_run: request.dry_run,
+                    applied: false,
+                    idempotent: true,
+                    created: 0,
+                    updated: 0,
+                    deleted: 0,
+                    unchanged,
+                    traffic_controls: request.bundle.traffic_controls.len(),
+                    conflicts: Vec::new(),
+                    runtime_invalidations: Vec::new(),
+                });
+            }
             if request.dry_run {
                 return Ok(FleetReconcileResult {
                     source_instance_id,
@@ -557,10 +660,10 @@ impl PolicyService {
             }
             // 先移除所有发生变化的旧行，再写入新值，允许两个资源在同一事务内交换端口或主机名。
             for planned in &plan {
+                if !planned.write_required {
+                    continue;
+                }
                 if let Some(old) = existing.get(&planned.resource.resource_id) {
-                    if old.resource_sha256 == planned.resource_sha256 {
-                        continue;
-                    }
                     collect_runtime_invalidation(transaction, old, &mut runtime_invalidations)?;
                     delete_policy_row(transaction, old.kind, old.policy_id)?;
                 } else if planned.kind.requires_credential() {
@@ -569,10 +672,7 @@ impl PolicyService {
                 }
             }
             for planned in &plan {
-                if existing
-                    .get(&planned.resource.resource_id)
-                    .is_some_and(|old| old.resource_sha256 == planned.resource_sha256)
-                {
+                if !planned.write_required {
                     continue;
                 }
                 upsert_planned_resource(
@@ -649,24 +749,45 @@ fn resolve_bundle_clients(
     transaction: &Transaction<'_>,
     bundle: &FleetBundleV2,
 ) -> anyhow::Result<HashMap<Uuid, Uuid>> {
+    let referenced = bundle
+        .resources
+        .iter()
+        .flat_map(referenced_agent_ids)
+        .collect::<HashSet<_>>();
+    let bundle_clients = bundle
+        .clients
+        .iter()
+        .map(|client| (client.agent_instance_id, client))
+        .collect::<HashMap<_, _>>();
     let mut clients = HashMap::new();
-    for client in &bundle.clients {
-        let local: Option<(String, i64)> = transaction
+    for agent_instance_id in referenced {
+        let client = bundle_clients
+            .get(&agent_instance_id)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("Fleet resource references an undeclared client"))?;
+        let expected_public_key = client.agent_identity_public_key.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("Fleet client identity is not cryptographically verified")
+        })?;
+        let local: Option<(String, i64, Option<String>)> = transaction
             .query_row(
-                "SELECT client_id, enabled FROM clients WHERE agent_instance_id = ?1",
-                [client.agent_instance_id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                "SELECT client_id, enabled, agent_identity_public_key FROM clients WHERE agent_instance_id = ?1",
+                [agent_instance_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        let Some((local_client_id, enabled)) = local else {
+        let Some((local_client_id, enabled, local_public_key)) = local else {
             anyhow::bail!(
                 "Fleet client {} ({}) is not enrolled on this server",
                 client.name,
-                client.agent_instance_id
+                agent_instance_id
             );
         };
         anyhow::ensure!(enabled != 0, "Fleet client {} is disabled", client.name);
-        clients.insert(client.agent_instance_id, Uuid::parse_str(&local_client_id)?);
+        anyhow::ensure!(
+            local_public_key.as_deref() == Some(expected_public_key),
+            "Fleet client identity public key does not match local enrollment"
+        );
+        clients.insert(agent_instance_id, Uuid::parse_str(&local_client_id)?);
     }
     Ok(clients)
 }
@@ -712,14 +833,11 @@ fn plan_resource(
     source_instance_id: Uuid,
     resource: &FleetResource,
     existing: Option<&OwnedResource>,
+    clients: &HashMap<Uuid, Uuid>,
 ) -> anyhow::Result<PlannedResource> {
     let kind = resource_kind(resource);
     if let Some(existing) = existing {
         anyhow::ensure!(existing.kind == kind, "Fleet resource kind cannot change");
-        anyhow::ensure!(
-            policy_exists(transaction, existing.kind, existing.policy_id)?,
-            "Fleet ownership references a missing local policy"
-        );
     }
     let requested_credential = credential_ref(resource);
     let (policy_id, credential_hash) = if let Some(credential_ref) = requested_credential {
@@ -728,26 +846,20 @@ fn plan_resource(
                 existing.credential_ref == Some(credential_ref),
                 "Fleet credential reference cannot change"
             );
+            let binding =
+                credential_binding_policy(transaction, source_instance_id, credential_ref, kind)?;
+            anyhow::ensure!(
+                binding == Some(existing.policy_id),
+                "Fleet credential binding was revoked or changed"
+            );
             (
                 existing.policy_id,
                 Some(read_credential_hash(transaction, kind, existing.policy_id)?),
             )
         } else {
-            let binding: Option<String> = transaction
-                .query_row(
-                    "SELECT policy_id FROM fleet_credential_bindings WHERE source_instance_id = ?1 AND credential_ref = ?2 AND kind = ?3",
-                    params![
-                        source_instance_id.to_string(),
-                        credential_ref.to_string(),
-                        kind.as_str(),
-                    ],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let policy_id = binding
-                .map(|value| Uuid::parse_str(&value))
-                .transpose()?
-                .ok_or_else(|| {
+            let policy_id =
+                credential_binding_policy(transaction, source_instance_id, credential_ref, kind)?
+                    .ok_or_else(|| {
                     anyhow::anyhow!(
                         "credential_ref {credential_ref} is not bound to a local {} policy",
                         kind.as_str()
@@ -771,13 +883,41 @@ fn plan_resource(
         };
         (policy_id, None)
     };
-    Ok(PlannedResource {
+    let resource_sha256 = resource_sha256(resource)?;
+    let write_required = existing.is_none_or(|old| old.resource_sha256 != resource_sha256);
+    let mut planned = PlannedResource {
         resource: resource.clone(),
         kind,
         policy_id,
-        resource_sha256: resource_sha256(resource)?,
+        resource_sha256,
         credential_hash,
-    })
+        write_required,
+    };
+    if existing.is_some() && !policy_matches_planned(transaction, &planned, clients)? {
+        planned.write_required = true;
+    }
+    Ok(planned)
+}
+
+fn credential_binding_policy(
+    transaction: &Transaction<'_>,
+    source_instance_id: Uuid,
+    credential_ref: Uuid,
+    kind: FleetPolicyKind,
+) -> anyhow::Result<Option<Uuid>> {
+    transaction
+        .query_row(
+            "SELECT policy_id FROM fleet_credential_bindings WHERE source_instance_id = ?1 AND credential_ref = ?2 AND kind = ?3",
+            params![
+                source_instance_id.to_string(),
+                credential_ref.to_string(),
+                kind.as_str(),
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|value| Uuid::parse_str(&value).map_err(Into::into))
+        .transpose()
 }
 
 fn read_credential_hash(
@@ -806,6 +946,216 @@ fn read_credential_hash(
         .ok_or_else(|| anyhow::anyhow!("bound Fleet credential policy does not exist"))
 }
 
+fn policy_matches_planned(
+    transaction: &Transaction<'_>,
+    planned: &PlannedResource,
+    clients: &HashMap<Uuid, Uuid>,
+) -> anyhow::Result<bool> {
+    let id = planned.policy_id.to_string();
+    let matches = match &planned.resource.spec {
+        FleetResourceSpec::Tcp(value) => {
+            let client_id = local_client_id(clients, value.agent_instance_id)?.to_string();
+            transaction
+            .query_row(
+                "SELECT client_id, name, public_port, target_addr, max_connections, bandwidth_limit_bps, enabled FROM tcp_tunnel_policies WHERE id = ?1",
+                [&id],
+                |row| {
+                    Ok(row.get::<_, String>(0)? == client_id
+                        && row.get::<_, String>(1)? == value.name
+                        && row.get::<_, u16>(2)? == value.public_port
+                        && row.get::<_, String>(3)? == value.target_addr
+                        && row.get::<_, u16>(4)? == value.max_connections
+                        && row.get::<_, Option<u64>>(5)? == value.bandwidth_limit_bps
+                        && (row.get::<_, i64>(6)? != 0) == planned.resource.enabled)
+                },
+            )
+            .optional()?
+            .unwrap_or(false)
+        }
+        FleetResourceSpec::Udp(value) => {
+            let client_id = local_client_id(clients, value.agent_instance_id)?.to_string();
+            transaction
+            .query_row(
+                "SELECT client_id, name, public_port, target_addr, max_sessions, session_idle_timeout_seconds, bandwidth_limit_bps, enabled FROM udp_tunnel_policies WHERE id = ?1",
+                [&id],
+                |row| {
+                    Ok(row.get::<_, String>(0)? == client_id
+                        && row.get::<_, String>(1)? == value.name
+                        && row.get::<_, u16>(2)? == value.public_port
+                        && row.get::<_, String>(3)? == value.target_addr
+                        && row.get::<_, u16>(4)? == value.max_sessions
+                        && row.get::<_, u32>(5)? == value.session_idle_timeout_seconds
+                        && row.get::<_, Option<u64>>(6)? == value.bandwidth_limit_bps
+                        && (row.get::<_, i64>(7)? != 0) == planned.resource.enabled)
+                },
+            )
+            .optional()?
+            .unwrap_or(false)
+        }
+        FleetResourceSpec::PortGroup(value) => {
+            let client_id = local_client_id(clients, value.agent_instance_id)?.to_string();
+            let row_matches = transaction
+                .query_row(
+                    "SELECT client_id, name, protocol, public_ports, target_host, target_ports, max_connections, max_sessions, session_idle_timeout_seconds, bandwidth_limit_bps, enabled FROM port_group_policies WHERE id = ?1",
+                    [&id],
+                    |row| {
+                        Ok(row.get::<_, String>(0)? == client_id
+                            && row.get::<_, String>(1)? == value.name
+                            && row.get::<_, String>(2)? == port_group_protocol(value.protocol)
+                            && row.get::<_, String>(3)? == value.public_ports
+                            && row.get::<_, String>(4)? == value.target_host
+                            && row.get::<_, String>(5)? == value.target_ports
+                            && row.get::<_, u16>(6)? == value.max_connections
+                            && row.get::<_, u16>(7)? == value.max_sessions
+                            && row.get::<_, u32>(8)? == value.session_idle_timeout_seconds
+                            && row.get::<_, Option<u64>>(9)? == value.bandwidth_limit_bps
+                            && (row.get::<_, i64>(10)? != 0) == planned.resource.enabled)
+                    },
+                )
+                .optional()?
+                .unwrap_or(false);
+            if !row_matches {
+                false
+            } else {
+                let parsed = parse_port_mappings(
+                    &value.public_ports,
+                    &value.target_ports,
+                    1,
+                    u16::MAX,
+                    MAX_PORT_MAPPINGS,
+                )?;
+                let expected = parsed
+                    .pairs
+                    .into_iter()
+                    .map(|mapping| {
+                        (
+                            mapping.public_port,
+                            mapping.target_port,
+                            target_addr(&value.target_host, mapping.target_port),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let mut statement = transaction.prepare(
+                    "SELECT public_port, target_port, target_addr FROM port_group_mappings WHERE policy_id = ?1 ORDER BY public_port",
+                )?;
+                let actual = statement
+                    .query_map([&id], |row| {
+                        Ok((
+                            row.get::<_, u16>(0)?,
+                            row.get::<_, u16>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                actual == expected
+            }
+        }
+        FleetResourceSpec::HttpRoute(value) => {
+            let client_id = local_client_id(clients, value.agent_instance_id)?.to_string();
+            transaction
+            .query_row(
+                "SELECT client_id, name, hostname, target_addr, max_connections, enabled FROM http_route_policies WHERE id = ?1",
+                [&id],
+                |row| {
+                    Ok(row.get::<_, String>(0)? == client_id
+                        && row.get::<_, String>(1)? == value.name
+                        && row.get::<_, String>(2)? == value.hostname
+                        && row.get::<_, String>(3)? == value.target_addr
+                        && row.get::<_, u16>(4)? == value.max_connections
+                        && (row.get::<_, i64>(5)? != 0) == planned.resource.enabled)
+                },
+            )
+            .optional()?
+            .unwrap_or(false)
+        }
+        FleetResourceSpec::SniRoute(value) => {
+            let client_id = local_client_id(clients, value.agent_instance_id)?.to_string();
+            transaction
+            .query_row(
+                "SELECT client_id, name, hostname, target_addr, max_connections, bandwidth_limit_bps, enabled FROM sni_route_policies WHERE id = ?1",
+                [&id],
+                |row| {
+                    Ok(row.get::<_, String>(0)? == client_id
+                        && row.get::<_, String>(1)? == value.name
+                        && row.get::<_, String>(2)? == value.hostname
+                        && row.get::<_, String>(3)? == value.target_addr
+                        && row.get::<_, u16>(4)? == value.max_connections
+                        && row.get::<_, Option<u64>>(5)? == value.bandwidth_limit_bps
+                        && (row.get::<_, i64>(6)? != 0) == planned.resource.enabled)
+                },
+            )
+            .optional()?
+            .unwrap_or(false)
+        }
+        FleetResourceSpec::SecretTunnel(value) => {
+            let provider_id =
+                local_client_id(clients, value.provider_agent_instance_id)?.to_string();
+            let allowed_id = value
+                .allowed_agent_instance_id
+                .map(|agent| local_client_id(clients, agent).map(|client| client.to_string()))
+                .transpose()?;
+            transaction
+            .query_row(
+                "SELECT provider_client_id, allowed_client_id, name, target_addr, access_key_hash, max_connections, bandwidth_limit_bps, enabled FROM secret_tunnel_policies WHERE id = ?1",
+                [&id],
+                |row| {
+                    Ok(row.get::<_, String>(0)? == provider_id
+                        && row.get::<_, Option<String>>(1)? == allowed_id
+                        && row.get::<_, String>(2)? == value.name
+                        && row.get::<_, String>(3)? == value.target_addr
+                        && row.get::<_, String>(4)? == planned.credential_hash.clone().unwrap_or_default()
+                        && row.get::<_, u16>(5)? == value.max_connections
+                        && row.get::<_, Option<u64>>(6)? == value.bandwidth_limit_bps
+                        && (row.get::<_, i64>(7)? != 0) == planned.resource.enabled)
+                },
+            )
+            .optional()?
+            .unwrap_or(false)
+        }
+        FleetResourceSpec::Socks5Proxy(value) => {
+            let client_id = local_client_id(clients, value.agent_instance_id)?.to_string();
+            transaction
+            .query_row(
+                "SELECT client_id, name, public_port, username, password_hash, max_connections, bandwidth_limit_bps, enabled FROM socks5_proxy_policies WHERE id = ?1",
+                [&id],
+                |row| {
+                    Ok(row.get::<_, String>(0)? == client_id
+                        && row.get::<_, String>(1)? == value.name
+                        && row.get::<_, u16>(2)? == value.public_port
+                        && row.get::<_, String>(3)? == value.username
+                        && row.get::<_, String>(4)? == planned.credential_hash.clone().unwrap_or_default()
+                        && row.get::<_, u16>(5)? == value.max_connections
+                        && row.get::<_, Option<u64>>(6)? == value.bandwidth_limit_bps
+                        && (row.get::<_, i64>(7)? != 0) == planned.resource.enabled)
+                },
+            )
+            .optional()?
+            .unwrap_or(false)
+        }
+        FleetResourceSpec::HttpProxy(value) => {
+            let client_id = local_client_id(clients, value.agent_instance_id)?.to_string();
+            transaction
+            .query_row(
+                "SELECT client_id, name, public_port, username, password_hash, max_connections, bandwidth_limit_bps, enabled FROM http_proxy_policies WHERE id = ?1",
+                [&id],
+                |row| {
+                    Ok(row.get::<_, String>(0)? == client_id
+                        && row.get::<_, String>(1)? == value.name
+                        && row.get::<_, u16>(2)? == value.public_port
+                        && row.get::<_, String>(3)? == value.username
+                        && row.get::<_, String>(4)? == planned.credential_hash.clone().unwrap_or_default()
+                        && row.get::<_, u16>(5)? == value.max_connections
+                        && row.get::<_, Option<u64>>(6)? == value.bandwidth_limit_bps
+                        && (row.get::<_, i64>(7)? != 0) == planned.resource.enabled)
+                },
+            )
+            .optional()?
+            .unwrap_or(false)
+        }
+    };
+    Ok(matches)
+}
+
 fn validate_plan(
     transaction: &Transaction<'_>,
     public_port_policy: &PublicPortPolicy,
@@ -820,6 +1170,7 @@ fn validate_plan(
     let mut desired_http = HashMap::<String, DesiredEndpoint>::new();
     let mut desired_sni = HashMap::<String, DesiredEndpoint>::new();
     let mut desired_names = HashSet::<(FleetPolicyKind, Uuid, String)>::new();
+    let mut desired_credentials = HashMap::<(FleetPolicyKind, Uuid), Uuid>::new();
     let plan_by_resource = plan
         .iter()
         .map(|planned| (planned.resource.resource_id, planned))
@@ -827,6 +1178,18 @@ fn validate_plan(
 
     for planned in plan {
         let resource_id = planned.resource.resource_id;
+        if let Some(reference) = credential_ref(&planned.resource) {
+            if let Some(other) = desired_credentials.insert((planned.kind, reference), resource_id)
+            {
+                conflicts.push(FleetConflict {
+                    code: "duplicate_credential_ref".to_owned(),
+                    resource_id: Some(resource_id),
+                    message: format!(
+                        "credential_ref {reference} is also used by Fleet resource {other}"
+                    ),
+                });
+            }
+        }
         let endpoint = DesiredEndpoint {
             resource_id,
             kind: planned.kind,
@@ -1616,6 +1979,58 @@ fn reconcile_traffic_controls(
     Ok(())
 }
 
+fn traffic_controls_match(
+    transaction: &Transaction<'_>,
+    controls: &[FleetTrafficControl],
+    plan: &[PlannedResource],
+) -> anyhow::Result<bool> {
+    let desired = controls
+        .iter()
+        .map(|control| (control.resource_id, control))
+        .collect::<HashMap<_, _>>();
+    for resource in plan {
+        let stored: Option<StoredTrafficControl> = transaction
+            .query_row(
+                "SELECT allowed_cidrs, denied_cidrs, max_connections_per_minute, daily_quota_bytes, active_weekdays_utc, start_minute_utc, end_minute_utc, enabled FROM traffic_controls WHERE kind = ?1 AND policy_id = ?2",
+                params![resource.kind.traffic_kind(), resource.policy_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some(control) = desired.get(&resource.resource.resource_id).copied() else {
+            if stored.is_some() {
+                return Ok(false);
+            }
+            continue;
+        };
+        let Some((allowed, denied, rate, quota, weekdays, start, end, enabled)) = stored else {
+            return Ok(false);
+        };
+        if serde_json::from_str::<Vec<String>>(&allowed)? != control.allowed_cidrs
+            || serde_json::from_str::<Vec<String>>(&denied)? != control.denied_cidrs
+            || rate != control.max_connections_per_minute
+            || quota != control.daily_quota_bytes
+            || serde_json::from_str::<Vec<u8>>(&weekdays)? != control.active_weekdays_utc
+            || start != control.start_minute_utc
+            || end != control.end_minute_utc
+            || (enabled != 0) != control.enabled
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn reserve_generation(transaction: &Transaction<'_>) -> anyhow::Result<(Uuid, u64)> {
     let (source, generation): (String, u64) = transaction.query_row(
         "SELECT source_instance_id, generation FROM fleet_local_state WHERE singleton_id = 1",
@@ -1636,22 +2051,24 @@ fn load_fleet_clients(
     transaction: &Transaction<'_>,
 ) -> anyhow::Result<Vec<(Uuid, linklake_core::fleet_protocol::FleetClientRef)>> {
     let mut statement = transaction.prepare(
-        "SELECT client_id, agent_instance_id, name FROM clients WHERE enabled = 1 ORDER BY agent_instance_id",
+        "SELECT client_id, agent_instance_id, name, agent_identity_public_key FROM clients WHERE enabled = 1 AND agent_identity_public_key IS NOT NULL ORDER BY agent_instance_id",
     )?;
     let rows = statement.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
         ))
     })?;
     rows.map(|row| {
-        let (client, agent, name) = row?;
+        let (client, agent, name, public_key) = row?;
         Ok((
             Uuid::parse_str(&client)?,
             linklake_core::fleet_protocol::FleetClientRef {
                 agent_instance_id: Uuid::parse_str(&agent)?,
                 name,
+                agent_identity_public_key: Some(public_key),
             },
         ))
     })
@@ -1684,18 +2101,6 @@ fn excluded_local_policies(
     Ok(excluded)
 }
 
-fn require_agent(
-    agents: &HashMap<Uuid, Uuid>,
-    client_id: Uuid,
-    policy_id: Uuid,
-) -> anyhow::Result<Uuid> {
-    agents.get(&client_id).copied().ok_or_else(|| {
-        anyhow::anyhow!(
-            "policy {policy_id} references a disabled or missing local client {client_id}"
-        )
-    })
-}
-
 fn export_resources(
     transaction: &Transaction<'_>,
     agents: &HashMap<Uuid, Uuid>,
@@ -1724,7 +2129,9 @@ fn export_resources(
         if excluded.contains(&(FleetPolicyKind::Tcp, id)) {
             continue;
         }
-        let client = require_agent(agents, Uuid::parse_str(&client)?, id)?;
+        let Some(client) = agents.get(&Uuid::parse_str(&client)?).copied() else {
+            continue;
+        };
         resources.push(FleetResource {
             resource_id: id,
             enabled,
@@ -1762,7 +2169,9 @@ fn export_resources(
         if excluded.contains(&(FleetPolicyKind::Udp, id)) {
             continue;
         }
-        let client = require_agent(agents, Uuid::parse_str(&client)?, id)?;
+        let Some(client) = agents.get(&Uuid::parse_str(&client)?).copied() else {
+            continue;
+        };
         resources.push(FleetResource {
             resource_id: id,
             enabled,
@@ -1817,7 +2226,9 @@ fn export_resources(
         if excluded.contains(&(FleetPolicyKind::PortGroup, id)) {
             continue;
         }
-        let client = require_agent(agents, Uuid::parse_str(&client)?, id)?;
+        let Some(client) = agents.get(&Uuid::parse_str(&client)?).copied() else {
+            continue;
+        };
         resources.push(FleetResource {
             resource_id: id,
             enabled,
@@ -1861,7 +2272,9 @@ fn export_resources(
         if excluded.contains(&(FleetPolicyKind::HttpRoute, id)) {
             continue;
         }
-        let client = require_agent(agents, Uuid::parse_str(&client)?, id)?;
+        let Some(client) = agents.get(&Uuid::parse_str(&client)?).copied() else {
+            continue;
+        };
         resources.push(FleetResource {
             resource_id: id,
             enabled,
@@ -1897,7 +2310,9 @@ fn export_resources(
         if excluded.contains(&(FleetPolicyKind::SniRoute, id)) {
             continue;
         }
-        let client = require_agent(agents, Uuid::parse_str(&client)?, id)?;
+        let Some(client) = agents.get(&Uuid::parse_str(&client)?).copied() else {
+            continue;
+        };
         resources.push(FleetResource {
             resource_id: id,
             enabled,
@@ -1934,13 +2349,19 @@ fn export_resources(
         if excluded.contains(&(FleetPolicyKind::SecretTunnel, id)) {
             continue;
         }
-        let provider = require_agent(agents, Uuid::parse_str(&provider)?, id)?;
-        let allowed = allowed
-            .map(|value| {
+        let Some(provider) = agents.get(&Uuid::parse_str(&provider)?).copied() else {
+            continue;
+        };
+        let allowed = match allowed {
+            Some(value) => {
                 let client = Uuid::parse_str(&value)?;
-                require_agent(agents, client, id)
-            })
-            .transpose()?;
+                let Some(agent) = agents.get(&client).copied() else {
+                    continue;
+                };
+                Some(agent)
+            }
+            None => None,
+        };
         resources.push(FleetResource {
             resource_id: id,
             enabled,
@@ -1982,7 +2403,9 @@ fn export_resources(
             if excluded.contains(&(kind, id)) {
                 continue;
             }
-            let client = require_agent(agents, Uuid::parse_str(&client)?, id)?;
+            let Some(client) = agents.get(&Uuid::parse_str(&client)?).copied() else {
+                continue;
+            };
             let spec = if kind == FleetPolicyKind::Socks5Proxy {
                 FleetResourceSpec::Socks5Proxy(FleetSocks5ProxyResource {
                     agent_instance_id: client,
@@ -2083,6 +2506,23 @@ fn resource_kind(resource: &FleetResource) -> FleetPolicyKind {
     }
 }
 
+fn referenced_agent_ids(resource: &FleetResource) -> Vec<Uuid> {
+    match &resource.spec {
+        FleetResourceSpec::Tcp(value) => vec![value.agent_instance_id],
+        FleetResourceSpec::Udp(value) => vec![value.agent_instance_id],
+        FleetResourceSpec::PortGroup(value) => vec![value.agent_instance_id],
+        FleetResourceSpec::HttpRoute(value) => vec![value.agent_instance_id],
+        FleetResourceSpec::SniRoute(value) => vec![value.agent_instance_id],
+        FleetResourceSpec::SecretTunnel(value) => {
+            let mut clients = vec![value.provider_agent_instance_id];
+            clients.extend(value.allowed_agent_instance_id);
+            clients
+        }
+        FleetResourceSpec::Socks5Proxy(value) => vec![value.agent_instance_id],
+        FleetResourceSpec::HttpProxy(value) => vec![value.agent_instance_id],
+    }
+}
+
 fn credential_ref(resource: &FleetResource) -> Option<Uuid> {
     match &resource.spec {
         FleetResourceSpec::SecretTunnel(value) => Some(value.credential_ref),
@@ -2149,10 +2589,11 @@ mod tests {
         let mut clients = ClientRegistry::open_with_database(&database).unwrap();
         let agent_instance_id = Uuid::new_v4();
         let (client_id, _, _) = clients
-            .enroll(
+            .enroll_with_identity(
                 "fleet-agent".to_owned(),
                 "windows".to_owned(),
                 Some(agent_instance_id),
+                Some("11".repeat(32)),
             )
             .unwrap();
         let mut tunnels =
@@ -2345,6 +2786,7 @@ mod tests {
             vec![FleetClientRef {
                 agent_instance_id: agent,
                 name: "fleet-agent".into(),
+                agent_identity_public_key: Some("11".repeat(32)),
             }],
             resources,
             vec![FleetTrafficControl {
@@ -2543,7 +2985,17 @@ mod tests {
                 bandwidth_limit_bps: None,
             })
             .unwrap();
+        ClientRegistry::open_with_database(&state.database)
+            .unwrap()
+            .enroll_with_identity(
+                "unused-agent".into(),
+                "linux".into(),
+                Some(Uuid::new_v4()),
+                Some("22".repeat(32)),
+            )
+            .unwrap();
         let exported = state.service.export_bundle(30).unwrap();
+        assert_eq!(exported.clients.len(), 1);
         assert_eq!(
             exported.clients[0].agent_instance_id,
             state.agent_instance_id
@@ -2554,5 +3006,265 @@ mod tests {
             exported.resources[0].spec,
             FleetResourceSpec::Tcp(_)
         ));
+    }
+
+    #[test]
+    fn reconcile_repairs_database_drift_and_missing_non_secret_rows() {
+        let state = setup();
+        let desired = bundle(&state, 1, 32_001, 32_005);
+        state
+            .service
+            .reconcile(
+                FleetReconcileRequest {
+                    bundle: desired.clone(),
+                    dry_run: false,
+                    expected_generation: None,
+                    expected_revision: None,
+                },
+                10,
+            )
+            .unwrap();
+        let policy_id = state
+            .database
+            .with_connection(|connection| {
+                Ok(connection.query_row(
+                    "SELECT policy_id FROM fleet_resource_ownership WHERE source_instance_id = ?1 AND resource_id = ?2",
+                    params![state.source_instance_id.to_string(), Uuid::from_u128(1).to_string()],
+                    |row| row.get::<_, String>(0),
+                )?)
+            })
+            .unwrap();
+        state
+            .database
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE tcp_tunnel_policies SET target_addr = '127.0.0.1:29999' WHERE id = ?1",
+                    [&policy_id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let repaired = state
+            .service
+            .reconcile(
+                FleetReconcileRequest {
+                    bundle: desired.clone(),
+                    dry_run: false,
+                    expected_generation: None,
+                    expected_revision: None,
+                },
+                11,
+            )
+            .unwrap();
+        assert!(repaired.applied);
+        assert_eq!(repaired.updated, 1);
+        state
+            .database
+            .with_connection(|connection| {
+                connection.execute(
+                    "DELETE FROM tcp_tunnel_policies WHERE id = ?1",
+                    [&policy_id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let recreated = state
+            .service
+            .reconcile(
+                FleetReconcileRequest {
+                    bundle: desired,
+                    dry_run: false,
+                    expected_generation: None,
+                    expected_revision: None,
+                },
+                12,
+            )
+            .unwrap();
+        assert!(recreated.applied);
+        assert_eq!(recreated.updated, 1);
+        state
+            .database
+            .with_connection(|connection| {
+                let target: String = connection.query_row(
+                    "SELECT target_addr FROM tcp_tunnel_policies WHERE id = ?1",
+                    [&policy_id],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(target, "127.0.0.1:23001");
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn credential_unbind_detaches_ownership_and_revokes_future_reconcile() {
+        let state = setup();
+        state
+            .service
+            .reconcile(
+                FleetReconcileRequest {
+                    bundle: bundle(&state, 1, 32_001, 32_005),
+                    dry_run: false,
+                    expected_generation: None,
+                    expected_revision: None,
+                },
+                10,
+            )
+            .unwrap();
+        let binding = state
+            .service
+            .list_credential_bindings()
+            .unwrap()
+            .into_iter()
+            .find(|binding| binding.credential_ref == state.socks_ref)
+            .unwrap();
+        assert!(state
+            .service
+            .delete_credential_binding(
+                state.source_instance_id,
+                FleetPolicyKind::Socks5Proxy,
+                state.socks_ref,
+            )
+            .unwrap());
+        assert!(!state
+            .service
+            .is_policy_managed(FleetPolicyKind::Socks5Proxy, binding.policy_id)
+            .unwrap());
+        state
+            .database
+            .with_connection(|connection| {
+                let exists: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM socks5_proxy_policies WHERE id = ?1)",
+                    [binding.policy_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                assert!(exists, "unbind must retain the local credential policy");
+                Ok(())
+            })
+            .unwrap();
+        let mut changed = bundle(&state, 2, 32_001, 32_009);
+        changed.refresh_integrity().unwrap();
+        let rejected = state
+            .service
+            .reconcile(
+                FleetReconcileRequest {
+                    bundle: changed,
+                    dry_run: false,
+                    expected_generation: None,
+                    expected_revision: None,
+                },
+                20,
+            )
+            .unwrap();
+        assert!(!rejected.applied);
+        assert!(rejected
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.message.contains("credential")));
+    }
+
+    #[test]
+    fn unused_bundle_clients_do_not_block_reconcile() {
+        let state = setup();
+        let mut desired = bundle(&state, 1, 32_001, 32_005);
+        desired.clients.push(FleetClientRef {
+            agent_instance_id: Uuid::new_v4(),
+            name: "not-enrolled-and-unused".into(),
+            agent_identity_public_key: Some("33".repeat(32)),
+        });
+        desired.refresh_integrity().unwrap();
+        let result = state
+            .service
+            .reconcile(
+                FleetReconcileRequest {
+                    bundle: desired,
+                    dry_run: false,
+                    expected_generation: None,
+                    expected_revision: None,
+                },
+                10,
+            )
+            .unwrap();
+        assert!(result.applied);
+        assert_eq!(result.created, 8);
+    }
+
+    #[test]
+    fn duplicate_credential_refs_are_reported_before_sql_writes() {
+        let state = setup();
+        let mut desired = bundle(&state, 1, 32_001, 32_005);
+        let mut duplicate = desired.resources[5].clone();
+        duplicate.resource_id = Uuid::from_u128(9);
+        if let FleetResourceSpec::SecretTunnel(secret) = &mut duplicate.spec {
+            secret.name = "second-secret".into();
+            secret.target_addr = "127.0.0.1:23009".into();
+        }
+        desired.resources.push(duplicate);
+        desired.refresh_integrity().unwrap();
+        let result = state
+            .service
+            .reconcile(
+                FleetReconcileRequest {
+                    bundle: desired,
+                    dry_run: false,
+                    expected_generation: None,
+                    expected_revision: None,
+                },
+                10,
+            )
+            .unwrap();
+        assert!(!result.applied);
+        assert!(result
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.code == "duplicate_credential_ref"));
+        let sources = state.service.list_sources().unwrap();
+        assert!(sources.is_empty());
+    }
+
+    #[test]
+    fn unreasonable_generation_is_rejected_and_admin_reset_recovers_state() {
+        let state = setup();
+        assert!(state
+            .service
+            .reconcile(
+                FleetReconcileRequest {
+                    bundle: bundle(&state, MAX_FLEET_GENERATION_ADVANCE + 1, 32_001, 32_005,),
+                    dry_run: false,
+                    expected_generation: None,
+                    expected_revision: None,
+                },
+                10,
+            )
+            .is_err());
+        state
+            .service
+            .reconcile(
+                FleetReconcileRequest {
+                    bundle: bundle(&state, 1, 32_001, 32_005),
+                    dry_run: false,
+                    expected_generation: None,
+                    expected_revision: None,
+                },
+                11,
+            )
+            .unwrap();
+        assert!(state
+            .service
+            .reset_source_state(state.source_instance_id)
+            .unwrap());
+        let recovered = state
+            .service
+            .reconcile(
+                FleetReconcileRequest {
+                    bundle: bundle(&state, 1, 32_001, 32_005),
+                    dry_run: false,
+                    expected_generation: None,
+                    expected_revision: None,
+                },
+                12,
+            )
+            .unwrap();
+        assert!(recovered.applied || recovered.idempotent);
     }
 }

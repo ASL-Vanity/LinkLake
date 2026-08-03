@@ -5,7 +5,7 @@ use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 11;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 12;
 
 const MIGRATION_V10_NAME: &str = "shared_database_foundation";
 const MIGRATION_V10_SQL: &str = "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -58,6 +58,11 @@ CREATE TABLE IF NOT EXISTS fleet_credential_bindings (
 );
 "#;
 
+const MIGRATION_V12_NAME: &str = "fleet_identity_binding";
+const MIGRATION_V12_CONTRACT: &str = "ALTER TABLE clients ADD COLUMN agent_identity_public_key TEXT;
+CREATE UNIQUE INDEX clients_agent_identity_public_key ON clients(agent_identity_public_key) WHERE agent_identity_public_key IS NOT NULL;
+ALTER TABLE management_api_tokens ADD COLUMN fleet_source_instance_id TEXT;";
+
 pub(crate) struct MigrationPlan {
     database: Database,
     from_version: u32,
@@ -102,6 +107,10 @@ impl MigrationPlan {
                     11 => {
                         apply_v11(transaction)?;
                         (MIGRATION_V11_NAME, migration_v11_checksum())
+                    }
+                    12 => {
+                        apply_v12(transaction)?;
+                        (MIGRATION_V12_NAME, migration_v12_checksum())
                     }
                     _ => anyhow::bail!("unsupported database migration version {version}"),
                 };
@@ -156,6 +165,52 @@ fn apply_v11(transaction: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
         [],
     )?;
     transaction.execute_batch(FLEET_V11_SCHEMA_SQL)?;
+    Ok(())
+}
+
+fn apply_v12(transaction: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
+    let identity_column_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('clients') WHERE name = 'agent_identity_public_key')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !identity_column_exists {
+        transaction.execute(
+            "ALTER TABLE clients ADD COLUMN agent_identity_public_key TEXT",
+            [],
+        )?;
+    }
+    transaction.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS clients_agent_identity_public_key
+         ON clients(agent_identity_public_key)
+         WHERE agent_identity_public_key IS NOT NULL",
+        [],
+    )?;
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS management_api_tokens (
+            id TEXT PRIMARY KEY NOT NULL,
+            name TEXT NOT NULL UNIQUE,
+            scope TEXT NOT NULL,
+            token_hash BLOB NOT NULL UNIQUE,
+            created_unix_seconds INTEGER NOT NULL,
+            expires_unix_seconds INTEGER,
+            last_used_unix_seconds INTEGER,
+            fleet_source_instance_id TEXT
+        );
+        CREATE INDEX IF NOT EXISTS management_api_tokens_expiry
+            ON management_api_tokens(expires_unix_seconds);",
+    )?;
+    let source_column_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('management_api_tokens') WHERE name = 'fleet_source_instance_id')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !source_column_exists {
+        transaction.execute(
+            "ALTER TABLE management_api_tokens ADD COLUMN fleet_source_instance_id TEXT",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -240,6 +295,7 @@ fn verify_migration_ledger(
         let (expected_name, expected_checksum) = match version {
             10 => (MIGRATION_V10_NAME, migration_checksum(MIGRATION_V10_SQL)),
             11 => (MIGRATION_V11_NAME, migration_v11_checksum()),
+            12 => (MIGRATION_V12_NAME, migration_v12_checksum()),
             _ => anyhow::bail!("unsupported database migration version {version}"),
         };
         let record = connection
@@ -284,6 +340,10 @@ fn migration_v11_checksum() -> String {
         .iter()
         .map(|value| format!("{value:02x}"))
         .collect()
+}
+
+fn migration_v12_checksum() -> String {
+    migration_checksum(MIGRATION_V12_CONTRACT)
 }
 
 #[cfg(test)]
@@ -332,6 +392,21 @@ mod tests {
             .expect("migration ledger should read");
         assert_eq!(ledger.0, MIGRATION_V10_NAME);
         assert_eq!(ledger.1, migration_checksum(MIGRATION_V10_SQL));
+        let agent_key_column: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('clients') WHERE name = 'agent_identity_public_key')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("agent identity column should exist");
+        let source_binding_column: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('management_api_tokens') WHERE name = 'fleet_source_instance_id')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("Fleet source binding column should exist");
+        assert!(agent_key_column && source_binding_column);
         let value: String = Connection::open(&backup)
             .expect("backup should open")
             .query_row("SELECT value FROM legacy", [], |row| row.get(0))
@@ -392,6 +467,68 @@ mod tests {
         assert!(plan.backup_path().is_none());
         plan.finish().unwrap();
         prepare(&database).expect("current migration ledger should verify");
+        drop(database);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_v12_migration_rolls_back_v11_schema_and_ledger() {
+        let root = temporary_directory("linklake-migration-rollback");
+        fs::create_dir_all(&root).unwrap();
+        let database_path = root.join("linklake.sqlite3");
+        let checksum = migration_checksum(MIGRATION_V10_SQL);
+        Connection::open(&database_path)
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TABLE schema_migrations (
+                    version INTEGER PRIMARY KEY NOT NULL,
+                    name TEXT NOT NULL,
+                    checksum_sha256 TEXT NOT NULL,
+                    applied_unix_seconds INTEGER NOT NULL
+                 );
+                 INSERT INTO schema_migrations VALUES (10, '{MIGRATION_V10_NAME}', '{checksum}', 1);
+                 CREATE TABLE clients (
+                    client_id TEXT PRIMARY KEY NOT NULL,
+                    name TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    access_token_hash TEXT NOT NULL,
+                    last_seen_unix_seconds INTEGER NOT NULL
+                 );
+                 CREATE VIEW management_api_tokens AS SELECT client_id AS id FROM clients;
+                 PRAGMA user_version = 10;"
+            ))
+            .unwrap();
+        let database = Database::persistent(&root).unwrap();
+        let plan = prepare(&database).unwrap();
+        assert!(plan.finish().is_err());
+        let connection = database.connect().unwrap();
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        let agent_column: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('clients') WHERE name = 'agent_instance_id')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let fleet_table: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fleet_local_state')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let ledger_rows: u32 = connection
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 10);
+        assert!(!agent_column);
+        assert!(!fleet_table);
+        assert_eq!(ledger_rows, 1);
+        drop(connection);
         drop(database);
         fs::remove_dir_all(root).unwrap();
     }

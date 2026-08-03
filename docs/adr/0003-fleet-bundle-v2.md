@@ -36,7 +36,9 @@ LinkLake 使用 `FleetBundleV2` 表达一个来源实例在某一 generation 下
 7. SOCKS5 Proxy
 8. HTTP Proxy
 
-每项资源使用来源实例内稳定且非空的 `resource_id`。策略引用客户端时使用跨服务端稳定的 `agent_instance_id`，不使用某一台服务端签发的 `client_id` 或可变名称。
+每项资源使用来源实例内稳定且非空的 `resource_id`。策略引用客户端时使用跨服务端稳定的 `agent_instance_id`，不使用某一台服务端签发的 `client_id` 或可变名称。客户端同时携带经过 enrollment 持有证明验证的 Ed25519 公钥；接收端必须同时匹配实例 ID 与公钥，未验证的旧客户端只能继续使用本地策略，不能接管 Fleet 资源。
+
+客户端首次 enrollment 会在本机状态目录原子创建机器级身份文件，后续向其他服务端注册时复用同一实例 ID 和密钥。实例 ID 由公钥确定性派生，服务端验证 enrollment 签名，避免只凭一个可复制 UUID 抢注其他客户端。
 
 Secret、SOCKS5 和 HTTP Proxy 只携带不含秘密的 `credential_ref`。凭据材料若需要跨节点复制，必须由未来独立、受限且加密的凭据通道处理。
 
@@ -73,6 +75,8 @@ Secret、SOCKS5 和 HTTP Proxy 只携带不含秘密的 `credential_ref`。凭�
 
 Fleet Bundle 是策略期望状态，不是秘密封装格式。
 
+接收端的 reconcile 只接受绑定到单一 `source_instance_id` 的 write/administrator API Token。通用管理 Token、交互式会话以及绑定到其他来源的 Token 均不能提交 Bundle。绑定关系持久化在 Token 记录中；generation 还必须处于受限增长范围，管理员可在保留 ownership 的前提下重置异常来源状态。
+
 以下内容不得进入 Bundle：
 
 - 客户端 enrollment token 和 client token。
@@ -86,6 +90,8 @@ Fleet Bundle 是策略期望状态，不是秘密封装格式。
 ## 后果
 
 - 后续 Fleet reconcile 可以用 `(source_instance_id, resource_id)` 建立稳定 ownership。
+- 普通策略 CRUD 必须拒绝修改 Fleet-owned 策略；reconcile 会比较实际策略行并修复非秘密资源的本地漂移或缺失。
+- 删除凭据绑定会把对应策略安全地转回本地 ownership，来源必须重新绑定后才能再次控制。
 - generation 可用于拒绝旧状态和重放。
 - revision 可用于幂等同步、审计和能力比较。
 - 八类策略和流量控制共享一份协议合同。

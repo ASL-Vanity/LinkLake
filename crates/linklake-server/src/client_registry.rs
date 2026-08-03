@@ -28,6 +28,7 @@ pub(crate) struct ClientRegistry {
 #[derive(Clone)]
 struct RegisteredClient {
     agent_instance_id: Uuid,
+    agent_identity_public_key: Option<String>,
     name: String,
     platform: String,
     group_name: Option<String>,
@@ -56,16 +57,32 @@ impl ClientRegistry {
     #[allow(dead_code)]
     pub(crate) fn open(data_dir: Option<&Path>) -> anyhow::Result<Self> {
         let database = Database::open(data_dir)?;
+        if database.is_persistent() {
+            crate::database_migrations::prepare(&database)?.finish()?;
+        }
         Self::open_with_database(&database)
     }
 
     pub(crate) fn open_with_database(database: &Database) -> anyhow::Result<Self> {
+        let persistent = database.is_persistent();
         let database = database.connect()?;
-        database.execute_batch(
-            "
+        if persistent {
+            let clients_exists: bool = database.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'clients')",
+                [],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(
+                clients_exists,
+                "clients schema is missing after database migration"
+            );
+        } else {
+            database.execute_batch(
+                "
             CREATE TABLE IF NOT EXISTS clients (
                 client_id TEXT PRIMARY KEY NOT NULL,
                 agent_instance_id TEXT NOT NULL UNIQUE,
+                agent_identity_public_key TEXT,
                 name TEXT NOT NULL,
                 platform TEXT NOT NULL,
                 group_name TEXT,
@@ -83,16 +100,22 @@ impl ClientRegistry {
                 config_checked_unix_seconds INTEGER
             );
             ",
-        )?;
-        ensure_column(&database, "agent_instance_id", "TEXT")?;
-        database.execute(
-            "UPDATE clients SET agent_instance_id = client_id WHERE agent_instance_id IS NULL OR TRIM(agent_instance_id) = ''",
-            [],
-        )?;
-        database.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS clients_agent_instance_id ON clients(agent_instance_id)",
-            [],
-        )?;
+            )?;
+            ensure_column(&database, "agent_instance_id", "TEXT")?;
+            ensure_column(&database, "agent_identity_public_key", "TEXT")?;
+            database.execute(
+                "UPDATE clients SET agent_instance_id = client_id WHERE agent_instance_id IS NULL OR TRIM(agent_instance_id) = ''",
+                [],
+            )?;
+            database.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS clients_agent_instance_id ON clients(agent_instance_id)",
+                [],
+            )?;
+            database.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS clients_agent_identity_public_key ON clients(agent_identity_public_key) WHERE agent_identity_public_key IS NOT NULL",
+                [],
+            )?;
+        }
         ensure_column(&database, "config_mode", "TEXT NOT NULL DEFAULT 'local'")?;
         ensure_column(&database, "group_name", "TEXT")?;
         ensure_column(&database, "tags_json", "TEXT NOT NULL DEFAULT '[]'")?;
@@ -114,7 +137,7 @@ impl ClientRegistry {
         ensure_column(&database, "config_checked_unix_seconds", "INTEGER")?;
 
         let mut statement = database.prepare(
-            "SELECT client_id, agent_instance_id, name, platform, group_name, tags_json, notes, enabled, created_unix_seconds, token_rotated_unix_seconds, access_token_hash, last_seen_unix_seconds, config_mode, config_sync_status, applied_config_revision, config_sync_error, config_checked_unix_seconds FROM clients",
+            "SELECT client_id, agent_instance_id, agent_identity_public_key, name, platform, group_name, tags_json, notes, enabled, created_unix_seconds, token_rotated_unix_seconds, access_token_hash, last_seen_unix_seconds, config_mode, config_sync_status, applied_config_revision, config_sync_error, config_checked_unix_seconds FROM clients",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -122,23 +145,24 @@ impl ClientRegistry {
                 RegisteredClient {
                     agent_instance_id: Uuid::parse_str(&row.get::<_, String>(1)?)
                         .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    name: row.get(2)?,
-                    platform: row.get(3)?,
-                    group_name: row.get(4)?,
-                    tags: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
-                    notes: row.get(6)?,
-                    enabled: row.get::<_, i64>(7)? != 0,
-                    created_unix_seconds: row.get::<_, i64>(8)?.max(0) as u64,
+                    agent_identity_public_key: row.get(2)?,
+                    name: row.get(3)?,
+                    platform: row.get(4)?,
+                    group_name: row.get(5)?,
+                    tags: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
+                    notes: row.get(7)?,
+                    enabled: row.get::<_, i64>(8)? != 0,
+                    created_unix_seconds: row.get::<_, i64>(9)?.max(0) as u64,
                     token_rotated_unix_seconds: row
-                        .get::<_, Option<i64>>(9)?
+                        .get::<_, Option<i64>>(10)?
                         .map(|value| value.max(0) as u64),
-                    access_token_hash: row.get(10)?,
-                    last_seen_unix_seconds: row.get(11)?,
-                    config_mode: parse_config_mode(&row.get::<_, String>(12)?),
-                    config_sync_status: parse_config_status(&row.get::<_, String>(13)?),
-                    applied_config_revision: row.get(14)?,
-                    config_sync_error: row.get(15)?,
-                    config_checked_unix_seconds: row.get(16)?,
+                    access_token_hash: row.get(11)?,
+                    last_seen_unix_seconds: row.get(12)?,
+                    config_mode: parse_config_mode(&row.get::<_, String>(13)?),
+                    config_sync_status: parse_config_status(&row.get::<_, String>(14)?),
+                    applied_config_revision: row.get(15)?,
+                    config_sync_error: row.get(16)?,
+                    config_checked_unix_seconds: row.get(17)?,
                 },
             ))
         })?;
@@ -174,6 +198,7 @@ impl ClientRegistry {
             .map(|(client_id, client)| ClientSummary {
                 client_id: *client_id,
                 agent_instance_id: client.agent_instance_id,
+                agent_identity_public_key: client.agent_identity_public_key.clone(),
                 name: client.name.clone(),
                 platform: client.platform.clone(),
                 group_name: client.group_name.clone(),
@@ -198,13 +223,23 @@ impl ClientRegistry {
         self.summary(client_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn enroll(
         &mut self,
         name: String,
         platform: String,
         agent_instance_id: Option<Uuid>,
     ) -> anyhow::Result<(Uuid, Uuid, String)> {
-        let client_id = Uuid::new_v4();
+        self.enroll_with_identity(name, platform, agent_instance_id, None)
+    }
+
+    pub(crate) fn enroll_with_identity(
+        &mut self,
+        name: String,
+        platform: String,
+        agent_instance_id: Option<Uuid>,
+        agent_identity_public_key: Option<String>,
+    ) -> anyhow::Result<(Uuid, Uuid, String)> {
         let agent_instance_id = agent_instance_id.unwrap_or_else(Uuid::new_v4);
         anyhow::ensure!(
             !agent_instance_id.is_nil(),
@@ -212,8 +247,38 @@ impl ClientRegistry {
         );
         let client_token = format!("llc_{}", Uuid::new_v4().simple());
         let now = unix_seconds();
+        if let Some((client_id, existing)) = self
+            .clients
+            .iter()
+            .find(|(_, client)| client.agent_instance_id == agent_instance_id)
+            .map(|(client_id, client)| (*client_id, client.clone()))
+        {
+            let Some(public_key) = agent_identity_public_key else {
+                anyhow::bail!("agent instance ID is already enrolled");
+            };
+            anyhow::ensure!(
+                existing
+                    .agent_identity_public_key
+                    .as_deref()
+                    .is_none_or(|stored| stored == public_key),
+                "agent identity public key does not match the enrolled instance"
+            );
+            let mut upgraded = existing;
+            upgraded.agent_identity_public_key = Some(public_key);
+            upgraded.name = name;
+            upgraded.platform = platform;
+            upgraded.enabled = true;
+            upgraded.access_token_hash = hash_token(&client_token)?;
+            upgraded.token_rotated_unix_seconds = Some(now);
+            upgraded.last_seen_unix_seconds = now;
+            self.persist_client(client_id, &upgraded)?;
+            self.clients.insert(client_id, upgraded);
+            return Ok((client_id, agent_instance_id, client_token));
+        }
+        let client_id = Uuid::new_v4();
         let client = RegisteredClient {
             agent_instance_id,
+            agent_identity_public_key,
             name,
             platform,
             group_name: None,
@@ -307,6 +372,7 @@ impl ClientRegistry {
         Some(ClientSummary {
             client_id,
             agent_instance_id: client.agent_instance_id,
+            agent_identity_public_key: client.agent_identity_public_key.clone(),
             name: client.name.clone(),
             platform: client.platform.clone(),
             group_name: client.group_name.clone(),
@@ -353,10 +419,11 @@ impl ClientRegistry {
         };
         database.execute(
             "
-            INSERT INTO clients (client_id, agent_instance_id, name, platform, group_name, tags_json, notes, enabled, created_unix_seconds, token_rotated_unix_seconds, access_token_hash, last_seen_unix_seconds, config_mode, config_sync_status, applied_config_revision, config_sync_error, config_checked_unix_seconds)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+            INSERT INTO clients (client_id, agent_instance_id, agent_identity_public_key, name, platform, group_name, tags_json, notes, enabled, created_unix_seconds, token_rotated_unix_seconds, access_token_hash, last_seen_unix_seconds, config_mode, config_sync_status, applied_config_revision, config_sync_error, config_checked_unix_seconds)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
             ON CONFLICT(client_id) DO UPDATE SET
                 agent_instance_id = excluded.agent_instance_id,
+                agent_identity_public_key = excluded.agent_identity_public_key,
                 name = excluded.name,
                 platform = excluded.platform,
                 group_name = excluded.group_name,
@@ -376,6 +443,7 @@ impl ClientRegistry {
             params![
                 client_id.to_string(),
                 client.agent_instance_id.to_string(),
+                client.agent_identity_public_key,
                 client.name,
                 client.platform,
                 client.group_name,
@@ -530,6 +598,53 @@ mod tests {
             registry.authenticate_and_touch(client_id, "wrong-token"),
             Ok(Authentication::InvalidToken)
         ));
+    }
+
+    #[test]
+    fn verified_identity_reuses_client_and_overrides_unverified_preclaim() {
+        let mut registry = ClientRegistry::open(None).unwrap();
+        let agent_instance_id = uuid::Uuid::new_v4();
+        let (preclaimed_client_id, _, preclaimed_token) = registry
+            .enroll(
+                "legacy-preclaim".into(),
+                "windows".into(),
+                Some(agent_instance_id),
+            )
+            .unwrap();
+        let public_key = "44".repeat(32);
+        let (verified_client_id, _, verified_token) = registry
+            .enroll_with_identity(
+                "verified-agent".into(),
+                "windows".into(),
+                Some(agent_instance_id),
+                Some(public_key.clone()),
+            )
+            .unwrap();
+        assert_eq!(verified_client_id, preclaimed_client_id);
+        assert!(matches!(
+            registry.authenticate_and_touch(preclaimed_client_id, &preclaimed_token),
+            Ok(Authentication::InvalidToken)
+        ));
+        assert!(matches!(
+            registry.authenticate_and_touch(verified_client_id, &verified_token),
+            Ok(Authentication::Authenticated)
+        ));
+        assert_eq!(
+            registry
+                .summary_by_id(verified_client_id)
+                .unwrap()
+                .agent_identity_public_key
+                .as_deref(),
+            Some(public_key.as_str())
+        );
+        assert!(registry
+            .enroll_with_identity(
+                "attacker".into(),
+                "linux".into(),
+                Some(agent_instance_id),
+                Some("55".repeat(32)),
+            )
+            .is_err());
     }
 
     #[test]

@@ -33,6 +33,9 @@ const MAX_UDP_IDLE_TIMEOUT_SECONDS: u32 = 3_600;
 pub struct FleetClientRef {
     pub agent_instance_id: Uuid,
     pub name: String,
+    /// 经过 enrollment 持有证明验证的 Ed25519 公钥。旧 bundle 可省略，但不能据此接管资源。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_identity_public_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -407,6 +410,15 @@ impl FleetBundleV2 {
             }
             if !valid_name(&client.name, MAX_NAME_BYTES) {
                 return Err(FleetBundleError::InvalidField("clients.name"));
+            }
+            if client
+                .agent_identity_public_key
+                .as_deref()
+                .is_some_and(|value| !valid_hex(value, 32))
+            {
+                return Err(FleetBundleError::InvalidField(
+                    "clients.agent_identity_public_key",
+                ));
             }
             if !clients.insert(client.agent_instance_id) {
                 return Err(FleetBundleError::DuplicateClient(client.agent_instance_id));
@@ -830,7 +842,11 @@ where
 }
 
 fn valid_sha256(value: &str) -> bool {
-    value.len() == 64
+    valid_hex(value, 32)
+}
+
+fn valid_hex(value: &str, bytes: usize) -> bool {
+    value.len() == bytes * 2
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
@@ -863,14 +879,17 @@ mod tests {
             FleetClientRef {
                 agent_instance_id: provider,
                 name: "provider".to_owned(),
+                agent_identity_public_key: None,
             },
             FleetClientRef {
                 agent_instance_id: visitor,
                 name: "visitor".to_owned(),
+                agent_identity_public_key: None,
             },
             FleetClientRef {
                 agent_instance_id: edge,
                 name: "edge".to_owned(),
+                agent_identity_public_key: None,
             },
         ];
         let resources = vec![

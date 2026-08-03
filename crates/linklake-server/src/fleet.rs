@@ -467,6 +467,7 @@ mod tests {
         ClientSummary {
             client_id: Uuid::new_v4(),
             agent_instance_id: Uuid::new_v4(),
+            agent_identity_public_key: None,
             name: name.to_owned(),
             platform: "linux".to_owned(),
             group_name: None,
