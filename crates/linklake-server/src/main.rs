@@ -8,6 +8,7 @@ mod client_registry;
 mod database;
 mod database_migrations;
 mod database_tools;
+mod dual_stack_udp;
 mod fleet;
 pub mod http_backend_pool;
 mod http_proxy_tunnel;
@@ -55,6 +56,7 @@ use certificate_manager::CertificateManager;
 use clap::{Parser, Subcommand};
 use client_registry::{Authentication, ClientRegistry, UpdateClient};
 use database::Database;
+use dual_stack_udp::{DualStackUdpSocket, PublicUdpBindMode};
 use fleet::{FleetCatalog, FleetImportResult, FleetPeer, FleetPolicyBundle, UpsertFleetPeer};
 use http_route_catalog::{
     CreateHttpRouteError, CreateHttpRoutePolicy, HttpRouteCatalog, HttpRoutePolicy,
@@ -310,6 +312,7 @@ struct AppState {
     traffic_controls: Mutex<TrafficControlCatalog>,
     management_cookies_secure: bool,
     public_port_policy: PublicPortPolicy,
+    udp_public_bind_mode: PublicUdpBindMode,
     clients: Mutex<ClientRegistry>,
     tunnel_catalog: Mutex<TunnelCatalog>,
     tunnels: Mutex<HashMap<u16, tcp_tunnel::TunnelRegistration>>,
@@ -369,6 +372,10 @@ struct ServerCounters {
     p2p_session_offers_total: AtomicU64,
     p2p_direct_connections_total: AtomicU64,
     p2p_relay_fallbacks_total: AtomicU64,
+    udp_public_ipv4_bind_successes_total: AtomicU64,
+    udp_public_ipv6_bind_successes_total: AtomicU64,
+    udp_public_ipv6_bind_fallbacks_total: AtomicU64,
+    udp_public_bind_failures_total: AtomicU64,
 }
 
 #[derive(Clone, Copy)]
@@ -741,6 +748,7 @@ struct StatusResponse {
     p2p_nodes: usize,
     p2p_nodes_total: usize,
     clients: usize,
+    udp_public_bind_mode: &'static str,
 }
 
 #[derive(Serialize)]
@@ -799,6 +807,10 @@ struct MetricsResponse {
     http_proxy_transfer_errors: u64,
     #[serde(flatten)]
     udp: UdpMetricsResponse,
+    udp_public_ipv4_bind_successes_total: u64,
+    udp_public_ipv6_bind_successes_total: u64,
+    udp_public_ipv6_bind_fallbacks_total: u64,
+    udp_public_bind_failures_total: u64,
     control_connections_total: u64,
     control_protocol_errors_total: u64,
     tls_handshake_failures_total: u64,
@@ -1804,6 +1816,23 @@ async fn run_server(
     let udp_relay_server_name = std::env::var("LINKLAKE_UDP_RELAY_SERVER_NAME")
         .ok()
         .filter(|value| !value.trim().is_empty());
+    let udp_public_bind_mode = std::env::var("LINKLAKE_UDP_PUBLIC_BIND_MODE")
+        .unwrap_or_else(|_| "auto".to_owned())
+        .parse::<PublicUdpBindMode>()?;
+    tracing::info!(
+        mode = udp_public_bind_mode.as_str(),
+        "Loaded public UDP bind mode"
+    );
+    if udp_public_bind_mode == PublicUdpBindMode::DualStackRequired {
+        let probe = DualStackUdpSocket::bind(0, udp_public_bind_mode)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "dual-stack public UDP is required, but the host capability probe failed: {error}"
+                )
+            })?;
+        drop(probe);
+    }
     let public_port_policy = PublicPortPolicy::from_environment(
         std::iter::once(address)
             .chain(std::iter::once(control_address))
@@ -1942,6 +1971,7 @@ async fn run_server(
         traffic_controls: Mutex::new(TrafficControlCatalog::open_with_database(&database)?),
         management_cookies_secure,
         public_port_policy: public_port_policy.clone(),
+        udp_public_bind_mode,
         clients: Mutex::new(ClientRegistry::open_with_database(&database)?),
         tunnel_catalog: Mutex::new(TunnelCatalog::open_with_database(
             &database,
@@ -2509,6 +2539,7 @@ async fn status(
         sni_routes: sni_routes.len(),
         p2p_nodes,
         p2p_nodes_total,
+        udp_public_bind_mode: state.udp_public_bind_mode.as_str(),
         https_routes: state
             .certificate_manager
             .as_ref()
@@ -2784,6 +2815,22 @@ async fn metrics(
             statistics.transfer_errors.load(Ordering::Relaxed)
         }),
         udp: udp_metrics_response(udp_totals),
+        udp_public_ipv4_bind_successes_total: state
+            .metrics
+            .udp_public_ipv4_bind_successes_total
+            .load(Ordering::Relaxed),
+        udp_public_ipv6_bind_successes_total: state
+            .metrics
+            .udp_public_ipv6_bind_successes_total
+            .load(Ordering::Relaxed),
+        udp_public_ipv6_bind_fallbacks_total: state
+            .metrics
+            .udp_public_ipv6_bind_fallbacks_total
+            .load(Ordering::Relaxed),
+        udp_public_bind_failures_total: state
+            .metrics
+            .udp_public_bind_failures_total
+            .load(Ordering::Relaxed),
         control_connections_total: state
             .metrics
             .control_connections_total

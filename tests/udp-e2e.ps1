@@ -374,16 +374,31 @@ function Wait-UdpPortAvailable {
     param([int]$Port, [int]$Seconds = 20)
     $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
     while ([DateTime]::UtcNow -lt $deadline) {
-        $socket = [System.Net.Sockets.UdpClient]::new(
-            [System.Net.Sockets.AddressFamily]::InterNetwork
-        )
-        try {
-            $socket.Client.Bind([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, $Port))
-            return
-        } catch { Start-Sleep -Milliseconds 100 }
-        finally { $socket.Dispose() }
+        $available = $true
+        foreach ($family in @(
+            [System.Net.Sockets.AddressFamily]::InterNetwork,
+            [System.Net.Sockets.AddressFamily]::InterNetworkV6
+        )) {
+            $socket = [System.Net.Sockets.UdpClient]::new($family)
+            try {
+                if ($family -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
+                    $socket.Client.DualMode = $false
+                    $bindAddress = [System.Net.IPAddress]::IPv6Any
+                } else {
+                    $bindAddress = [System.Net.IPAddress]::Any
+                }
+                $socket.Client.Bind([System.Net.IPEndPoint]::new($bindAddress, $Port))
+            } catch {
+                $available = $false
+                break
+            } finally {
+                $socket.Dispose()
+            }
+        }
+        if ($available) { return }
+        Start-Sleep -Milliseconds 100
     }
-    throw "UDP port $Port was not released."
+    throw "UDP port $Port was not released for both IPv4 and IPv6."
 }
 
 function Wait-MetricAtLeast {
@@ -427,12 +442,20 @@ function Wait-UdpPolicyMetricAtLeast {
 }
 
 function New-UdpSocket {
-    $socket = [System.Net.Sockets.UdpClient]::new(
-        [System.Net.Sockets.AddressFamily]::InterNetwork
+    param(
+        [System.Net.Sockets.AddressFamily]$AddressFamily =
+            [System.Net.Sockets.AddressFamily]::InterNetwork
     )
+    $socket = [System.Net.Sockets.UdpClient]::new($AddressFamily)
+    if ($AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
+        $socket.Client.DualMode = $false
+        $bindAddress = [System.Net.IPAddress]::IPv6Loopback
+    } else {
+        $bindAddress = [System.Net.IPAddress]::Loopback
+    }
     $socket.Client.ReceiveBufferSize = 4 * 1024 * 1024
     $socket.Client.SendBufferSize = 4 * 1024 * 1024
-    $socket.Client.Bind([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Loopback, 0))
+    $socket.Client.Bind([System.Net.IPEndPoint]::new($bindAddress, 0))
     return $socket
 }
 
@@ -459,13 +482,22 @@ function Send-UdpAndReceive {
         [int]$TimeoutMilliseconds = 15000
     )
     $receive = $Socket.ReceiveAsync()
-    $remote = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Loopback, $Port)
+    if ($Socket.Client.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
+        $remoteAddress = [System.Net.IPAddress]::IPv6Loopback
+    } else {
+        $remoteAddress = [System.Net.IPAddress]::Loopback
+    }
+    $remote = [System.Net.IPEndPoint]::new($remoteAddress, $Port)
     $sent = $Socket.Send($Payload, $Payload.Length, $remote)
     if ($sent -ne $Payload.Length) { throw "UDP socket sent only $sent of $($Payload.Length) bytes." }
     if (-not $receive.Wait($TimeoutMilliseconds)) {
         throw "UDP echo timed out for a $($Payload.Length)-byte datagram."
     }
-    return ,$receive.Result.Buffer
+    $result = $receive.Result
+    if ($result.RemoteEndPoint.AddressFamily -ne $Socket.Client.AddressFamily) {
+        throw 'UDP response did not use the same address family as the request.'
+    }
+    return ,$result.Buffer
 }
 
 function Assert-NoUdpResponse {
@@ -656,6 +688,7 @@ try {
         LINKLAKE_UDP_RELAY_BIND = "127.0.0.1:$relayPort"
         LINKLAKE_UDP_RELAY_ENDPOINT = "127.0.0.1:$relayPort"
         LINKLAKE_UDP_RELAY_SERVER_NAME = 'localhost'
+        LINKLAKE_UDP_PUBLIC_BIND_MODE = 'dual_stack_required'
         LINKLAKE_CONTROL_CERT_PATH = $certificates.Chain
         LINKLAKE_CONTROL_KEY_PATH = $certificates.Key
         LINKLAKE_ENROLLMENT_TOKEN = $enrollmentToken
@@ -754,11 +787,34 @@ config_mode = "server_managed"
     Wait-PortGroupState -BaseUrl $baseUrl -Session $webSession -PolicyId $tcpGroup.id -OnlineMappings 2
     Wait-PortGroupState -BaseUrl $baseUrl -Session $webSession -PolicyId $udpGroup.id -OnlineMappings 2
     $baselineMetrics = Invoke-RestMethod -Uri "$baseUrl/api/v1/metrics" -WebSession $webSession
+    if ([uint64]$baselineMetrics.udp_public_ipv6_bind_successes_total -lt 1 -or
+        [uint64]$baselineMetrics.udp_public_ipv6_bind_fallbacks_total -ne 0) {
+        throw 'The required dual-stack UDP listeners did not report a successful IPv6 bind.'
+    }
     $limitedPolicyBeforeIdle = Get-UdpTunnel -BaseUrl $baseUrl -Session $webSession -PolicyId $limitedPolicy.id
     if ($null -eq $limitedPolicyBeforeIdle) {
         throw 'The limited UDP policy disappeared before its idle-recovery check.'
     }
     $limitedSessionTimeoutBaseline = [Convert]::ToUInt64($limitedPolicyBeforeIdle.session_timeouts)
+
+    $dualStackSockets = @(
+        (New-UdpSocket -AddressFamily ([System.Net.Sockets.AddressFamily]::InterNetwork)),
+        (New-UdpSocket -AddressFamily ([System.Net.Sockets.AddressFamily]::InterNetworkV6))
+    )
+    try {
+        $dualStackPayloads = @(
+            [Text.Encoding]::UTF8.GetBytes('dual-stack-ipv4'),
+            [Text.Encoding]::UTF8.GetBytes('dual-stack-ipv6')
+        )
+        for ($index = 0; $index -lt $dualStackSockets.Count; $index++) {
+            $response = Send-UdpAndReceive -Socket $dualStackSockets[$index] `
+                -Port $sharedPublicPort -Payload $dualStackPayloads[$index]
+            Assert-BytesEqual -Expected $dualStackPayloads[$index] -Actual $response `
+                -Context "dual-stack address family $index"
+        }
+    } finally {
+        foreach ($socket in $dualStackSockets) { $socket.Dispose() }
+    }
 
     $sizeSocket = New-UdpSocket
     $expectedMinimumBytes = 0L

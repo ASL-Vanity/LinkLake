@@ -2258,6 +2258,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2",
+ "socket2 0.6.5",
  "tokio",
  "tokio-rustls",
  "tower-http 0.5.2",

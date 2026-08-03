@@ -147,19 +147,52 @@ function Open-Socks5Connection {
         $authReply = Read-Exact -Stream $stream -Length 2
         if ($authReply[0] -ne 1 -or $authReply[1] -ne 0) { throw 'SOCKS5 authentication failed.' }
 
-        $hostBytes = [Text.Encoding]::ASCII.GetBytes($TargetHost)
         $request = [Collections.Generic.List[byte]]::new()
         $request.Add(5)
         $request.Add($Command)
         $request.Add(0)
-        $request.Add(3)
-        $request.Add([byte]$hostBytes.Length)
-        $request.AddRange($hostBytes)
+        $targetAddress = $null
+        if ([Net.IPAddress]::TryParse($TargetHost, [ref]$targetAddress)) {
+            if ($targetAddress.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetworkV6) {
+                $request.Add(4)
+            } else {
+                $request.Add(1)
+            }
+            $request.AddRange($targetAddress.GetAddressBytes())
+        } else {
+            $hostBytes = [Text.Encoding]::ASCII.GetBytes($TargetHost)
+            $request.Add(3)
+            $request.Add([byte]$hostBytes.Length)
+            $request.AddRange($hostBytes)
+        }
         $request.Add([byte](($TargetPort -shr 8) -band 255))
         $request.Add([byte]($TargetPort -band 255))
         Write-Bytes -Stream $stream -Bytes $request.ToArray()
-        $reply = Read-Exact -Stream $stream -Length 10
-        return [pscustomobject]@{ Client = $tcp; Stream = $stream; Reply = $reply[1] }
+        $replyHeader = Read-Exact -Stream $stream -Length 4
+        $boundAddressLength = switch ($replyHeader[3]) {
+            1 { 4 }
+            4 { 16 }
+            3 {
+                $domainLength = Read-Exact -Stream $stream -Length 1
+                [int]$domainLength[0]
+            }
+            default { throw "SOCKS5 returned unsupported address type $($replyHeader[3])." }
+        }
+        $boundAddressBytes = Read-Exact -Stream $stream -Length $boundAddressLength
+        $boundPortBytes = Read-Exact -Stream $stream -Length 2
+        $boundAddress = if ($replyHeader[3] -eq 3) {
+            [Text.Encoding]::ASCII.GetString($boundAddressBytes)
+        } else {
+            ([Net.IPAddress]::new($boundAddressBytes)).ToString()
+        }
+        return [pscustomobject]@{
+            Client = $tcp
+            Stream = $stream
+            Reply = $replyHeader[1]
+            BoundAddressType = $replyHeader[3]
+            BoundAddress = $boundAddress
+            BoundPort = ([int]$boundPortBytes[0] -shl 8) -bor [int]$boundPortBytes[1]
+        }
     } catch {
         $tcp.Dispose()
         throw
@@ -270,7 +303,8 @@ try {
         'LINKLAKE_MANAGEMENT_TOKEN', 'LINKLAKE_DATA_DIR', 'LINKLAKE_ADMIN_USERNAME',
         'LINKLAKE_ADMIN_PASSWORD', 'LINKLAKE_UDP_RELAY_BIND',
         'LINKLAKE_UDP_RELAY_ENDPOINT', 'LINKLAKE_UDP_RELAY_SERVER_NAME',
-        'LINKLAKE_CONTROL_CERT_PATH', 'LINKLAKE_CONTROL_KEY_PATH'
+        'LINKLAKE_UDP_PUBLIC_BIND_MODE', 'LINKLAKE_CONTROL_CERT_PATH',
+        'LINKLAKE_CONTROL_KEY_PATH'
     )
     $oldEnvironment = @{}
     foreach ($name in $environmentNames) { $oldEnvironment[$name] = [Environment]::GetEnvironmentVariable($name) }
@@ -285,6 +319,7 @@ try {
         $env:LINKLAKE_UDP_RELAY_BIND = "127.0.0.1:$relayPort"
         $env:LINKLAKE_UDP_RELAY_ENDPOINT = "127.0.0.1:$relayPort"
         $env:LINKLAKE_UDP_RELAY_SERVER_NAME = 'localhost'
+        $env:LINKLAKE_UDP_PUBLIC_BIND_MODE = 'dual_stack_required'
         $env:LINKLAKE_CONTROL_CERT_PATH = $certificates.Chain
         $env:LINKLAKE_CONTROL_KEY_PATH = $certificates.Key
         $serverProcess = Start-HiddenProcess -FilePath $serverPath
@@ -495,6 +530,50 @@ managed_config_path = "$managedTomlPath"
         $proxy.udp_active_associations -eq 0
     }
 
+    $stage = 'IPv6 UDP ASSOCIATE'
+    $udpV6Client = [Net.Sockets.UdpClient]::new([Net.Sockets.AddressFamily]::InterNetworkV6)
+    $udpV6Client.Client.DualMode = $false
+    $udpV6Client.Client.Bind([Net.IPEndPoint]::new([Net.IPAddress]::IPv6Loopback, 0))
+    $udpV6SourcePort = ([Net.IPEndPoint]$udpV6Client.Client.LocalEndPoint).Port
+    $udpV6Association = Open-Socks5Connection -ProxyPort $proxyPort -Username $created.username `
+        -Password $created.password -TargetHost '::1' -TargetPort $udpV6SourcePort -Command 3
+    try {
+        if ($udpV6Association.Reply -ne 0 -or $udpV6Association.BoundAddressType -ne 1 -or
+            $udpV6Association.BoundAddress -ne '0.0.0.0' -or
+            $udpV6Association.BoundPort -ne $proxyPort) {
+            throw 'SOCKS5 IPv6 UDP ASSOCIATE did not advertise the server-side IPv4 control address family.'
+        }
+        $udpV6Client.Client.ReceiveTimeout = 10000
+        $udpV6Payload = [Text.Encoding]::UTF8.GetBytes('socks5-udp-ipv6-transport')
+        $udpV6Request = [Collections.Generic.List[byte]]::new()
+        $udpV6Request.AddRange([byte[]](0, 0, 0, 1, 127, 0, 0, 1))
+        $udpV6Request.Add([byte](($udpTargetPort -shr 8) -band 255))
+        $udpV6Request.Add([byte]($udpTargetPort -band 255))
+        $udpV6Request.AddRange($udpV6Payload)
+        $ipv6RelayEndpoint = [Net.IPEndPoint]::new([Net.IPAddress]::IPv6Loopback, $proxyPort)
+        $sent = $udpV6Client.Send($udpV6Request.ToArray(), $udpV6Request.Count, $ipv6RelayEndpoint)
+        if ($sent -ne $udpV6Request.Count) { throw 'The SOCKS5 IPv6 UDP request was truncated.' }
+        $responseSource = [Net.IPEndPoint]::new([Net.IPAddress]::IPv6Any, 0)
+        $udpV6Response = $udpV6Client.Receive([ref]$responseSource)
+        if ($responseSource.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetworkV6 -or
+            $udpV6Response.Length -lt 10 -or $udpV6Response[0] -ne 0 -or
+            $udpV6Response[1] -ne 0 -or $udpV6Response[2] -ne 0 -or $udpV6Response[3] -ne 1) {
+            throw 'The SOCKS5 IPv6 UDP response header or transport family is invalid.'
+        }
+        $responsePayload = [byte[]]$udpV6Response[10..($udpV6Response.Length - 1)]
+        if ([Text.Encoding]::UTF8.GetString($responsePayload) -ne 'socks5-udp-ipv6-transport') {
+            throw 'The SOCKS5 IPv6 UDP response payload was corrupted.'
+        }
+    } finally {
+        $udpV6Client.Dispose()
+        $udpV6Association.Client.Dispose()
+    }
+    Wait-ForCondition -Failure 'The SOCKS5 IPv6 UDP association did not close with its TCP control connection.' -Condition {
+        $proxy = Invoke-RestMethod -Uri "$baseUrl/api/v1/socks5-proxies" -Headers $headers |
+            Where-Object { $_.id -eq $created.id }
+        $proxy.udp_active_associations -eq 0
+    }
+
     $proxyStats = Invoke-RestMethod -Uri "$baseUrl/api/v1/socks5-proxies" -Headers $headers |
         Where-Object { $_.id -eq $created.id }
     $metrics = Invoke-RestMethod -Uri "$baseUrl/api/v1/metrics" -Headers $headers
@@ -503,7 +582,7 @@ managed_config_path = "$managedTomlPath"
         $proxyStats.udp_fragmentation_unsupported_total -lt 1 -or
         $metrics.socks5_requests_total -lt 2 -or $metrics.socks5_bind_rejected_total -lt 1 -or
         $metrics.socks5_udp_fragmentation_unsupported_total -lt 1 -or
-        $proxyStats.udp_datagrams_from_public -lt 1 -or $proxyStats.udp_datagrams_to_public -lt 1 -or
+        $proxyStats.udp_datagrams_from_public -lt 2 -or $proxyStats.udp_datagrams_to_public -lt 2 -or
         $proxyStats.udp_dropped_datagrams -lt 1 -or $metrics.socks5_udp_datagrams_from_public -lt 1) {
         throw 'SOCKS5 policy or aggregate metrics were not updated as expected.'
     }
@@ -513,6 +592,10 @@ managed_config_path = "$managedTomlPath"
         $metrics.socks5_capabilities.udp_fragmentation) {
         throw 'The aggregate SOCKS5 capability contract is incorrect.'
     }
+    if ([uint64]$metrics.udp_public_ipv6_bind_successes_total -lt 1 -or
+        [uint64]$metrics.udp_public_ipv6_bind_fallbacks_total -ne 0) {
+        throw 'The SOCKS5 required dual-stack UDP listener did not report a successful IPv6 bind.'
+    }
 
     Invoke-RestMethod -Method Delete -Uri "$baseUrl/api/v1/socks5-proxies/$($created.id)" -Headers $headers
     Wait-ForCondition -Failure 'The deleted SOCKS5 policy remained visible.' -Condition {
@@ -520,7 +603,7 @@ managed_config_path = "$managedTomlPath"
         -not ($remaining | Where-Object { $_.id -eq $created.id })
     }
 
-    Write-Host 'SOCKS5 TCP/UDP E2E passed: CONNECT and UDP ASSOCIATE, explicit BIND/FRAG boundaries, control-connection cleanup, lifecycle, capabilities, and metrics.'
+    Write-Host 'SOCKS5 TCP/UDP E2E passed: managed exit, one-time password, mandatory auth, CONNECT, IPv4/IPv6 UDP ASSOCIATE, explicit BIND/FRAG boundaries, limits, lifecycle, capabilities, and metrics.'
 } finally {
     foreach ($process in $processes) {
         if ($process -and -not $process.HasExited) {

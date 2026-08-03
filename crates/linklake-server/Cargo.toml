@@ -30,6 +30,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 sha1.workspace = true
+socket2.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 tower-http.workspace = true

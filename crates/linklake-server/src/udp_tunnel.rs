@@ -2,7 +2,10 @@
 
 use crate::traffic_control::TrafficDecision;
 use crate::{
-    client_registry::Authentication, record_audit, udp_data_plane::AuthenticatedUdpConnection,
+    client_registry::Authentication,
+    dual_stack_udp::{bind_public_socket, DualStackUdpSocket, PublicUdpEndpoint},
+    record_audit,
+    udp_data_plane::AuthenticatedUdpConnection,
     AppState,
 };
 use bytes::Bytes;
@@ -19,7 +22,7 @@ use linklake_core::{
 };
 use std::{
     collections::HashMap,
-    net::{IpAddr, SocketAddr},
+    net::IpAddr,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock,
@@ -28,7 +31,6 @@ use std::{
 };
 use tokio::{
     io::split,
-    net::UdpSocket,
     sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore},
     time::{interval, timeout, MissedTickBehavior},
 };
@@ -350,7 +352,7 @@ struct RegisteredTunnelRuntime {
     state: Arc<AppState>,
     public_port: u16,
     registration_id: Uuid,
-    socket: UdpSocket,
+    socket: DualStackUdpSocket,
     authenticated: AuthenticatedUdpConnection,
     policy: crate::tunnel_catalog::UdpTunnelRuntimePolicy,
     statistics: Arc<UdpTunnelStatistics>,
@@ -412,7 +414,7 @@ pub(crate) async fn register_tunnel(
         .await;
         return;
     };
-    let public_socket = match UdpSocket::bind(("0.0.0.0", public_port)).await {
+    let public_socket = match bind_public_socket(&state, public_port, "udp_tunnel").await {
         Ok(socket) => socket,
         Err(_) => {
             reject_registration(&state, &mut stream, "public UDP port is unavailable").await;
@@ -643,7 +645,7 @@ async fn run_tunnel(runtime: RegisteredTunnelRuntime) {
 async fn run_tunnel_loop(
     state: &Arc<AppState>,
     public_port: u16,
-    socket: UdpSocket,
+    socket: DualStackUdpSocket,
     connection: &quinn::Connection,
     mut quic_control_send: quinn::SendStream,
     mut tcp_control_writer: tokio::io::WriteHalf<BoxedIo>,
@@ -654,8 +656,8 @@ async fn run_tunnel_loop(
     mut stop: watch::Receiver<()>,
 ) -> RuntimeStop {
     let policy_permits = Arc::new(Semaphore::new(policy.max_sessions));
-    let mut sessions_by_external = HashMap::<SocketAddr, UdpSession>::new();
-    let mut external_by_session = HashMap::<Uuid, SocketAddr>::new();
+    let mut sessions_by_external = HashMap::<PublicUdpEndpoint, UdpSession>::new();
+    let mut external_by_session = HashMap::<Uuid, PublicUdpEndpoint>::new();
     let mut session_admission = SessionAdmission::new(Instant::now());
     let mut reassembler = UdpReassembler::new(UdpReassemblyConfig::default())
         .expect("the built-in UDP reassembly configuration is valid");
@@ -730,7 +732,10 @@ async fn run_tunnel_loop(
                 None => break RuntimeStop::DataPlaneClosed,
             },
             received = socket.recv_from(&mut public_buffer) => match received {
-                Ok((length, external_address)) => {
+                Ok(received) => {
+                    let length = received.length;
+                    let external_endpoint = received.source;
+                    let external_address = external_endpoint.address();
                     let now = Instant::now();
                     if let Some(limiter) = &mut limiter {
                         if !limiter.try_consume(length, now) {
@@ -738,7 +743,7 @@ async fn run_tunnel_loop(
                             continue;
                         }
                     }
-                    let (session_id, created_new_session) = if let Some(session) = sessions_by_external.get_mut(&external_address) {
+                    let (session_id, created_new_session) = if let Some(session) = sessions_by_external.get_mut(&external_endpoint) {
                         session.last_activity = now;
                         (session.session_id, false)
                     } else {
@@ -774,14 +779,14 @@ async fn run_tunnel_loop(
                             }
                         }
                         let session_id = Uuid::new_v4();
-                        sessions_by_external.insert(external_address, UdpSession {
+                        sessions_by_external.insert(external_endpoint, UdpSession {
                             session_id,
                             source_ip: external_address.ip(),
                             last_activity: now,
                             _policy_permit: policy_permit,
                             _global_permit: global_permit,
                         });
-                        external_by_session.insert(session_id, external_address);
+                        external_by_session.insert(session_id, external_endpoint);
                         statistics.active_sessions.fetch_add(1, Ordering::Relaxed);
                         (session_id, true)
                     };
@@ -802,7 +807,7 @@ async fn run_tunnel_loop(
                                     &mut sessions_by_external,
                                     &mut external_by_session,
                                     &mut session_admission,
-                                    external_address,
+                                    external_endpoint,
                                     now,
                                 )
                                 .is_some()
@@ -819,7 +824,7 @@ async fn run_tunnel_loop(
                                 &mut sessions_by_external,
                                 &mut external_by_session,
                                 &mut session_admission,
-                                external_address,
+                                external_endpoint,
                                 now,
                             )
                             .is_some()
@@ -851,7 +856,7 @@ async fn run_tunnel_loop(
                             continue;
                         }
                     };
-                    let Some(external_address) = external_by_session.get(&fragment.session_id).copied() else {
+                    let Some(external_endpoint) = external_by_session.get(&fragment.session_id).copied() else {
                         record_drop(statistics, &statistics.dropped_unknown_session);
                         continue;
                     };
@@ -865,9 +870,9 @@ async fn run_tunnel_loop(
                                     continue;
                                 }
                             }
-                            match socket.send_to(&payload, external_address).await {
+                            match socket.send_to(&payload, external_endpoint).await {
                                 Ok(sent) if sent == payload.len() => {
-                                    if let Some(session) = sessions_by_external.get_mut(&external_address) {
+                                    if let Some(session) = sessions_by_external.get_mut(&external_endpoint) {
                                         session.last_activity = now;
                                     }
                                     statistics.packets_to_public.fetch_add(1, Ordering::Relaxed);
@@ -1016,13 +1021,13 @@ async fn read_tcp_control_frames(
 }
 
 fn remove_session(
-    sessions_by_external: &mut HashMap<SocketAddr, UdpSession>,
-    external_by_session: &mut HashMap<Uuid, SocketAddr>,
+    sessions_by_external: &mut HashMap<PublicUdpEndpoint, UdpSession>,
+    external_by_session: &mut HashMap<Uuid, PublicUdpEndpoint>,
     session_admission: &mut SessionAdmission,
-    external_address: SocketAddr,
+    external_endpoint: PublicUdpEndpoint,
     now: Instant,
 ) -> Option<Uuid> {
-    let session = sessions_by_external.remove(&external_address)?;
+    let session = sessions_by_external.remove(&external_endpoint)?;
     external_by_session.remove(&session.session_id);
     session_admission.release(session.source_ip, now);
     Some(session.session_id)
@@ -1133,6 +1138,7 @@ mod tests {
         SessionAdmissionRejection, SourceAdmission, TokenBucket, UdpSession, UdpTunnelStatistics,
         UdpTunnelStatisticsSnapshot, MAX_SESSIONS_PER_SOURCE_IP,
     };
+    use crate::dual_stack_udp::PublicUdpEndpoint;
     use linklake_core::{udp_protocol::UdpProtocolError, udp_reassembly::UdpReassemblyError};
     use std::{
         collections::HashMap,
@@ -1183,6 +1189,7 @@ mod tests {
         sessions.insert(
             "127.0.0.1:40000"
                 .parse::<SocketAddr>()
+                .map(PublicUdpEndpoint::from)
                 .expect("valid address"),
             UdpSession {
                 session_id: Uuid::new_v4(),
