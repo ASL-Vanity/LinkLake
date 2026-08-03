@@ -53,7 +53,7 @@ TCP 与 UDP 使用独立的操作系统端口命名空间，因此可以同时�
 
 UDP relay 默认不启用。只有设置 `LINKLAKE_UDP_RELAY_BIND` 时才会启动，并且必须同时提供外部可达的 `LINKLAKE_UDP_RELAY_ENDPOINT` 和与控制通道证书匹配的 `LINKLAKE_UDP_RELAY_SERVER_NAME`。UDP 已完成自动化本地验收以及独立公网服务器、Linux 服务端和 Windows 客户端之间的端到端验收。
 
-首个 UDP 发布阶段的公网业务端口仅监听 IPv4（`0.0.0.0`）；QUIC relay 是否同时提供 IPv6 取决于 `LINKLAKE_UDP_RELAY_BIND` 的绑定地址。客户端到本地 target 的连接按目标地址族建立，可使用 IPv4 或 IPv6。部署时只开放实际需要的 relay 和业务 UDP 端口，并保留云防火墙或上游 DDoS 防护。
+公网业务 UDP 端口默认使用 `LINKLAKE_UDP_PUBLIC_BIND_MODE=auto`：服务端为同一端口分别创建 IPv4 与 `IPV6_V6ONLY` socket；主机明确不支持或未启用 IPv6 时仅降级为 IPv4，端口冲突、权限不足等真实部署错误不会被自动忽略。设为 `ipv4_only` 可显式只监听 IPv4；设为 `dual_stack_required` 时，服务端启动阶段会探测双栈能力，且后续任一公网 UDP 监听器无法同时绑定 IPv4/IPv6 都会失败关闭。QUIC relay 的地址族仍由 `LINKLAKE_UDP_RELAY_BIND` 独立决定。客户端到本地 target 的连接按目标地址族建立，可使用 IPv4 或 IPv6。部署时只开放实际需要的 relay 和业务 UDP 端口，并保留云防火墙或上游 DDoS 防护。
 
 UDP 和 QUIC DATAGRAM 均为最佳努力传输，LinkLake 不会把 UDP 转换为可靠字节流。自动化本地测试覆盖到 `65507` 字节的数据报，但公网中的 MTU、IP 分片、运营商网络、代理和防火墙可能丢弃较大的原始 UDP 数据报；应用可以控制包长时，建议将 `1200` 字节或更小作为保守的互联网默认值，并在业务层按需实现重试、序号或容错。
 
@@ -145,6 +145,7 @@ path_policy = "prefer_direct"
 - 用户名限制为 1 到 64 个 ASCII 字母、数字、点、下划线或连字符
 - TCP 和 UDP 均支持 IPv4、IPv6 和域名目标，域名由出口客户端解析；UDP 每个关联最多记录 256 个已访问目标，只接受这些目标的响应
 - UDP 关联绑定到已认证的 TCP 控制连接、客户端源 IP 和首个 UDP endpoint；控制连接关闭时立即撤销关联
+- `UDP ASSOCIATE` 的公网 UDP 监听遵循 `LINKLAKE_UDP_PUBLIC_BIND_MODE`；服务端按实际接收地址族回包，`BND.ADDR` 始终描述服务端侧地址族，不回显客户端请求地址
 - SOCKS5 UDP `FRAG` 不受支持，非零 `FRAG` 数据报会被丢弃并计入指标
 - TCP/UDP 共享策略聚合带宽上限，并支持策略/全局/待配对连接限制、握手和配对超时、启停/删除和客户端自动重连
 - Web UI 和指标提供连接、CONNECT 请求、认证失败、握手错误、不支持命令、目标连接失败、TCP/UDP 流量、UDP 关联/数据报/限速丢包和传输错误统计
@@ -397,11 +398,12 @@ sudo ./systemd/install-linux.sh client
 LINKLAKE_UDP_RELAY_BIND=0.0.0.0:32104
 LINKLAKE_UDP_RELAY_ENDPOINT=udp.example.com:32104
 LINKLAKE_UDP_RELAY_SERVER_NAME=udp.example.com
+LINKLAKE_UDP_PUBLIC_BIND_MODE=auto
 ```
 
 relay QUIC TLS 复用 `LINKLAKE_CONTROL_CERT_PATH` 和 `LINKLAKE_CONTROL_KEY_PATH`。必须在云安全组和系统防火墙中开放 relay 的 UDP 端口，以及实际创建的 UDP 公网策略端口；不要在没有需要时开放整个允许范围。
 
-当前 UDP 公网业务端口首版仅绑定 IPv4；仅把 relay 绑定到 IPv6 并不会自动提供 IPv6 业务端口访问。
+`LINKLAKE_UDP_PUBLIC_BIND_MODE` 可选 `auto`（默认）、`ipv4_only`、`dual_stack_required`。业务 UDP 与 relay 的监听地址族相互独立；仅把 relay 绑定到 IPv6 不会改变业务端口策略，反之亦然。运行指标提供 IPv4/IPv6 绑定成功、自动降级和绑定失败计数。
 
 ## 构建与验证
 
@@ -436,7 +438,7 @@ sh scripts/package-manager-linux.sh
 sh scripts/verify-manager-linux.sh
 ```
 
-TCP 端到端测试覆盖真实二进制回显、限速、连接限制、重连、策略生命周期、配对超时和指标。UDP 端到端测试覆盖 `0` 到 `65507` 字节真实数据报回显、多会话、限速丢包、空闲回收、分片重组、策略生命周期、重连、TCP/UDP 同数值端口、TCP/UDP 连续端口组的全部映射及指标；生产验收还覆盖独立公网服务器、Linux 服务端和 Windows 客户端。TLS SNI E2E 使用真实自签名目标和 .NET `SslStream`，覆盖原始 ClientHello 透传、真实 TLS 握手/回显、未知 SNI 拒绝、启停恢复、删除和指标。Secret E2E 覆盖托管目标端、一次性密钥隔离、访问客户端白名单、错误密钥、连接限制、启停恢复、删除失效、统计、两个独立客户端之间的真实 P2P 直连、不可达候选下的显式中继回退，以及服务端无公网业务监听。SOCKS5 E2E 覆盖托管出口、一次性密码隔离、强制认证、错误密码、域名/IPv4 CONNECT、真实 UDP ASSOCIATE 回显、UDP 分片拒绝、TCP 控制连接生命周期、BIND 拒绝、连接限制、策略恢复和指标。HTTP E2E 同时覆盖 Host 路由以及正向代理的一次性密码、强制/错误认证、absolute-form 改写、凭据隔离、GET/POST 请求体、请求走私拒绝、真实 CONNECT 隧道、连接限制、客户端重连、策略生命周期和指标。HTTPS/ACME 测试在 Linux CI 中使用本地 Pebble 服务，覆盖 HTTP-01、SNI、证书签发与续期、HTTPS 转发、跳转、持久化、失败恢复和证书指标，不访问公网证书机构。
+TCP 端到端测试覆盖真实二进制回显、限速、连接限制、重连、策略生命周期、配对超时和指标。UDP 端到端测试覆盖同一业务端口的 IPv4/IPv6 双栈回显、`0` 到 `65507` 字节真实数据报回显、多会话、限速丢包、空闲回收、分片重组、策略生命周期、重连、TCP/UDP 同数值端口、TCP/UDP 连续端口组的全部映射及指标；生产验收还覆盖独立公网服务器、Linux 服务端和 Windows 客户端。TLS SNI E2E 使用真实自签名目标和 .NET `SslStream`，覆盖原始 ClientHello 透传、真实 TLS 握手/回显、未知 SNI 拒绝、启停恢复、删除和指标。Secret E2E 覆盖托管目标端、一次性密钥隔离、访问客户端白名单、错误密钥、连接限制、启停恢复、删除失效、统计、两个独立客户端之间的真实 P2P 直连、不可达候选下的显式中继回退，以及服务端无公网业务监听。SOCKS5 E2E 覆盖托管出口、一次性密码隔离、强制认证、错误密码、域名/IPv4 CONNECT、IPv4/IPv6 公网传输下的真实 UDP ASSOCIATE 回显、UDP 分片拒绝、TCP 控制连接生命周期、BIND 拒绝、连接限制、策略恢复和指标。HTTP E2E 同时覆盖 Host 路由以及正向代理的一次性密码、强制/错误认证、absolute-form 改写、凭据隔离、GET/POST 请求体、请求走私拒绝、真实 CONNECT 隧道、连接限制、客户端重连、策略生命周期和指标。HTTPS/ACME 测试在 Linux CI 中使用本地 Pebble 服务，覆盖 HTTP-01、SNI、证书签发与续期、HTTPS 转发、跳转、持久化、失败恢复和证书指标，不访问公网证书机构。
 
 macOS 使用 `scripts/package-macos.sh`、`scripts/verify-macos-package.sh`、`scripts/package-manager-macos.sh` 和 `scripts/verify-manager-macos.sh` 构建并校验核心服务与 Flutter 管理客户端。
 

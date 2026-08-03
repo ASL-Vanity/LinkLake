@@ -1,6 +1,7 @@
 use crate::traffic_control::{TrafficDecision, TrafficPolicyKind};
 use crate::{
     client_registry::Authentication,
+    dual_stack_udp::{bind_public_socket, DualStackUdpSocket, PublicUdpEndpoint},
     record_audit,
     tcp_tunnel::{copy_bidirectional_with_limit, BandwidthLimiter},
     tunnel_catalog::socks5_password_matches,
@@ -27,7 +28,7 @@ use std::{
 };
 use tokio::{
     io::{split, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
-    net::{TcpListener, TcpStream, UdpSocket},
+    net::{TcpListener, TcpStream},
     sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore},
     time::{interval, timeout, Instant, MissedTickBehavior},
 };
@@ -110,7 +111,7 @@ struct UdpAssociationRequest {
 struct UdpAssociation {
     peer_ip: IpAddr,
     requested: Option<UdpAssociationRequest>,
-    public_endpoint: Option<SocketAddr>,
+    public_endpoint: Option<PublicUdpEndpoint>,
 }
 
 struct UdpProxyContext {
@@ -175,7 +176,7 @@ pub(crate) async fn register_proxy(
         .map(BandwidthLimiter::new)
         .map(Arc::new);
     let udp_runtime = if let Some(data_plane) = state.udp_data_plane.clone() {
-        let socket = match UdpSocket::bind(("0.0.0.0", public_port)).await {
+        let socket = match bind_public_socket(&state, public_port, "socks5_udp_associate").await {
             Ok(socket) => socket,
             Err(_) => {
                 reject(&state, &mut stream, "SOCKS5 UDP public port is unavailable").await;
@@ -387,7 +388,7 @@ async fn run_registered_control(
 }
 
 async fn run_udp_runtime(
-    socket: UdpSocket,
+    socket: DualStackUdpSocket,
     mut authenticated: AuthenticatedUdpConnection,
     max_datagram_size: usize,
     context: Arc<UdpProxyContext>,
@@ -436,7 +437,9 @@ async fn run_udp_runtime(
                 None => anyhow::bail!("SOCKS5 UDP control reader stopped"),
             },
             incoming = socket.recv_from(&mut receive_buffer) => {
-                let (received, source) = incoming?;
+                let incoming = incoming?;
+                let received = incoming.length;
+                let source = incoming.source;
                 let encoded = &receive_buffer[..received];
                 if decode_socks5_udp_datagram(encoded).is_err() {
                     statistics.udp_dropped_datagrams.fetch_add(1, Ordering::Relaxed);
@@ -576,7 +579,7 @@ async fn run_udp_runtime(
 
 fn association_for_source(
     associations: &Mutex<HashMap<Uuid, UdpAssociation>>,
-    source: SocketAddr,
+    source: PublicUdpEndpoint,
 ) -> Option<Uuid> {
     let mut associations = associations
         .lock()
@@ -590,13 +593,19 @@ fn association_for_source(
     let candidates = associations
         .iter()
         .filter_map(|(id, association)| {
-            (association.public_endpoint.is_none()
-                && association.peer_ip == source.ip()
-                && association.requested.is_none_or(|requested| {
-                    requested.ip.is_none_or(|ip| ip == source.ip())
-                        && requested.port.is_none_or(|port| port == source.port())
-                }))
-            .then_some(*id)
+            let source_address = source.address();
+            let source_matches = match association.requested {
+                Some(requested) => {
+                    requested.ip.map_or_else(
+                        || association.peer_ip == source_address.ip(),
+                        |ip| ip == source_address.ip(),
+                    ) && requested
+                        .port
+                        .is_none_or(|port| port == source_address.port())
+                }
+                None => association.peer_ip == source_address.ip(),
+            };
+            (association.public_endpoint.is_none() && source_matches).then_some(*id)
         })
         .collect::<Vec<_>>();
     if candidates.len() != 1 {
@@ -1213,9 +1222,10 @@ mod tests {
     fn first_udp_datagram_binds_the_only_matching_association() {
         let id = Uuid::new_v4();
         let source = SocketAddr::from(([192, 0, 2, 10], 40_000));
+        let endpoint = PublicUdpEndpoint::from(source);
         let associations = Mutex::new(HashMap::from([(id, association(source.ip(), None))]));
 
-        assert_eq!(association_for_source(&associations, source), Some(id));
+        assert_eq!(association_for_source(&associations, endpoint), Some(id));
         assert_eq!(
             associations
                 .lock()
@@ -1223,9 +1233,9 @@ mod tests {
                 .get(&id)
                 .unwrap()
                 .public_endpoint,
-            Some(source)
+            Some(endpoint)
         );
-        assert_eq!(association_for_source(&associations, source), Some(id));
+        assert_eq!(association_for_source(&associations, endpoint), Some(id));
     }
 
     #[test]
@@ -1236,7 +1246,7 @@ mod tests {
             (Uuid::new_v4(), association(source.ip(), None)),
         ]));
 
-        assert_eq!(association_for_source(&associations, source), None);
+        assert_eq!(association_for_source(&associations, source.into()), None);
         assert!(associations
             .lock()
             .unwrap()
@@ -1260,11 +1270,55 @@ mod tests {
         )]));
 
         assert_eq!(
-            association_for_source(&associations, SocketAddr::new(peer_ip, 40_001)),
+            association_for_source(&associations, SocketAddr::new(peer_ip, 40_001).into(),),
             None
         );
         assert_eq!(
-            association_for_source(&associations, SocketAddr::new(peer_ip, 40_000)),
+            association_for_source(&associations, SocketAddr::new(peer_ip, 40_000).into(),),
+            Some(id)
+        );
+    }
+
+    #[test]
+    fn explicit_ipv6_udp_source_can_match_an_ipv4_control_connection() {
+        let id = Uuid::new_v4();
+        let requested_ip = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        let requested_port = 40_000;
+        let associations = Mutex::new(HashMap::from([(
+            id,
+            association(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                Some(UdpAssociationRequest {
+                    ip: Some(requested_ip),
+                    port: Some(requested_port),
+                }),
+            ),
+        )]));
+
+        assert_eq!(
+            association_for_source(
+                &associations,
+                SocketAddr::new(requested_ip, requested_port).into(),
+            ),
+            Some(id)
+        );
+    }
+
+    #[test]
+    fn unspecified_udp_source_still_matches_the_tcp_peer_ip() {
+        let id = Uuid::new_v4();
+        let peer_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        let associations = Mutex::new(HashMap::from([(id, association(peer_ip, None))]));
+
+        assert_eq!(
+            association_for_source(
+                &associations,
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 40_000).into(),
+            ),
+            None
+        );
+        assert_eq!(
+            association_for_source(&associations, SocketAddr::new(peer_ip, 40_000).into(),),
             Some(id)
         );
     }
