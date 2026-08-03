@@ -240,17 +240,6 @@ impl HttpRouteCatalog {
         )? != 0)
     }
 
-    pub(crate) fn hostname_for_id(&self, id: Uuid) -> anyhow::Result<Option<String>> {
-        self.database
-            .query_row(
-                "SELECT hostname FROM http_route_policies WHERE id = ?1",
-                [id.to_string()],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(Into::into)
-    }
-
     pub(crate) fn enabled_hostname_exists(&self, hostname: &str) -> anyhow::Result<bool> {
         let hostname = normalize_hostname(hostname)?;
         let count: i64 = self.database.query_row(

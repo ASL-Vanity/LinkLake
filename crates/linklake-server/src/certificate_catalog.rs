@@ -1,7 +1,7 @@
 use hyper::Uri;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
-use std::{error::Error, fmt, path::Path};
+use std::{error::Error, fmt, net::IpAddr, path::Path};
 use uuid::Uuid;
 
 use crate::database::Database;
@@ -44,6 +44,34 @@ impl AcmeEnvironment {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum AcmeChallengeType {
+    #[default]
+    #[serde(rename = "http-01")]
+    Http01,
+    #[serde(rename = "dns-01")]
+    Dns01,
+}
+
+impl AcmeChallengeType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Http01 => "http-01",
+            Self::Dns01 => "dns-01",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, CertificateCatalogError> {
+        match value {
+            "http-01" => Ok(Self::Http01),
+            "dns-01" => Ok(Self::Dns01),
+            _ => Err(CertificateCatalogError::InvalidStoredData(
+                "acme_challenge_type",
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct AcmeConfig {
     pub(crate) enabled: bool,
@@ -51,17 +79,21 @@ pub(crate) struct AcmeConfig {
     pub(crate) directory_url: String,
     pub(crate) contact_email: String,
     pub(crate) terms_accepted: bool,
+    pub(crate) challenge_type: AcmeChallengeType,
     pub(crate) renew_before_days: u8,
     pub(crate) updated_at: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct UpdateAcmeConfig {
     pub(crate) enabled: bool,
     pub(crate) environment: AcmeEnvironment,
     pub(crate) directory_url: String,
     pub(crate) contact_email: String,
     pub(crate) terms_accepted: bool,
+    #[serde(default)]
+    pub(crate) challenge_type: Option<AcmeChallengeType>,
     pub(crate) renew_before_days: u8,
 }
 
@@ -94,6 +126,7 @@ pub(crate) struct RouteTlsPolicy {
     pub(crate) route_id: Uuid,
     pub(crate) mode: RouteTlsMode,
     pub(crate) redirect_http_to_https: bool,
+    pub(crate) certificate_identifier: Option<String>,
     pub(crate) updated_at: i64,
 }
 
@@ -101,6 +134,8 @@ pub(crate) struct RouteTlsPolicy {
 pub(crate) struct UpdateRouteTlsPolicy {
     pub(crate) mode: RouteTlsMode,
     pub(crate) redirect_http_to_https: bool,
+    #[serde(default)]
+    pub(crate) certificate_identifier: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,6 +217,7 @@ pub(crate) enum CertificateCatalogError {
     TermsNotAccepted,
     InvalidRenewalWindow,
     InvalidRedirectPolicy,
+    InvalidCertificateIdentifier,
     InvalidCertificateValidity,
     InvalidIssuer,
     InvalidErrorCode,
@@ -201,6 +237,7 @@ impl CertificateCatalogError {
             Self::TermsNotAccepted => "terms_not_accepted",
             Self::InvalidRenewalWindow => "invalid_renewal_window",
             Self::InvalidRedirectPolicy => "invalid_redirect_policy",
+            Self::InvalidCertificateIdentifier => "invalid_certificate_identifier",
             Self::InvalidCertificateValidity => "invalid_certificate_validity",
             Self::InvalidIssuer => "invalid_issuer",
             Self::InvalidErrorCode => "invalid_error_code",
@@ -229,6 +266,7 @@ impl fmt::Display for CertificateCatalogError {
             Self::TermsNotAccepted => "ACME terms must be accepted before enabling ACME",
             Self::InvalidRenewalWindow => "certificate renewal window is invalid",
             Self::InvalidRedirectPolicy => "HTTP to HTTPS redirect requires ACME TLS mode",
+            Self::InvalidCertificateIdentifier => "certificate identifier is invalid",
             Self::InvalidCertificateValidity => "certificate validity period is invalid",
             Self::InvalidIssuer => "certificate issuer is invalid",
             Self::InvalidErrorCode => "certificate error code is invalid",
@@ -286,21 +324,23 @@ impl CertificateCatalog {
                 directory_url TEXT NOT NULL,
                 contact_email TEXT NOT NULL,
                 terms_accepted INTEGER NOT NULL,
+                challenge_type TEXT NOT NULL DEFAULT 'http-01',
                 renew_before_days INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
             INSERT OR IGNORE INTO acme_config (
                 singleton_id, enabled, environment, directory_url, contact_email,
-                terms_accepted, renew_before_days, updated_at
+                terms_accepted, challenge_type, renew_before_days, updated_at
             ) VALUES (
                 1, 0, 'production',
-                'https://acme-v02.api.letsencrypt.org/directory', '', 0, 30, 0
+                'https://acme-v02.api.letsencrypt.org/directory', '', 0, 'http-01', 30, 0
             );
 
             CREATE TABLE IF NOT EXISTS http_route_tls_policies (
                 route_id TEXT PRIMARY KEY NOT NULL,
                 mode TEXT NOT NULL,
                 redirect_http_to_https INTEGER NOT NULL,
+                certificate_identifier TEXT,
                 updated_at INTEGER NOT NULL
             );
 
@@ -321,12 +361,24 @@ impl CertificateCatalog {
                 ON certificate_states(status, next_renewal);
             ",
         )?;
+        ensure_column(
+            &database,
+            "acme_config",
+            "challenge_type",
+            "TEXT NOT NULL DEFAULT 'http-01'",
+        )?;
+        ensure_column(
+            &database,
+            "http_route_tls_policies",
+            "certificate_identifier",
+            "TEXT",
+        )?;
         Ok(Self { database })
     }
 
     pub(crate) fn get_acme_config(&self) -> Result<AcmeConfig, CertificateCatalogError> {
         let stored = self.database.query_row(
-            "SELECT enabled, environment, directory_url, contact_email, terms_accepted, renew_before_days, updated_at FROM acme_config WHERE singleton_id = 1",
+            "SELECT enabled, environment, directory_url, contact_email, terms_accepted, challenge_type, renew_before_days, updated_at FROM acme_config WHERE singleton_id = 1",
             [],
             |row| {
                 Ok((
@@ -335,12 +387,13 @@ impl CertificateCatalog {
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
-                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(5)?,
                     row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
                 ))
             },
         )?;
-        let renew_before_days = u8::try_from(stored.5)
+        let renew_before_days = u8::try_from(stored.6)
             .map_err(|_| CertificateCatalogError::InvalidStoredData("renew_before_days"))?;
         if !(MIN_RENEW_BEFORE_DAYS..=MAX_RENEW_BEFORE_DAYS).contains(&renew_before_days) {
             return Err(CertificateCatalogError::InvalidStoredData(
@@ -353,8 +406,9 @@ impl CertificateCatalog {
             directory_url: stored.2,
             contact_email: stored.3,
             terms_accepted: stored.4 != 0,
+            challenge_type: AcmeChallengeType::parse(&stored.5)?,
             renew_before_days,
-            updated_at: stored.6,
+            updated_at: stored.7,
         })
     }
 
@@ -364,16 +418,20 @@ impl CertificateCatalog {
         now: i64,
     ) -> Result<AcmeConfig, CertificateCatalogError> {
         validate_acme_config(&request)?;
+        let challenge_type = request
+            .challenge_type
+            .unwrap_or(self.get_acme_config()?.challenge_type);
         let directory_url = request.directory_url.trim().to_owned();
         let contact_email = request.contact_email.trim().to_ascii_lowercase();
         self.database.execute(
-            "UPDATE acme_config SET enabled = ?1, environment = ?2, directory_url = ?3, contact_email = ?4, terms_accepted = ?5, renew_before_days = ?6, updated_at = ?7 WHERE singleton_id = 1",
+            "UPDATE acme_config SET enabled = ?1, environment = ?2, directory_url = ?3, contact_email = ?4, terms_accepted = ?5, challenge_type = ?6, renew_before_days = ?7, updated_at = ?8 WHERE singleton_id = 1",
             params![
                 request.enabled,
                 request.environment.as_str(),
                 directory_url,
                 contact_email,
                 request.terms_accepted,
+                challenge_type.as_str(),
                 request.renew_before_days,
                 now,
             ],
@@ -388,26 +446,30 @@ impl CertificateCatalog {
         let stored = self
             .database
             .query_row(
-                "SELECT mode, redirect_http_to_https, updated_at FROM http_route_tls_policies WHERE route_id = ?1",
+                "SELECT mode, redirect_http_to_https, certificate_identifier, updated_at FROM http_route_tls_policies WHERE route_id = ?1",
                 [route_id.to_string()],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)?,
                     ))
                 },
             )
             .optional()?;
         stored
-            .map(|(mode, redirect_http_to_https, updated_at)| {
-                Ok(RouteTlsPolicy {
-                    route_id,
-                    mode: RouteTlsMode::parse(&mode)?,
-                    redirect_http_to_https: redirect_http_to_https != 0,
-                    updated_at,
-                })
-            })
+            .map(
+                |(mode, redirect_http_to_https, certificate_identifier, updated_at)| {
+                    Ok(RouteTlsPolicy {
+                        route_id,
+                        mode: RouteTlsMode::parse(&mode)?,
+                        redirect_http_to_https: redirect_http_to_https != 0,
+                        certificate_identifier,
+                        updated_at,
+                    })
+                },
+            )
             .transpose()
     }
 
@@ -420,12 +482,19 @@ impl CertificateCatalog {
         if request.mode == RouteTlsMode::Disabled && request.redirect_http_to_https {
             return Err(CertificateCatalogError::InvalidRedirectPolicy);
         }
+        let certificate_identifier = request
+            .certificate_identifier
+            .as_deref()
+            .map(normalize_certificate_identifier)
+            .transpose()
+            .map_err(|_| CertificateCatalogError::InvalidCertificateIdentifier)?;
         self.database.execute(
-            "INSERT INTO http_route_tls_policies (route_id, mode, redirect_http_to_https, updated_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(route_id) DO UPDATE SET mode = excluded.mode, redirect_http_to_https = excluded.redirect_http_to_https, updated_at = excluded.updated_at",
+            "INSERT INTO http_route_tls_policies (route_id, mode, redirect_http_to_https, certificate_identifier, updated_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(route_id) DO UPDATE SET mode = excluded.mode, redirect_http_to_https = excluded.redirect_http_to_https, certificate_identifier = excluded.certificate_identifier, updated_at = excluded.updated_at",
             params![
                 route_id.to_string(),
                 request.mode.as_str(),
                 request.redirect_http_to_https,
+                certificate_identifier,
                 now,
             ],
         )?;
@@ -433,6 +502,7 @@ impl CertificateCatalog {
             route_id,
             mode: request.mode,
             redirect_http_to_https: request.redirect_http_to_https,
+            certificate_identifier,
             updated_at: now,
         })
     }
@@ -659,6 +729,89 @@ fn validate_acme_config(request: &UpdateAcmeConfig) -> Result<(), CertificateCat
     Ok(())
 }
 
+pub(crate) fn normalize_certificate_identifier(value: &str) -> anyhow::Result<String> {
+    let mut value = value.trim().to_ascii_lowercase();
+    while value.ends_with('.') {
+        value.pop();
+    }
+    let wildcard = value.strip_prefix("*.");
+    let hostname = wildcard.unwrap_or(&value);
+    anyhow::ensure!(
+        !hostname.is_empty()
+            && hostname.len() <= 253
+            && hostname.contains('.')
+            && hostname.parse::<IpAddr>().is_err()
+            && !hostname.contains('*')
+            && !hostname.contains('/')
+            && !hostname.contains('@')
+            && !hostname.contains(':')
+            && !hostname.chars().any(char::is_whitespace),
+        "certificate identifier is invalid"
+    );
+    let labels = hostname.split('.').collect::<Vec<_>>();
+    anyhow::ensure!(
+        labels.len() >= if wildcard.is_some() { 2 } else { 1 },
+        "certificate identifier is invalid"
+    );
+    for label in labels {
+        anyhow::ensure!(
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
+            "certificate identifier is invalid"
+        );
+    }
+    if wildcard.is_some() {
+        Ok(format!("*.{hostname}"))
+    } else {
+        Ok(hostname.to_owned())
+    }
+}
+
+pub(crate) fn certificate_identifier_covers_hostname(
+    certificate_identifier: &str,
+    hostname: &str,
+) -> bool {
+    let Ok(identifier) = normalize_certificate_identifier(certificate_identifier) else {
+        return false;
+    };
+    let Ok(hostname) = crate::http_route_catalog::normalize_hostname(hostname) else {
+        return false;
+    };
+    if identifier == hostname {
+        return true;
+    }
+    let Some(suffix) = identifier.strip_prefix("*.") else {
+        return false;
+    };
+    hostname
+        .strip_suffix(suffix)
+        .is_some_and(|prefix| prefix.ends_with('.') && !prefix[..prefix.len() - 1].contains('.'))
+}
+
+fn ensure_column(
+    database: &Connection,
+    table: &str,
+    name: &str,
+    definition: &str,
+) -> Result<(), CertificateCatalogError> {
+    let mut statement = database.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|column| column == name) {
+        database.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {name} {definition}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 fn validate_https_url(value: &str) -> Result<(), CertificateCatalogError> {
     let uri = value
         .parse::<Uri>()
@@ -708,10 +861,12 @@ fn valid_email(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AcmeEnvironment, CertificateCatalog, CertificateCatalogError, CertificateStatus,
-        RouteTlsMode, UpdateAcmeConfig, UpdateRouteTlsPolicy, LETS_ENCRYPT_PRODUCTION_DIRECTORY,
-        LETS_ENCRYPT_STAGING_DIRECTORY,
+        certificate_identifier_covers_hostname, normalize_certificate_identifier,
+        AcmeChallengeType, AcmeEnvironment, CertificateCatalog, CertificateCatalogError,
+        CertificateStatus, RouteTlsMode, UpdateAcmeConfig, UpdateRouteTlsPolicy,
+        LETS_ENCRYPT_PRODUCTION_DIRECTORY, LETS_ENCRYPT_STAGING_DIRECTORY,
     };
+    use serde_json::json;
     use std::fs;
     use uuid::Uuid;
 
@@ -722,6 +877,7 @@ mod tests {
             directory_url: directory_url.to_owned(),
             contact_email: "Admin@Example.com".to_owned(),
             terms_accepted: true,
+            challenge_type: Some(AcmeChallengeType::Http01),
             renew_before_days: 30,
         }
     }
@@ -735,7 +891,10 @@ mod tests {
             let mut catalog = CertificateCatalog::open(Some(&root)).expect("catalog should open");
             let config = catalog
                 .update_acme_config(
-                    enabled_config(AcmeEnvironment::Staging, LETS_ENCRYPT_STAGING_DIRECTORY),
+                    UpdateAcmeConfig {
+                        challenge_type: Some(AcmeChallengeType::Dns01),
+                        ..enabled_config(AcmeEnvironment::Staging, LETS_ENCRYPT_STAGING_DIRECTORY)
+                    },
                     100,
                 )
                 .expect("config should update");
@@ -746,29 +905,100 @@ mod tests {
                     UpdateRouteTlsPolicy {
                         mode: RouteTlsMode::Acme,
                         redirect_http_to_https: true,
+                        certificate_identifier: Some("*.Example.com.".to_owned()),
                     },
                     101,
                 )
                 .expect("route policy should update");
         }
         let catalog = CertificateCatalog::open(Some(&root)).expect("catalog should reopen");
+        let config = catalog.get_acme_config().expect("config should persist");
+        assert_eq!(config.environment, AcmeEnvironment::Staging);
+        assert_eq!(config.challenge_type, AcmeChallengeType::Dns01);
+        let policy = catalog
+            .get_route_tls(route_id)
+            .expect("route policy should load")
+            .expect("route policy should exist");
+        assert_eq!(policy.mode, RouteTlsMode::Acme);
         assert_eq!(
-            catalog
-                .get_acme_config()
-                .expect("config should persist")
-                .environment,
-            AcmeEnvironment::Staging
-        );
-        assert_eq!(
-            catalog
-                .get_route_tls(route_id)
-                .expect("route policy should load")
-                .expect("route policy should exist")
-                .mode,
-            RouteTlsMode::Acme
+            policy.certificate_identifier.as_deref(),
+            Some("*.example.com")
         );
         drop(catalog);
         fs::remove_dir_all(root).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn certificate_identifiers_are_strict_and_wildcards_cover_one_label() {
+        assert_eq!(
+            normalize_certificate_identifier(" *.Example.COM. ")
+                .expect("wildcard should normalize"),
+            "*.example.com"
+        );
+        assert!(certificate_identifier_covers_hostname(
+            "*.example.com",
+            "node.example.com"
+        ));
+        assert!(!certificate_identifier_covers_hostname(
+            "*.example.com",
+            "nested.node.example.com"
+        ));
+        assert!(!certificate_identifier_covers_hostname(
+            "*.example.com",
+            "example.com"
+        ));
+        for invalid in [
+            "*.*.example.com",
+            "*.com",
+            "example.com:443",
+            "127.0.0.1",
+            "../example.com",
+            "bad_label.example.com",
+        ] {
+            assert!(
+                normalize_certificate_identifier(invalid).is_err(),
+                "{invalid} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_acme_json_preserves_challenge_type_and_rejects_raw_token_fields() {
+        let base = json!({
+            "enabled": true,
+            "environment": "production",
+            "directory_url": LETS_ENCRYPT_PRODUCTION_DIRECTORY,
+            "contact_email": "admin@example.com",
+            "terms_accepted": true,
+            "renew_before_days": 30
+        });
+        let request: UpdateAcmeConfig =
+            serde_json::from_value(base.clone()).expect("legacy HTTP-01 request should parse");
+        assert!(request.challenge_type.is_none());
+        let mut catalog = CertificateCatalog::open(None).expect("catalog should open");
+        catalog
+            .update_acme_config(
+                UpdateAcmeConfig {
+                    challenge_type: Some(AcmeChallengeType::Dns01),
+                    ..enabled_config(
+                        AcmeEnvironment::Production,
+                        LETS_ENCRYPT_PRODUCTION_DIRECTORY,
+                    )
+                },
+                1,
+            )
+            .expect("DNS-01 should configure");
+        assert_eq!(
+            catalog
+                .update_acme_config(request, 2)
+                .expect("legacy update should remain compatible")
+                .challenge_type,
+            AcmeChallengeType::Dns01
+        );
+
+        let mut with_token = base;
+        with_token["cloudflare_api_token"] = json!("must-never-enter-the-api");
+        assert!(serde_json::from_value::<UpdateAcmeConfig>(with_token).is_err());
     }
 
     #[test]
@@ -827,6 +1057,7 @@ mod tests {
                 UpdateRouteTlsPolicy {
                     mode: RouteTlsMode::Disabled,
                     redirect_http_to_https: true,
+                    certificate_identifier: None,
                 },
                 1,
             ),
@@ -840,6 +1071,7 @@ mod tests {
                 UpdateRouteTlsPolicy {
                     mode: RouteTlsMode::Acme,
                     redirect_http_to_https: false,
+                    certificate_identifier: None,
                 },
                 1,
             )

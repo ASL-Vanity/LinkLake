@@ -5,6 +5,7 @@ mod audit_log;
 mod certificate_catalog;
 mod certificate_manager;
 mod client_registry;
+mod cloudflare_dns;
 mod database;
 mod database_migrations;
 mod database_tools;
@@ -49,6 +50,7 @@ use axum::{
 };
 use axum_server::tls_rustls::RustlsConfig as ManagementTlsConfig;
 use certificate_catalog::{
+    certificate_identifier_covers_hostname, normalize_certificate_identifier, AcmeChallengeType,
     AcmeConfig, CertificateCatalog, CertificateCatalogError, CertificateState, CertificateStatus,
     RouteTlsMode, RouteTlsPolicy, UpdateAcmeConfig, UpdateRouteTlsPolicy,
 };
@@ -367,6 +369,7 @@ struct ServerCounters {
     acme_renewals_total: AtomicU64,
     acme_renewal_failures_total: AtomicU64,
     acme_http01_challenges_total: AtomicU64,
+    acme_dns01_challenges_total: AtomicU64,
     sni_client_hello_errors_total: AtomicU64,
     sni_unknown_hostname_total: AtomicU64,
     p2p_session_offers_total: AtomicU64,
@@ -849,6 +852,7 @@ struct MetricsResponse {
     acme_renewals_total: u64,
     acme_renewal_failures_total: u64,
     acme_http01_challenges_total: u64,
+    acme_dns01_challenges_total: u64,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -1267,6 +1271,7 @@ struct HttpProxyView {
 struct RouteTlsView {
     mode: RouteTlsMode,
     redirect_http_to_https: bool,
+    certificate_identifier: String,
     https_online: bool,
     status: CertificateStatus,
     issuer: Option<String>,
@@ -1287,7 +1292,8 @@ struct AcmeConfigView {
     directory_url: String,
     contact_email: Option<String>,
     terms_accepted: bool,
-    challenge_type: &'static str,
+    challenge_type: AcmeChallengeType,
+    cloudflare_token_configured: bool,
     renew_before_days: u8,
     account_registered: bool,
     updated_at_unix_seconds: Option<i64>,
@@ -1459,7 +1465,8 @@ fn coded_certificate_catalog_error(error: CertificateCatalogError) -> CodedApiEr
         | CertificateCatalogError::InvalidContactEmail
         | CertificateCatalogError::TermsNotAccepted
         | CertificateCatalogError::InvalidRenewalWindow
-        | CertificateCatalogError::InvalidRedirectPolicy => StatusCode::BAD_REQUEST,
+        | CertificateCatalogError::InvalidRedirectPolicy
+        | CertificateCatalogError::InvalidCertificateIdentifier => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     CodedApiError(status, error.code(), "certificate configuration is invalid")
@@ -1476,11 +1483,76 @@ fn acme_config_view(state: &AppState, config: AcmeConfig) -> AcmeConfigView {
         directory_url: config.directory_url,
         contact_email: (!config.contact_email.is_empty()).then_some(config.contact_email),
         terms_accepted: config.terms_accepted,
-        challenge_type: "http-01",
+        challenge_type: config.challenge_type,
+        cloudflare_token_configured: state
+            .certificate_manager
+            .as_ref()
+            .is_some_and(CertificateManager::cloudflare_token_configured),
         renew_before_days: config.renew_before_days,
         account_registered,
         updated_at_unix_seconds: (config.updated_at > 0).then_some(config.updated_at),
     }
+}
+
+fn effective_certificate_identifier(hostname: &str, policy: Option<&RouteTlsPolicy>) -> String {
+    policy
+        .and_then(|policy| policy.certificate_identifier.clone())
+        .unwrap_or_else(|| hostname.to_owned())
+}
+
+fn resolve_certificate_identifier_update(
+    hostname: &str,
+    old_policy: Option<&RouteTlsPolicy>,
+    requested: Option<&str>,
+    mode: RouteTlsMode,
+) -> anyhow::Result<(String, Option<String>)> {
+    if mode == RouteTlsMode::Disabled {
+        return Ok((hostname.to_owned(), None));
+    }
+    let requested = requested
+        .or_else(|| old_policy.and_then(|policy| policy.certificate_identifier.as_deref()))
+        .unwrap_or(hostname);
+    let identifier = normalize_certificate_identifier(requested)?;
+    let stored = (identifier != hostname).then_some(identifier.clone());
+    Ok((identifier, stored))
+}
+
+fn certificate_identifier_used_by_other_route(
+    state: &AppState,
+    certificate_identifier: &str,
+    excluded_route_id: Uuid,
+) -> Result<bool, CodedApiError> {
+    let routes = state
+        .http_route_catalog
+        .lock()
+        .expect("HTTP route catalog lock poisoned")
+        .list()
+        .map_err(|_| {
+            CodedApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "could not read HTTP routes",
+            )
+        })?;
+    let catalog = state
+        .certificate_catalog
+        .lock()
+        .expect("certificate catalog lock poisoned");
+    for route in routes
+        .into_iter()
+        .filter(|route| route.id != excluded_route_id)
+    {
+        let policy = catalog
+            .get_route_tls(route.id)
+            .map_err(coded_certificate_catalog_error)?;
+        if policy.as_ref().map(|policy| policy.mode) == Some(RouteTlsMode::Acme)
+            && effective_certificate_identifier(&route.hostname, policy.as_ref())
+                == certificate_identifier
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn route_tls_view(
@@ -1489,6 +1561,7 @@ fn route_tls_view(
     policy: Option<RouteTlsPolicy>,
     certificate: Option<CertificateState>,
 ) -> RouteTlsView {
+    let certificate_identifier = effective_certificate_identifier(hostname, policy.as_ref());
     let mode = policy
         .as_ref()
         .map_or(RouteTlsMode::Disabled, |policy| policy.mode);
@@ -1503,10 +1576,11 @@ fn route_tls_view(
     let https_online = state
         .certificate_manager
         .as_ref()
-        .is_some_and(|manager| manager.has_certificate(hostname));
+        .is_some_and(|manager| manager.has_certificate(&certificate_identifier));
     RouteTlsView {
         mode,
         redirect_http_to_https,
+        certificate_identifier,
         https_online,
         status,
         issuer: certificate.as_ref().and_then(|value| value.issuer.clone()),
@@ -2908,6 +2982,10 @@ async fn metrics(
         acme_http01_challenges_total: state
             .metrics
             .acme_http01_challenges_total
+            .load(Ordering::Relaxed),
+        acme_dns01_challenges_total: state
+            .metrics
+            .acme_dns01_challenges_total
             .load(Ordering::Relaxed),
     }))
 }
@@ -4350,9 +4428,68 @@ async fn get_acme_config(
 async fn update_acme_config(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(request): Json<UpdateAcmeConfig>,
+    Json(mut request): Json<UpdateAcmeConfig>,
 ) -> Result<Json<AcmeConfigView>, CodedApiError> {
     authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let challenge_type = request.challenge_type.unwrap_or(
+        state
+            .certificate_catalog
+            .lock()
+            .expect("certificate catalog lock poisoned")
+            .get_acme_config()
+            .map_err(coded_certificate_catalog_error)?
+            .challenge_type,
+    );
+    request.challenge_type = Some(challenge_type);
+    if request.enabled
+        && challenge_type == AcmeChallengeType::Dns01
+        && !state
+            .certificate_manager
+            .as_ref()
+            .is_some_and(CertificateManager::cloudflare_token_configured)
+    {
+        return Err(CodedApiError(
+            StatusCode::CONFLICT,
+            "cloudflare_token_not_configured",
+            "Cloudflare API token is required for DNS-01",
+        ));
+    }
+    if challenge_type == AcmeChallengeType::Http01 {
+        let routes = state
+            .http_route_catalog
+            .lock()
+            .expect("HTTP route catalog lock poisoned")
+            .list()
+            .map_err(|_| {
+                CodedApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "could not read HTTP routes",
+                )
+            })?;
+        let catalog = state
+            .certificate_catalog
+            .lock()
+            .expect("certificate catalog lock poisoned");
+        let wildcard_configured = routes.into_iter().any(|route| {
+            catalog
+                .get_route_tls(route.id)
+                .ok()
+                .flatten()
+                .is_some_and(|policy| {
+                    policy.mode == RouteTlsMode::Acme
+                        && effective_certificate_identifier(&route.hostname, Some(&policy))
+                            .starts_with("*.")
+                })
+        });
+        if wildcard_configured {
+            return Err(CodedApiError(
+                StatusCode::CONFLICT,
+                "wildcard_certificate_requires_dns01",
+                "wildcard certificate identifiers require DNS-01",
+            ));
+        }
+    }
     let config = state
         .certificate_catalog
         .lock()
@@ -4364,8 +4501,8 @@ async fn update_acme_config(
         "acme.config.updated",
         "global",
         &format!(
-            "enabled={}; environment={:?}; renew_before_days={}",
-            config.enabled, config.environment, config.renew_before_days
+            "enabled={}; environment={:?}; challenge_type={:?}; renew_before_days={}",
+            config.enabled, config.environment, config.challenge_type, config.renew_before_days
         ),
     );
     Ok(Json(acme_config_view(&state, config)))
@@ -4375,7 +4512,7 @@ async fn set_http_route_tls(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(route_id): Path<Uuid>,
-    Json(request): Json<UpdateRouteTlsPolicy>,
+    Json(mut request): Json<UpdateRouteTlsPolicy>,
 ) -> Result<Json<RouteTlsPolicy>, CodedApiError> {
     authorize_management(&state, &headers).map_err(coded_management_error)?;
     let route = http_route_policy_for_id(&state, route_id)?.ok_or(CodedApiError(
@@ -4383,11 +4520,83 @@ async fn set_http_route_tls(
         "unknown_http_route",
         "HTTP route does not exist",
     ))?;
+    let (old_policy, acme_config) = {
+        let catalog = state
+            .certificate_catalog
+            .lock()
+            .expect("certificate catalog lock poisoned");
+        (
+            catalog
+                .get_route_tls(route_id)
+                .map_err(coded_certificate_catalog_error)?,
+            catalog
+                .get_acme_config()
+                .map_err(coded_certificate_catalog_error)?,
+        )
+    };
+    let (certificate_identifier, stored_certificate_identifier) =
+        resolve_certificate_identifier_update(
+            &route.hostname,
+            old_policy.as_ref(),
+            request.certificate_identifier.as_deref(),
+            request.mode,
+        )
+        .map_err(|_| {
+            CodedApiError(
+                StatusCode::BAD_REQUEST,
+                "invalid_certificate_identifier",
+                "certificate identifier is invalid",
+            )
+        })?;
+    if request.mode == RouteTlsMode::Acme
+        && !certificate_identifier_covers_hostname(&certificate_identifier, &route.hostname)
+    {
+        return Err(CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "certificate_identifier_does_not_cover_route",
+            "certificate identifier does not cover the route hostname",
+        ));
+    }
+    if request.mode == RouteTlsMode::Acme
+        && certificate_identifier.starts_with("*.")
+        && acme_config.challenge_type != AcmeChallengeType::Dns01
+    {
+        return Err(CodedApiError(
+            StatusCode::CONFLICT,
+            "wildcard_certificate_requires_dns01",
+            "wildcard certificate identifiers require DNS-01",
+        ));
+    }
+    if request.mode == RouteTlsMode::Acme
+        && certificate_identifier_used_by_other_route(&state, &certificate_identifier, route_id)?
+    {
+        return Err(CodedApiError(
+            StatusCode::CONFLICT,
+            "duplicate_certificate_identifier",
+            "certificate identifier is already assigned to another route",
+        ));
+    }
+    request.certificate_identifier = stored_certificate_identifier;
+    let old_certificate_identifier =
+        effective_certificate_identifier(&route.hostname, old_policy.as_ref());
     let certificate_jobs = state
         .certificate_jobs
         .lock()
         .expect("certificate jobs lock poisoned");
-    if request.mode == RouteTlsMode::Disabled && certificate_jobs.contains_key(&route.hostname) {
+    if (request.mode == RouteTlsMode::Disabled
+        || old_certificate_identifier != certificate_identifier)
+        && certificate_jobs.contains_key(&old_certificate_identifier)
+    {
+        return Err(CodedApiError(
+            StatusCode::CONFLICT,
+            "certificate_operation_in_progress",
+            "certificate operation is already in progress",
+        ));
+    }
+    if certificate_jobs
+        .get(&certificate_identifier)
+        .is_some_and(|owner| *owner != route_id)
+    {
         return Err(CodedApiError(
             StatusCode::CONFLICT,
             "certificate_operation_in_progress",
@@ -4402,6 +4611,7 @@ async fn set_http_route_tls(
         .expect("certificate catalog lock poisoned")
         .set_route_tls(route_id, request, unix_seconds() as i64)
         .map_err(coded_certificate_catalog_error)?;
+    let certificate_identifier = effective_certificate_identifier(&route.hostname, Some(&policy));
     {
         let mut redirects = state
             .https_redirect_hosts
@@ -4413,9 +4623,24 @@ async fn set_http_route_tls(
             redirects.remove(&route.hostname);
         }
     }
+    if old_certificate_identifier != certificate_identifier {
+        if let Some(manager) = &state.certificate_manager {
+            if let Err(error) = manager.delete_certificate(&old_certificate_identifier) {
+                tracing::warn!(
+                    "could not delete superseded certificate {old_certificate_identifier}: {error}"
+                );
+            }
+        }
+        state
+            .certificate_catalog
+            .lock()
+            .expect("certificate catalog lock poisoned")
+            .delete_certificate_state(route_id)
+            .map_err(coded_certificate_catalog_error)?;
+    }
     if mode == RouteTlsMode::Disabled {
         if let Some(manager) = &state.certificate_manager {
-            manager.remove_certificate(&route.hostname);
+            manager.remove_certificate(&certificate_identifier);
         }
         set_persisted_certificate_status(&state, route_id, CertificateStatus::Disabled)?;
     } else {
@@ -4431,7 +4656,7 @@ async fn set_http_route_tls(
             && state
                 .certificate_manager
                 .as_ref()
-                .is_some_and(|manager| manager.load_certificate(&route.hostname).is_ok());
+                .is_some_and(|manager| manager.load_certificate(&certificate_identifier).is_ok());
         if restored {
             set_persisted_certificate_status(&state, route_id, CertificateStatus::Active)?;
         } else {
@@ -4451,8 +4676,8 @@ async fn set_http_route_tls(
         "http_route.tls.updated",
         &route_id.to_string(),
         &format!(
-            "hostname={}; mode={:?}; redirect={}",
-            route.hostname, policy.mode, policy.redirect_http_to_https
+            "hostname={}; certificate_identifier={}; mode={:?}; redirect={}",
+            route.hostname, certificate_identifier, policy.mode, policy.redirect_http_to_https
         ),
     );
     if issue_automatically {
@@ -4662,6 +4887,26 @@ fn queue_certificate_operation(
             "certificate storage is unavailable",
         ));
     };
+    let certificate_identifier =
+        effective_certificate_identifier(&route.hostname, tls_policy.as_ref());
+    if certificate_identifier.starts_with("*.")
+        && acme_config.challenge_type != AcmeChallengeType::Dns01
+    {
+        return Err(CodedApiError(
+            StatusCode::CONFLICT,
+            "wildcard_certificate_requires_dns01",
+            "wildcard certificate identifiers require DNS-01",
+        ));
+    }
+    if acme_config.challenge_type == AcmeChallengeType::Dns01
+        && !manager.cloudflare_token_configured()
+    {
+        return Err(CodedApiError(
+            StatusCode::CONFLICT,
+            "cloudflare_token_not_configured",
+            "Cloudflare API token is required for DNS-01",
+        ));
+    }
     match operation {
         CertificateOperation::Issue
             if certificate.as_ref().is_some_and(|certificate| {
@@ -4675,7 +4920,7 @@ fn queue_certificate_operation(
                 "certificate is already valid",
             ));
         }
-        CertificateOperation::Renew if !manager.has_certificate(&route.hostname) => {
+        CertificateOperation::Renew if !manager.has_certificate(&certificate_identifier) => {
             return Err(CodedApiError(
                 StatusCode::CONFLICT,
                 "certificate_not_available",
@@ -4698,7 +4943,7 @@ fn queue_certificate_operation(
             "certificate operation was attempted too recently",
         ));
     }
-    if !reserve_certificate_job(&state, &route)? {
+    if !reserve_certificate_job(&state, &route, &certificate_identifier)? {
         return Err(CodedApiError(
             StatusCode::CONFLICT,
             "certificate_operation_in_progress",
@@ -4710,7 +4955,7 @@ fn queue_certificate_operation(
         CertificateOperation::Renew => CertificateStatus::Renewing,
     };
     if let Err(error) = mark_certificate_operation_status(&state, route_id, target_status) {
-        release_certificate_job(&state, &route.hostname, route_id);
+        release_certificate_job(&state, &certificate_identifier, route_id);
         return Err(error);
     }
     state
@@ -4730,12 +4975,16 @@ fn queue_certificate_operation(
             CertificateOperation::Renew => "certificate.renew.started",
         },
         &route_id.to_string(),
-        &format!("hostname={}", route.hostname),
+        &format!(
+            "hostname={}; certificate_identifier={}",
+            route.hostname, certificate_identifier
+        ),
     );
     tokio::spawn(run_certificate_operation(
         state,
         manager,
         route,
+        certificate_identifier,
         acme_config,
         operation,
     ));
@@ -4745,12 +4994,13 @@ fn queue_certificate_operation(
 fn reserve_certificate_job(
     state: &AppState,
     expected: &HttpRoutePolicy,
+    expected_certificate_identifier: &str,
 ) -> Result<bool, CodedApiError> {
     let mut jobs = state
         .certificate_jobs
         .lock()
         .expect("certificate jobs lock poisoned");
-    if jobs.contains_key(&expected.hostname) {
+    if jobs.contains_key(expected_certificate_identifier) {
         return Ok(false);
     }
     let current = http_route_policy_for_id(state, expected.id)?.ok_or(CodedApiError(
@@ -4785,9 +5035,18 @@ fn reserve_certificate_job(
             "automatic TLS is not enabled for this route",
         ));
     }
+    if effective_certificate_identifier(&current.hostname, tls_policy.as_ref())
+        != expected_certificate_identifier
+    {
+        return Err(CodedApiError(
+            StatusCode::CONFLICT,
+            "certificate_target_changed",
+            "certificate target changed before the operation started",
+        ));
+    }
     Ok(reserve_certificate_job_slot(
         &mut jobs,
-        &expected.hostname,
+        expected_certificate_identifier,
         expected.id,
     ))
 }
@@ -4822,16 +5081,18 @@ async fn run_certificate_operation(
     state: Arc<AppState>,
     manager: CertificateManager,
     route: HttpRoutePolicy,
+    certificate_identifier: String,
     acme_config: AcmeConfig,
     operation: CertificateOperation,
 ) {
     let issue_config = certificate_manager::AcmeIssueConfig {
         directory_url: acme_config.directory_url,
         contact_email: acme_config.contact_email,
+        challenge_type: acme_config.challenge_type,
         root_ca_path: std::env::var_os("LINKLAKE_ACME_ROOT_CA_PATH").map(PathBuf::from),
     };
     let result = manager
-        .issue_certificate(&route.hostname, &issue_config)
+        .issue_certificate(&certificate_identifier, &issue_config)
         .await;
     let now = unix_seconds() as i64;
     match result {
@@ -4839,10 +5100,15 @@ async fn run_certificate_operation(
             state
                 .metrics
                 .acme_http01_challenges_total
-                .fetch_add(result.challenges_completed, Ordering::Relaxed);
+                .fetch_add(result.http01_challenges_completed, Ordering::Relaxed);
+            state
+                .metrics
+                .acme_dns01_challenges_total
+                .fetch_add(result.dns01_challenges_completed, Ordering::Relaxed);
             let current = record_certificate_success_if_current(
                 &state,
                 &route,
+                &certificate_identifier,
                 &result.metadata.issuer,
                 result.metadata.not_before_unix_seconds as i64,
                 result.metadata.not_after_unix_seconds as i64,
@@ -4858,13 +5124,25 @@ async fn run_certificate_operation(
                     &route.id.to_string(),
                     &format!("hostname={}", route.hostname),
                 ),
-                Ok(false) => discard_stale_certificate_result(&state, &manager, &route, operation),
+                Ok(false) => discard_stale_certificate_result(
+                    &state,
+                    &manager,
+                    &route,
+                    &certificate_identifier,
+                    operation,
+                ),
                 Err(error) => {
                     tracing::error!(
                         "could not verify or persist certificate metadata for {}: {error}",
                         route.hostname
                     );
-                    discard_stale_certificate_result(&state, &manager, &route, operation);
+                    discard_stale_certificate_result(
+                        &state,
+                        &manager,
+                        &route,
+                        &certificate_identifier,
+                        operation,
+                    );
                 }
             }
         }
@@ -4883,6 +5161,7 @@ async fn run_certificate_operation(
             match record_certificate_failure_if_current(
                 &state,
                 &route,
+                &certificate_identifier,
                 match operation {
                     CertificateOperation::Issue => "certificate_issue_failed",
                     CertificateOperation::Renew => "certificate_renew_failed",
@@ -4918,11 +5197,12 @@ async fn run_certificate_operation(
             }
         }
     }
-    release_certificate_job(&state, &route.hostname, route.id);
+    release_certificate_job(&state, &certificate_identifier, route.id);
 }
 
 fn certificate_target_matches(
     expected: &HttpRoutePolicy,
+    expected_certificate_identifier: &str,
     current: Option<&HttpRoutePolicy>,
     tls_policy: Option<&RouteTlsPolicy>,
 ) -> bool {
@@ -4931,7 +5211,10 @@ fn certificate_target_matches(
             && current.hostname == expected.hostname
             && current.enabled
             && tls_policy.is_some_and(|policy| {
-                policy.route_id == expected.id && policy.mode == RouteTlsMode::Acme
+                policy.route_id == expected.id
+                    && policy.mode == RouteTlsMode::Acme
+                    && effective_certificate_identifier(&current.hostname, Some(policy))
+                        == expected_certificate_identifier
             })
     })
 }
@@ -4939,6 +5222,7 @@ fn certificate_target_matches(
 fn record_certificate_success_if_current(
     state: &AppState,
     expected: &HttpRoutePolicy,
+    expected_certificate_identifier: &str,
     issuer: &str,
     not_before: i64,
     not_after: i64,
@@ -4955,7 +5239,12 @@ fn record_certificate_success_if_current(
         .lock()
         .expect("certificate catalog lock poisoned");
     let tls_policy = certificate_catalog.get_route_tls(expected.id)?;
-    if !certificate_target_matches(expected, current, tls_policy.as_ref()) {
+    if !certificate_target_matches(
+        expected,
+        expected_certificate_identifier,
+        current,
+        tls_policy.as_ref(),
+    ) {
         return Ok(false);
     }
     certificate_catalog.record_certificate_success(
@@ -4973,6 +5262,7 @@ fn record_certificate_success_if_current(
 fn record_certificate_failure_if_current(
     state: &AppState,
     expected: &HttpRoutePolicy,
+    expected_certificate_identifier: &str,
     error_code: &str,
     error_message: &str,
     attempted_at: i64,
@@ -4988,7 +5278,12 @@ fn record_certificate_failure_if_current(
         .lock()
         .expect("certificate catalog lock poisoned");
     let tls_policy = certificate_catalog.get_route_tls(expected.id)?;
-    if !certificate_target_matches(expected, current, tls_policy.as_ref()) {
+    if !certificate_target_matches(
+        expected,
+        expected_certificate_identifier,
+        current,
+        tls_policy.as_ref(),
+    ) {
         return Ok(false);
     }
     certificate_catalog.record_certificate_failure(
@@ -5006,9 +5301,10 @@ fn discard_stale_certificate_result(
     state: &AppState,
     manager: &CertificateManager,
     route: &HttpRoutePolicy,
+    certificate_identifier: &str,
     operation: CertificateOperation,
 ) {
-    if let Err(error) = manager.delete_certificate(&route.hostname) {
+    if let Err(error) = manager.delete_certificate(certificate_identifier) {
         tracing::warn!(
             "could not remove stale certificate result for {}: {error}",
             route.hostname
@@ -5074,6 +5370,8 @@ fn restore_managed_certificates(state: &Arc<AppState>) -> anyhow::Result<()> {
         if tls_policy.mode != RouteTlsMode::Acme {
             continue;
         }
+        let certificate_identifier =
+            effective_certificate_identifier(&route.hostname, Some(&tls_policy));
         if certificate
             .as_ref()
             .is_some_and(|certificate| certificate.expired_at(now))
@@ -5087,7 +5385,7 @@ fn restore_managed_certificates(state: &Arc<AppState>) -> anyhow::Result<()> {
             .and_then(|value| value.not_after)
             .is_some()
         {
-            match manager.load_certificate(&route.hostname) {
+            match manager.load_certificate(&certificate_identifier) {
                 Ok(_) => {
                     if certificate.as_ref().is_some_and(|certificate| {
                         matches!(
@@ -5191,11 +5489,13 @@ fn scan_certificate_maintenance(state: Arc<AppState>) {
         if tls_policy.as_ref().map(|policy| policy.mode) != Some(RouteTlsMode::Acme) {
             continue;
         }
+        let certificate_identifier =
+            effective_certificate_identifier(&route.hostname, tls_policy.as_ref());
         if certificate.as_ref().is_some_and(|certificate| {
             certificate.status != CertificateStatus::Error && certificate.expired_at(now)
         }) {
             if let Some(manager) = &state.certificate_manager {
-                manager.remove_certificate(&route.hostname);
+                manager.remove_certificate(&certificate_identifier);
             }
             let _ = set_persisted_certificate_status(&state, route.id, CertificateStatus::Expired);
         } else if certificate
@@ -5203,13 +5503,13 @@ fn scan_certificate_maintenance(state: Arc<AppState>) {
             .is_some_and(|certificate| certificate.expired_at(now))
         {
             if let Some(manager) = &state.certificate_manager {
-                manager.remove_certificate(&route.hostname);
+                manager.remove_certificate(&certificate_identifier);
             }
         }
         let has_certificate = state
             .certificate_manager
             .as_ref()
-            .is_some_and(|manager| manager.has_certificate(&route.hostname));
+            .is_some_and(|manager| manager.has_certificate(&certificate_identifier));
         let operation =
             select_certificate_maintenance_operation(certificate.as_ref(), has_certificate, now);
         if let Some(operation) = operation {
@@ -8262,6 +8562,14 @@ async fn update_http_route(
     Json(request): Json<UpdateHttpRoutePolicy>,
 ) -> Result<Json<HttpRoutePolicy>, CodedApiError> {
     authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let requested_hostname =
+        http_route_catalog::normalize_hostname(&request.hostname).map_err(|_| {
+            CodedApiError(
+                StatusCode::BAD_REQUEST,
+                "invalid_hostname",
+                "HTTP route hostname is invalid",
+            )
+        })?;
     if !state
         .clients
         .lock()
@@ -8274,10 +8582,6 @@ async fn update_http_route(
             "unknown client for HTTP route",
         ));
     }
-    let certificate_jobs = state
-        .certificate_jobs
-        .lock()
-        .expect("certificate jobs lock poisoned");
     let (old_policy, tls_policy) = {
         let catalog = state
             .http_route_catalog
@@ -8291,13 +8595,6 @@ async fn update_http_route(
                 "unknown_http_route",
                 "unknown HTTP route",
             ))?;
-        if certificate_jobs.contains_key(&old.hostname) {
-            return Err(CodedApiError(
-                StatusCode::CONFLICT,
-                "certificate_operation_in_progress",
-                "certificate operation is already in progress",
-            ));
-        }
         let tls_policy = state
             .certificate_catalog
             .lock()
@@ -8306,6 +8603,48 @@ async fn update_http_route(
             .map_err(coded_certificate_catalog_error)?;
         (old, tls_policy)
     };
+    let old_certificate_identifier =
+        effective_certificate_identifier(&old_policy.hostname, tls_policy.as_ref());
+    let new_certificate_identifier =
+        effective_certificate_identifier(&requested_hostname, tls_policy.as_ref());
+    if tls_policy.as_ref().map(|policy| policy.mode) == Some(RouteTlsMode::Acme)
+        && !certificate_identifier_covers_hostname(&new_certificate_identifier, &requested_hostname)
+    {
+        return Err(CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "certificate_identifier_does_not_cover_route",
+            "certificate identifier does not cover the updated route hostname",
+        ));
+    }
+    if old_certificate_identifier != new_certificate_identifier
+        && tls_policy.as_ref().map(|policy| policy.mode) == Some(RouteTlsMode::Acme)
+        && certificate_identifier_used_by_other_route(
+            &state,
+            &new_certificate_identifier,
+            route_id,
+        )?
+    {
+        return Err(CodedApiError(
+            StatusCode::CONFLICT,
+            "duplicate_certificate_identifier",
+            "certificate identifier is already assigned to another route",
+        ));
+    }
+    let certificate_jobs = state
+        .certificate_jobs
+        .lock()
+        .expect("certificate jobs lock poisoned");
+    if certificate_jobs.contains_key(&old_certificate_identifier)
+        || certificate_jobs
+            .get(&new_certificate_identifier)
+            .is_some_and(|owner| *owner != route_id)
+    {
+        return Err(CodedApiError(
+            StatusCode::CONFLICT,
+            "certificate_operation_in_progress",
+            "certificate operation is already in progress",
+        ));
+    }
     let policy = state
         .http_route_catalog
         .lock()
@@ -8327,16 +8666,12 @@ async fn update_http_route(
             .lock()
             .expect("HTTP route statistics lock poisoned")
             .remove(&old_policy.hostname);
-        state
-            .https_redirect_hosts
-            .lock()
-            .expect("HTTPS redirect registry lock poisoned")
-            .remove(&old_policy.hostname);
+    }
+    if old_certificate_identifier != new_certificate_identifier {
         if let Some(manager) = &state.certificate_manager {
-            if let Err(error) = manager.delete_certificate(&old_policy.hostname) {
+            if let Err(error) = manager.delete_certificate(&old_certificate_identifier) {
                 tracing::warn!(
-                    "could not delete certificate files for {}: {error}",
-                    old_policy.hostname
+                    "could not delete certificate files for {old_certificate_identifier}: {error}"
                 );
             }
         }
@@ -8347,16 +8682,19 @@ async fn update_http_route(
             .delete_certificate_state(route_id)
             .map_err(coded_certificate_catalog_error)?;
     }
-    // 主机名未更换时保留现有证书；更换主机名后由证书维护任务重新签发。
-    if old_policy.hostname != policy.hostname
-        && tls_policy.is_some_and(|tls| tls.mode == RouteTlsMode::Disabled)
+    let mut redirects = state
+        .https_redirect_hosts
+        .lock()
+        .expect("HTTPS redirect registry lock poisoned");
+    redirects.remove(&old_policy.hostname);
+    if policy.enabled
+        && tls_policy
+            .as_ref()
+            .is_some_and(|tls| tls.mode == RouteTlsMode::Acme && tls.redirect_http_to_https)
     {
-        state
-            .https_redirect_hosts
-            .lock()
-            .expect("HTTPS redirect registry lock poisoned")
-            .remove(&policy.hostname);
+        redirects.insert(policy.hostname.clone());
     }
+    drop(redirects);
     record_audit(
         &state,
         "http_route.policy.updated",
@@ -8376,26 +8714,24 @@ async fn set_http_route_enabled(
     Json(request): Json<EnableTunnelRequest>,
 ) -> Result<StatusCode, CodedApiError> {
     authorize_management(&state, &headers).map_err(coded_management_error)?;
-    let hostname = state
-        .http_route_catalog
+    let route = http_route_policy_for_id(&state, route_id)?;
+    let tls_policy = state
+        .certificate_catalog
         .lock()
-        .expect("HTTP route catalog lock poisoned")
-        .hostname_for_id(route_id)
-        .map_err(|_| {
-            CodedApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                "could not read HTTP route policy",
-            )
-        })?;
+        .expect("certificate catalog lock poisoned")
+        .get_route_tls(route_id)
+        .map_err(coded_certificate_catalog_error)?;
+    let certificate_identifier = route
+        .as_ref()
+        .map(|route| effective_certificate_identifier(&route.hostname, tls_policy.as_ref()));
     let certificate_jobs = state
         .certificate_jobs
         .lock()
         .expect("certificate jobs lock poisoned");
     if !request.enabled
-        && hostname
+        && certificate_identifier
             .as_deref()
-            .is_some_and(|hostname| certificate_jobs.contains_key(hostname))
+            .is_some_and(|identifier| certificate_jobs.contains_key(identifier))
     {
         return Err(CodedApiError(
             StatusCode::CONFLICT,
@@ -8423,7 +8759,8 @@ async fn set_http_route_enabled(
         ));
     }
     if !request.enabled {
-        if let Some(hostname) = hostname.as_deref() {
+        if let Some(route) = route.as_ref() {
+            let hostname = &route.hostname;
             http_tunnel::stop_hostname(&state, hostname);
             state
                 .https_redirect_hosts
@@ -8431,10 +8768,13 @@ async fn set_http_route_enabled(
                 .expect("HTTPS redirect registry lock poisoned")
                 .remove(hostname);
             if let Some(manager) = &state.certificate_manager {
-                manager.remove_certificate(hostname);
+                if let Some(identifier) = certificate_identifier.as_deref() {
+                    manager.remove_certificate(identifier);
+                }
             }
         }
-    } else if let Some(hostname) = hostname.as_deref() {
+    } else if let Some(route) = route.as_ref() {
+        let hostname = &route.hostname;
         let should_load = {
             let catalog = state
                 .certificate_catalog
@@ -8453,7 +8793,8 @@ async fn set_http_route_enabled(
         };
         if should_load {
             if let Some(manager) = &state.certificate_manager {
-                if let Err(error) = manager.load_certificate(hostname) {
+                let identifier = certificate_identifier.as_deref().unwrap_or(hostname);
+                if let Err(error) = manager.load_certificate(identifier) {
                     tracing::warn!("could not reload certificate for {hostname}: {error}");
                 }
             }
@@ -8496,25 +8837,23 @@ async fn delete_http_route(
     Path(route_id): Path<Uuid>,
 ) -> Result<StatusCode, CodedApiError> {
     authorize_management(&state, &headers).map_err(coded_management_error)?;
-    let hostname = state
-        .http_route_catalog
+    let route = http_route_policy_for_id(&state, route_id)?;
+    let tls_policy = state
+        .certificate_catalog
         .lock()
-        .expect("HTTP route catalog lock poisoned")
-        .hostname_for_id(route_id)
-        .map_err(|_| {
-            CodedApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                "could not read HTTP route policy",
-            )
-        })?;
+        .expect("certificate catalog lock poisoned")
+        .get_route_tls(route_id)
+        .map_err(coded_certificate_catalog_error)?;
+    let certificate_identifier = route
+        .as_ref()
+        .map(|route| effective_certificate_identifier(&route.hostname, tls_policy.as_ref()));
     let certificate_jobs = state
         .certificate_jobs
         .lock()
         .expect("certificate jobs lock poisoned");
-    if hostname
+    if certificate_identifier
         .as_deref()
-        .is_some_and(|hostname| certificate_jobs.contains_key(hostname))
+        .is_some_and(|identifier| certificate_jobs.contains_key(identifier))
     {
         return Err(CodedApiError(
             StatusCode::CONFLICT,
@@ -8541,7 +8880,8 @@ async fn delete_http_route(
             "unknown HTTP route",
         ));
     }
-    if let Some(hostname) = hostname {
+    if let Some(route) = route {
+        let hostname = route.hostname;
         http_tunnel::stop_hostname(&state, &hostname);
         state
             .http_route_statistics
@@ -8554,8 +8894,9 @@ async fn delete_http_route(
             .expect("HTTPS redirect registry lock poisoned")
             .remove(&hostname);
         if let Some(manager) = &state.certificate_manager {
-            if let Err(error) = manager.delete_certificate(&hostname) {
-                tracing::warn!("could not delete certificate files for {hostname}: {error}");
+            let identifier = certificate_identifier.as_deref().unwrap_or(&hostname);
+            if let Err(error) = manager.delete_certificate(identifier) {
+                tracing::warn!("could not delete certificate files for {identifier}: {error}");
             }
         }
     }
@@ -9797,14 +10138,14 @@ mod tests {
         certificate_target_matches, coded_http_route_creation_error, coded_tcp_policy_error,
         login_throttle_identity, management_session_cookie, normalize_metrics_history_step,
         parse_metrics_history_range, release_certificate_job_slot, render_prometheus_metrics,
-        reserve_certificate_job_slot, select_certificate_maintenance_operation,
-        session_cookie_header, tcp_history_error_total, udp_history_error_total,
-        udp_metrics_response, CertificateOperation, HistoryCounters, LoginResponse, LoginThrottle,
-        MetricsHistory, MetricsHistoryProtocol, MetricsHistorySample, Socks5CapabilitiesView,
-        UserRole, LOGIN_THROTTLE_MAX_IDENTITIES, MANAGEMENT_UI, METRICS_HISTORY_ARCHIVE_CAPACITY,
-        METRICS_HISTORY_ARCHIVE_SAMPLE_INTERVAL_SECONDS, METRICS_HISTORY_CAPACITY,
-        METRICS_HISTORY_RECENT_RETENTION_SECONDS, METRICS_HISTORY_RETENTION_SECONDS,
-        METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS,
+        reserve_certificate_job_slot, resolve_certificate_identifier_update,
+        select_certificate_maintenance_operation, session_cookie_header, tcp_history_error_total,
+        udp_history_error_total, udp_metrics_response, CertificateOperation, HistoryCounters,
+        LoginResponse, LoginThrottle, MetricsHistory, MetricsHistoryProtocol, MetricsHistorySample,
+        Socks5CapabilitiesView, UserRole, LOGIN_THROTTLE_MAX_IDENTITIES, MANAGEMENT_UI,
+        METRICS_HISTORY_ARCHIVE_CAPACITY, METRICS_HISTORY_ARCHIVE_SAMPLE_INTERVAL_SECONDS,
+        METRICS_HISTORY_CAPACITY, METRICS_HISTORY_RECENT_RETENTION_SECONDS,
+        METRICS_HISTORY_RETENTION_SECONDS, METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS,
     };
     use crate::{
         admin_auth::SessionIdentity,
@@ -10646,6 +10987,47 @@ mod tests {
     }
 
     #[test]
+    fn omitted_certificate_identifier_preserves_an_existing_wildcard() {
+        let route_id = Uuid::new_v4();
+        let policy = RouteTlsPolicy {
+            route_id,
+            mode: RouteTlsMode::Acme,
+            redirect_http_to_https: false,
+            certificate_identifier: Some("*.example.com".to_owned()),
+            updated_at: 1,
+        };
+        let (identifier, stored) = resolve_certificate_identifier_update(
+            "node.example.com",
+            Some(&policy),
+            None,
+            RouteTlsMode::Acme,
+        )
+        .expect("an omitted identifier should preserve the current wildcard");
+        assert_eq!(identifier, "*.example.com");
+        assert_eq!(stored.as_deref(), Some("*.example.com"));
+
+        let (identifier, stored) = resolve_certificate_identifier_update(
+            "node.example.com",
+            Some(&policy),
+            Some("node.example.com"),
+            RouteTlsMode::Acme,
+        )
+        .expect("an explicit route hostname should reset wildcard selection");
+        assert_eq!(identifier, "node.example.com");
+        assert!(stored.is_none());
+
+        let (identifier, stored) = resolve_certificate_identifier_update(
+            "node.example.com",
+            Some(&policy),
+            Some("*.example.com"),
+            RouteTlsMode::Disabled,
+        )
+        .expect("disabling TLS should clear the certificate identifier");
+        assert_eq!(identifier, "node.example.com");
+        assert!(stored.is_none());
+    }
+
+    #[test]
     fn certificate_target_requires_the_same_enabled_route_and_acme_policy() {
         let route_id = Uuid::new_v4();
         let expected = http_route(route_id, "secure.example.com", true);
@@ -10654,10 +11036,12 @@ mod tests {
             route_id,
             mode: RouteTlsMode::Acme,
             redirect_http_to_https: true,
+            certificate_identifier: None,
             updated_at: 1,
         };
         assert!(certificate_target_matches(
             &expected,
+            "secure.example.com",
             Some(&current),
             Some(&policy)
         ));
@@ -10665,6 +11049,7 @@ mod tests {
         let disabled = http_route(route_id, "secure.example.com", false);
         assert!(!certificate_target_matches(
             &expected,
+            "secure.example.com",
             Some(&disabled),
             Some(&policy)
         ));
@@ -10672,6 +11057,7 @@ mod tests {
         let replacement = http_route(Uuid::new_v4(), "secure.example.com", true);
         assert!(!certificate_target_matches(
             &expected,
+            "secure.example.com",
             Some(&replacement),
             Some(&policy)
         ));
@@ -10682,6 +11068,7 @@ mod tests {
         };
         assert!(!certificate_target_matches(
             &expected,
+            "secure.example.com",
             Some(&current),
             Some(&disabled_tls)
         ));

@@ -36,6 +36,7 @@ tokio-rustls.workspace = true
 tower-http.workspace = true
 uuid.workspace = true
 x509-parser.workspace = true
+zeroize.workspace = true
 rustls-pemfile.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
