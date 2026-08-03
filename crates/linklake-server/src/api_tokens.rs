@@ -4,8 +4,10 @@ use getrandom::fill as random_fill;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{fmt, fs, path::Path, str::FromStr};
+use std::{fmt, path::Path, str::FromStr};
 use uuid::Uuid;
+
+use crate::database::Database;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -66,13 +68,14 @@ pub(crate) struct ApiTokenCatalog {
 }
 
 impl ApiTokenCatalog {
+    #[allow(dead_code)]
     pub(crate) fn open(data_dir: Option<&Path>) -> anyhow::Result<Self> {
-        let database = if let Some(data_dir) = data_dir {
-            fs::create_dir_all(data_dir)?;
-            Connection::open(data_dir.join("linklake.sqlite3"))?
-        } else {
-            Connection::open_in_memory()?
-        };
+        let database = Database::open(data_dir)?;
+        Self::open_with_database(&database)
+    }
+
+    pub(crate) fn open_with_database(database: &Database) -> anyhow::Result<Self> {
+        let database = database.connect()?;
         database.execute_batch("CREATE TABLE IF NOT EXISTS management_api_tokens (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL UNIQUE, scope TEXT NOT NULL, token_hash BLOB NOT NULL UNIQUE, created_unix_seconds INTEGER NOT NULL, expires_unix_seconds INTEGER, last_used_unix_seconds INTEGER); CREATE INDEX IF NOT EXISTS management_api_tokens_expiry ON management_api_tokens(expires_unix_seconds);")?;
         Ok(Self { database })
     }

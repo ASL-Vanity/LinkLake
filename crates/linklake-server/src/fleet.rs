@@ -2,9 +2,10 @@
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fs, path::Path};
+use std::{collections::HashMap, path::Path};
 use uuid::Uuid;
 
+use crate::database::Database;
 use crate::tunnel_catalog::{CreateTcpTunnelPolicy, CreateUdpTunnelPolicy, TunnelCatalog};
 use linklake_core::ClientSummary;
 
@@ -282,13 +283,14 @@ pub(crate) struct FleetCatalog {
 }
 
 impl FleetCatalog {
+    #[allow(dead_code)]
     pub(crate) fn open(data_dir: Option<&Path>) -> anyhow::Result<Self> {
-        let database = if let Some(data_dir) = data_dir {
-            fs::create_dir_all(data_dir)?;
-            Connection::open(data_dir.join("linklake.sqlite3"))?
-        } else {
-            Connection::open_in_memory()?
-        };
+        let database = Database::open(data_dir)?;
+        Self::open_with_database(&database)
+    }
+
+    pub(crate) fn open_with_database(database: &Database) -> anyhow::Result<Self> {
+        let database = database.connect()?;
         database.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS fleet_peers (

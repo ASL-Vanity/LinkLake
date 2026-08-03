@@ -4,9 +4,10 @@ use argon2::{
 };
 use linklake_core::{ClientSummary, ManagedConfigMode, ManagedConfigStatus};
 use rusqlite::{params, Connection};
-use std::{collections::HashMap, fs, path::Path};
+use std::{collections::HashMap, path::Path};
 use uuid::Uuid;
 
+use crate::database::Database;
 use crate::unix_seconds;
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -51,19 +52,16 @@ pub(crate) enum Authentication {
 }
 
 impl ClientRegistry {
+    #[allow(dead_code)]
     pub(crate) fn open(data_dir: Option<&Path>) -> anyhow::Result<Self> {
-        let Some(data_dir) = data_dir else {
-            return Ok(Self {
-                clients: HashMap::new(),
-                database: None,
-            });
-        };
-        fs::create_dir_all(data_dir)?;
-        let database_path = data_dir.join("linklake.sqlite3");
-        let database = Connection::open(database_path)?;
+        let database = Database::open(data_dir)?;
+        Self::open_with_database(&database)
+    }
+
+    pub(crate) fn open_with_database(database: &Database) -> anyhow::Result<Self> {
+        let database = database.connect()?;
         database.execute_batch(
             "
-            PRAGMA journal_mode = WAL;
             CREATE TABLE IF NOT EXISTS clients (
                 client_id TEXT PRIMARY KEY NOT NULL,
                 name TEXT NOT NULL,

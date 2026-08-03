@@ -1,8 +1,10 @@
 use hyper::Uri;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
-use std::{error::Error, fmt, fs, path::Path};
+use std::{error::Error, fmt, path::Path};
 use uuid::Uuid;
+
+use crate::database::Database;
 
 pub(crate) const LETS_ENCRYPT_PRODUCTION_DIRECTORY: &str =
     "https://acme-v02.api.letsencrypt.org/directory";
@@ -266,17 +268,17 @@ pub(crate) struct CertificateCatalog {
 }
 
 impl CertificateCatalog {
+    #[allow(dead_code)]
     pub(crate) fn open(data_dir: Option<&Path>) -> Result<Self, CertificateCatalogError> {
-        let database = match data_dir {
-            Some(data_dir) => {
-                fs::create_dir_all(data_dir)?;
-                Connection::open(data_dir.join("linklake.sqlite3"))?
-            }
-            None => Connection::open_in_memory()?,
-        };
+        let database = Database::open(data_dir)
+            .map_err(|error| CertificateCatalogError::Io(std::io::Error::other(error)))?;
+        Self::open_with_database(&database)
+    }
+
+    pub(crate) fn open_with_database(database: &Database) -> Result<Self, CertificateCatalogError> {
+        let database = database.connect()?;
         database.execute_batch(
             "
-            PRAGMA journal_mode = WAL;
             CREATE TABLE IF NOT EXISTS acme_config (
                 singleton_id INTEGER PRIMARY KEY NOT NULL CHECK (singleton_id = 1),
                 enabled INTEGER NOT NULL,

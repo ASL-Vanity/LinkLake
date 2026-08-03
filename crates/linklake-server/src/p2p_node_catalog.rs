@@ -1,8 +1,10 @@
 use linklake_core::p2p_protocol::{P2pCandidate, P2pIrohAddress, P2pTransport};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
-use std::{fs, net::SocketAddr, path::Path};
+use std::{net::SocketAddr, path::Path};
 use uuid::Uuid;
+
+use crate::database::Database;
 
 const MAX_CANDIDATES: usize = 8;
 
@@ -18,14 +20,14 @@ pub(crate) struct P2pNodeCatalog {
 }
 
 impl P2pNodeCatalog {
+    #[allow(dead_code)]
     pub(crate) fn open(data_dir: Option<&Path>) -> anyhow::Result<Self> {
-        let database = match data_dir {
-            Some(data_dir) => {
-                fs::create_dir_all(data_dir)?;
-                Connection::open(data_dir.join("linklake.sqlite3"))?
-            }
-            None => Connection::open_in_memory()?,
-        };
+        let database = Database::open(data_dir)?;
+        Self::open_with_database(&database)
+    }
+
+    pub(crate) fn open_with_database(database: &Database) -> anyhow::Result<Self> {
+        let database = database.connect()?;
         database.execute_batch(
             "CREATE TABLE IF NOT EXISTS p2p_nodes (
                 client_id TEXT PRIMARY KEY NOT NULL,
