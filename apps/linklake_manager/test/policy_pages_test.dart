@@ -200,6 +200,68 @@ void main() {
     });
   });
 
+  testWidgets('HTTP transport capabilities and H2 metrics are read-only', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1200, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final api = FakeLinkLakeApi();
+    await tester.pumpWidget(
+      policyHarness(
+        api: api,
+        kind: PolicyKind.http,
+        policies: const [
+          {
+            'id': 'route-h2',
+            'name': 'grpc-service',
+            'client_id': 'client-1',
+            'hostname': 'grpc.example.com',
+            'target_addr': '127.0.0.1:50051',
+            'max_connections': 64,
+            'enabled': true,
+            'online': true,
+            'active_connections': 2,
+            'requests_total': 12,
+            'failed_requests': 1,
+            'http2_active_streams': 2,
+            'http2_requests_total': 10,
+            'grpc_requests_total': 8,
+            'grpc_failures_total': 1,
+            'http2_backend_reused_total': 7,
+            'http2_backend_connections_total': 2,
+            'capabilities': {
+              'http1': true,
+              'http2': true,
+              'grpc': true,
+              'tls_alpn': true,
+              'h2c_prior_knowledge': true,
+              'grpc_backend_transport': 'h2c',
+            },
+            'tls': {'status': 'active', 'mode': 'acme'},
+          },
+        ],
+      ),
+    );
+
+    expect(
+      find.byKey(const Key('http-transport-capabilities-route-h2')),
+      findsOneWidget,
+    );
+    expect(find.textContaining('pooled h2c backend'), findsOneWidget);
+    expect(find.text('H2: 2/10'), findsOneWidget);
+    expect(find.text('gRPC: 8'), findsOneWidget);
+    expect(
+      PolicyKind.http.fields.map((field) => field.name),
+      isNot(contains('http2')),
+    );
+    expect(
+      PolicyKind.http.fields.map((field) => field.name),
+      isNot(contains('grpc')),
+    );
+  });
+
   testWidgets('HTTP partial TLS failure refreshes and reports partial save', (
     tester,
   ) async {

@@ -174,7 +174,11 @@ HTTP forward proxies, SOCKS5 proxies, and regular TCP tunnels share the TCP publ
 - Supports Let's Encrypt production, staging, and custom ACME directories with HTTP-01 issuance and automatic renewal
 - Provides bilingual ACME settings, per-route TLS controls, immediate issue/renew actions, certificate status, and errors in the Web UI
 - Can return a `308` HTTP-to-HTTPS redirect after the certificate is active; the HTTP-01 challenge path always remains reachable over plain HTTP
-- The first stage supports HTTP/1.1 and WebSocket/WSS; wildcard certificates that require DNS-01 are not supported
+- The public cleartext listener auto-detects HTTP/1.1 and HTTP/2 prior knowledge. Native HTTPS prefers `h2` through ALPN and retains `http/1.1` fallback
+- Regular HTTP/2 requests are translated to HTTP/1.1 for compatibility with existing websites. Native `Content-Type: application/grpc` requests use a persistent h2c backend pool
+- gRPC supports long-lived and bidirectional streams, trailers, cancellation, connection reuse, GOAWAY draining, and subsequent connection recovery. Route concurrency limits apply per HTTP/2 stream
+- The local gRPC target must currently provide cleartext HTTP/2 prior knowledge (h2c). h2c Upgrade and TLS to the local target are not supported yet; see the [HTTP/2 and gRPC guide](docs/http2-grpc.en.md)
+- WebSocket/WSS continues to use HTTP/1.1 Upgrade. Wildcard certificates that require DNS-01 are not supported
 
 Before using a route, point its DNS record to the LinkLake server. HTTP-01 requires public port 80 to reach `LINKLAKE_HTTP_BIND` with the original Host, while public port 443 must deliver the TLS stream unchanged to `LINKLAKE_HTTPS_BIND` so LinkLake can select the certificate by SNI and terminate TLS.
 

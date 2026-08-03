@@ -174,7 +174,11 @@ HTTP 正向代理、SOCKS5 和普通 TCP 隧道共享 TCP 公网端口命名空�
 - ACME 支持 Let's Encrypt 生产环境、测试环境和自定义目录，通过 HTTP-01 自动签发和续期证书
 - Web UI 提供中英文 ACME 设置、路由 TLS 开关、立即签发/续期、证书状态和错误展示
 - 可在证书生效后使用 `308` 将 HTTP 跳转到 HTTPS；HTTP-01 挑战路径始终保持明文可达
-- 第一阶段提供 HTTP/1.1 和 WebSocket/WSS，不支持需要 DNS-01 的通配符证书
+- 公网明文入口自动识别 HTTP/1.1 和 HTTP/2 prior knowledge；原生 HTTPS 通过 ALPN 优先协商 `h2`，并保留 `http/1.1` 回退
+- 普通 HTTP/2 请求会转换为 HTTP/1.1 后端请求以兼容现有网站；`Content-Type: application/grpc` 的原生 gRPC 请求使用持久化 h2c 后端连接池
+- gRPC 支持长流、双向流、trailers、取消、连接复用、GOAWAY 排空与后续连接恢复；策略并发限制按 HTTP/2 流生效
+- 当前 gRPC 本地目标必须提供明文 HTTP/2 prior knowledge（h2c），暂不支持 h2c Upgrade 或本地目标 TLS；详细边界见 [HTTP/2 与 gRPC 指南](docs/http2-grpc.md)
+- WebSocket/WSS 继续使用 HTTP/1.1 Upgrade；不支持需要 DNS-01 的通配符证书
 
 使用前需要把路由域名的 DNS 记录指向 LinkLake 服务端。HTTP-01 要求公网 80 端口能够按原始 Host 到达 `LINKLAKE_HTTP_BIND`；业务 HTTPS 的公网 443 端口必须把 TLS 原样送到 `LINKLAKE_HTTPS_BIND`，由 LinkLake 完成 SNI 选证书和 TLS 终止。
 

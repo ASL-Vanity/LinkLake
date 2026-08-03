@@ -10,6 +10,7 @@ mod database_migrations;
 mod database_tools;
 mod dual_stack_udp;
 mod fleet;
+mod http2_backend;
 pub mod http_backend_pool;
 mod http_proxy_tunnel;
 mod http_route_catalog;
@@ -856,12 +857,28 @@ struct MetricsResponse {
     tunnel_reconnects_total: u64,
     registration_rejections_total: u64,
     authentication_failures_total: u64,
+    http_transport_capabilities: HttpTransportCapabilitiesView,
     http_active_connections: usize,
     http_requests_total: u64,
     http_failed_requests: u64,
     http_bytes_from_public: u64,
     http_bytes_to_public: u64,
     http_pairing_timeouts: u64,
+    http2_active_streams: usize,
+    http2_requests_total: u64,
+    grpc_active_streams: usize,
+    grpc_requests_total: u64,
+    grpc_trailers_total: u64,
+    grpc_failures_total: u64,
+    grpc_cancellations_total: u64,
+    http2_backend_active_connections: usize,
+    http2_backend_active_streams: usize,
+    http2_backend_connections_total: u64,
+    http2_backend_reused_total: u64,
+    http2_backend_reconnects_total: u64,
+    http2_backend_goaway_total: u64,
+    http2_backend_failures_total: u64,
+    http2_backend_pool_exhausted_total: u64,
     sni_active_connections: usize,
     sni_connections_total: u64,
     sni_rejected_connections: u64,
@@ -1186,6 +1203,29 @@ struct PortGroupView {
 }
 
 #[derive(Serialize)]
+struct HttpTransportCapabilitiesView {
+    http1: bool,
+    http2: bool,
+    grpc: bool,
+    tls_alpn: bool,
+    h2c_prior_knowledge: bool,
+    grpc_backend_transport: &'static str,
+}
+
+impl Default for HttpTransportCapabilitiesView {
+    fn default() -> Self {
+        Self {
+            http1: true,
+            http2: true,
+            grpc: true,
+            tls_alpn: true,
+            h2c_prior_knowledge: true,
+            grpc_backend_transport: "h2c",
+        }
+    }
+}
+
+#[derive(Serialize)]
 struct HttpRouteView {
     #[serde(flatten)]
     policy: HttpRoutePolicy,
@@ -1196,6 +1236,22 @@ struct HttpRouteView {
     bytes_from_public: u64,
     bytes_to_public: u64,
     pairing_timeouts: u64,
+    capabilities: HttpTransportCapabilitiesView,
+    http2_active_streams: usize,
+    http2_requests_total: u64,
+    grpc_active_streams: usize,
+    grpc_requests_total: u64,
+    grpc_trailers_total: u64,
+    grpc_failures_total: u64,
+    grpc_cancellations_total: u64,
+    http2_backend_active_connections: usize,
+    http2_backend_active_streams: usize,
+    http2_backend_connections_total: u64,
+    http2_backend_reused_total: u64,
+    http2_backend_reconnects_total: u64,
+    http2_backend_goaway_total: u64,
+    http2_backend_failures_total: u64,
+    http2_backend_pool_exhausted_total: u64,
     tls: RouteTlsView,
 }
 
@@ -2870,6 +2926,12 @@ async fn metrics(
             .map(|statistics| load(statistics))
             .sum()
     };
+    let sum_http_usize = |load: fn(&http_tunnel::HttpRouteStatistics) -> usize| {
+        http_statistics
+            .values()
+            .map(|statistics| load(statistics))
+            .sum()
+    };
     let socks5_statistics = state
         .socks5_proxy_statistics
         .lock()
@@ -3151,6 +3213,7 @@ async fn metrics(
             .metrics
             .authentication_failures_total
             .load(Ordering::Relaxed),
+        http_transport_capabilities: HttpTransportCapabilitiesView::default(),
         http_active_connections: http_statistics
             .values()
             .map(|statistics| statistics.active_connections.load(Ordering::Relaxed))
@@ -3169,6 +3232,75 @@ async fn metrics(
         }),
         http_pairing_timeouts: sum_http_u64(|statistics| {
             statistics.pairing_timeouts.load(Ordering::Relaxed)
+        }),
+        http2_active_streams: sum_http_usize(|statistics| {
+            statistics.http2_active_streams.load(Ordering::Relaxed)
+        }),
+        http2_requests_total: sum_http_u64(|statistics| {
+            statistics.http2_requests_total.load(Ordering::Relaxed)
+        }),
+        grpc_active_streams: sum_http_usize(|statistics| {
+            statistics.grpc_active_streams.load(Ordering::Relaxed)
+        }),
+        grpc_requests_total: sum_http_u64(|statistics| {
+            statistics.grpc_requests_total.load(Ordering::Relaxed)
+        }),
+        grpc_trailers_total: sum_http_u64(|statistics| {
+            statistics.grpc_trailers_total.load(Ordering::Relaxed)
+        }),
+        grpc_failures_total: sum_http_u64(|statistics| {
+            statistics.grpc_failures_total.load(Ordering::Relaxed)
+        }),
+        grpc_cancellations_total: sum_http_u64(|statistics| {
+            statistics.grpc_cancellations_total.load(Ordering::Relaxed)
+        }),
+        http2_backend_active_connections: sum_http_usize(|statistics| {
+            statistics
+                .http2_backend
+                .active_connections
+                .load(Ordering::Relaxed)
+        }),
+        http2_backend_active_streams: sum_http_usize(|statistics| {
+            statistics
+                .http2_backend
+                .active_streams
+                .load(Ordering::Relaxed)
+        }),
+        http2_backend_connections_total: sum_http_u64(|statistics| {
+            statistics
+                .http2_backend
+                .connections_total
+                .load(Ordering::Relaxed)
+        }),
+        http2_backend_reused_total: sum_http_u64(|statistics| {
+            statistics
+                .http2_backend
+                .reused_total
+                .load(Ordering::Relaxed)
+        }),
+        http2_backend_reconnects_total: sum_http_u64(|statistics| {
+            statistics
+                .http2_backend
+                .reconnects_total
+                .load(Ordering::Relaxed)
+        }),
+        http2_backend_goaway_total: sum_http_u64(|statistics| {
+            statistics
+                .http2_backend
+                .goaway_total
+                .load(Ordering::Relaxed)
+        }),
+        http2_backend_failures_total: sum_http_u64(|statistics| {
+            statistics
+                .http2_backend
+                .failures_total
+                .load(Ordering::Relaxed)
+        }),
+        http2_backend_pool_exhausted_total: sum_http_u64(|statistics| {
+            statistics
+                .http2_backend
+                .pool_exhausted_total
+                .load(Ordering::Relaxed)
         }),
         https_active_connections: state
             .metrics
@@ -8267,6 +8399,7 @@ async fn list_http_routes(
                 let certificate = certificate_catalog
                     .get_certificate_state(policy.id)
                     .unwrap_or(None);
+                let http2_backend = route_statistics.map(|value| value.http2_backend.clone());
                 HttpRouteView {
                     online: online.contains(&policy.hostname),
                     active_connections: route_statistics
@@ -8281,6 +8414,48 @@ async fn list_http_routes(
                         .map_or(0, |value| value.bytes_to_public.load(Ordering::Relaxed)),
                     pairing_timeouts: route_statistics
                         .map_or(0, |value| value.pairing_timeouts.load(Ordering::Relaxed)),
+                    capabilities: HttpTransportCapabilitiesView::default(),
+                    http2_active_streams: route_statistics.map_or(0, |value| {
+                        value.http2_active_streams.load(Ordering::Relaxed)
+                    }),
+                    http2_requests_total: route_statistics.map_or(0, |value| {
+                        value.http2_requests_total.load(Ordering::Relaxed)
+                    }),
+                    grpc_active_streams: route_statistics
+                        .map_or(0, |value| value.grpc_active_streams.load(Ordering::Relaxed)),
+                    grpc_requests_total: route_statistics
+                        .map_or(0, |value| value.grpc_requests_total.load(Ordering::Relaxed)),
+                    grpc_trailers_total: route_statistics
+                        .map_or(0, |value| value.grpc_trailers_total.load(Ordering::Relaxed)),
+                    grpc_failures_total: route_statistics
+                        .map_or(0, |value| value.grpc_failures_total.load(Ordering::Relaxed)),
+                    grpc_cancellations_total: route_statistics.map_or(0, |value| {
+                        value.grpc_cancellations_total.load(Ordering::Relaxed)
+                    }),
+                    http2_backend_active_connections: http2_backend
+                        .as_ref()
+                        .map_or(0, |value| value.active_connections.load(Ordering::Relaxed)),
+                    http2_backend_active_streams: http2_backend
+                        .as_ref()
+                        .map_or(0, |value| value.active_streams.load(Ordering::Relaxed)),
+                    http2_backend_connections_total: http2_backend
+                        .as_ref()
+                        .map_or(0, |value| value.connections_total.load(Ordering::Relaxed)),
+                    http2_backend_reused_total: http2_backend
+                        .as_ref()
+                        .map_or(0, |value| value.reused_total.load(Ordering::Relaxed)),
+                    http2_backend_reconnects_total: http2_backend
+                        .as_ref()
+                        .map_or(0, |value| value.reconnects_total.load(Ordering::Relaxed)),
+                    http2_backend_goaway_total: http2_backend
+                        .as_ref()
+                        .map_or(0, |value| value.goaway_total.load(Ordering::Relaxed)),
+                    http2_backend_failures_total: http2_backend
+                        .as_ref()
+                        .map_or(0, |value| value.failures_total.load(Ordering::Relaxed)),
+                    http2_backend_pool_exhausted_total: http2_backend.as_ref().map_or(0, |value| {
+                        value.pool_exhausted_total.load(Ordering::Relaxed)
+                    }),
                     tls: route_tls_view(&state, &policy.hostname, tls_policy, certificate),
                     policy,
                 }
@@ -10103,12 +10278,12 @@ mod tests {
         parse_metrics_history_range, release_certificate_job_slot, render_prometheus_metrics,
         reserve_certificate_job_slot, select_certificate_maintenance_operation,
         session_cookie_header, tcp_history_error_total, udp_history_error_total,
-        udp_metrics_response, CertificateOperation, HistoryCounters, LoginResponse, LoginThrottle,
-        MetricsHistory, MetricsHistoryProtocol, MetricsHistorySample, Socks5CapabilitiesView,
-        UserRole, LOGIN_THROTTLE_MAX_IDENTITIES, MANAGEMENT_UI, METRICS_HISTORY_ARCHIVE_CAPACITY,
-        METRICS_HISTORY_ARCHIVE_SAMPLE_INTERVAL_SECONDS, METRICS_HISTORY_CAPACITY,
-        METRICS_HISTORY_RECENT_RETENTION_SECONDS, METRICS_HISTORY_RETENTION_SECONDS,
-        METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS,
+        udp_metrics_response, CertificateOperation, HistoryCounters, HttpTransportCapabilitiesView,
+        LoginResponse, LoginThrottle, MetricsHistory, MetricsHistoryProtocol, MetricsHistorySample,
+        Socks5CapabilitiesView, UserRole, LOGIN_THROTTLE_MAX_IDENTITIES, MANAGEMENT_UI,
+        METRICS_HISTORY_ARCHIVE_CAPACITY, METRICS_HISTORY_ARCHIVE_SAMPLE_INTERVAL_SECONDS,
+        METRICS_HISTORY_CAPACITY, METRICS_HISTORY_RECENT_RETENTION_SECONDS,
+        METRICS_HISTORY_RETENTION_SECONDS, METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS,
     };
     use crate::{
         admin_auth::SessionIdentity,
@@ -10717,6 +10892,39 @@ mod tests {
             );
         }
         assert!(MANAGEMENT_UI.contains("/api/v1/p2p/nodes"));
+    }
+
+    #[test]
+    fn http_transport_capabilities_are_explicit_and_read_only() {
+        let capabilities = serde_json::to_value(HttpTransportCapabilitiesView::default())
+            .expect("HTTP transport capabilities should serialize");
+        assert_eq!(capabilities["http1"], true);
+        assert_eq!(capabilities["http2"], true);
+        assert_eq!(capabilities["grpc"], true);
+        assert_eq!(capabilities["tls_alpn"], true);
+        assert_eq!(capabilities["h2c_prior_knowledge"], true);
+        assert_eq!(capabilities["grpc_backend_transport"], "h2c");
+    }
+
+    #[test]
+    fn web_ui_displays_http2_grpc_capabilities_without_fake_switches() {
+        for marker in [
+            "httpTransportCapabilities",
+            "http2_active_streams",
+            "http2_requests_total",
+            "grpc_requests_total",
+            "grpc_failures_total",
+            "http2_backend_reused_total",
+            "http2_backend_connections_total",
+        ] {
+            assert!(
+                MANAGEMENT_UI.contains(marker),
+                "Web UI does not consume HTTP/2 or gRPC field {marker}"
+            );
+        }
+        assert!(!MANAGEMENT_UI.contains("{ name: 'http2'"));
+        assert!(!MANAGEMENT_UI.contains("{ name: 'grpc'"));
+        assert!(!MANAGEMENT_UI.contains("{ name: 'grpc_backend_transport'"));
     }
 
     #[test]

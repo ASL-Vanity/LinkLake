@@ -28,7 +28,7 @@ fs2 = "0.4"
 getrandom = "0.4"
 clap = { version = "4.5", features = ["derive"] }
 ed25519-dalek = { version = "2.2", features = ["pkcs8", "rand_core"] }
-http-body-util = "0.1"
+http-body-util = { version = "0.1", features = ["channel"] }
 hyper = { version = "1.11", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 hmac = "0.12"
