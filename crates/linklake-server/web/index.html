@@ -2661,12 +2661,19 @@
       function renderFleet() {
         const overview = state.dashboard.fleetOverview || { peers: [], conflicts: [], failover_order: [] };
         const peers = overview.peers || [];
+        const dnsFailovers = overview.dns_failovers || [];
+        const healthMetrics = overview.health_metrics || {};
         const preferred = peers.find(peer => peer.id === overview.preferred_peer_id);
+        const frozenDns = dnsFailovers.filter(item => item.frozen).length;
+        const dnsText = state.language === 'zh'
+          ? { title: 'DNS 故障切换', frozen: '已冻结', manualFreeze: '手动冻结', failed: '最近更新失败', waiting: '等待健康节点', never: '尚未切换' }
+          : { title: 'DNS failover', frozen: 'frozen', manualFreeze: 'manual freeze', failed: 'Last update failed', waiting: 'Waiting for an eligible peer', never: 'not switched' };
         elements.fleet_summary.replaceChildren(
-          createKpi(String(peers.filter(peer => peer.online).length), t('onlineServers'), `${peers.length} ${t('total')}`),
+          createKpi(String(healthMetrics.fleet_peers_healthy ?? peers.filter(peer => peer.online).length), t('onlineServers'), `${peers.length} ${t('total')}`),
           createKpi(preferred?.name || '—', t('preferredEntry'), preferred?.region || ''),
           createKpi(String((overview.failover_order || []).length), t('failoverEntries')),
-          createKpi(formatBytes(peers.reduce((sum, peer) => sum + Number(peer.bytes_total || 0), 0)), t('traffic'))
+          createKpi(formatBytes(peers.reduce((sum, peer) => sum + Number(peer.bytes_total || 0), 0)), t('traffic')),
+          createKpi(String(dnsFailovers.length), dnsText.title, `${frozenDns} ${dnsText.frozen}`)
         );
         elements.fleet_conflicts.replaceChildren();
         (overview.conflicts || []).forEach(message => {
@@ -2674,6 +2681,19 @@
           item.className = 'alert-item warning';
           const strong = document.createElement('strong'); strong.textContent = t('fleetConflict');
           const detail = document.createElement('span'); detail.textContent = message;
+          item.append(strong, detail);
+          elements.fleet_conflicts.append(item);
+        });
+        dnsFailovers.forEach(failover => {
+          const item = document.createElement('div');
+          item.className = `alert-item ${(failover.frozen || failover.last_error_summary) ? 'warning' : 'info'}`;
+          const strong = document.createElement('strong'); strong.textContent = `${failover.hostname} · ${failover.record_type}`;
+          const detail = document.createElement('span');
+          detail.textContent = failover.frozen
+            ? `${dnsText.frozen}: ${failover.freeze_reason || dnsText.manualFreeze}`
+            : failover.last_error_summary
+              ? `${dnsText.failed}: ${failover.last_error_summary}`
+              : `${failover.current_target || dnsText.waiting} · ${failover.last_switch_reason || dnsText.never}`;
           item.append(strong, detail);
           elements.fleet_conflicts.append(item);
         });
@@ -2685,10 +2705,15 @@
         }
         peers.forEach(peer => {
           const row = document.createElement('tr');
-          const status = !peer.enabled ? t('disabled') : peer.online ? t('online') : t('offline');
+          const healthState = peer.health?.state || 'unknown';
+          const healthLabels = state.language === 'zh'
+            ? { unknown: '未知', healthy: '健康', degraded: '降级', unhealthy: '不健康', recovering: '恢复中' }
+            : { unknown: 'Unknown', healthy: 'Healthy', degraded: 'Degraded', unhealthy: 'Unhealthy', recovering: 'Recovering' };
+          const status = !peer.enabled ? t('disabled') : (healthLabels[healthState] || healthState);
           [peer.name, peer.region, status, peer.latency_millis == null ? '—' : `${peer.latency_millis} ms`, String(peer.priority), String(peer.weight), formatBytes(peer.bytes_total)].forEach(value => {
             const cell = document.createElement('td'); cell.textContent = value; row.append(cell);
           });
+          row.children[2].title = `${peer.health?.last_transition_reason || ''} · success ${peer.health?.consecutive_successes || 0}/${peer.health_config?.success_threshold || 0} · failure ${peer.health?.consecutive_failures || 0}/${peer.health_config?.failure_threshold || 0} · cooldown ${peer.health_config?.cooldown_seconds || 0}s`;
           const actions = document.createElement('td'); actions.className = 'table-actions';
           actions.append(actionButton(t('editPolicy'), () => openFleetModal(peer)), actionButton(t('delete'), () => deleteFleetPeer(peer), 'danger-button'));
           row.append(actions); elements.fleet_list.append(row);
