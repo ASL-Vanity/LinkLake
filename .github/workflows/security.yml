@@ -124,6 +124,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Validate immutable workflow and release-evidence contracts
+        run: |
+          node scripts/check-workflow-hardening.mjs
+          node --test tests/release-attestations.test.mjs
       - name: Install checksum-verified actionlint
         shell: bash
         run: |
@@ -152,7 +156,6 @@ jobs:
           advanced-security: false
           annotations: true
           token: ""
-          config: .github/zizmor.yml
 
   filesystem-vulnerabilities:
     name: Filesystem vulnerability and misconfiguration scan
