@@ -8,8 +8,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
-use std::{fs, path::Path};
+use std::path::Path;
 use uuid::Uuid;
+
+use crate::database::Database;
 
 const SESSION_LIFETIME_SECONDS: u64 = 8 * 60 * 60;
 
@@ -158,20 +160,22 @@ impl BootstrapCredentials {
 }
 
 impl AdminAuth {
+    #[allow(dead_code)]
     pub(crate) fn open(
         data_dir: Option<&Path>,
         bootstrap: Option<BootstrapCredentials>,
     ) -> anyhow::Result<Self> {
-        let database = match data_dir {
-            Some(data_dir) => {
-                fs::create_dir_all(data_dir)?;
-                Connection::open(data_dir.join("linklake.sqlite3"))?
-            }
-            None => Connection::open_in_memory()?,
-        };
+        let database = Database::open(data_dir)?;
+        Self::open_with_database(&database, bootstrap)
+    }
+
+    pub(crate) fn open_with_database(
+        database: &Database,
+        bootstrap: Option<BootstrapCredentials>,
+    ) -> anyhow::Result<Self> {
+        let database = database.connect()?;
         database.execute_batch(
             "
-            PRAGMA journal_mode = WAL;
             CREATE TABLE IF NOT EXISTS administrators (
                 username TEXT PRIMARY KEY NOT NULL,
                 password_hash TEXT NOT NULL,

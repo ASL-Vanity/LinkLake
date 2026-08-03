@@ -1,9 +1,10 @@
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{fmt, fs, net::Ipv6Addr, path::Path};
+use std::{fmt, net::Ipv6Addr, path::Path};
 use uuid::Uuid;
 
+use crate::database::Database;
 use crate::public_port_policy::PublicPortPolicy;
 use crate::traffic_control::TrafficPolicyKind;
 
@@ -446,20 +447,22 @@ impl TunnelCatalog {
         Self::open_with_port_policy(data_dir, PublicPortPolicy::development_default())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn open_with_port_policy(
         data_dir: Option<&Path>,
         public_port_policy: PublicPortPolicy,
     ) -> anyhow::Result<Self> {
-        let database = match data_dir {
-            Some(data_dir) => {
-                fs::create_dir_all(data_dir)?;
-                Connection::open(data_dir.join("linklake.sqlite3"))?
-            }
-            None => Connection::open_in_memory()?,
-        };
+        let database = Database::open(data_dir)?;
+        Self::open_with_database(&database, public_port_policy)
+    }
+
+    pub(crate) fn open_with_database(
+        database: &Database,
+        public_port_policy: PublicPortPolicy,
+    ) -> anyhow::Result<Self> {
+        let database = database.connect()?;
         database.execute_batch(
             "
-            PRAGMA journal_mode = WAL;
             CREATE TABLE IF NOT EXISTS tcp_tunnel_policies (
                 id TEXT PRIMARY KEY NOT NULL,
                 client_id TEXT NOT NULL,

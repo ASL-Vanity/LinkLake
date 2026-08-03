@@ -1,6 +1,8 @@
 use rusqlite::{params, Connection};
 use serde::Serialize;
-use std::{fs, path::Path};
+use std::path::Path;
+
+use crate::database::Database;
 
 #[derive(Serialize)]
 pub(crate) struct AuditEvent {
@@ -16,17 +18,16 @@ pub(crate) struct AuditLog {
 }
 
 impl AuditLog {
+    #[allow(dead_code)]
     pub(crate) fn open(data_dir: Option<&Path>) -> anyhow::Result<Self> {
-        let database = match data_dir {
-            Some(data_dir) => {
-                fs::create_dir_all(data_dir)?;
-                Connection::open(data_dir.join("linklake.sqlite3"))?
-            }
-            None => Connection::open_in_memory()?,
-        };
+        let database = Database::open(data_dir)?;
+        Self::open_with_database(&database)
+    }
+
+    pub(crate) fn open_with_database(database: &Database) -> anyhow::Result<Self> {
+        let database = database.connect()?;
         database.execute_batch(
             "
-            PRAGMA journal_mode = WAL;
             CREATE TABLE IF NOT EXISTS audit_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 occurred_unix_seconds INTEGER NOT NULL,

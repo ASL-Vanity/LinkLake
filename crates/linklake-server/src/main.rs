@@ -5,6 +5,7 @@ mod audit_log;
 mod certificate_catalog;
 mod certificate_manager;
 mod client_registry;
+mod database;
 mod database_migrations;
 mod database_tools;
 mod fleet;
@@ -52,6 +53,7 @@ use certificate_catalog::{
 use certificate_manager::CertificateManager;
 use clap::{Parser, Subcommand};
 use client_registry::{Authentication, ClientRegistry, UpdateClient};
+use database::Database;
 use fleet::{FleetCatalog, FleetImportResult, FleetPeer, FleetPolicyBundle, UpsertFleetPeer};
 use http_route_catalog::{
     CreateHttpRouteError, CreateHttpRoutePolicy, HttpRouteCatalog, HttpRoutePolicy,
@@ -291,6 +293,8 @@ pub(crate) fn managed_config_for_client(
 }
 
 struct AppState {
+    // 持有进程级数据库锁和共享内存数据库 keeper，必须与 AppState 同生命周期。
+    _database: Database,
     started_at: Instant,
     instance_id: String,
     enrollment_token: String,
@@ -522,17 +526,26 @@ impl MetricsHistory {
         }
     }
 
+    #[allow(dead_code)]
     fn open(
         data_dir: Option<&FsPath>,
         capacity: usize,
         archive_capacity: usize,
     ) -> anyhow::Result<Self> {
+        let database = Database::open(data_dir)?;
+        Self::open_with_database(&database, capacity, archive_capacity)
+    }
+
+    fn open_with_database(
+        database: &Database,
+        capacity: usize,
+        archive_capacity: usize,
+    ) -> anyhow::Result<Self> {
         let mut history = Self::new(capacity, archive_capacity);
-        let Some(data_dir) = data_dir else {
+        if !database.is_persistent() {
             return Ok(history);
-        };
-        std::fs::create_dir_all(data_dir)?;
-        let database = Connection::open(data_dir.join("linklake.sqlite3"))?;
+        }
+        let database = database.connect()?;
         database.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS metrics_history_recent (
@@ -1867,9 +1880,10 @@ async fn run_server(
         tracing::warn!("No LINKLAKE_DATA_DIR configured; identities and administrator sessions are in-memory only.");
     }
     let bootstrap_admin = BootstrapCredentials::from_environment(insecure_default_requested)?;
-    let migration_plan = data_dir
-        .as_deref()
-        .map(database_migrations::prepare)
+    let database = Database::open(data_dir.as_deref())?;
+    let migration_plan = database
+        .is_persistent()
+        .then(|| database_migrations::prepare(&database))
         .transpose()?;
     if let Some(plan) = &migration_plan {
         if let Some(backup) = plan.backup_path() {
@@ -1887,23 +1901,24 @@ async fn run_server(
         .transpose()?;
     let management_cookies_secure = management_tls.is_some();
     let state = Arc::new(AppState {
+        _database: database.clone(),
         started_at: Instant::now(),
         instance_id: uuid::Uuid::new_v4().to_string(),
         enrollment_token,
         management_token: configured_management_token,
-        admin_auth: Mutex::new(AdminAuth::open(data_dir.as_deref(), bootstrap_admin)?),
-        api_tokens: Mutex::new(ApiTokenCatalog::open(data_dir.as_deref())?),
+        admin_auth: Mutex::new(AdminAuth::open_with_database(&database, bootstrap_admin)?),
+        api_tokens: Mutex::new(ApiTokenCatalog::open_with_database(&database)?),
         login_throttle: Mutex::new(LoginThrottle::default()),
         login_hash_permits: Arc::new(Semaphore::new(LOGIN_HASH_CONCURRENCY)),
-        audit: Mutex::new(AuditLog::open(data_dir.as_deref())?),
-        alerts: Mutex::new(AlertCatalog::open(data_dir.as_deref())?),
-        fleet: Mutex::new(FleetCatalog::open(data_dir.as_deref())?),
-        traffic_controls: Mutex::new(TrafficControlCatalog::open(data_dir.as_deref())?),
+        audit: Mutex::new(AuditLog::open_with_database(&database)?),
+        alerts: Mutex::new(AlertCatalog::open_with_database(&database)?),
+        fleet: Mutex::new(FleetCatalog::open_with_database(&database)?),
+        traffic_controls: Mutex::new(TrafficControlCatalog::open_with_database(&database)?),
         management_cookies_secure,
         public_port_policy: public_port_policy.clone(),
-        clients: Mutex::new(ClientRegistry::open(data_dir.as_deref())?),
-        tunnel_catalog: Mutex::new(TunnelCatalog::open_with_port_policy(
-            data_dir.as_deref(),
+        clients: Mutex::new(ClientRegistry::open_with_database(&database)?),
+        tunnel_catalog: Mutex::new(TunnelCatalog::open_with_database(
+            &database,
             public_port_policy,
         )?),
         tunnels: Mutex::new(HashMap::new()),
@@ -1913,23 +1928,23 @@ async fn run_server(
         udp_tunnels: Mutex::new(HashMap::new()),
         udp_tunnel_statistics: Mutex::new(HashMap::new()),
         seen_udp_tunnel_registrations: Mutex::new(HashSet::new()),
-        http_route_catalog: Mutex::new(HttpRouteCatalog::open(data_dir.as_deref())?),
+        http_route_catalog: Mutex::new(HttpRouteCatalog::open_with_database(&database)?),
         http_routes: Mutex::new(HashMap::new()),
         http_route_statistics: Mutex::new(HashMap::new()),
         seen_http_route_registrations: Mutex::new(HashSet::new()),
-        sni_route_catalog: Mutex::new(SniRouteCatalog::open(data_dir.as_deref())?),
+        sni_route_catalog: Mutex::new(SniRouteCatalog::open_with_database(&database)?),
         sni_routes: Mutex::new(HashMap::new()),
         sni_route_statistics: Mutex::new(HashMap::new()),
-        p2p_node_catalog: Mutex::new(P2pNodeCatalog::open(data_dir.as_deref())?),
+        p2p_node_catalog: Mutex::new(P2pNodeCatalog::open_with_database(&database)?),
         p2p_sessions: Mutex::new(HashMap::new()),
-        secret_tunnel_catalog: Mutex::new(SecretTunnelCatalog::open(data_dir.as_deref())?),
+        secret_tunnel_catalog: Mutex::new(SecretTunnelCatalog::open_with_database(&database)?),
         secret_tunnels: Mutex::new(HashMap::new()),
         secret_tunnel_statistics: Mutex::new(HashMap::new()),
         socks5_proxies: Mutex::new(HashMap::new()),
         socks5_proxy_statistics: Mutex::new(HashMap::new()),
         http_proxies: Mutex::new(HashMap::new()),
         http_proxy_statistics: Mutex::new(HashMap::new()),
-        certificate_catalog: Mutex::new(CertificateCatalog::open(data_dir.as_deref())?),
+        certificate_catalog: Mutex::new(CertificateCatalog::open_with_database(&database)?),
         certificate_manager,
         certificate_jobs: Mutex::new(HashMap::new()),
         https_redirect_hosts: Mutex::new(HashSet::new()),
@@ -1938,8 +1953,8 @@ async fn run_server(
         pending_connection_permits: Arc::new(Semaphore::new(PENDING_CONNECTION_LIMIT)),
         global_udp_session_permits: Arc::new(Semaphore::new(GLOBAL_UDP_SESSION_LIMIT)),
         metrics: ServerCounters::default(),
-        metrics_history: Mutex::new(MetricsHistory::open(
-            data_dir.as_deref(),
+        metrics_history: Mutex::new(MetricsHistory::open_with_database(
+            &database,
             METRICS_HISTORY_CAPACITY,
             METRICS_HISTORY_ARCHIVE_CAPACITY,
         )?),

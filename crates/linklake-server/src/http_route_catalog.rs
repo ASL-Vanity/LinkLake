@@ -1,8 +1,10 @@
 use linklake_core::target_pool::parse_target_pool;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::{error::Error, fmt, fs, net::IpAddr, path::Path};
+use std::{error::Error, fmt, net::IpAddr, path::Path};
 use uuid::Uuid;
+
+use crate::database::Database;
 
 const DEFAULT_MAX_CONNECTIONS: u16 = 64;
 
@@ -79,17 +81,16 @@ pub(crate) struct HttpRouteCatalog {
 }
 
 impl HttpRouteCatalog {
+    #[allow(dead_code)]
     pub(crate) fn open(data_dir: Option<&Path>) -> anyhow::Result<Self> {
-        let database = match data_dir {
-            Some(data_dir) => {
-                fs::create_dir_all(data_dir)?;
-                Connection::open(data_dir.join("linklake.sqlite3"))?
-            }
-            None => Connection::open_in_memory()?,
-        };
+        let database = Database::open(data_dir)?;
+        Self::open_with_database(&database)
+    }
+
+    pub(crate) fn open_with_database(database: &Database) -> anyhow::Result<Self> {
+        let database = database.connect()?;
         database.execute_batch(
             "
-            PRAGMA journal_mode = WAL;
             CREATE TABLE IF NOT EXISTS http_route_policies (
                 id TEXT PRIMARY KEY NOT NULL,
                 client_id TEXT NOT NULL,
