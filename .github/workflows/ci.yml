@@ -91,6 +91,8 @@ jobs:
           fi
       - name: Check shell scripts
         run: find packaging scripts -name '*.sh' -print0 | xargs -0 -n1 bash -n
+      - name: Verify macOS Manager host integration contract
+        run: node --test tests/manager-macos-contract.test.mjs
 
   windows-test:
     name: Windows test and tunnel E2E
