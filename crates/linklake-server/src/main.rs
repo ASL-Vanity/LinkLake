@@ -10,6 +10,7 @@ mod database_migrations;
 mod database_tools;
 mod dual_stack_udp;
 mod fleet;
+mod fleet_health;
 mod http2_backend;
 pub mod http_backend_pool;
 mod http_proxy_tunnel;
@@ -60,6 +61,11 @@ use client_registry::{Authentication, ClientRegistry, UpdateClient};
 use database::Database;
 use dual_stack_udp::{DualStackUdpSocket, PublicUdpBindMode};
 use fleet::{FleetCatalog, FleetImportResult, FleetPeer, FleetPolicyBundle, UpsertFleetPeer};
+use fleet_health::{
+    FleetDnsChangeResult, FleetDnsFailover, FleetDnsSwitchEvent, FleetHealthCatalog,
+    FleetHealthConfig, FleetHealthMetrics, FleetHealthSnapshot, FleetHealthState, FleetPeerHealth,
+    FleetProbeObservation, FreezeFleetDnsFailover, UpdateFleetHealthConfig, UpsertFleetDnsFailover,
+};
 use http_route_catalog::{
     CreateHttpRouteError, CreateHttpRoutePolicy, HttpRouteCatalog, HttpRoutePolicy,
     UpdateHttpRoutePolicy,
@@ -315,6 +321,7 @@ struct AppState {
     audit: Mutex<AuditLog>,
     alerts: Mutex<AlertCatalog>,
     fleet: Mutex<FleetCatalog>,
+    fleet_health: Mutex<FleetHealthCatalog>,
     traffic_controls: Mutex<TrafficControlCatalog>,
     management_cookies_secure: bool,
     public_port_policy: PublicPortPolicy,
@@ -904,6 +911,8 @@ struct MetricsResponse {
     acme_renewals_total: u64,
     acme_renewal_failures_total: u64,
     acme_http01_challenges_total: u64,
+    #[serde(flatten)]
+    fleet_health: FleetHealthMetrics,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -1020,7 +1029,10 @@ struct SearchResult {
 struct FleetPeerStatus {
     #[serde(flatten)]
     peer: FleetPeer,
+    health_config: FleetHealthConfig,
+    health: FleetPeerHealth,
     online: bool,
+    dns_eligible: bool,
     latency_millis: Option<u64>,
     error: Option<String>,
     active_connections: u64,
@@ -1035,6 +1047,13 @@ struct FleetOverview {
     failover_order: Vec<Uuid>,
     conflicts: Vec<String>,
     peers: Vec<FleetPeerStatus>,
+    dns_failovers: Vec<FleetDnsFailover>,
+    health_metrics: FleetHealthMetrics,
+}
+
+#[derive(Serialize)]
+struct FleetDnsReconcileResponse {
+    results: Vec<FleetDnsChangeResult>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -2063,6 +2082,7 @@ async fn run_server(
         audit: Mutex::new(AuditLog::open_with_database(&database)?),
         alerts: Mutex::new(AlertCatalog::open_with_database(&database)?),
         fleet: Mutex::new(FleetCatalog::open_with_database(&database)?),
+        fleet_health: Mutex::new(FleetHealthCatalog::open_with_database(&database)?),
         traffic_controls: Mutex::new(TrafficControlCatalog::open_with_database(&database)?),
         management_cookies_secure,
         public_port_policy: public_port_policy.clone(),
@@ -2206,9 +2226,37 @@ async fn run_server(
             "/api/v1/fleet/peers/:peer_id",
             put(update_fleet_peer).delete(delete_fleet_peer),
         )
+        .route(
+            "/api/v1/fleet/peers/:peer_id/health-config",
+            get(get_fleet_health_config).put(update_fleet_health_config),
+        )
         .route("/api/v1/fleet/overview", get(fleet_overview))
         .route("/api/v1/fleet/import", post(import_fleet_policies))
         .route("/api/v1/fleet/sync", post(sync_fleet_policies))
+        .route(
+            "/api/v1/fleet/dns-failovers",
+            get(list_fleet_dns_failovers).post(create_fleet_dns_failover),
+        )
+        .route(
+            "/api/v1/fleet/dns-failovers/:failover_id",
+            put(update_fleet_dns_failover).delete(delete_fleet_dns_failover),
+        )
+        .route(
+            "/api/v1/fleet/dns-failovers/:failover_id/events",
+            get(list_fleet_dns_switch_events),
+        )
+        .route(
+            "/api/v1/fleet/dns-failovers/:failover_id/freeze",
+            post(freeze_fleet_dns_failover),
+        )
+        .route(
+            "/api/v1/fleet/dns-failovers/:failover_id/resume",
+            post(resume_fleet_dns_failover),
+        )
+        .route(
+            "/api/v1/fleet/dns-failovers/:failover_id/reconcile",
+            post(reconcile_fleet_dns_failover),
+        )
         .route(
             "/api/v1/traffic-controls/:kind/:policy_id",
             get(get_traffic_control)
@@ -2383,6 +2431,7 @@ async fn run_server(
         state.clone(),
         shutdown_rx.clone(),
     ));
+    tokio::spawn(run_fleet_health_monitor(state.clone(), shutdown_rx.clone()));
     let shutdown_state = state.clone();
     tokio::spawn(async move {
         match service_shutdown {
@@ -2901,6 +2950,17 @@ async fn metrics(
     headers: HeaderMap,
 ) -> Result<Json<MetricsResponse>, ApiError> {
     authorize_management(&state, &headers)?;
+    let fleet_health = state
+        .fleet_health
+        .lock()
+        .expect("fleet health catalog lock poisoned")
+        .metrics()
+        .map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not read fleet health metrics",
+            )
+        })?;
     let statistics = state
         .tunnel_statistics
         .lock()
@@ -3333,6 +3393,7 @@ async fn metrics(
             .metrics
             .acme_http01_challenges_total
             .load(Ordering::Relaxed),
+        fleet_health,
     }))
 }
 
@@ -6293,6 +6354,16 @@ async fn alert_notification_channels(
     Ok(Json(notifications::channel_view()))
 }
 
+fn fleet_peer_exists(state: &AppState, peer_id: Uuid) -> anyhow::Result<bool> {
+    Ok(state
+        .fleet
+        .lock()
+        .expect("fleet catalog lock poisoned")
+        .list()?
+        .iter()
+        .any(|peer| peer.id == peer_id))
+}
+
 async fn list_fleet_peers(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -6319,6 +6390,12 @@ async fn create_fleet_peer(
         .lock()
         .expect("fleet catalog lock poisoned")
         .create(request, unix_seconds())
+        .map_err(coded_fleet_error)?;
+    state
+        .fleet_health
+        .lock()
+        .expect("fleet health catalog lock poisoned")
+        .ensure_peer(peer.id, unix_seconds())
         .map_err(coded_fleet_error)?;
     record_audit(
         &state,
@@ -6384,6 +6461,312 @@ async fn delete_fleet_peer(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn get_fleet_health_config(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(peer_id): Path<Uuid>,
+) -> Result<Json<FleetHealthSnapshot>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    if !fleet_peer_exists(&state, peer_id).map_err(coded_fleet_error)? {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_fleet_peer",
+            "fleet peer does not exist",
+        ));
+    }
+    state
+        .fleet_health
+        .lock()
+        .expect("fleet health catalog lock poisoned")
+        .ensure_peer(peer_id, unix_seconds())
+        .map_err(coded_fleet_error)?;
+    state
+        .fleet_health
+        .lock()
+        .expect("fleet health catalog lock poisoned")
+        .snapshot(peer_id)
+        .map_err(coded_fleet_error)?
+        .map(Json)
+        .ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_fleet_peer",
+            "fleet peer does not exist",
+        ))
+}
+
+async fn update_fleet_health_config(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(peer_id): Path<Uuid>,
+    Json(request): Json<UpdateFleetHealthConfig>,
+) -> Result<Json<FleetHealthSnapshot>, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    if !fleet_peer_exists(&state, peer_id).map_err(coded_fleet_error)? {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_fleet_peer",
+            "fleet peer does not exist",
+        ));
+    }
+    let snapshot = state
+        .fleet_health
+        .lock()
+        .expect("fleet health catalog lock poisoned")
+        .update_health_config(peer_id, request, unix_seconds())
+        .map_err(coded_fleet_error)?
+        .ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_fleet_peer",
+            "fleet peer does not exist",
+        ))?;
+    record_audit(
+        &state,
+        "fleet.peer.health_config_updated",
+        &peer_id.to_string(),
+        &format!(
+            "actor={}; success_threshold={}; failure_threshold={}; cooldown_seconds={}",
+            principal.username,
+            snapshot.config.success_threshold,
+            snapshot.config.failure_threshold,
+            snapshot.config.cooldown_seconds
+        ),
+    );
+    Ok(Json(snapshot))
+}
+
+async fn list_fleet_dns_failovers(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<FleetDnsFailover>>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    Ok(Json(
+        state
+            .fleet_health
+            .lock()
+            .expect("fleet health catalog lock poisoned")
+            .list_dns_failovers()
+            .map_err(coded_fleet_error)?,
+    ))
+}
+
+async fn list_fleet_dns_switch_events(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(failover_id): Path<Uuid>,
+) -> Result<Json<Vec<FleetDnsSwitchEvent>>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let fleet_health = state
+        .fleet_health
+        .lock()
+        .expect("fleet health catalog lock poisoned");
+    if fleet_health
+        .get_dns_failover(failover_id)
+        .map_err(coded_fleet_error)?
+        .is_none()
+    {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_fleet_dns_failover",
+            "fleet DNS failover does not exist",
+        ));
+    }
+    Ok(Json(
+        fleet_health
+            .list_dns_switch_events(failover_id, 100)
+            .map_err(coded_fleet_error)?,
+    ))
+}
+
+async fn create_fleet_dns_failover(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<UpsertFleetDnsFailover>,
+) -> Result<(StatusCode, Json<FleetDnsFailover>), CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    let peers = state
+        .fleet
+        .lock()
+        .expect("fleet catalog lock poisoned")
+        .list()
+        .map_err(coded_fleet_error)?;
+    let failover = state
+        .fleet_health
+        .lock()
+        .expect("fleet health catalog lock poisoned")
+        .create_dns_failover(request, &peers, unix_seconds())
+        .map_err(coded_fleet_error)?;
+    record_audit(
+        &state,
+        "fleet.dns_failover.created",
+        &failover.id.to_string(),
+        &format!(
+            "actor={}; hostname={}; record_type={}; targets={}; token_env={}",
+            principal.username,
+            failover.hostname,
+            failover.record_type.as_str(),
+            failover.targets.len(),
+            failover.token_env
+        ),
+    );
+    Ok((StatusCode::CREATED, Json(failover)))
+}
+
+async fn update_fleet_dns_failover(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(failover_id): Path<Uuid>,
+    Json(request): Json<UpsertFleetDnsFailover>,
+) -> Result<Json<FleetDnsFailover>, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    let peers = state
+        .fleet
+        .lock()
+        .expect("fleet catalog lock poisoned")
+        .list()
+        .map_err(coded_fleet_error)?;
+    let failover = state
+        .fleet_health
+        .lock()
+        .expect("fleet health catalog lock poisoned")
+        .update_dns_failover(failover_id, request, &peers, unix_seconds())
+        .map_err(coded_fleet_error)?
+        .ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_fleet_dns_failover",
+            "fleet DNS failover does not exist",
+        ))?;
+    record_audit(
+        &state,
+        "fleet.dns_failover.updated",
+        &failover_id.to_string(),
+        &format!(
+            "actor={}; hostname={}; targets={}; token_env={}",
+            principal.username,
+            failover.hostname,
+            failover.targets.len(),
+            failover.token_env
+        ),
+    );
+    Ok(Json(failover))
+}
+
+async fn delete_fleet_dns_failover(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(failover_id): Path<Uuid>,
+) -> Result<StatusCode, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    if !state
+        .fleet_health
+        .lock()
+        .expect("fleet health catalog lock poisoned")
+        .delete_dns_failover(failover_id)
+        .map_err(coded_fleet_error)?
+    {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_fleet_dns_failover",
+            "fleet DNS failover does not exist",
+        ));
+    }
+    record_audit(
+        &state,
+        "fleet.dns_failover.deleted",
+        &failover_id.to_string(),
+        &format!("actor={}", principal.username),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn freeze_fleet_dns_failover(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(failover_id): Path<Uuid>,
+    Json(request): Json<FreezeFleetDnsFailover>,
+) -> Result<Json<FleetDnsFailover>, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    let failover = state
+        .fleet_health
+        .lock()
+        .expect("fleet health catalog lock poisoned")
+        .set_dns_frozen(failover_id, true, Some(&request.reason), unix_seconds())
+        .map_err(coded_fleet_error)?
+        .ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_fleet_dns_failover",
+            "fleet DNS failover does not exist",
+        ))?;
+    record_audit(
+        &state,
+        "fleet.dns_failover.frozen",
+        &failover_id.to_string(),
+        &format!(
+            "actor={}; reason={}",
+            principal.username,
+            failover.freeze_reason.as_deref().unwrap_or("manual freeze")
+        ),
+    );
+    Ok(Json(failover))
+}
+
+async fn resume_fleet_dns_failover(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(failover_id): Path<Uuid>,
+) -> Result<Json<FleetDnsFailover>, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    let failover = state
+        .fleet_health
+        .lock()
+        .expect("fleet health catalog lock poisoned")
+        .set_dns_frozen(failover_id, false, None, unix_seconds())
+        .map_err(coded_fleet_error)?
+        .ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_fleet_dns_failover",
+            "fleet DNS failover does not exist",
+        ))?;
+    record_audit(
+        &state,
+        "fleet.dns_failover.resumed",
+        &failover_id.to_string(),
+        &format!("actor={}", principal.username),
+    );
+    Ok(Json(failover))
+}
+
+async fn reconcile_fleet_dns_failover(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(failover_id): Path<Uuid>,
+) -> Result<Json<FleetDnsReconcileResponse>, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    if state
+        .fleet_health
+        .lock()
+        .expect("fleet health catalog lock poisoned")
+        .get_dns_failover(failover_id)
+        .map_err(coded_fleet_error)?
+        .is_none()
+    {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_fleet_dns_failover",
+            "fleet DNS failover does not exist",
+        ));
+    }
+    let results = execute_fleet_dns_reconciliation(&state, Some(failover_id))
+        .await
+        .map_err(coded_fleet_error)?;
+    record_audit(
+        &state,
+        "fleet.dns_failover.reconciled",
+        &failover_id.to_string(),
+        &format!("actor={}; operations={}", principal.username, results.len()),
+    );
+    Ok(Json(FleetDnsReconcileResponse { results }))
+}
+
 async fn fleet_overview(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -6395,17 +6778,48 @@ async fn fleet_overview(
         .expect("fleet catalog lock poisoned")
         .list()
         .map_err(coded_fleet_error)?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .build()
-        .map_err(|error| coded_fleet_error(error.into()))?;
+    let now = unix_seconds();
+    let fleet_health = state
+        .fleet_health
+        .lock()
+        .expect("fleet health catalog lock poisoned");
+    for peer in &peers {
+        fleet_health
+            .ensure_peer(peer.id, now)
+            .map_err(coded_fleet_error)?;
+    }
+    let snapshots = fleet_health.snapshots().map_err(coded_fleet_error)?;
+    let dns_failovers = fleet_health
+        .list_dns_failovers()
+        .map_err(coded_fleet_error)?;
+    let health_metrics = fleet_health.metrics().map_err(coded_fleet_error)?;
+    drop(fleet_health);
     let mut statuses = Vec::with_capacity(peers.len());
     for peer in peers {
-        statuses.push(probe_fleet_peer(&client, peer).await);
+        let snapshot = snapshots.get(&peer.id).cloned().ok_or(CodedApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "fleet_health_state_missing",
+            "fleet peer health state is missing",
+        ))?;
+        let online = peer.enabled && snapshot.health.state == FleetHealthState::Healthy;
+        let dns_eligible = snapshot.health.dns_eligible(peer.enabled, now);
+        statuses.push(FleetPeerStatus {
+            latency_millis: snapshot.health.last_latency_millis,
+            error: snapshot.health.last_error_summary.clone(),
+            active_connections: snapshot.health.active_connections,
+            bytes_total: snapshot.health.bytes_total,
+            clients: snapshot.health.clients,
+            policies: snapshot.health.policies,
+            health_config: snapshot.config,
+            health: snapshot.health,
+            peer,
+            online,
+            dns_eligible,
+        });
     }
     let mut available = statuses
         .iter()
-        .filter(|status| status.peer.enabled && status.online)
+        .filter(|status| status.dns_eligible)
         .collect::<Vec<_>>();
     available.sort_by_key(|status| (status.peer.priority, std::cmp::Reverse(status.peer.weight)));
     let failover_order = available
@@ -6432,6 +6846,8 @@ async fn fleet_overview(
         failover_order,
         conflicts,
         peers: statuses,
+        dns_failovers,
+        health_metrics,
     }))
 }
 
@@ -6658,27 +7074,119 @@ async fn delete_traffic_control(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn probe_fleet_peer(client: &reqwest::Client, peer: FleetPeer) -> FleetPeerStatus {
-    let started = Instant::now();
-    if !peer.enabled {
-        return FleetPeerStatus {
-            peer,
-            online: false,
-            latency_millis: None,
-            error: Some("peer disabled".to_owned()),
-            active_connections: 0,
-            bytes_total: 0,
-            clients: 0,
-            policies: 0,
-        };
+fn fleet_probe_interval_seconds() -> u64 {
+    std::env::var("LINKLAKE_FLEET_PROBE_INTERVAL_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(15)
+        .clamp(5, 3_600)
+}
+
+async fn run_fleet_health_monitor(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::error!("Could not initialize Fleet health HTTP client: {error}");
+            return;
+        }
+    };
+    let mut interval = tokio::time::interval(Duration::from_secs(fleet_probe_interval_seconds()));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            _ = interval.tick() => {
+                if let Err(error) = run_fleet_probe_round(&state, &client).await {
+                    tracing::error!("Fleet health probe round failed: {error}");
+                }
+            }
+        }
     }
+}
+
+async fn run_fleet_probe_round(
+    state: &Arc<AppState>,
+    client: &reqwest::Client,
+) -> anyhow::Result<()> {
+    let peers = state
+        .fleet
+        .lock()
+        .expect("fleet catalog lock poisoned")
+        .list()?
+        .into_iter()
+        .filter(|peer| peer.enabled)
+        .collect::<Vec<_>>();
+    let permits = Arc::new(Semaphore::new(16));
+    let mut probes = tokio::task::JoinSet::new();
+    for peer in peers {
+        let client = client.clone();
+        let permits = permits.clone();
+        probes.spawn(async move {
+            let _permit = permits
+                .acquire_owned()
+                .await
+                .expect("Fleet probe semaphore closed unexpectedly");
+            let peer_id = peer.id;
+            (peer_id, probe_fleet_peer(&client, peer).await)
+        });
+    }
+    while let Some(result) = probes.join_next().await {
+        let (peer_id, observation) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::warn!("Fleet health probe task failed: {error}");
+                continue;
+            }
+        };
+        let result = state
+            .fleet_health
+            .lock()
+            .expect("fleet health catalog lock poisoned")
+            .record_probe(peer_id, observation)?;
+        if result.duplicate {
+            tracing::debug!(peer_id = %result.peer_id, "Ignored duplicate Fleet probe event");
+        }
+        if result.accepted && result.previous_state != result.health.state {
+            record_audit(
+                state,
+                "fleet.peer.health_changed",
+                &result.peer_id.to_string(),
+                &format!(
+                    "from={}; to={}; reason={}; revision={}",
+                    result.previous_state.as_str(),
+                    result.health.state.as_str(),
+                    result.transition_reason,
+                    result.health.revision
+                ),
+            );
+        }
+    }
+    if let Err(error) = execute_fleet_dns_reconciliation(state, None).await {
+        tracing::error!("Fleet DNS reconciliation failed: {error}");
+    }
+    Ok(())
+}
+
+async fn probe_fleet_peer(client: &reqwest::Client, peer: FleetPeer) -> FleetProbeObservation {
+    let started = Instant::now();
     let Some(token) = std::env::var_os(&peer.token_env).and_then(|value| value.into_string().ok())
     else {
-        return FleetPeerStatus {
-            peer,
-            online: false,
+        return FleetProbeObservation {
+            event_id: Uuid::new_v4(),
+            observed_unix_seconds: unix_seconds(),
+            success: false,
             latency_millis: None,
-            error: Some("management token environment variable is not configured".to_owned()),
+            error_summary: Some(
+                "management token environment variable is not configured".to_owned(),
+            ),
             active_connections: 0,
             bytes_total: 0,
             clients: 0,
@@ -6703,7 +7211,25 @@ async fn probe_fleet_peer(client: &reqwest::Client, peer: FleetPeer) -> FleetPee
             .error_for_status()?
             .json::<serde_json::Value>()
             .await?;
-        Ok::<_, reqwest::Error>((status, metrics))
+        anyhow::ensure!(
+            status["product"].as_str() == Some(PRODUCT_NAME),
+            "peer status response has an unexpected product"
+        );
+        anyhow::ensure!(
+            status["api_version"].as_str() == Some(API_VERSION),
+            "peer status response has an incompatible API version"
+        );
+        anyhow::ensure!(
+            status["instance_id"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "peer status response is missing its instance identity"
+        );
+        anyhow::ensure!(
+            metrics["uptime_seconds"].is_number(),
+            "peer metrics response is incomplete"
+        );
+        Ok::<_, anyhow::Error>((status, metrics))
     }
     .await;
     match result {
@@ -6741,28 +7267,86 @@ async fn probe_fleet_peer(client: &reqwest::Client, peer: FleetPeer) -> FleetPee
             .iter()
             .map(|key| status[*key].as_u64().unwrap_or(0))
             .sum();
-            FleetPeerStatus {
+            FleetProbeObservation {
+                event_id: Uuid::new_v4(),
+                observed_unix_seconds: unix_seconds(),
+                success: true,
                 clients: status["clients"].as_u64().unwrap_or(0),
-                peer,
-                online: true,
                 latency_millis: Some(started.elapsed().as_millis() as u64),
-                error: None,
+                error_summary: None,
                 active_connections,
                 bytes_total,
                 policies,
             }
         }
-        Err(error) => FleetPeerStatus {
-            peer,
-            online: false,
+        Err(error) => FleetProbeObservation {
+            event_id: Uuid::new_v4(),
+            observed_unix_seconds: unix_seconds(),
+            success: false,
             latency_millis: Some(started.elapsed().as_millis() as u64),
-            error: Some(error.to_string()),
+            error_summary: Some(error.to_string()),
             active_connections: 0,
             bytes_total: 0,
             clients: 0,
             policies: 0,
         },
     }
+}
+
+async fn execute_fleet_dns_reconciliation(
+    state: &Arc<AppState>,
+    only: Option<Uuid>,
+) -> anyhow::Result<Vec<FleetDnsChangeResult>> {
+    let plans = state
+        .fleet_health
+        .lock()
+        .expect("fleet health catalog lock poisoned")
+        .plan_dns_changes(unix_seconds(), only)?;
+    if plans.is_empty() {
+        return Ok(Vec::new());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let mut results = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let apply_error = fleet_health::apply_cloudflare_dns_change(&client, &plan)
+            .await
+            .err()
+            .map(|error| error.to_string());
+        let completion = state
+            .fleet_health
+            .lock()
+            .expect("fleet health catalog lock poisoned")
+            .complete_dns_change(
+                &plan,
+                apply_error.as_deref().map_or(Ok(()), Err),
+                unix_seconds(),
+            )?;
+        record_audit(
+            state,
+            if completion.applied {
+                "fleet.dns_failover.switched"
+            } else {
+                "fleet.dns_failover.switch_failed"
+            },
+            &plan.failover_id.to_string(),
+            &format!(
+                "operation_id={}; failover={}; peer_id={}; peer={}; target={}; reason={}; applied={}; error={}",
+                plan.operation_id,
+                plan.failover_name,
+                plan.peer_id,
+                plan.peer_name,
+                plan.target,
+                plan.reason,
+                completion.applied,
+                completion.error_summary.as_deref().unwrap_or("")
+            ),
+        );
+        results.push(completion);
+    }
+    Ok(results)
 }
 
 async fn list_tcp_tunnels(
@@ -10020,11 +10604,22 @@ fn coded_alert_error(error: anyhow::Error) -> CodedApiError {
 
 fn coded_fleet_error(error: anyhow::Error) -> CodedApiError {
     let message = error.to_string();
-    if message.contains("fleet peer") || message.contains("UNIQUE constraint") {
+    if message.contains("operation is pending") || message.contains("operation is stale") {
+        CodedApiError(
+            StatusCode::CONFLICT,
+            "fleet_operation_conflict",
+            "a conflicting fleet operation is already in progress",
+        )
+    } else if message.contains("fleet peer")
+        || message.contains("fleet health")
+        || message.contains("fleet DNS")
+        || message.contains("Cloudflare")
+        || message.contains("UNIQUE constraint")
+    {
         CodedApiError(
             StatusCode::BAD_REQUEST,
-            "invalid_fleet_peer",
-            "fleet peer configuration is invalid or duplicated",
+            "invalid_fleet_configuration",
+            "fleet health, peer, or DNS failover configuration is invalid or duplicated",
         )
     } else {
         tracing::error!("Fleet catalog operation failed: {message}");
@@ -10871,6 +11466,25 @@ mod tests {
             assert!(
                 MANAGEMENT_UI.contains(field),
                 "Web UI does not consume client configuration field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn web_ui_displays_fleet_health_and_dns_failover_state() {
+        for marker in [
+            "health_config",
+            "consecutive_successes",
+            "consecutive_failures",
+            "fleet_peers_healthy",
+            "dns_failovers",
+            "freeze_reason",
+            "last_switch_reason",
+            "recovering",
+        ] {
+            assert!(
+                MANAGEMENT_UI.contains(marker),
+                "Web UI does not consume Fleet health or DNS field {marker}"
             );
         }
     }

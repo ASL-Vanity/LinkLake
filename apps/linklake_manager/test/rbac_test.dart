@@ -183,6 +183,77 @@ void main() {
     expect(find.text('Healthy client'), findsOneWidget);
   });
 
+  testWidgets('fleet page renders persisted health and DNS failover state', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1400, 1000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final api = FakeLinkLakeApi();
+    api.objectResponses['/api/v1/fleet/overview'] = const {
+      'preferred_peer_id': 'peer-1',
+      'failover_order': ['peer-1'],
+      'conflicts': [],
+      'health_metrics': {'fleet_peers_healthy': 1},
+      'peers': [
+        {
+          'id': 'peer-1',
+          'name': 'Singapore',
+          'region': 'ap-southeast',
+          'url': 'https://sg.example.test',
+          'enabled': true,
+          'online': true,
+          'latency_millis': 18,
+          'priority': 10,
+          'weight': 100,
+          'error': null,
+          'health_config': {
+            'success_threshold': 2,
+            'failure_threshold': 3,
+            'cooldown_seconds': 30,
+          },
+          'health': {
+            'state': 'healthy',
+            'consecutive_successes': 2,
+            'consecutive_failures': 0,
+          },
+        },
+      ],
+      'dns_failovers': [
+        {
+          'hostname': 'link.example.com',
+          'record_type': 'A',
+          'frozen': true,
+          'freeze_reason': 'maintenance',
+          'last_error_summary': null,
+        },
+      ],
+    };
+    await tester.pumpWidget(
+      MaterialApp(
+        home: DashboardPage(
+          api: api,
+          chinese: false,
+          onLanguageChanged: (_) {},
+          themeMode: ThemeMode.system,
+          onThemeChanged: (_) {},
+          initialIdentity: const {'role': 'administrator'},
+          settings: const ManagerSettings(chinese: false),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('nav-fleet')));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('Singapore · Preferred'), findsOneWidget);
+    expect(find.textContaining('Healthy · Success: 2/2'), findsOneWidget);
+    expect(find.text('link.example.com · A'), findsOneWidget);
+    expect(find.textContaining('Frozen: maintenance'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('role downgrade removes privileged navigation immediately', (
     tester,
   ) async {

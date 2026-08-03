@@ -2514,8 +2514,35 @@ class _DashboardPageState extends State<DashboardPage> {
     }
   }
 
+  String _fleetHealthLabel(Map<String, dynamic> peer) {
+    final health = Map<String, dynamic>.from(
+      peer['health'] as Map? ?? const {},
+    );
+    return switch (health['state']?.toString()) {
+      'healthy' => t('健康', 'Healthy'),
+      'degraded' => t('降级', 'Degraded'),
+      'unhealthy' => t('不健康', 'Unhealthy'),
+      'recovering' => t('恢复中', 'Recovering'),
+      _ => t('未知', 'Unknown'),
+    };
+  }
+
+  String _fleetHealthDetails(Map<String, dynamic> peer) {
+    final health = Map<String, dynamic>.from(
+      peer['health'] as Map? ?? const {},
+    );
+    final config = Map<String, dynamic>.from(
+      peer['health_config'] as Map? ?? const {},
+    );
+    return '${_fleetHealthLabel(peer)} · '
+        '${t('连续成功', 'Success')}: ${health['consecutive_successes'] ?? 0}/${config['success_threshold'] ?? 0} · '
+        '${t('连续失败', 'Failure')}: ${health['consecutive_failures'] ?? 0}/${config['failure_threshold'] ?? 0} · '
+        '${t('冷却', 'Cooldown')}: ${config['cooldown_seconds'] ?? 0}s';
+  }
+
   Widget _fleetPage() {
     final peers = (_fleet['peers'] as List? ?? const []);
+    final dnsFailovers = (_fleet['dns_failovers'] as List? ?? const []);
     final preferred = _fleet['preferred_peer_id']?.toString();
     final conflicts = (_fleet['conflicts'] as List? ?? const []);
     return _pagePadding(
@@ -2551,6 +2578,36 @@ class _DashboardPageState extends State<DashboardPage> {
                   subtitle: Text(conflict.toString()),
                 ),
               ),
+          if (dnsFailovers.isNotEmpty)
+            for (final raw in dnsFailovers)
+              Builder(
+                builder: (context) {
+                  final failover = Map<String, dynamic>.from(raw as Map);
+                  final frozen = failover['frozen'] == true;
+                  final error = failover['last_error_summary']?.toString();
+                  return Card(
+                    margin: const EdgeInsets.only(bottom: 8),
+                    child: ListTile(
+                      leading: Icon(
+                        frozen
+                            ? Icons.pause_circle_outline
+                            : error != null
+                            ? Icons.warning_amber_outlined
+                            : Icons.dns_outlined,
+                      ),
+                      title: Text(
+                        '${failover['hostname']} · ${failover['record_type']}',
+                      ),
+                      subtitle: Text(
+                        frozen
+                            ? '${t('已冻结', 'Frozen')}: ${failover['freeze_reason'] ?? '-'}'
+                            : error ??
+                                  '${failover['current_target'] ?? t('等待健康节点', 'Waiting for an eligible peer')} · ${failover['last_switch_reason'] ?? t('尚未切换', 'Not switched')}',
+                      ),
+                    ),
+                  );
+                },
+              ),
           if (peers.isEmpty)
             _emptyCard(t('尚未配置多云服务端', 'No multi-cloud servers configured')),
           for (final raw in peers)
@@ -2566,7 +2623,7 @@ class _DashboardPageState extends State<DashboardPage> {
                   '${raw['name']}${raw['id']?.toString() == preferred ? ' · ${t('首选', 'Preferred')}' : ''}',
                 ),
                 subtitle: Text(
-                  '${raw['region']} · ${raw['url']}\n${t('延迟', 'Latency')}: ${raw['latency_millis'] ?? '-'} ms · ${t('优先级', 'Priority')}: ${raw['priority']} · ${t('权重', 'Weight')}: ${raw['weight']}\n${raw['error'] ?? t('在线', 'Online')}',
+                  '${raw['region']} · ${raw['url']}\n${t('延迟', 'Latency')}: ${raw['latency_millis'] ?? '-'} ms · ${t('优先级', 'Priority')}: ${raw['priority']} · ${t('权重', 'Weight')}: ${raw['weight']}\n${_fleetHealthDetails(Map<String, dynamic>.from(raw))}${raw['error'] == null ? '' : '\n${raw['error']}'}',
                 ),
                 isThreeLine: true,
                 trailing: Wrap(
