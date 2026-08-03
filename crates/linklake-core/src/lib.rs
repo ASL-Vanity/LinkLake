@@ -7,6 +7,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
+pub mod fleet_protocol;
 pub mod p2p_protocol;
 pub mod port_mapping;
 pub mod public_ports;
