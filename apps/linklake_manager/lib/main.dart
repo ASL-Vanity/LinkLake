@@ -11,6 +11,7 @@ import 'manager_settings.dart';
 import 'policy_pages.dart';
 import 'rbac.dart';
 import 'server_profiles.dart';
+import 'update_protocol.dart';
 import 'version.dart';
 
 Future<void> main() async {
@@ -583,6 +584,8 @@ class _DashboardPageState extends State<DashboardPage> {
   String? _latestRelease;
   bool? _updateAvailable;
   bool _clientUpdateBusy = false;
+  bool _managerUpdateBusy = false;
+  int? _managerExitCountdown;
   final Map<String, List<dynamic>> _resources = {};
 
   bool get zh => _chinese;
@@ -597,6 +600,7 @@ class _DashboardPageState extends State<DashboardPage> {
     _settings = widget.settings;
     _identity = Map<String, dynamic>.from(widget.initialIdentity);
     _refresh();
+    unawaited(_refreshManagerUpdateStatus(silent: true));
     _timer = Timer.periodic(
       const Duration(seconds: 10),
       (_) => _refresh(silent: true),
@@ -2094,6 +2098,8 @@ class _DashboardPageState extends State<DashboardPage> {
           ],
         ),
         const SizedBox(height: 16),
+        _managerUpdatePanel(),
+        const SizedBox(height: 16),
         if (_diagnostics.isEmpty)
           _emptyCard(t('尚未运行诊断', 'Diagnostics have not run yet'))
         else
@@ -2112,45 +2118,368 @@ class _DashboardPageState extends State<DashboardPage> {
     ),
   );
 
+  Widget _managerUpdatePanel() {
+    final saved = _settings.managerUpdate;
+    final protocol = saved.protocol;
+    final state = saved.state;
+    final stateLabel = switch (state) {
+      'downloaded' => t('已下载并验证', 'Downloaded and verified'),
+      'scheduled' => t(
+        '已计划，等待 Manager 退出',
+        'Scheduled; waiting for Manager exit',
+      ),
+      'waiting_for_exit' => t('等待 Manager 退出', 'Waiting for Manager exit'),
+      'installing' => t('正在安装', 'Installing'),
+      'succeeded' => t('更新成功', 'Update succeeded'),
+      'rolled_back' => t('已回滚', 'Rolled back'),
+      'failed' => t('更新失败', 'Update failed'),
+      _ => t('空闲', 'Idle'),
+    };
+    final stateColor = switch (state) {
+      'succeeded' => Colors.green,
+      'rolled_back' => Colors.orange,
+      'failed' => Colors.red,
+      'scheduled' || 'waiting_for_exit' || 'installing' => Colors.blue,
+      _ => Theme.of(context).colorScheme.primary,
+    };
+    final disabled = _managerUpdateBusy || _managerExitCountdown != null;
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    t('LinkLake Manager 自更新', 'LinkLake Manager self-update'),
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
+                ),
+                Chip(
+                  avatar: Icon(Icons.circle, size: 12, color: stateColor),
+                  label: Text(stateLabel),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(
+              t(
+                '检查仅比较发行版；下载会通过 Rust 更新器验证 Ed25519 签名、SHA-256、平台与归档内容。',
+                'Check only compares releases. Download delegates Ed25519, SHA-256, platform, and archive validation to the Rust updater.',
+              ),
+            ),
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                OutlinedButton.icon(
+                  onPressed: disabled ? null : _checkManagerUpdate,
+                  icon: const Icon(Icons.manage_search_outlined),
+                  label: Text(t('检查 Manager 更新', 'Check Manager update')),
+                ),
+                OutlinedButton.icon(
+                  onPressed: disabled
+                      ? null
+                      : () => _runManagerUpdate('download'),
+                  icon: const Icon(Icons.download_for_offline_outlined),
+                  label: Text(
+                    t('下载并验证 Manager', 'Download and verify Manager'),
+                  ),
+                ),
+                FilledButton.icon(
+                  onPressed: disabled
+                      ? null
+                      : () => _confirmManagerUpdate('apply'),
+                  icon: const Icon(Icons.system_update_alt),
+                  label: Text(t('安装 Manager 更新', 'Install Manager update')),
+                ),
+                OutlinedButton.icon(
+                  onPressed: disabled
+                      ? null
+                      : () => _confirmManagerUpdate('rollback'),
+                  icon: const Icon(Icons.settings_backup_restore),
+                  label: Text(t('回滚 Manager', 'Rollback Manager')),
+                ),
+                OutlinedButton.icon(
+                  onPressed: disabled
+                      ? null
+                      : () => _refreshManagerUpdateStatus(),
+                  icon: const Icon(Icons.fact_check_outlined),
+                  label: Text(t('Manager 更新状态', 'Manager update status')),
+                ),
+              ],
+            ),
+            if (_managerUpdateBusy) ...[
+              const SizedBox(height: 12),
+              const LinearProgressIndicator(),
+            ],
+            if (_managerExitCountdown case final seconds?) ...[
+              const SizedBox(height: 12),
+              Text(
+                t(
+                  '更新助手已验证 PID 与进程身份。Manager 将在 $seconds 秒后退出。',
+                  'The updater verified the PID and process identity. Manager exits in $seconds seconds.',
+                ),
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.error,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+            if (saved.statusPath case final path?) ...[
+              const SizedBox(height: 12),
+              Text(t('状态路径', 'Status path')),
+              SelectableText(path),
+            ],
+            if (protocol['manager_process_id'] case final processId?) ...[
+              const SizedBox(height: 8),
+              SelectableText(
+                'manager_process_id=$processId\n'
+                'manager_process_identity=${protocol['manager_process_identity']}\n'
+                'exit_deadline_unix_seconds=${protocol['exit_deadline_unix_seconds']}',
+              ),
+            ],
+            if (protocol['message'] case final message?) ...[
+              const SizedBox(height: 8),
+              Text(message.toString()),
+            ],
+            if (protocol['error'] case final error?) ...[
+              const SizedBox(height: 8),
+              SelectableText(
+                error.toString(),
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  ManagerUpdateProtocol _managerUpdateProtocol() {
+    final statusPath = _settings.managerUpdate.statusPath;
+    return ManagerUpdateProtocol(
+      clientExecutable: _clientBinary(),
+      installDirectory: _managerInstallDirectory(),
+      currentReleaseVersion: managerReleaseVersion,
+      stateDirectory: statusPath == null ? null : File(statusPath).parent.path,
+    );
+  }
+
+  String _managerInstallDirectory() {
+    final executableDirectory = File(Platform.resolvedExecutable).parent;
+    if (!Platform.isMacOS) return executableDirectory.path;
+    final contentsDirectory = executableDirectory.parent;
+    final appBundle = contentsDirectory.parent;
+    return appBundle.parent.path;
+  }
+
+  Future<void> _persistManagerUpdateResponse(
+    Map<String, Object?> response,
+  ) async {
+    final updated = _settings.copyWith(
+      managerUpdate: _settings.managerUpdate.withProtocol(response),
+    );
+    await _applyDashboardSettings(updated);
+  }
+
+  Future<String?> _fetchLatestManagerRelease() async {
+    final releaseClient = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 10);
+    try {
+      final request = await releaseClient.getUrl(
+        Uri.parse(
+          'https://api.github.com/repos/ASL-Vanity/LinkLake/releases?per_page=30',
+        ),
+      );
+      request.headers.set(
+        HttpHeaders.userAgentHeader,
+        'LinkLake-Manager/$managerVersion',
+      );
+      final response = await request.close().timeout(
+        const Duration(seconds: 15),
+      );
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw HttpException(
+          'GitHub releases returned HTTP ${response.statusCode}',
+        );
+      }
+      final decoded = jsonDecode(await utf8.decoder.bind(response).join());
+      if (decoded is! List) {
+        throw const FormatException(
+          'GitHub releases returned a non-list value.',
+        );
+      }
+      return selectLatestReleaseTag(decoded, managerReleaseVersion);
+    } finally {
+      releaseClient.close(force: true);
+    }
+  }
+
+  Future<void> _checkManagerUpdate() async {
+    setState(() => _managerUpdateBusy = true);
+    try {
+      final latest = await _fetchLatestManagerRelease();
+      final status = await _managerUpdateProtocol().status();
+      if (!mounted) return;
+      _latestRelease = latest;
+      _updateAvailable = latest == null
+          ? null
+          : isReleaseNewer(latest, managerReleaseVersion);
+      await _persistManagerUpdateResponse(status);
+      if (!mounted) return;
+      setState(
+        () => _diagnostics['manager_update_check'] = {
+          'current_release': managerReleaseVersion,
+          'latest_release': latest,
+          'update_available': _updateAvailable,
+          'local_status': status,
+          'note': t(
+            '实际下载仍由签名更新器重新选择并验证候选版本。',
+            'The signed updater selects and validates the candidate again during download.',
+          ),
+        },
+      );
+    } catch (error) {
+      if (mounted) {
+        setState(
+          () => _diagnostics['manager_update_error'] = {
+            'action': 'check',
+            'error': error.toString(),
+          },
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _managerUpdateBusy = false);
+    }
+  }
+
+  Future<void> _refreshManagerUpdateStatus({bool silent = false}) async {
+    if (_managerUpdateBusy) return;
+    if (!silent && mounted) setState(() => _managerUpdateBusy = true);
+    try {
+      final response = await _managerUpdateProtocol().status();
+      if (!mounted) return;
+      await _persistManagerUpdateResponse(response);
+    } catch (error) {
+      if (!silent && mounted) {
+        setState(
+          () => _diagnostics['manager_update_error'] = {
+            'action': 'status',
+            'error': error.toString(),
+          },
+        );
+      }
+    } finally {
+      if (!silent && mounted) setState(() => _managerUpdateBusy = false);
+    }
+  }
+
+  Future<void> _confirmManagerUpdate(String action) async {
+    final rollback = action == 'rollback';
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(
+          rollback
+              ? t('确认回滚 Manager', 'Confirm Manager rollback')
+              : t('确认安装 Manager 更新', 'Confirm Manager update'),
+        ),
+        content: Text(
+          t(
+            'Rust 更新助手会校验当前 PID 与进程身份。计划成功后将保存状态路径，并在倒计时后真正退出 Manager；不会最小化到托盘。',
+            'The Rust helper verifies the current PID and process identity. After scheduling, Manager saves the status path and exits after the countdown instead of minimizing to the tray.',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: Text(t('取消', 'Cancel')),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: Text(rollback ? t('回滚', 'Rollback') : t('安装', 'Install')),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) await _runManagerUpdate(action);
+  }
+
+  Future<void> _runManagerUpdate(String action) async {
+    setState(() => _managerUpdateBusy = true);
+    try {
+      final protocol = _managerUpdateProtocol();
+      final response = switch (action) {
+        'download' => await protocol.download(),
+        'apply' => await protocol.apply(),
+        'rollback' => await protocol.rollback(),
+        _ => await protocol.status(),
+      };
+      if (!mounted) return;
+      await _persistManagerUpdateResponse(response);
+      if (!mounted) return;
+      setState(
+        () => _diagnostics['manager_update'] = {
+          'action': action,
+          'response': response,
+          'status_path': _settings.managerUpdate.statusPath,
+        },
+      );
+      if ((action == 'apply' || action == 'rollback') &&
+          response['requires_manager_exit'] == true) {
+        await _exitForScheduledManagerUpdate(response);
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(
+          () => _diagnostics['manager_update_error'] = {
+            'action': action,
+            'error': error.toString(),
+          },
+        );
+      }
+    } finally {
+      if (mounted && _managerExitCountdown == null) {
+        setState(() => _managerUpdateBusy = false);
+      }
+    }
+  }
+
+  Future<void> _exitForScheduledManagerUpdate(
+    Map<String, Object?> response,
+  ) async {
+    final deadline = response['exit_deadline_unix_seconds']! as int;
+    final remaining = deadline - DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    var countdown = math.min(3, math.max(1, remaining));
+    while (countdown > 0 && mounted) {
+      setState(() => _managerExitCountdown = countdown);
+      await Future<void>.delayed(const Duration(seconds: 1));
+      countdown--;
+    }
+    if (!mounted) return;
+    final lifecycle = widget.desktopLifecycle;
+    if (lifecycle == null) {
+      throw StateError(
+        'Desktop lifecycle is required for Manager self-update.',
+      );
+    }
+    await lifecycle.exitApplication();
+  }
+
   Future<void> _runDiagnostics() async {
     final started = DateTime.now();
     try {
       final health = await widget.api.getObject('/api/v1/health');
       final status = await widget.api.getObject('/api/v1/status');
       final channels = await widget.api.getObject('/api/v1/alerts/channels');
-      final releaseClient = HttpClient()
-        ..connectionTimeout = const Duration(seconds: 10);
-      try {
-        final request = await releaseClient.getUrl(
-          Uri.parse(
-            'https://api.github.com/repos/ASL-Vanity/LinkLake/releases?per_page=30',
-          ),
-        );
-        request.headers.set(
-          HttpHeaders.userAgentHeader,
-          'LinkLake-Manager/$managerVersion',
-        );
-        final response = await request.close().timeout(
-          const Duration(seconds: 15),
-        );
-        if (response.statusCode < 200 || response.statusCode >= 300) {
-          throw HttpException(
-            'GitHub releases returned HTTP ${response.statusCode}',
-          );
-        }
-        final decoded = jsonDecode(await utf8.decoder.bind(response).join());
-        if (decoded is List) {
-          _latestRelease = selectLatestReleaseTag(
-            decoded,
-            managerReleaseVersion,
-          );
-          _updateAvailable = _latestRelease == null
-              ? null
-              : isReleaseNewer(_latestRelease!, managerReleaseVersion);
-        }
-      } finally {
-        releaseClient.close(force: true);
-      }
+      _latestRelease = await _fetchLatestManagerRelease();
+      _updateAvailable = _latestRelease == null
+          ? null
+          : isReleaseNewer(_latestRelease!, managerReleaseVersion);
       if (!mounted) return;
       setState(
         () => _diagnostics = {

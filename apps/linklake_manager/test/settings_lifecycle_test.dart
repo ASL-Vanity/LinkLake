@@ -99,6 +99,36 @@ void main() {
     expect(await File('$path.tmp').exists(), isFalse);
   });
 
+  test('Manager update schema and status path survive restart', () async {
+    final directory = await Directory.systemTemp.createTemp(
+      'linklake-manager-',
+    );
+    addTearDown(() => directory.delete(recursive: true));
+    final path = '${directory.path}/settings.json';
+    final store = ManagerSettingsStore(path: path);
+    const protocol = <String, dynamic>{
+      'schema_version': 2,
+      'state': 'scheduled',
+      'operation': 'apply',
+      'manager_process_id': 4242,
+      'manager_process_identity': '4242:1785700000',
+      'requires_manager_exit': true,
+    };
+    await store.save(
+      const ManagerSettings(
+        managerUpdate: ManagerUpdateUiState(
+          statusPath: r'C:\state\manager-status.json',
+          protocol: protocol,
+        ),
+      ),
+    );
+
+    final loaded = await store.load();
+    expect(loaded.managerUpdate.statusPath, r'C:\state\manager-status.json');
+    expect(loaded.managerUpdate.protocol, protocol);
+    expect(loaded.managerUpdate.state, 'scheduled');
+  });
+
   test(
     'desktop close-to-tray and explicit exit are independently testable',
     () async {

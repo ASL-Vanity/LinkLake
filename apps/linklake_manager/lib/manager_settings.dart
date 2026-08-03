@@ -40,6 +40,45 @@ class WindowPreferences {
   }
 }
 
+class ManagerUpdateUiState {
+  const ManagerUpdateUiState({
+    this.statusPath,
+    this.protocol = const <String, dynamic>{},
+  });
+
+  final String? statusPath;
+  final Map<String, dynamic> protocol;
+
+  String get state =>
+      protocol['state']?.toString() ??
+      (protocol.containsKey('staged_directory') ? 'downloaded' : 'idle');
+
+  Map<String, dynamic> toJson() => {
+    'status_path': statusPath,
+    'protocol': protocol,
+  };
+
+  static ManagerUpdateUiState fromJson(Object? value) {
+    if (value is! Map) return const ManagerUpdateUiState();
+    final map = Map<String, dynamic>.from(value);
+    final protocolValue = map['protocol'];
+    return ManagerUpdateUiState(
+      statusPath: map['status_path']?.toString(),
+      protocol: protocolValue is Map
+          ? Map<String, dynamic>.from(protocolValue)
+          : const <String, dynamic>{},
+    );
+  }
+
+  ManagerUpdateUiState withProtocol(Map<String, Object?> value) {
+    final next = Map<String, dynamic>.from(value);
+    return ManagerUpdateUiState(
+      statusPath: next['status_file']?.toString() ?? statusPath,
+      protocol: next,
+    );
+  }
+}
+
 class ManagerSettings {
   const ManagerSettings({
     this.chinese = true,
@@ -49,6 +88,7 @@ class ManagerSettings {
     this.launchAtStartup = false,
     this.rememberWindow = true,
     this.window = const WindowPreferences(),
+    this.managerUpdate = const ManagerUpdateUiState(),
   });
 
   final bool chinese;
@@ -58,6 +98,7 @@ class ManagerSettings {
   final bool launchAtStartup;
   final bool rememberWindow;
   final WindowPreferences window;
+  final ManagerUpdateUiState managerUpdate;
 
   ManagerSettings copyWith({
     bool? chinese,
@@ -67,6 +108,7 @@ class ManagerSettings {
     bool? launchAtStartup,
     bool? rememberWindow,
     WindowPreferences? window,
+    ManagerUpdateUiState? managerUpdate,
   }) => ManagerSettings(
     chinese: chinese ?? this.chinese,
     themeMode: themeMode ?? this.themeMode,
@@ -75,6 +117,7 @@ class ManagerSettings {
     launchAtStartup: launchAtStartup ?? this.launchAtStartup,
     rememberWindow: rememberWindow ?? this.rememberWindow,
     window: window ?? this.window,
+    managerUpdate: managerUpdate ?? this.managerUpdate,
   );
 
   Map<String, dynamic> toJson() => {
@@ -85,6 +128,7 @@ class ManagerSettings {
     'launch_at_startup': launchAtStartup,
     'remember_window': rememberWindow,
     'window': window.toJson(),
+    'manager_update': managerUpdate.toJson(),
   };
 
   static ManagerSettings fromJson(Object? value) {
@@ -106,6 +150,7 @@ class ManagerSettings {
       launchAtStartup: map['launch_at_startup'] == true,
       rememberWindow: map['remember_window'] != false,
       window: WindowPreferences.fromJson(map['window']),
+      managerUpdate: ManagerUpdateUiState.fromJson(map['manager_update']),
     );
   }
 }
