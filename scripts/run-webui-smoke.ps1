@@ -30,7 +30,7 @@ $controlPrivateKey = Join-Path $projectRoot '.tmp-tls-test\control-key.pem'
 $serverProcess = $null
 
 if (-not (Test-Path -LiteralPath $controlCertificate) -or -not (Test-Path -LiteralPath $controlPrivateKey)) {
-    throw 'WebUI 冒烟测试需要 .tmp-tls-test 中的 localhost 控制通道证书与私钥'
+    throw 'WebUI smoke test requires localhost control certificate and key files in .tmp-tls-test.'
 }
 
 function Remove-SmokeData {
@@ -39,7 +39,7 @@ function Remove-SmokeData {
     $resolved = (Resolve-Path -LiteralPath $Path).Path
     $expectedParent = (Resolve-Path -LiteralPath $projectRoot).Path
     if ((Split-Path -Parent $resolved) -ne $expectedParent -or (Split-Path -Leaf $resolved) -ne '.tmp-webui-smoke-data') {
-        throw "拒绝删除意外路径：$resolved"
+        throw "Refusing to delete unexpected smoke data path: $resolved"
     }
     Remove-Item -LiteralPath $resolved -Recurse -Force
 }
@@ -50,7 +50,7 @@ function Reset-SmokeOutput {
     $resolved = (Resolve-Path -LiteralPath $Path).Path
     $expectedParent = [System.IO.Path]::GetFullPath((Join-Path $projectRoot 'target'))
     if ((Split-Path -Parent $resolved) -ne $expectedParent -or (Split-Path -Leaf $resolved) -ne $OutputName) {
-        throw "拒绝删除意外的 WebUI 输出路径：$resolved"
+        throw "Refusing to delete unexpected WebUI output path: $resolved"
     }
     Remove-Item -LiteralPath $resolved -Recurse -Force
 }
@@ -102,23 +102,23 @@ try {
 
     $ready = $false
     for ($attempt = 0; $attempt -lt 100; $attempt++) {
-        if ($serverProcess.HasExited) { throw "LinkLake 服务提前退出，代码 $($serverProcess.ExitCode)" }
+        if ($serverProcess.HasExited) { throw "LinkLake server exited early with code $($serverProcess.ExitCode)" }
         try {
             $health = Invoke-RestMethod -Uri "$baseUrl/api/v1/health" -TimeoutSec 1
             if ($health.status -eq 'ok') { $ready = $true; break }
         } catch {}
         Start-Sleep -Milliseconds 100
     }
-    if (-not $ready) { throw '等待 LinkLake 本地服务启动超时' }
+    if (-not $ready) { throw 'Timed out waiting for the LinkLake local server.' }
 
     $enrollmentHeaders = @{ Authorization = "Bearer $enrollmentToken" }
     $managementHeaders = @{ Authorization = "Bearer $managementToken" }
     $portPolicy = Invoke-RestMethod -Uri "$baseUrl/api/v1/public-port-policy" -Headers $managementHeaders
     if ($portPolicy.tcp_allowed -ne '18080-18081,32900-32999' -or $portPolicy.udp_allowed -ne '18080-18081,32900-32999') {
-        throw "公网端口允许策略未按服务端配置返回：$($portPolicy | ConvertTo-Json -Compress)"
+        throw "Public port policy did not match server configuration: $($portPolicy | ConvertTo-Json -Compress)"
     }
     if ([string]$portPolicy.tcp_reserved -notmatch '18081') {
-        throw "TCP 保留端口策略未包含显式保留端口：$($portPolicy.tcp_reserved)"
+        throw "TCP reserved-port policy omitted the configured port: $($portPolicy.tcp_reserved)"
     }
     $client = Invoke-LinkLakeJson -Method Post -Path '/api/v1/clients/enroll' -Headers $enrollmentHeaders -Body @{ name = 'smoke-client'; platform = 'windows' }
     $clientId = [string]$client.client_id
@@ -152,7 +152,7 @@ try {
     $env:LINKLAKE_SMOKE_OUTPUT = $outputDir
     $node = 'C:\Users\Laker\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe'
     & $node (Join-Path $PSScriptRoot 'webui-smoke.mjs')
-    if ($LASTEXITCODE -ne 0) { throw "WebUI $BrowserLabel 冒烟测试失败，退出码 $LASTEXITCODE" }
+    if ($LASTEXITCODE -ne 0) { throw "WebUI $BrowserLabel smoke test failed with exit code $LASTEXITCODE" }
 } finally {
     if (-not $KeepServer -and $serverProcess -and -not $serverProcess.HasExited) {
         $serverProcess.Kill()
