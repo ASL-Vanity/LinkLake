@@ -321,6 +321,50 @@ void main() {
     expect(find.byKey(const Key('delete-socks5-proxy-1')), findsNothing);
   });
 
+  testWidgets('SOCKS5 capability boundaries are explanatory only', (
+    tester,
+  ) async {
+    final api = FakeLinkLakeApi();
+    await tester.pumpWidget(
+      policyHarness(
+        api: api,
+        kind: PolicyKind.socks5,
+        policies: const [
+          {
+            'id': 'proxy-capabilities',
+            'name': 'capability-check',
+            'client_id': 'client-1',
+            'public_port': 32101,
+            'username': 'viewer',
+            'enabled': true,
+            'online': true,
+            'capabilities': {
+              'connect': true,
+              'udp_associate': true,
+              'bind': false,
+              'udp_fragmentation': false,
+            },
+          },
+        ],
+      ),
+    );
+
+    expect(
+      find.byKey(const Key('socks5-capabilities-proxy-capabilities')),
+      findsOneWidget,
+    );
+    expect(find.textContaining('UDP ASSOCIATE are available'), findsOneWidget);
+    expect(find.textContaining('BIND and UDP FRAG'), findsOneWidget);
+    expect(
+      PolicyKind.socks5.fields.map((field) => field.name),
+      isNot(contains('bind')),
+    );
+    expect(
+      PolicyKind.socks5.fields.map((field) => field.name),
+      isNot(contains('udp_fragmentation')),
+    );
+  });
+
   testWidgets('API failures surface as local error feedback', (tester) async {
     final api = FakeLinkLakeApi();
     api.failures['/api/v1/tcp-tunnels/tcp-1/enabled'] = const FormatException(

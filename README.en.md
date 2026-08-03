@@ -20,6 +20,7 @@ The current release completes production TCP and UDP, multi-port/range forwardin
 
 - [Docker Compose](deploy/docker-compose.yml) includes LinkLake, Prometheus, and Grafana. `/api/v1/metrics/prometheus` requires Bearer authentication and exports `linklake_` metrics.
 - The [deployment guide](docs/deployment.md) covers Nginx, Caddy, Cloudflare DNS-only/proxy boundaries, least-privilege DNS tokens, DEB/RPM, and container certificate requirements.
+- The [SOCKS5 supported-boundaries guide](docs/socks5-supported-boundaries.en.md) documents CONNECT, optional UDP ASSOCIATE, deterministic BIND rejection, and UDP FRAG dropping semantics.
 - Linux release assets include `.deb`, `.rpm`, and SHA-256 files. The idempotent Cloudflare DNS helper is `scripts/cloudflare-dns-upsert.ps1`.
 
 ## Production TCP capabilities

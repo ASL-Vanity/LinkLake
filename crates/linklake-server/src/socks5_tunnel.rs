@@ -10,7 +10,7 @@ use crate::{
 use bytes::Bytes;
 use linklake_core::{
     read_control_frame, read_udp_data_plane_control_frame,
-    socks5_udp::decode_socks5_udp_datagram,
+    socks5_udp::{decode_socks5_udp_datagram, Socks5UdpError},
     udp_protocol::{fragment_datagram, UdpDirection, UdpFragment, MAX_UDP_DATAGRAM_BYTES},
     udp_reassembly::{UdpReassembler, UdpReassemblyConfig, UdpReassemblyOutcome},
     write_control_frame, write_udp_data_plane_control_frame, BoxedIo, ControlFrame,
@@ -52,6 +52,7 @@ pub(crate) struct Socks5ProxyStatistics {
     pub(crate) authentication_failures: AtomicU64,
     pub(crate) rejected_connections: AtomicU64,
     pub(crate) unsupported_commands: AtomicU64,
+    pub(crate) bind_rejected_total: AtomicU64,
     pub(crate) handshake_errors: AtomicU64,
     pub(crate) handshake_timeouts: AtomicU64,
     pub(crate) bytes_from_public: AtomicU64,
@@ -67,6 +68,7 @@ pub(crate) struct Socks5ProxyStatistics {
     pub(crate) udp_bytes_to_public: AtomicU64,
     pub(crate) udp_dropped_datagrams: AtomicU64,
     pub(crate) udp_dropped_bandwidth_limit: AtomicU64,
+    pub(crate) udp_fragmentation_unsupported_total: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -83,10 +85,10 @@ struct PublicConnectionContext {
     udp: Option<Arc<UdpProxyContext>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 enum HandshakeError {
     Authentication,
-    UnsupportedCommand,
+    UnsupportedCommand { command: u8 },
     Protocol,
 }
 
@@ -438,8 +440,7 @@ async fn run_udp_runtime(
             incoming = socket.recv_from(&mut receive_buffer) => {
                 let (received, source) = incoming?;
                 let encoded = &receive_buffer[..received];
-                if decode_socks5_udp_datagram(encoded).is_err() {
-                    statistics.udp_dropped_datagrams.fetch_add(1, Ordering::Relaxed);
+                if !accept_socks5_udp_datagram(encoded, &statistics) {
                     continue;
                 }
                 let Some(session_id) = association_for_source(&context.associations, source) else {
@@ -500,8 +501,7 @@ async fn run_udp_runtime(
                         continue;
                     }
                 };
-                if decode_socks5_udp_datagram(&payload).is_err() {
-                    statistics.udp_dropped_datagrams.fetch_add(1, Ordering::Relaxed);
+                if !accept_socks5_udp_datagram(&payload, &statistics) {
                     continue;
                 }
                 let endpoint = context.associations
@@ -684,11 +684,8 @@ async fn serve_public_connection(
             finish_connection(&context.statistics);
             return;
         }
-        Ok(Err(HandshakeError::UnsupportedCommand)) => {
-            context
-                .statistics
-                .unsupported_commands
-                .fetch_add(1, Ordering::Relaxed);
+        Ok(Err(HandshakeError::UnsupportedCommand { command })) => {
+            record_unsupported_command(&context.statistics, command);
             finish_connection(&context.statistics);
             return;
         }
@@ -1065,10 +1062,38 @@ async fn perform_handshake(
             let _ = write_socks5_reply(stream, 0x08).await;
             Err(HandshakeError::Protocol)
         }
-        _ => {
+        command => {
             let _ = write_socks5_reply(stream, 0x07).await;
             let _ = stream.shutdown().await;
-            Err(HandshakeError::UnsupportedCommand)
+            Err(HandshakeError::UnsupportedCommand { command })
+        }
+    }
+}
+
+fn record_unsupported_command(statistics: &Socks5ProxyStatistics, command: u8) {
+    statistics
+        .unsupported_commands
+        .fetch_add(1, Ordering::Relaxed);
+    if command == 0x02 {
+        statistics
+            .bind_rejected_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn accept_socks5_udp_datagram(encoded: &[u8], statistics: &Socks5ProxyStatistics) -> bool {
+    match decode_socks5_udp_datagram(encoded) {
+        Ok(_) => true,
+        Err(error) => {
+            statistics
+                .udp_dropped_datagrams
+                .fetch_add(1, Ordering::Relaxed);
+            if error == Socks5UdpError::FragmentationUnsupported {
+                statistics
+                    .udp_fragmentation_unsupported_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            false
         }
     }
 }
@@ -1209,6 +1234,22 @@ mod tests {
         }
     }
 
+    async fn authenticate_test_client(client: &mut TcpStream, username: &[u8], password: &[u8]) {
+        client.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+        let mut method = [0_u8; 2];
+        client.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [0x05, 0x02]);
+
+        let mut auth = vec![0x01, username.len() as u8];
+        auth.extend_from_slice(username);
+        auth.push(password.len() as u8);
+        auth.extend_from_slice(password);
+        client.write_all(&auth).await.unwrap();
+        let mut auth_reply = [0_u8; 2];
+        client.read_exact(&mut auth_reply).await.unwrap();
+        assert_eq!(auth_reply, [0x01, 0x00]);
+    }
+
     #[test]
     fn first_udp_datagram_binds_the_only_matching_association() {
         let id = Uuid::new_v4();
@@ -1283,19 +1324,7 @@ mod tests {
         });
 
         let mut client = TcpStream::connect(address).await.unwrap();
-        client.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
-        let mut method = [0_u8; 2];
-        client.read_exact(&mut method).await.unwrap();
-        assert_eq!(method, [0x05, 0x02]);
-
-        let mut auth = vec![0x01, 0x05];
-        auth.extend_from_slice(b"admin");
-        auth.push(password.len() as u8);
-        auth.extend_from_slice(password.as_bytes());
-        client.write_all(&auth).await.unwrap();
-        let mut auth_reply = [0_u8; 2];
-        client.read_exact(&mut auth_reply).await.unwrap();
-        assert_eq!(auth_reply, [0x01, 0x00]);
+        authenticate_test_client(&mut client, b"admin", password.as_bytes()).await;
 
         client
             .write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0x9c, 0x40])
@@ -1310,6 +1339,56 @@ mod tests {
                 })
             }
         );
+    }
+
+    #[tokio::test]
+    async fn bind_is_deterministically_rejected_with_command_not_supported() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let password = format!("llp_{}", "b".repeat(64));
+        let password_hash = format!("{:x}", Sha256::digest(password.as_bytes()));
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            perform_handshake(&mut stream, b"admin", &password_hash).await
+        });
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        authenticate_test_client(&mut client, b"admin", password.as_bytes()).await;
+        client
+            .write_all(&[0x05, 0x02, 0x00, 0x01, 127, 0, 0, 1, 0, 80])
+            .await
+            .unwrap();
+        let mut reply = [0_u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[0], 0x05);
+        assert_eq!(reply[1], 0x07);
+        assert_eq!(
+            server.await.unwrap(),
+            Err(HandshakeError::UnsupportedCommand { command: 0x02 })
+        );
+    }
+
+    #[test]
+    fn unsupported_bind_and_udp_fragmentation_have_independent_counters() {
+        let statistics = Socks5ProxyStatistics::default();
+        record_unsupported_command(&statistics, 0x02);
+        record_unsupported_command(&statistics, 0x04);
+        assert_eq!(statistics.unsupported_commands.load(Ordering::Relaxed), 2);
+        assert_eq!(statistics.bind_rejected_total.load(Ordering::Relaxed), 1);
+
+        let valid = [0, 0, 0, 1, 127, 0, 0, 1, 0, 53];
+        let fragmented = [0, 0, 1, 1, 127, 0, 0, 1, 0, 53];
+        let malformed = [1, 0, 0, 1, 127, 0, 0, 1, 0, 53];
+        assert!(accept_socks5_udp_datagram(&valid, &statistics));
+        assert!(!accept_socks5_udp_datagram(&fragmented, &statistics));
+        assert!(!accept_socks5_udp_datagram(&malformed, &statistics));
+        assert_eq!(
+            statistics
+                .udp_fragmentation_unsupported_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(statistics.udp_dropped_datagrams.load(Ordering::Relaxed), 2);
     }
 
     #[test]
