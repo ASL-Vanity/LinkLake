@@ -1173,6 +1173,11 @@ class _DashboardPageState extends State<DashboardPage> {
         Icons.http,
       ),
       (
+        t('gRPC 活跃流', 'gRPC streams'),
+        '${_metrics['grpc_active_streams'] ?? 0}',
+        Icons.multiple_stop,
+      ),
+      (
         t('P2P 直连', 'P2P direct'),
         '${_metrics['p2p_direct_connections_total'] ?? 0}',
         Icons.hub,

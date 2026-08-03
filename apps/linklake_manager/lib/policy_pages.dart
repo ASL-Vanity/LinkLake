@@ -100,8 +100,8 @@ extension PolicyKindInfo on PolicyKind {
       zh ? '批量映射连续或离散的 TCP/UDP 端口' : 'Map ranges or lists of TCP/UDP ports',
     PolicyKind.http =>
       zh
-          ? '基于域名的 HTTP 路由和自动 HTTPS'
-          : 'Hostname routes with optional automatic HTTPS',
+          ? '基于域名的 HTTP/1.1、HTTP/2、gRPC 路由和自动 HTTPS'
+          : 'HTTP/1.1, HTTP/2 and gRPC hostname routes with optional HTTPS',
     PolicyKind.sni =>
       zh ? '不终止 TLS 的 SNI 透传路由' : 'TLS pass-through routing by SNI',
     PolicyKind.secret =>
@@ -556,6 +556,16 @@ class _PolicyPageState extends State<PolicyPage> {
             ),
             const SizedBox(height: 6),
             SelectableText(_endpoint(policy)),
+            if (widget.kind == PolicyKind.http) ...[
+              const SizedBox(height: 8),
+              Text(
+                _httpTransportCapabilityText(policy),
+                key: Key('http-transport-capabilities-${policy['id']}'),
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ],
             const SizedBox(height: 10),
             Wrap(
               spacing: 18,
@@ -912,6 +922,22 @@ class _PolicyPageState extends State<PolicyPage> {
       '${_clientName(policy['client_id'])} · ${policy['username']}@:${policy['public_port']}',
   };
 
+  String _httpTransportCapabilityText(Map<String, dynamic> policy) {
+    final capabilities = policy['capabilities'] is Map
+        ? Map<String, dynamic>.from(policy['capabilities'] as Map)
+        : const <String, dynamic>{};
+    if (capabilities['http2'] == true && capabilities['grpc'] == true) {
+      return t(
+        '公网支持 HTTP/1.1 与 HTTP/2；原生 gRPC 使用复用的 h2c 后端连接池，HTTPS 通过 ALPN 协商 h2。',
+        'Public HTTP/1.1 and HTTP/2 are supported. Native gRPC uses a pooled h2c backend, and HTTPS negotiates h2 with ALPN.',
+      );
+    }
+    return t(
+      '当前服务端未报告 HTTP/2 与 gRPC 能力。',
+      'The server did not report HTTP/2 and gRPC capabilities.',
+    );
+  }
+
   List<(String, String)> _stats(
     Map<String, dynamic> policy,
   ) => switch (widget.kind) {
@@ -956,7 +982,19 @@ class _PolicyPageState extends State<PolicyPage> {
         '${policy['active_connections'] ?? 0}/${policy['max_connections'] ?? 0}',
       ),
       (t('请求', 'Requests'), '${policy['requests_total'] ?? 0}'),
-      (t('失败', 'Failed'), '${policy['failed_requests'] ?? 0}'),
+      (
+        'H2',
+        '${policy['http2_active_streams'] ?? 0}/${policy['http2_requests_total'] ?? 0}',
+      ),
+      ('gRPC', '${policy['grpc_requests_total'] ?? 0}'),
+      (
+        t('复用', 'Reuse'),
+        '${policy['http2_backend_reused_total'] ?? 0}/${policy['http2_backend_connections_total'] ?? 0}',
+      ),
+      (
+        t('失败', 'Failed'),
+        '${(policy['failed_requests'] as num? ?? 0) + (policy['grpc_failures_total'] as num? ?? 0)}',
+      ),
       (
         t('证书', 'Certificate'),
         '${(policy['tls'] as Map?)?['status'] ?? 'disabled'}',

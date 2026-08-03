@@ -80,7 +80,7 @@ impl CertificateManager {
         let mut config = ServerConfig::builder()
             .with_no_client_auth()
             .with_cert_resolver(self.resolver.clone());
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         Arc::new(config)
     }
 
@@ -693,6 +693,21 @@ mod tests {
     fn empty_dynamic_resolver_rejects_unknown_names() {
         let resolver = DynamicCertResolver::default();
         assert!(!resolver.contains("unknown.example.com"));
+    }
+
+    #[test]
+    fn https_tls_config_prefers_http2_and_keeps_http1_fallback() {
+        let directory = std::env::temp_dir().join(format!(
+            "linklake-certificate-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let manager = CertificateManager::new(directory.clone()).expect("manager should open");
+        let config = manager.tls_config();
+        assert_eq!(
+            config.alpn_protocols,
+            [b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]

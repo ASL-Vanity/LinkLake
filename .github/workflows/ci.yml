@@ -143,6 +143,9 @@ jobs:
       - name: Run HTTP route and forward proxy end-to-end tests
         shell: powershell
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\http-e2e.ps1 -SkipBuild
+      - name: Run HTTP/2 and gRPC end-to-end tests
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\http2-grpc-e2e.ps1
       - name: Run managed configuration end-to-end tests
         shell: powershell
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\managed-config-e2e.ps1 -SkipBuild

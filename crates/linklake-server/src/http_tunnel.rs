@@ -1,23 +1,30 @@
 use crate::traffic_control::{TrafficDecision, TrafficPolicyKind};
 use crate::{
-    client_registry::Authentication, http_route_catalog::normalize_hostname, record_audit, AppState,
+    client_registry::Authentication,
+    http2_backend::{
+        BoxError, Http2BackendCounters, Http2BackendLease, Http2BackendPool, ProxyBody,
+    },
+    http_backend_pool::{BackendProtocol, BackendSecurity, OriginKey},
+    http_route_catalog::normalize_hostname,
+    record_audit, AppState,
 };
 use bytes::Bytes;
-use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
+use http_body_util::{BodyExt, Full};
 use hyper::{
     body::{Body, Frame, Incoming, SizeHint},
     client::conn::http1 as client_http1,
     header::{self, HeaderName, HeaderValue},
-    server::conn::http1 as server_http1,
     service::service_fn,
-    Request, Response, StatusCode,
+    Request, Response, StatusCode, Version,
 };
-use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo, TokioTimer},
+    server::conn::auto as server_auto,
+};
 use linklake_core::{read_control_frame, write_control_frame, BoxedIo, ControlFrame};
 use std::{
     collections::HashSet,
     convert::Infallible,
-    error::Error,
     future::Future,
     net::{IpAddr, SocketAddr},
     pin::Pin,
@@ -44,17 +51,22 @@ const BACKEND_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HTTP_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_PUBLIC_HTTP_CONNECTIONS: usize = 2048;
+const MAX_PUBLIC_HTTP2_STREAMS: u32 = 256;
 
 static PUBLIC_HTTP_CONNECTION_PERMITS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(MAX_PUBLIC_HTTP_CONNECTIONS)));
-
-type BoxError = Box<dyn Error + Send + Sync>;
-type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PublicScheme {
     Http,
     Https,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublicProtocol {
+    Auto,
+    Http1,
+    Http2,
 }
 
 impl PublicScheme {
@@ -80,6 +92,14 @@ pub(crate) struct HttpRouteStatistics {
     pub(crate) bytes_from_public: AtomicU64,
     pub(crate) bytes_to_public: AtomicU64,
     pub(crate) pairing_timeouts: AtomicU64,
+    pub(crate) http2_active_streams: AtomicUsize,
+    pub(crate) http2_requests_total: AtomicU64,
+    pub(crate) grpc_active_streams: AtomicUsize,
+    pub(crate) grpc_requests_total: AtomicU64,
+    pub(crate) grpc_trailers_total: AtomicU64,
+    pub(crate) grpc_failures_total: AtomicU64,
+    pub(crate) grpc_cancellations_total: AtomicU64,
+    pub(crate) http2_backend: Arc<Http2BackendCounters>,
 }
 
 struct HttpRouteContext {
@@ -89,12 +109,22 @@ struct HttpRouteContext {
     stop: watch::Receiver<()>,
     permits: Arc<Semaphore>,
     statistics: Arc<HttpRouteStatistics>,
+    http2_backend: Arc<Http2BackendPool>,
 }
 
 struct TrackedBody {
     inner: ProxyBody,
     _activity: Option<ConnectionActivity>,
+    _backend_lease: Option<Http2BackendLease>,
+    grpc: Option<GrpcBodyState>,
     stop: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+}
+
+struct GrpcBodyState {
+    statistics: Arc<HttpRouteStatistics>,
+    status_seen: bool,
+    failure_recorded: bool,
+    completed: bool,
 }
 
 struct ConnectionActivity {
@@ -102,8 +132,16 @@ struct ConnectionActivity {
     policy_id: Uuid,
     usage: Arc<AtomicU64>,
     statistics: Arc<HttpRouteStatistics>,
+    http2: bool,
+    grpc: bool,
     _route_permit: OwnedSemaphorePermit,
     _global_permit: OwnedSemaphorePermit,
+}
+
+#[derive(Clone, Copy)]
+struct RequestProtocols {
+    http2: bool,
+    grpc: bool,
 }
 
 struct PendingConnectionGuard {
@@ -126,6 +164,8 @@ impl TrackedBody {
             .body(Self {
                 inner: body,
                 _activity: None,
+                _backend_lease: None,
+                grpc: None,
                 stop: None,
             })
             .expect("static HTTP error response should build")
@@ -142,6 +182,8 @@ impl TrackedBody {
                 .body(Self {
                     inner: body,
                     _activity: None,
+                    _backend_lease: None,
+                    grpc: None,
                     stop: None,
                 })
                 .expect("HTTPS redirect response should build"),
@@ -153,6 +195,8 @@ impl TrackedBody {
         inner: ProxyBody,
         activity: Option<ConnectionActivity>,
         stop: Option<watch::Receiver<()>>,
+        backend_lease: Option<Http2BackendLease>,
+        grpc: Option<GrpcBodyState>,
     ) -> Self {
         let stop = stop.map(|mut stop| {
             Box::pin(async move {
@@ -162,7 +206,77 @@ impl TrackedBody {
         Self {
             inner,
             _activity: activity,
+            _backend_lease: backend_lease,
+            grpc,
             stop,
+        }
+    }
+}
+
+impl GrpcBodyState {
+    fn new(statistics: Arc<HttpRouteStatistics>, response: &Response<Incoming>) -> Self {
+        let mut state = Self {
+            statistics,
+            status_seen: false,
+            failure_recorded: false,
+            completed: false,
+        };
+        if response.status() != StatusCode::OK {
+            state.record_failure();
+        }
+        if response.headers().contains_key("grpc-status") {
+            state.record_trailers(response.headers());
+        }
+        state
+    }
+
+    fn record_trailers(&mut self, trailers: &hyper::HeaderMap) {
+        if !self.status_seen {
+            self.status_seen = true;
+            self.statistics
+                .grpc_trailers_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if trailers
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok())
+            != Some("0")
+        {
+            self.record_failure();
+        }
+    }
+
+    fn record_failure(&mut self) {
+        if !self.failure_recorded {
+            self.failure_recorded = true;
+            self.statistics
+                .grpc_failures_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn finish(&mut self) {
+        if !self.completed {
+            self.completed = true;
+            if !self.status_seen {
+                self.record_failure();
+            }
+        }
+    }
+
+    fn fail(&mut self) {
+        if !self.completed {
+            self.completed = true;
+            self.record_failure();
+        }
+    }
+
+    fn cancel(&mut self) {
+        if !self.completed {
+            self.completed = true;
+            self.statistics
+                .grpc_cancellations_total
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -173,6 +287,7 @@ impl ConnectionActivity {
         policy_id: Uuid,
         usage: Arc<AtomicU64>,
         statistics: Arc<HttpRouteStatistics>,
+        protocols: RequestProtocols,
         route_permit: OwnedSemaphorePermit,
         global_permit: OwnedSemaphorePermit,
     ) -> Self {
@@ -181,6 +296,8 @@ impl ConnectionActivity {
             policy_id,
             usage,
             statistics,
+            http2: protocols.http2,
+            grpc: protocols.grpc,
             _route_permit: route_permit,
             _global_permit: global_permit,
         }
@@ -198,10 +315,26 @@ impl Body for TrackedBody {
         if let Some(stop) = self.stop.as_mut() {
             if stop.as_mut().poll(context).is_ready() {
                 self.stop = None;
+                if let Some(grpc) = self.grpc.as_mut() {
+                    grpc.cancel();
+                }
                 return Poll::Ready(None);
             }
         }
-        Pin::new(&mut self.inner).poll_frame(context)
+        let result = Pin::new(&mut self.inner).poll_frame(context);
+        if let Some(grpc) = self.grpc.as_mut() {
+            match &result {
+                Poll::Ready(Some(Ok(frame))) => {
+                    if let Some(trailers) = frame.trailers_ref() {
+                        grpc.record_trailers(trailers);
+                    }
+                }
+                Poll::Ready(Some(Err(_))) => grpc.fail(),
+                Poll::Ready(None) => grpc.finish(),
+                Poll::Pending => {}
+            }
+        }
+        result
     }
 
     fn is_end_stream(&self) -> bool {
@@ -213,11 +346,29 @@ impl Body for TrackedBody {
     }
 }
 
+impl Drop for TrackedBody {
+    fn drop(&mut self) {
+        if let Some(grpc) = self.grpc.as_mut() {
+            grpc.cancel();
+        }
+    }
+}
+
 impl Drop for ConnectionActivity {
     fn drop(&mut self) {
         self.statistics
             .active_connections
             .fetch_sub(1, Ordering::Relaxed);
+        if self.http2 {
+            self.statistics
+                .http2_active_streams
+                .fetch_sub(1, Ordering::Relaxed);
+        }
+        if self.grpc {
+            self.statistics
+                .grpc_active_streams
+                .fetch_sub(1, Ordering::Relaxed);
+        }
         let bytes = self.usage.load(Ordering::Relaxed);
         if let Err(error) = self
             .state
@@ -276,7 +427,15 @@ pub(crate) async fn run_http_listener(
                 let state = state.clone();
                 tokio::spawn(async move {
                     let _connection_permit = connection_permit;
-                    serve_http_connection(state, stream, peer, PublicScheme::Http, None).await;
+                    serve_http_connection(
+                        state,
+                        stream,
+                        peer,
+                        PublicScheme::Http,
+                        PublicProtocol::Auto,
+                        None,
+                    )
+                    .await;
                 });
             }
             Err(error) => tracing::error!("HTTP listener accept error: {error}"),
@@ -341,6 +500,17 @@ pub(crate) async fn run_https_listener(
                     else {
                         return;
                     };
+                    let protocol = match tls_stream.get_ref().1.alpn_protocol() {
+                        Some(b"h2") => PublicProtocol::Http2,
+                        Some(b"http/1.1") | None => PublicProtocol::Http1,
+                        Some(protocol) => {
+                            tracing::debug!(
+                                alpn = %String::from_utf8_lossy(protocol),
+                                "HTTPS connection negotiated an unsupported ALPN"
+                            );
+                            return;
+                        }
+                    };
                     state
                         .metrics
                         .https_active_connections
@@ -350,6 +520,7 @@ pub(crate) async fn run_https_listener(
                         tls_stream,
                         peer,
                         PublicScheme::Https,
+                        protocol,
                         Some(server_name),
                     )
                     .await;
@@ -369,6 +540,7 @@ async fn serve_http_connection<S>(
     stream: S,
     peer: SocketAddr,
     scheme: PublicScheme,
+    protocol: PublicProtocol,
     tls_hostname: Option<String>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -380,17 +552,41 @@ async fn serve_http_connection<S>(
             Ok::<_, Infallible>(proxy_request(state, peer, scheme, tls_hostname, request).await)
         }
     });
-    let mut builder = server_http1::Builder::new();
+    let mut builder = server_auto::Builder::new(TokioExecutor::new());
     builder
+        .http1()
         .keep_alive(true)
         .max_buf_size(MAX_HTTP_BUFFER_BYTES)
         .timer(TokioTimer::new())
-        .header_read_timeout(HTTP_HEADER_READ_TIMEOUT);
-    if let Err(error) = builder
-        .serve_connection(TokioIo::new(stream), service)
-        .with_upgrades()
-        .await
-    {
+        .header_read_timeout(Some(HTTP_HEADER_READ_TIMEOUT));
+    builder
+        .http2()
+        .adaptive_window(true)
+        .max_concurrent_streams(Some(MAX_PUBLIC_HTTP2_STREAMS))
+        .keep_alive_interval(Some(Duration::from_secs(20)))
+        .keep_alive_timeout(Duration::from_secs(10))
+        .max_header_list_size(MAX_HTTP_BUFFER_BYTES as u32)
+        .timer(TokioTimer::new());
+    let result = match protocol {
+        PublicProtocol::Auto => {
+            builder
+                .serve_connection_with_upgrades(TokioIo::new(stream), service)
+                .await
+        }
+        PublicProtocol::Http1 => {
+            builder
+                .http1_only()
+                .serve_connection_with_upgrades(TokioIo::new(stream), service)
+                .await
+        }
+        PublicProtocol::Http2 => {
+            builder
+                .http2_only()
+                .serve_connection(TokioIo::new(stream), service)
+                .await
+        }
+    };
+    if let Err(error) = result {
         tracing::debug!("HTTP public connection ended: {error}");
     }
 }
@@ -402,6 +598,8 @@ async fn proxy_request(
     tls_hostname: Option<String>,
     mut request: Request<Incoming>,
 ) -> Response<TrackedBody> {
+    let public_version = request.version();
+    let public_http2 = public_version == Version::HTTP_2;
     if scheme == PublicScheme::Https {
         state
             .metrics
@@ -409,13 +607,44 @@ async fn proxy_request(
             .fetch_add(1, Ordering::Relaxed);
     }
     let mut host_values = request.headers().get_all(header::HOST).iter();
-    let Some(host) = host_values.next().and_then(|value| value.to_str().ok()) else {
-        return TrackedBody::plain(StatusCode::BAD_REQUEST, "missing Host header");
+    let host_header = match host_values.next() {
+        Some(value) => match value.to_str() {
+            Ok(value) => Some(value.trim().to_owned()),
+            Err(_) => return TrackedBody::plain(StatusCode::BAD_REQUEST, "invalid Host header"),
+        },
+        None => None,
     };
     if host_values.next().is_some() {
         return TrackedBody::plain(StatusCode::BAD_REQUEST, "multiple Host headers");
     }
-    let original_host = host.trim().to_owned();
+    let request_authority = request
+        .uri()
+        .authority()
+        .map(|authority| authority.as_str().trim().to_owned());
+    if let (Some(host), Some(authority)) = (&host_header, &request_authority) {
+        let Ok(hostname) = normalize_hostname(host) else {
+            return TrackedBody::plain(StatusCode::BAD_REQUEST, "invalid Host header");
+        };
+        let Ok(authority_hostname) = normalize_hostname(authority) else {
+            return TrackedBody::plain(StatusCode::BAD_REQUEST, "invalid request authority");
+        };
+        if hostname != authority_hostname {
+            return TrackedBody::plain(
+                StatusCode::BAD_REQUEST,
+                "request authority conflicts with Host",
+            );
+        }
+    }
+    let Some(original_host) = host_header.or(request_authority.clone()) else {
+        return TrackedBody::plain(
+            StatusCode::BAD_REQUEST,
+            if public_http2 {
+                "missing request authority"
+            } else {
+                "missing Host header"
+            },
+        );
+    };
     let Ok(hostname) = normalize_hostname(&original_host) else {
         return TrackedBody::plain(StatusCode::BAD_REQUEST, "invalid Host header");
     };
@@ -451,8 +680,8 @@ async fn proxy_request(
     if request.method() == hyper::Method::CONNECT {
         return TrackedBody::plain(StatusCode::METHOD_NOT_ALLOWED, "CONNECT is not supported");
     }
-    if let Some(authority) = request.uri().authority() {
-        let Ok(authority_hostname) = normalize_hostname(authority.as_str()) else {
+    if let Some(authority) = request_authority.as_deref() {
+        let Ok(authority_hostname) = normalize_hostname(authority) else {
             return TrackedBody::plain(StatusCode::BAD_REQUEST, "invalid request authority");
         };
         if authority_hostname != hostname {
@@ -461,15 +690,15 @@ async fn proxy_request(
                 "request authority conflicts with Host",
             );
         }
-        let Some(path_and_query) = request.uri().path_and_query().cloned() else {
-            return TrackedBody::plain(StatusCode::BAD_REQUEST, "missing request path");
-        };
-        let Ok(origin_form) = hyper::Uri::builder().path_and_query(path_and_query).build() else {
-            return TrackedBody::plain(StatusCode::BAD_REQUEST, "invalid request target");
-        };
-        *request.uri_mut() = origin_form;
     } else if request.uri().scheme().is_some() {
         return TrackedBody::plain(StatusCode::BAD_REQUEST, "invalid request target");
+    }
+    let native_grpc = is_native_grpc_request(&request);
+    if native_grpc && !public_http2 {
+        return TrackedBody::plain(
+            StatusCode::HTTP_VERSION_NOT_SUPPORTED,
+            "native gRPC requires HTTP/2",
+        );
     }
     if scheme == PublicScheme::Http
         && state
@@ -537,83 +766,243 @@ async fn proxy_request(
         .statistics
         .requests_total
         .fetch_add(1, Ordering::Relaxed);
+    if public_http2 {
+        context
+            .statistics
+            .http2_active_streams
+            .fetch_add(1, Ordering::Relaxed);
+        context
+            .statistics
+            .http2_requests_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    if native_grpc {
+        context
+            .statistics
+            .grpc_active_streams
+            .fetch_add(1, Ordering::Relaxed);
+        context
+            .statistics
+            .grpc_requests_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
     let usage = Arc::new(AtomicU64::new(0));
     let activity = ConnectionActivity::new(
         state.clone(),
         context.policy_id,
         usage.clone(),
         context.statistics.clone(),
+        RequestProtocols {
+            http2: public_http2,
+            grpc: native_grpc,
+        },
         route_permit,
         global_permit,
     );
 
-    let client_upgrade = is_upgrade_request(&request).then(|| hyper::upgrade::on(&mut request));
-    prepare_forward_headers(&mut request, peer, &original_host, scheme);
+    let client_upgrade =
+        (!public_http2 && is_upgrade_request(&request)).then(|| hyper::upgrade::on(&mut request));
+    prepare_forward_headers(&mut request, peer, &original_host, scheme, native_grpc);
+    if !request.headers().contains_key(header::HOST) {
+        let Ok(host) = HeaderValue::from_str(&original_host) else {
+            return TrackedBody::plain(StatusCode::BAD_REQUEST, "invalid Host header");
+        };
+        request.headers_mut().insert(header::HOST, host);
+    }
+    let Some(path_and_query) = request.uri().path_and_query().cloned() else {
+        return TrackedBody::plain(StatusCode::BAD_REQUEST, "missing request path");
+    };
+    let backend_uri = if native_grpc {
+        hyper::Uri::builder()
+            .scheme("http")
+            .authority(original_host.as_str())
+            .path_and_query(path_and_query)
+            .build()
+    } else {
+        hyper::Uri::builder().path_and_query(path_and_query).build()
+    };
+    let Ok(backend_uri) = backend_uri else {
+        return TrackedBody::plain(StatusCode::BAD_REQUEST, "invalid request target");
+    };
+    *request.uri_mut() = backend_uri;
+    *request.version_mut() = if native_grpc {
+        Version::HTTP_2
+    } else {
+        Version::HTTP_11
+    };
     let (parts, body) = request.into_parts();
     let request_statistics = context.statistics.clone();
     let request_usage = usage.clone();
-    let body = body.inspect_frame(move |frame| {
-        if let Some(data) = frame.data_ref() {
-            request_statistics
-                .bytes_from_public
-                .fetch_add(data.len() as u64, Ordering::Relaxed);
-            request_usage.fetch_add(data.len() as u64, Ordering::Relaxed);
-        }
-    });
+    let body = body
+        .inspect_frame(move |frame| {
+            if let Some(data) = frame.data_ref() {
+                request_statistics
+                    .bytes_from_public
+                    .fetch_add(data.len() as u64, Ordering::Relaxed);
+                request_usage.fetch_add(data.len() as u64, Ordering::Relaxed);
+            }
+        })
+        .map_err(|error| -> BoxError { Box::new(error) })
+        .boxed_unsync();
     let request = Request::from_parts(parts, body);
 
-    let agent_stream = match request_client_stream(&state, &context).await {
-        Ok(stream) => stream,
-        Err(pairing_timeout) => {
-            context
-                .statistics
-                .failed_requests
-                .fetch_add(1, Ordering::Relaxed);
-            if pairing_timeout {
+    let (mut response, backend_lease) = if native_grpc {
+        let statistics = context.statistics.clone();
+        let pool = context.http2_backend.clone();
+        let acquire = pool
+            .acquire_or_connect(|| async {
+                match request_client_stream(&state, &context).await {
+                    Ok(stream) => Ok(stream),
+                    Err(pairing_timeout) => {
+                        if pairing_timeout {
+                            statistics.pairing_timeouts.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(Box::new(std::io::Error::new(
+                            if pairing_timeout {
+                                std::io::ErrorKind::TimedOut
+                            } else {
+                                std::io::ErrorKind::ConnectionAborted
+                            },
+                            "LinkLake HTTP/2 backend data stream is unavailable",
+                        )) as BoxError)
+                    }
+                }
+            })
+            .await;
+        let mut lease = match acquire {
+            Ok(lease) => lease,
+            Err(error) => {
+                tracing::warn!("HTTP/2 backend acquisition failed for {hostname}: {error}");
                 context
                     .statistics
-                    .pairing_timeouts
+                    .failed_requests
                     .fetch_add(1, Ordering::Relaxed);
+                context
+                    .statistics
+                    .grpc_failures_total
+                    .fetch_add(1, Ordering::Relaxed);
+                let status = if matches!(
+                    error,
+                    crate::http2_backend::Http2BackendAcquireError::CapacityBusy
+                ) {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::BAD_GATEWAY
+                };
+                return TrackedBody::plain(status, "HTTP/2 backend is unavailable");
             }
-            return TrackedBody::plain(StatusCode::BAD_GATEWAY, "HTTP backend is unavailable");
-        }
-    };
-    let (mut sender, connection) = match client_http1::handshake(TokioIo::new(agent_stream)).await {
-        Ok(connection) => connection,
-        Err(error) => {
-            tracing::warn!("HTTP backend handshake failed for {hostname}: {error}");
-            context
-                .statistics
-                .failed_requests
-                .fetch_add(1, Ordering::Relaxed);
-            return TrackedBody::plain(StatusCode::BAD_GATEWAY, "HTTP backend handshake failed");
-        }
-    };
-    tokio::spawn(async move {
-        if let Err(error) = connection.with_upgrades().await {
-            tracing::debug!("HTTP backend connection ended: {error}");
-        }
-    });
-    let mut response = match timeout(BACKEND_RESPONSE_TIMEOUT, sender.send_request(request)).await {
-        Ok(Ok(response)) => response,
-        Ok(Err(error)) => {
-            tracing::warn!("HTTP backend request failed for {hostname}: {error}");
-            context
-                .statistics
-                .failed_requests
-                .fetch_add(1, Ordering::Relaxed);
-            return TrackedBody::plain(StatusCode::BAD_GATEWAY, "HTTP backend request failed");
-        }
-        Err(_) => {
-            tracing::warn!("HTTP backend response timed out for {hostname}");
-            context
-                .statistics
-                .failed_requests
-                .fetch_add(1, Ordering::Relaxed);
-            return TrackedBody::plain(StatusCode::GATEWAY_TIMEOUT, "HTTP backend timed out");
-        }
+        };
+        let connection_id = lease.connection_id();
+        let response = match timeout(BACKEND_RESPONSE_TIMEOUT, lease.send_request(request)).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    "HTTP/2 backend request failed for {hostname} on connection {connection_id}: {error}"
+                );
+                context
+                    .statistics
+                    .failed_requests
+                    .fetch_add(1, Ordering::Relaxed);
+                context
+                    .statistics
+                    .grpc_failures_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return TrackedBody::plain(
+                    StatusCode::BAD_GATEWAY,
+                    "HTTP/2 backend request failed",
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "HTTP/2 backend response timed out for {hostname} on connection {connection_id}"
+                );
+                context
+                    .statistics
+                    .failed_requests
+                    .fetch_add(1, Ordering::Relaxed);
+                context
+                    .statistics
+                    .grpc_failures_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return TrackedBody::plain(StatusCode::GATEWAY_TIMEOUT, "HTTP/2 backend timed out");
+            }
+        };
+        (response, Some(lease))
+    } else {
+        let agent_stream = match request_client_stream(&state, &context).await {
+            Ok(stream) => stream,
+            Err(pairing_timeout) => {
+                context
+                    .statistics
+                    .failed_requests
+                    .fetch_add(1, Ordering::Relaxed);
+                if pairing_timeout {
+                    context
+                        .statistics
+                        .pairing_timeouts
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                return TrackedBody::plain(StatusCode::BAD_GATEWAY, "HTTP backend is unavailable");
+            }
+        };
+        let (mut sender, connection) = match timeout(
+            CONNECTION_PAIR_TIMEOUT,
+            client_http1::handshake(TokioIo::new(agent_stream)),
+        )
+        .await
+        {
+            Ok(Ok(connection)) => connection,
+            Ok(Err(error)) => {
+                tracing::warn!("HTTP backend handshake failed for {hostname}: {error}");
+                context
+                    .statistics
+                    .failed_requests
+                    .fetch_add(1, Ordering::Relaxed);
+                return TrackedBody::plain(
+                    StatusCode::BAD_GATEWAY,
+                    "HTTP backend handshake failed",
+                );
+            }
+            Err(_) => {
+                context
+                    .statistics
+                    .failed_requests
+                    .fetch_add(1, Ordering::Relaxed);
+                return TrackedBody::plain(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "HTTP backend handshake timed out",
+                );
+            }
+        };
+        tokio::spawn(async move {
+            if let Err(error) = connection.with_upgrades().await {
+                tracing::debug!("HTTP backend connection ended: {error}");
+            }
+        });
+        let response = match timeout(BACKEND_RESPONSE_TIMEOUT, sender.send_request(request)).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                tracing::warn!("HTTP backend request failed for {hostname}: {error}");
+                context
+                    .statistics
+                    .failed_requests
+                    .fetch_add(1, Ordering::Relaxed);
+                return TrackedBody::plain(StatusCode::BAD_GATEWAY, "HTTP backend request failed");
+            }
+            Err(_) => {
+                tracing::warn!("HTTP backend response timed out for {hostname}");
+                context
+                    .statistics
+                    .failed_requests
+                    .fetch_add(1, Ordering::Relaxed);
+                return TrackedBody::plain(StatusCode::GATEWAY_TIMEOUT, "HTTP backend timed out");
+            }
+        };
+        (response, None)
     };
     clean_response_headers(&mut response);
+    *response.version_mut() = public_version;
+    let grpc = native_grpc.then(|| GrpcBodyState::new(context.statistics.clone(), &response));
     let mut activity = Some(activity);
     if response.status() == StatusCode::SWITCHING_PROTOCOLS {
         if let Some(client_upgrade) = client_upgrade {
@@ -664,7 +1053,7 @@ async fn proxy_request(
         .boxed_unsync()
     });
     let stop = activity.as_ref().map(|_| context.stop.clone());
-    response.map(|body| TrackedBody::proxied(body, activity, stop))
+    response.map(|body| TrackedBody::proxied(body, activity, stop, backend_lease, grpc))
 }
 
 async fn request_client_stream(
@@ -766,6 +1155,18 @@ pub(crate) async fn register_route(
             .or_insert_with(|| Arc::new(HttpRouteStatistics::default()))
             .clone()
     };
+    let origin = OriginKey::new(
+        runtime_policy.policy_id,
+        &format!("{hostname}:80"),
+        BackendProtocol::Http2,
+        BackendSecurity::Plaintext,
+    )
+    .expect("validated HTTP hostname must form a backend origin");
+    let http2_backend = Http2BackendPool::new(
+        origin,
+        runtime_policy.max_connections,
+        statistics.http2_backend.clone(),
+    );
     let context = Arc::new(HttpRouteContext {
         client_id,
         policy_id: runtime_policy.policy_id,
@@ -773,6 +1174,7 @@ pub(crate) async fn register_route(
         stop: stop_rx.clone(),
         permits: Arc::new(Semaphore::new(runtime_policy.max_connections)),
         statistics,
+        http2_backend,
     });
     if let Some(previous) = state
         .http_routes
@@ -787,6 +1189,7 @@ pub(crate) async fn register_route(
             },
         )
     {
+        previous.context.http2_backend.invalidate();
         let _ = previous.stop_tx.send(());
     }
     state
@@ -906,6 +1309,7 @@ fn remove_route(state: &AppState, hostname: &str, registration_id: Uuid) {
         .is_some_and(|registration| registration.registration_id == registration_id)
     {
         if let Some(route) = routes.remove(hostname) {
+            route.context.http2_backend.invalidate();
             let _ = route.stop_tx.send(());
         }
     }
@@ -918,6 +1322,7 @@ pub(crate) fn stop_hostname(state: &AppState, hostname: &str) {
         .expect("HTTP route registry lock poisoned")
         .remove(hostname)
     {
+        route.context.http2_backend.invalidate();
         let _ = route.stop_tx.send(());
     }
 }
@@ -931,6 +1336,7 @@ pub(crate) fn stop_all(state: &AppState) {
         .map(|(_, route)| route)
         .collect::<Vec<_>>();
     for route in routes {
+        route.context.http2_backend.invalidate();
         let _ = route.stop_tx.send(());
     }
 }
@@ -972,11 +1378,12 @@ fn acme_challenge_response(
     }
 }
 
-fn prepare_forward_headers(
-    request: &mut Request<Incoming>,
+fn prepare_forward_headers<B>(
+    request: &mut Request<B>,
     peer: SocketAddr,
     original_host: &str,
     scheme: PublicScheme,
+    preserve_te_trailers: bool,
 ) {
     let client_ip = if scheme == PublicScheme::Http {
         trusted_client_ip(request, peer)
@@ -989,7 +1396,11 @@ fn prepare_forward_headers(
         scheme.as_str()
     };
     let preserve_upgrade = is_upgrade_request(request);
-    remove_hop_by_hop_headers(request.headers_mut(), preserve_upgrade);
+    remove_hop_by_hop_headers(
+        request.headers_mut(),
+        preserve_upgrade,
+        preserve_te_trailers,
+    );
     for name in [
         "forwarded",
         "x-real-ip",
@@ -1014,7 +1425,7 @@ fn prepare_forward_headers(
     );
 }
 
-fn trusted_client_ip(request: &Request<Incoming>, peer: SocketAddr) -> IpAddr {
+fn trusted_client_ip<B>(request: &Request<B>, peer: SocketAddr) -> IpAddr {
     if peer.ip().is_loopback() {
         if let Some(ip) = request
             .headers()
@@ -1028,7 +1439,7 @@ fn trusted_client_ip(request: &Request<Incoming>, peer: SocketAddr) -> IpAddr {
     peer.ip()
 }
 
-fn trusted_forwarded_proto(request: &Request<Incoming>, peer: SocketAddr) -> &'static str {
+fn trusted_forwarded_proto<B>(request: &Request<B>, peer: SocketAddr) -> &'static str {
     if peer.ip().is_loopback()
         && request
             .headers()
@@ -1044,10 +1455,15 @@ fn trusted_forwarded_proto(request: &Request<Incoming>, peer: SocketAddr) -> &'s
 
 fn clean_response_headers(response: &mut Response<Incoming>) {
     let upgrade = response.status() == StatusCode::SWITCHING_PROTOCOLS;
-    remove_hop_by_hop_headers(response.headers_mut(), upgrade);
+    let preserve_te_trailers = response.version() == Version::HTTP_2;
+    remove_hop_by_hop_headers(response.headers_mut(), upgrade, preserve_te_trailers);
 }
 
-fn remove_hop_by_hop_headers(headers: &mut hyper::HeaderMap, preserve_upgrade: bool) {
+fn remove_hop_by_hop_headers(
+    headers: &mut hyper::HeaderMap,
+    preserve_upgrade: bool,
+    preserve_te_trailers: bool,
+) {
     let connection_headers = headers
         .get_all(header::CONNECTION)
         .iter()
@@ -1064,11 +1480,23 @@ fn remove_hop_by_hop_headers(headers: &mut hyper::HeaderMap, preserve_upgrade: b
     for name in [
         header::PROXY_AUTHENTICATE,
         header::PROXY_AUTHORIZATION,
-        header::TE,
-        header::TRAILER,
         header::TRANSFER_ENCODING,
     ] {
         headers.remove(name);
+    }
+    if preserve_te_trailers {
+        let valid_te = headers
+            .get_all(header::TE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .all(|value| value.trim().eq_ignore_ascii_case("trailers"));
+        if !valid_te {
+            headers.remove(header::TE);
+        }
+    } else {
+        headers.remove(header::TE);
+        headers.remove(header::TRAILER);
     }
     headers.remove("proxy-connection");
     headers.remove("keep-alive");
@@ -1076,6 +1504,18 @@ fn remove_hop_by_hop_headers(headers: &mut hyper::HeaderMap, preserve_upgrade: b
         headers.remove(header::CONNECTION);
         headers.remove(header::UPGRADE);
     }
+}
+
+fn is_native_grpc_request<B>(request: &Request<B>) -> bool {
+    request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(';').next().unwrap_or_default().trim())
+        .is_some_and(|value| {
+            value.eq_ignore_ascii_case("application/grpc")
+                || value.to_ascii_lowercase().starts_with("application/grpc+")
+        })
 }
 
 fn is_upgrade_request<B>(request: &Request<B>) -> bool {
@@ -1097,4 +1537,132 @@ async fn send_error(stream: &mut BoxedIo, message: &str) {
         },
     )
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_proxy_body() -> ProxyBody {
+        Full::new(Bytes::new())
+            .map_err(|never| -> BoxError { match never {} })
+            .boxed_unsync()
+    }
+
+    #[test]
+    fn native_grpc_detection_excludes_grpc_web() {
+        for content_type in [
+            "application/grpc",
+            "application/grpc+proto",
+            "Application/GRPC+json; charset=utf-8",
+        ] {
+            let request = Request::builder()
+                .header(header::CONTENT_TYPE, content_type)
+                .body(())
+                .expect("test request should build");
+            assert!(is_native_grpc_request(&request));
+        }
+        for content_type in [
+            "application/grpc-web",
+            "application/grpc-web+proto",
+            "application/json",
+        ] {
+            let request = Request::builder()
+                .header(header::CONTENT_TYPE, content_type)
+                .body(())
+                .expect("test request should build");
+            assert!(!is_native_grpc_request(&request));
+        }
+    }
+
+    #[test]
+    fn http2_header_cleanup_preserves_only_te_trailers() {
+        let mut valid = hyper::HeaderMap::new();
+        valid.insert(header::TE, HeaderValue::from_static("trailers"));
+        valid.insert(header::TRAILER, HeaderValue::from_static("grpc-status"));
+        valid.insert(
+            header::TRANSFER_ENCODING,
+            HeaderValue::from_static("chunked"),
+        );
+        remove_hop_by_hop_headers(&mut valid, false, true);
+        assert_eq!(
+            valid.get(header::TE),
+            Some(&HeaderValue::from_static("trailers"))
+        );
+        assert_eq!(
+            valid.get(header::TRAILER),
+            Some(&HeaderValue::from_static("grpc-status"))
+        );
+        assert!(!valid.contains_key(header::TRANSFER_ENCODING));
+
+        let mut invalid = hyper::HeaderMap::new();
+        invalid.insert(header::TE, HeaderValue::from_static("trailers, deflate"));
+        invalid.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
+        invalid.insert("keep-alive", HeaderValue::from_static("timeout=5"));
+        remove_hop_by_hop_headers(&mut invalid, false, true);
+        assert!(!invalid.contains_key(header::TE));
+        assert!(!invalid.contains_key(header::CONNECTION));
+        assert!(!invalid.contains_key("keep-alive"));
+    }
+
+    #[test]
+    fn grpc_terminal_status_and_cancellation_are_counted_once() {
+        let success_statistics = Arc::new(HttpRouteStatistics::default());
+        let mut success = GrpcBodyState {
+            statistics: success_statistics.clone(),
+            status_seen: false,
+            failure_recorded: false,
+            completed: false,
+        };
+        let mut success_trailers = hyper::HeaderMap::new();
+        success_trailers.insert("grpc-status", HeaderValue::from_static("0"));
+        success.record_trailers(&success_trailers);
+        success.finish();
+        success.cancel();
+        assert_eq!(
+            success_statistics
+                .grpc_trailers_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            success_statistics
+                .grpc_failures_total
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            success_statistics
+                .grpc_cancellations_total
+                .load(Ordering::Relaxed),
+            0
+        );
+
+        let cancellation_statistics = Arc::new(HttpRouteStatistics::default());
+        let body = TrackedBody {
+            inner: empty_proxy_body(),
+            _activity: None,
+            _backend_lease: None,
+            grpc: Some(GrpcBodyState {
+                statistics: cancellation_statistics.clone(),
+                status_seen: false,
+                failure_recorded: false,
+                completed: false,
+            }),
+            stop: None,
+        };
+        drop(body);
+        assert_eq!(
+            cancellation_statistics
+                .grpc_cancellations_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            cancellation_statistics
+                .grpc_failures_total
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
 }
