@@ -1,0 +1,56 @@
+# LinkLake v0.8 Update Security Model
+
+Date: 2026-08-02
+
+## Threat model and compatibility audit
+
+The audit covered the former client-only updater, server startup order, Windows/systemd/launchd definitions, all package layouts, Manager bundles, and the Release workflow.
+
+The previous updater already restricted HTTPS hosts and repository paths, checked GitHub and `.sha256` digests, bounded archives, staged binaries, used same-directory replacement, restored services, and rolled back failures. The productization gaps were: no server updater; server version output occurred after startup-related work; checksum and asset shared one publisher trust domain; no stable Manager installation protocol; helper plans were client-specific; and no separation between production and test signing or key-rotation metadata.
+
+The v0.8 design protects against corrupted downloads, asset/checksum disagreement, replacement of GitHub release assets by a compromised repository publisher, path traversal, links and archive bombs, staged-file tampering, wrong-target replacement, concurrent target changes, service recovery failure, and installed-version mismatch.
+
+It does not by itself protect against a malicious build signed by an authorized production key, production-key disclosure, full administrator/root compromise of the running host, operating-system trust-root compromise, or a privileged process indefinitely locking a Manager installation. Mitigations include least-privilege CI, offline production-key generation, protected tags/releases, rotation and revocation, helper timeouts, and automatic rollback.
+
+## Signed manifest
+
+Every formal release publishes `linklake-release-manifest-v1.json` and `linklake-release-manifest-v1.sig`. The manifest binds `release_version`, `key_id`, `minimum_updater_version`, creation time, and each asset's `component`, `target`, `name`, `sha256`, and `size`. Assets are strictly sorted by component, target, and name. The detached signature is Ed25519 over one canonical byte encoding: compact UTF-8 JSON in the declared struct-field order followed by exactly one LF. Verifiers reject alternate whitespace, field order, duplicate identities, and trailing bytes even when a detached signature is otherwise valid.
+
+Verification order is: GitHub HTTPS/repository ownership; GitHub asset digest; Ed25519 manifest; release/key validity/minimum updater; signed asset identity/size/digest; `.sha256`; archive and internal `release.json`; staged digest; hashed helper plan; installed version; and service recovery.
+
+Production policy rejects network downgrade. Downgrade is a local verified-backup operation. `--allow-downgrade` is effective only with the explicit `--development-signature` test policy.
+
+## Key management and rotation
+
+- Production private keys are supplied only through the `LINKLAKE_RELEASE_SIGNING_KEY_B64` CI secret. They must never be generated or stored in the repository, artifacts, logs, or updater state.
+- `security/release-keys.json` contains public keys, purpose, and semantic-version validity ranges only.
+- The committed RFC 8032 private fixture is marked development and is rejected by production policy.
+- Rotation first adds a new public key with a future `not_before_version`, ships an updater that trusts old and new keys, then changes CI secrets, and finally assigns the old key a `not_after_version`.
+- Emergency revocation requires another trusted production key. Without one, a new trust root must be distributed through a separate authenticated channel.
+
+No production public key is registered yet. Tagged Releases therefore fail closed in the signing step until maintainers generate a production key offline, commit only its public key, and configure the two CI secrets. Using the development fixture to bypass this block is prohibited.
+
+## Replacement invariants
+
+- Client/server operations replace only the selected executable. Configuration, SQLite databases, certificates, logs, and managed state are outside the replacement set.
+- Incoming and displaced executables are renamed within the target parent directory.
+- A service is controlled only if it references the target executable. A previously stopped service remains stopped; a previously running service must become stably active again.
+- Manager binds the complete staged and installed directory trees into the helper plan, copies the staged payload beside the installation directory, verifies the copied tree, and switches directories on the target volume. Flutter passes its PID and must exit after `requires_manager_exit=true`; the helper waits for that exact process with a bounded timeout before touching the installation.
+- Any digest, version, rename, or service-recovery failure attempts automatic restoration and records a final JSON status.
+
+## Stable interfaces
+
+Client and server expose `check-update`, `update download/apply/status/rollback`, hidden helper commands, and `--version`/`--version-json`.
+
+Manager uses:
+
+```text
+linklake-client manager-update download --current-version <semver>
+linklake-client manager-update apply --install-dir <dir> --manager-pid <pid> --yes
+linklake-client manager-update status
+linklake-client manager-update rollback --install-dir <dir> --manager-pid <pid> --yes
+```
+
+Successful commands return JSON. `apply` and `rollback` return `schema_version=2`, the helper PID, the Manager PID, the status path, the exit deadline, and `requires_manager_exit=true`. The UI exits only after parsing that response, then polls `status` until `succeeded`, `rolled_back`, or `failed`. The machine-readable contract is `docs/manager-update-json-schema.json`; Flutter's lower-level adapter is `apps/linklake_manager/lib/update_protocol.dart`.
+
+Conflicting or unsafe conditions fail closed: another staged/installed tree digest, a changed release version or platform, an unknown install directory, the updater PID supplied as the Manager PID, Manager exit timeout, a remaining directory lock, failed same-volume rename, or failed post-switch validation. No operation edits environment files, SQLite databases, ACME state, certificates, or logs inside or outside the Manager payload.

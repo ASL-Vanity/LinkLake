@@ -26,6 +26,8 @@ else {
     if ($LASTEXITCODE -eq 0 -and $gitTimestamp) { [long]$gitTimestamp } else { [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
 }
 $archiveTimestamp = [DateTimeOffset]::FromUnixTimeSeconds($sourceDateEpoch)
+$commit = (& git -C $projectRoot rev-parse --short=12 HEAD).Trim()
+$env:LINKLAKE_GIT_COMMIT = $commit
 
 Push-Location $managerRoot
 try {
@@ -67,6 +69,7 @@ $releaseManifest = [ordered]@{
     version = $version
     target = 'windows-x86_64'
     built_unix_seconds = $sourceDateEpoch
+    commit = $commit
 } | ConvertTo-Json
 [IO.File]::WriteAllText(
     (Join-Path $stage 'release.json'),

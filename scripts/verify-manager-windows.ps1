@@ -24,5 +24,18 @@ try {
     }
 }
 finally { $zip.Dispose() }
+$verifyRoot = Join-Path $env:TEMP "linklake-manager-verify-$([guid]::NewGuid().ToString('N'))"
+try {
+    Expand-Archive -LiteralPath $archive -DestinationPath $verifyRoot
+    $clientVersion = (& (Join-Path $verifyRoot 'linklake-client.exe') --version).Trim()
+    if ($clientVersion -notmatch [regex]::Escape($version) -or $clientVersion -notmatch 'target=windows-x86_64') {
+        throw "Invalid packaged updater build information: $clientVersion"
+    }
+    $release = Get-Content -Raw -LiteralPath (Join-Path $verifyRoot 'release.json') | ConvertFrom-Json
+    if ($release.component -ne 'manager' -or -not $release.commit) { throw 'Invalid Manager release identity.' }
+}
+finally {
+    if (Test-Path -LiteralPath $verifyRoot) { Remove-Item -LiteralPath $verifyRoot -Recurse -Force }
+}
 Write-Host "Verified $archive"
 Write-Host "SHA256 $actualHash"

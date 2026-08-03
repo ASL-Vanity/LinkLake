@@ -269,7 +269,17 @@ linklake-client check-update --channel prerelease
 
 输出为 JSON，包含当前版本、所选通道、最新版本、是否存在更新和 Release 地址；网络请求最长等待 15 秒。
 
-### 安全自动更新与回滚
+### 构建身份、安全自动更新与回滚
+
+服务端和客户端使用同一套无副作用构建信息格式；`--version` 不读取配置、不初始化日志、不启动监听，也不要求管理员环境：
+
+```powershell
+linklake-server --version
+linklake-client --version
+linklake-server --version-json
+```
+
+输出包含产品名、语义版本、目标平台，以及发布构建通过 `LINKLAKE_GIT_COMMIT` 注入的可选提交号。
 
 客户端可以把“检查更新”继续到可信下载、原子安装和回滚：
 
@@ -280,16 +290,28 @@ linklake-client update status
 linklake-client update rollback --yes
 ```
 
+服务端使用相同契约：
+
+```powershell
+linklake-server check-update
+linklake-server update download
+linklake-server update apply --yes
+linklake-server update status
+linklake-server update rollback --yes
+```
+
 - `download` 仅下载和验证，不修改正在使用的程序。
 - `apply` 自动下载最新兼容版本，创建备份，并启动独立帮助进程替换客户端；替换系统安装目录通常需要管理员/root 权限。
 - `status` 返回最后一次操作的 `scheduled/installing/succeeded/rolled_back/failed` 状态。
-- `rollback` 使用最近一份与当前安装不同且摘要有效的备份。降级下载必须额外传入 `--allow-downgrade`。
-- 自动安装目标必须支持 `linklake-client --version`，因此不会自动安装 0.7.0-rc.1 之前的旧包；旧客户端仍可作为已验证备份被恢复。
+- `rollback` 使用最近一份与当前安装不同且摘要有效的本地备份。生产签名策略禁止网络降级；`--allow-downgrade` 仅与显式 `--development-signature` 测试路径同时有效。
+- 自动安装目标必须支持统一的 `--version`，因此不会自动安装 0.8.0-rc.1 之前不符合新契约的旧包；旧二进制仍可作为已验证本地备份恢复。
 - 默认状态目录位于当前用户的本地状态目录，也可以通过 `--state-dir` 显式指定。
 
-安全验证链包括：HTTPS 与仓库路径约束、GitHub 资产 SHA-256、独立 `.sha256`、下载大小、ZIP/TAR 路径与条目限制、`release.json` 产品/版本/平台、暂存二进制摘要、带摘要的帮助进程计划、安装前目标摘要、安装后 `--version` 以及系统服务恢复。更新器只替换 `linklake-client`，不会覆盖配置、托管状态、证书或日志。任一安装或服务检查失败时会自动恢复备份。
+安全验证链包括：HTTPS 与仓库路径约束、GitHub 资产 SHA-256、独立 `.sha256`、Ed25519 签名发布清单、下载大小、ZIP/TAR 路径与条目限制、`release.json` 产品/版本/平台、暂存二进制摘要、带摘要的帮助进程计划、安装前目标摘要、安装后 `--version` 以及 systemd/Windows service/launchd 恢复。客户端或服务端更新器只替换对应可执行文件，不覆盖配置、SQLite 数据库、托管状态、证书或日志。任一安装、版本或服务恢复检查失败时会自动恢复备份。
 
-自动更新的信任根是配置的 GitHub 仓库、GitHub HTTPS 和发布资产摘要。发布账号或仓库权限本身遭到入侵不在 SHA-256 能够解决的威胁范围内，因此仍应启用 GitHub 强认证、最小权限和发布保护；未来可在代码签名基础设施就绪后增加独立发布签名。
+独立信任根位于 `security/release-keys.json`。正式 Release 必须由 CI secret 提供与仓库生产公钥匹配的 Ed25519 私钥，否则流水线关闭失败；仓库只含公钥、格式和明确标记的 RFC 8032 测试夹具。开发测试必须显式使用 `--development-signature`，生产默认绝不接受测试密钥。密钥轮换通过并行登记新旧公钥及版本有效区间完成。完整威胁模型、清单格式和轮换步骤见 `docs/update-security.zh-CN.md`。
+
+Manager UI 不直接替换自身文件。`linklake-client manager-update download/apply/status/rollback` 提供稳定 JSON 契约，`apply`/`rollback` 必须传入 `--manager-pid <pid>`。命令返回 schema v2 且 `requires_manager_exit=true` 后 Manager 才退出；独立帮助进程等待该 PID，复核完整暂存/安装目录树摘要，在同卷切换目录并自动回滚失败。机器可读契约位于 `docs/manager-update-json-schema.json`，Flutter 封装位于 `apps/linklake_manager/lib/update_protocol.dart`。
 
 ## 管理与指标
 

@@ -263,7 +263,17 @@ linklake-client check-update --channel prerelease
 
 The JSON result contains the current version, resolved channel, latest version, update availability, and release URL. The network request has a 15-second timeout.
 
-### Secure automatic update and rollback
+### Build identity, secure automatic update, and rollback
+
+The server and client share a side-effect-free build identity format. `--version` does not read configuration, initialize logging, bind sockets, or require administrator state:
+
+```powershell
+linklake-server --version
+linklake-client --version
+linklake-server --version-json
+```
+
+The result contains the product, semantic version, target platform, and the optional commit injected through `LINKLAKE_GIT_COMMIT` for release builds.
 
 The client can continue from an update check to trusted download, atomic installation, and rollback:
 
@@ -274,16 +284,28 @@ linklake-client update status
 linklake-client update rollback --yes
 ```
 
+The server exposes the same contract:
+
+```powershell
+linklake-server check-update
+linklake-server update download
+linklake-server update apply --yes
+linklake-server update status
+linklake-server update rollback --yes
+```
+
 - `download` downloads and verifies an update without changing the installed program.
 - `apply` downloads the latest compatible release, creates a backup, and starts a detached helper to replace the client. Replacing a system installation normally requires administrator/root privileges.
 - `status` reports the last `scheduled/installing/succeeded/rolled_back/failed` state.
-- `rollback` selects the newest valid backup that differs from the current installation. Explicit downgrade downloads additionally require `--allow-downgrade`.
-- Automatic installation targets must support `linklake-client --version`, so packages older than 0.7.0-rc.1 are not installed automatically; a verified legacy client can still be restored from backup.
+- `rollback` selects the newest valid local backup that differs from the current installation. Production signature policy forbids network downgrades; `--allow-downgrade` is effective only with the explicit `--development-signature` test path.
+- Automatic targets must support the unified `--version` contract. Packages predating 0.8.0-rc.1 are not installed automatically, while a verified legacy binary may still be restored from a local backup.
 - The default state directory is under the current user's local state directory and can be overridden with `--state-dir`.
 
-The verification chain covers HTTPS and repository-path restrictions, GitHub's asset SHA-256, the independent `.sha256` asset, download size, safe ZIP/TAR entries, the `release.json` product/version/platform, the staged binary digest, a hashed helper plan, the pre-install target digest, the installed `--version`, and service recovery. Only `linklake-client` is replaced; configuration, managed state, certificates, and logs are preserved. Any installation or service verification failure restores the backup automatically.
+The verification chain covers HTTPS and repository-path restrictions, GitHub's asset SHA-256, the independent `.sha256` asset, an Ed25519-signed release manifest, download limits, safe ZIP/TAR entries, `release.json` product/version/platform, the staged binary digest, a hashed helper plan, the pre-install target digest, installed `--version`, and systemd/Windows service/launchd recovery. Client and server updates replace only the selected executable; configuration, SQLite databases, managed state, certificates, and logs are untouched. Any installation, version, or service recovery failure restores the backup automatically.
 
-The trust root is the configured GitHub repository, GitHub HTTPS, and its release asset digests. SHA-256 cannot protect against a compromised publisher account or repository permissions, so strong GitHub authentication, least privilege, and protected releases remain required. Independent release signatures can be added after code-signing infrastructure is available.
+The independent trust root is `security/release-keys.json`. A formal Release requires an Ed25519 private key supplied by CI secrets and matching a production public key in the repository; otherwise the workflow fails closed. The repository contains only public keys, formats, and an explicitly labeled RFC 8032 test fixture. Development testing requires `--development-signature`; production policy never accepts a development key. Rotation registers old and new public keys concurrently with semantic-version validity ranges. See `docs/update-security.md`.
+
+Manager never replaces its own files from Flutter. `linklake-client manager-update download/apply/status/rollback` is the stable JSON contract; `apply` and `rollback` require `--manager-pid <pid>`. After the command returns schema v2 with `requires_manager_exit=true`, Manager exits and a detached helper waits for that PID, verifies complete staged/installed directory-tree digests, performs a same-volume directory switch, and rolls back failures. The contract schema is `docs/manager-update-json-schema.json`, and the Flutter adapter is `apps/linklake_manager/lib/update_protocol.dart`.
 
 ## Management and metrics
 

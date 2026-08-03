@@ -40,4 +40,12 @@ printf '%s\n' "$required" | while IFS= read -r entry; do
   }
 done
 
+verify_root="$(mktemp -d)"
+trap 'rm -rf -- "$verify_root"' EXIT
+tar -xzf "$archive" -C "$verify_root"
+package_root="$(find "$verify_root" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+"$package_root/bin/linklake-server" --version | grep -F "$version" | grep -F 'target=linux-x86_64' >/dev/null
+"$package_root/bin/linklake-client" --version | grep -F "$version" | grep -F 'target=linux-x86_64' >/dev/null
+grep -F '"commit"' "$package_root/release.json" >/dev/null
+
 echo "Verified $archive"

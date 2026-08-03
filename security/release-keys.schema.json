@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LinkLake trusted release keys",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "keys"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "keys": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["key_id", "public_key_base64", "purpose", "not_before_version", "not_after_version"],
+        "properties": {
+          "key_id": { "type": "string", "minLength": 1 },
+          "public_key_base64": { "type": "string", "minLength": 44, "maxLength": 44 },
+          "purpose": { "enum": ["production", "development"] },
+          "not_before_version": { "type": "string", "minLength": 5 },
+          "not_after_version": { "type": ["string", "null"] }
+        }
+      }
+    }
+  }
+}
