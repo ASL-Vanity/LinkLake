@@ -1,19 +1,50 @@
 import 'dart:convert';
 import 'dart:io';
 
+abstract interface class LinkLakeApi {
+  Uri get baseUri;
+  bool get authenticated;
+
+  Future<Map<String, dynamic>> login(
+    String username,
+    String password, {
+    String? totpCode,
+  });
+
+  Future<void> changePassword(String password);
+  Future<void> logout();
+  Future<Map<String, dynamic>> getObject(String path);
+  Future<List<dynamic>> getList(String path);
+  Future<Map<String, dynamic>> postObject(
+    String path,
+    Map<String, dynamic> body,
+  );
+  Future<Map<String, dynamic>> putObject(
+    String path,
+    Map<String, dynamic> body,
+  );
+  Future<void> post(String path, [Map<String, dynamic>? body]);
+  Future<String> getText(String path);
+  Future<void> delete(String path);
+  void close();
+}
+
 /// LinkLake 管理 API 的桌面端会话客户端。
-class LinkLakeApiClient {
+class LinkLakeApiClient implements LinkLakeApi {
   LinkLakeApiClient(String baseUrl)
     : baseUri = Uri.parse(baseUrl.replaceAll(RegExp(r'/+$'), ''));
 
+  @override
   final Uri baseUri;
   final HttpClient _client = HttpClient()
     ..connectionTimeout = const Duration(seconds: 10)
     ..idleTimeout = const Duration(seconds: 30);
   String? _cookie;
 
+  @override
   bool get authenticated => _cookie != null;
 
+  @override
   Future<Map<String, dynamic>> login(
     String username,
     String password, {
@@ -41,6 +72,7 @@ class LinkLakeApiClient {
     return _decodeObject(response.body);
   }
 
+  @override
   Future<void> changePassword(String password) async {
     await _request(
       'POST',
@@ -49,6 +81,7 @@ class LinkLakeApiClient {
     );
   }
 
+  @override
   Future<void> logout() async {
     try {
       await _request('POST', '/api/v1/auth/logout');
@@ -57,11 +90,13 @@ class LinkLakeApiClient {
     }
   }
 
+  @override
   Future<Map<String, dynamic>> getObject(String path) async {
     final response = await _request('GET', path);
     return _decodeObject(response.body);
   }
 
+  @override
   Future<List<dynamic>> getList(String path) async {
     final response = await _request('GET', path);
     final decoded = response.body.isEmpty
@@ -77,6 +112,7 @@ class LinkLakeApiClient {
     return decoded;
   }
 
+  @override
   Future<Map<String, dynamic>> postObject(
     String path,
     Map<String, dynamic> body,
@@ -86,6 +122,7 @@ class LinkLakeApiClient {
     return _decodeObject(response.body);
   }
 
+  @override
   Future<Map<String, dynamic>> putObject(
     String path,
     Map<String, dynamic> body,
@@ -95,15 +132,18 @@ class LinkLakeApiClient {
     return _decodeObject(response.body);
   }
 
+  @override
   Future<void> post(String path, [Map<String, dynamic>? body]) async {
     await _request('POST', path, body: body);
   }
 
+  @override
   Future<String> getText(String path) async {
     final response = await _request('GET', path);
     return response.body;
   }
 
+  @override
   Future<void> delete(String path) async {
     await _request('DELETE', path);
   }
@@ -155,6 +195,7 @@ class LinkLakeApiClient {
     return decoded;
   }
 
+  @override
   void close() => _client.close(force: true);
 }
 
