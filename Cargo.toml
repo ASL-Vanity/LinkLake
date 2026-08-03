@@ -28,8 +28,8 @@ getrandom = "0.4"
 clap = { version = "4.5", features = ["derive"] }
 ed25519-dalek = { version = "2.2", features = ["pkcs8", "rand_core"] }
 http-body-util = "0.1"
-hyper = { version = "1.11", features = ["client", "http1", "server"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+hyper = { version = "1.11", features = ["client", "http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 hmac = "0.12"
 instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls", "rcgen"] }
 iroh = { version = "0.92.0", default-features = false }
