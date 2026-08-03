@@ -9,22 +9,30 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   LINKLAKE_GIT_COMMIT: ${{ github.sha }}
+  SYFT_VERSION: v1.50.0
 
 jobs:
   windows-package:
+    name: Windows release packages
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install pinned Rust toolchain
         shell: pwsh
         run: rustup toolchain install 1.88.0 --profile minimal
       - name: Select pinned Rust toolchain
         shell: pwsh
         run: rustup default 1.88.0
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~\.cargo\registry
@@ -32,7 +40,7 @@ jobs:
             target
           key: windows-release-${{ hashFiles('Cargo.lock') }}
           restore-keys: windows-release-
-      - uses: subosito/flutter-action@v2
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
         with:
           channel: stable
           flutter-version: '3.44.8'
@@ -49,7 +57,7 @@ jobs:
       - name: Verify Flutter manager Windows package
         shell: powershell
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-manager-windows.ps1
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linklake-windows-x86_64
           path: |
@@ -58,14 +66,17 @@ jobs:
           if-no-files-found: error
 
   linux-package:
+    name: Linux release packages
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal
       - name: Select pinned Rust toolchain
         run: rustup default 1.88.0
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -75,7 +86,7 @@ jobs:
           restore-keys: linux-release-
       - name: Install Flutter Linux dependencies
         run: sudo apt-get update && sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libayatana-appindicator3-dev rpm
-      - uses: subosito/flutter-action@v2
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
         with:
           channel: stable
           flutter-version: '3.44.8'
@@ -89,12 +100,14 @@ jobs:
       - name: Verify DEB and RPM packages
         run: sh scripts/verify-native-linux-packages.sh
       - name: Verify container image builds
-        run: docker build -t linklake:${{ github.ref_name }} .
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: docker build -t "linklake:$RELEASE_TAG" .
       - name: Build Flutter manager Linux package
         run: sh scripts/package-manager-linux.sh
       - name: Verify Flutter manager Linux package
         run: sh scripts/verify-manager-linux.sh
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linklake-linux-x86_64
           path: |
@@ -107,14 +120,17 @@ jobs:
           if-no-files-found: error
 
   macos-package:
+    name: macOS release packages
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal
       - name: Select pinned Rust toolchain
         run: rustup default 1.88.0
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -122,7 +138,7 @@ jobs:
             target
           key: macos-release-${{ hashFiles('Cargo.lock') }}
           restore-keys: macos-release-
-      - uses: subosito/flutter-action@v2
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
         with:
           channel: stable
           flutter-version: '3.44.8'
@@ -135,7 +151,7 @@ jobs:
         run: sh scripts/package-manager-macos.sh
       - name: Verify Flutter manager macOS package
         run: sh scripts/verify-manager-macos.sh
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linklake-macos
           path: |
@@ -144,6 +160,7 @@ jobs:
           if-no-files-found: error
 
   publish:
+    name: Sign, attest, and publish
     if: startsWith(github.ref, 'refs/tags/v')
     needs:
       - windows-package
@@ -151,31 +168,66 @@ jobs:
       - macos-package
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write # 创建或更新由当前标签标识的 GitHub Release。
+      id-token: write # 获取短期 OIDC 身份，用于 Sigstore 签署证明。
+      attestations: write # 将 provenance 与 SBOM 证明写入 GitHub Attestations API。
+      artifact-metadata: write # 为被证明的发布资产登记 GitHub 元数据。
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal
       - name: Select pinned Rust toolchain
         run: rustup default 1.88.0
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
           merge-multiple: true
+      - name: Resolve immutable release version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          case "$TAG" in
+            v*) ;;
+            *) echo "release tag must start with v" >&2; exit 1 ;;
+          esac
+          version="${TAG#v}"
+          test -n "$version"
+          printf 'RELEASE_VERSION=%s\n' "$version" >> "$GITHUB_ENV"
+      - name: Install pinned Syft
+        id: syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          syft-version: ${{ env.SYFT_VERSION }}
+      - name: Generate per-package SPDX SBOMs
+        env:
+          SYFT_CMD: ${{ steps.syft.outputs.cmd }}
+        run: node scripts/generate-package-sboms.mjs dist "$RELEASE_VERSION"
+      - name: Verify packages and prepare attestation subjects
+        run: node scripts/prepare-release-attestations.mjs dist "$RELEASE_VERSION"
       - name: Create and verify production Ed25519 release manifest
         env:
           LINKLAKE_RELEASE_SIGNING_KEY_B64: ${{ secrets.LINKLAKE_RELEASE_SIGNING_KEY_B64 }}
           LINKLAKE_RELEASE_SIGNING_KEY_ID: ${{ secrets.LINKLAKE_RELEASE_SIGNING_KEY_ID }}
-          TAG: ${{ github.ref_name }}
         run: |
           set -eu
           test -n "$LINKLAKE_RELEASE_SIGNING_KEY_B64" || { echo "production signing key secret is required" >&2; exit 1; }
           test -n "$LINKLAKE_RELEASE_SIGNING_KEY_ID" || { echo "production signing key ID secret is required" >&2; exit 1; }
-          version="${TAG#v}"
           cargo run --locked -p linklake-update --bin linklake-release-sign -- \
-            generate --dist dist --version "$version" \
+            generate --dist dist --version "$RELEASE_VERSION" \
             --key-id "$LINKLAKE_RELEASE_SIGNING_KEY_ID" \
             --minimum-updater-version 0.8.0-rc.1
+      - name: Attest release build provenance
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-checksums: dist/linklake-${{ env.RELEASE_VERSION }}-release-subjects.sha256
+      - name: Attest release SBOM
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-checksums: dist/linklake-${{ env.RELEASE_VERSION }}-release-subjects.sha256
+          sbom-path: dist/linklake-${{ env.RELEASE_VERSION }}-release.spdx.json
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}

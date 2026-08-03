@@ -19,19 +19,22 @@ concurrency:
 
 jobs:
   windows-soak:
+    name: Windows reliability soak
     runs-on: windows-latest
     timeout-minutes: 180
     env:
       SOAK_MINUTES: ${{ github.event.inputs.duration_minutes || '60' }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install pinned Rust toolchain
         shell: pwsh
         run: rustup toolchain install 1.88.0 --profile minimal
       - name: Select pinned Rust toolchain
         shell: pwsh
         run: rustup default 1.88.0
-      - uses: actions/cache@v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~\.cargo\registry
@@ -47,7 +50,7 @@ jobs:
             -OutputPath .\tests\soak-results.json
       - name: Upload soak report
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linklake-soak-report
           path: tests/soak-results.json
