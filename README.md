@@ -20,6 +20,7 @@ LinkLake 的代码实现、自动化测试与项目文档由 OpenAI GPT-5.6 完�
 
 - [Docker Compose](deploy/docker-compose.yml) 提供 LinkLake、Prometheus 和 Grafana；`/api/v1/metrics/prometheus` 使用 Bearer 鉴权并输出 `linklake_` 指标。
 - [部署指南](docs/deployment.md) 包含 Nginx、Caddy、Cloudflare DNS-only/代理边界、最小权限 DNS Token、DEB/RPM 和容器证书要求。
+- [SOCKS5 支持边界说明](docs/adr/0003-socks5-supported-boundaries.md) 明确记录 CONNECT、可选 UDP ASSOCIATE、BIND 拒绝和 UDP FRAG 丢弃语义。
 - Linux 发布资产包含 `.deb`、`.rpm` 及 SHA-256；Cloudflare DNS 幂等更新脚本位于 `scripts/cloudflare-dns-upsert.ps1`。
 
 ## TCP 生产能力

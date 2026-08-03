@@ -344,6 +344,12 @@ managed_config_path = "$managedTomlPath"
             Where-Object { $_.id -eq $created.id }
         $proxy.online
     }
+    $proxyContract = Invoke-RestMethod -Uri "$baseUrl/api/v1/socks5-proxies" -Headers $headers |
+        Where-Object { $_.id -eq $created.id }
+    if (-not $proxyContract.capabilities.connect -or -not $proxyContract.capabilities.udp_associate -or
+        $proxyContract.capabilities.bind -or $proxyContract.capabilities.udp_fragmentation) {
+        throw 'The SOCKS5 API capability contract is incorrect.'
+    }
 
     $stage = 'no-auth rejection'
     Assert-NoAuthRejected -ProxyPort $proxyPort
@@ -395,6 +401,11 @@ managed_config_path = "$managedTomlPath"
     } finally {
         $unsupported.Client.Dispose()
     }
+    Wait-ForCondition -Failure 'The SOCKS5 BIND rejection metric was not updated.' -Condition {
+        $proxy = Invoke-RestMethod -Uri "$baseUrl/api/v1/socks5-proxies" -Headers $headers |
+            Where-Object { $_.id -eq $created.id }
+        $proxy.bind_rejected_total -ge 1 -and $proxy.unsupported_commands -ge 1
+    }
 
     $stage = 'disable policy'
     Invoke-RestMethod -Method Post -Uri "$baseUrl/api/v1/socks5-proxies/$($created.id)/enabled" `
@@ -433,6 +444,11 @@ managed_config_path = "$managedTomlPath"
     $udpClient = [Net.Sockets.UdpClient]::new([Net.Sockets.AddressFamily]::InterNetwork)
     try {
         if ($udpAssociation.Reply -ne 0) { throw 'SOCKS5 UDP ASSOCIATE was rejected.' }
+        Wait-ForCondition -Failure 'The SOCKS5 UDP association was not reported as active.' -Condition {
+            $proxy = Invoke-RestMethod -Uri "$baseUrl/api/v1/socks5-proxies" -Headers $headers |
+                Where-Object { $_.id -eq $created.id }
+            $proxy.udp_active_associations -eq 1
+        }
         $udpClient.Client.Bind([Net.IPEndPoint]::new([Net.IPAddress]::Loopback, 0))
         $udpClient.Client.ReceiveTimeout = 10000
         $udpPayload = [Text.Encoding]::UTF8.GetBytes('socks5-udp-echo')
@@ -464,6 +480,11 @@ managed_config_path = "$managedTomlPath"
             $null = $udpClient.Receive([ref]$unexpectedSource)
             throw 'A fragmented SOCKS5 UDP datagram was forwarded.'
         } catch [Net.Sockets.SocketException] {}
+        Wait-ForCondition -Failure 'The SOCKS5 UDP FRAG rejection metric was not updated.' -Condition {
+            $proxy = Invoke-RestMethod -Uri "$baseUrl/api/v1/socks5-proxies" -Headers $headers |
+                Where-Object { $_.id -eq $created.id }
+            $proxy.udp_fragmentation_unsupported_total -ge 1
+        }
     } finally {
         $udpClient.Dispose()
         $udpAssociation.Client.Dispose()
@@ -478,10 +499,19 @@ managed_config_path = "$managedTomlPath"
         Where-Object { $_.id -eq $created.id }
     $metrics = Invoke-RestMethod -Uri "$baseUrl/api/v1/metrics" -Headers $headers
     if ($proxyStats.requests_total -lt 2 -or $proxyStats.authentication_failures -lt 2 -or
-        $proxyStats.unsupported_commands -lt 1 -or $metrics.socks5_requests_total -lt 2 -or
+        $proxyStats.unsupported_commands -lt 1 -or $proxyStats.bind_rejected_total -lt 1 -or
+        $proxyStats.udp_fragmentation_unsupported_total -lt 1 -or
+        $metrics.socks5_requests_total -lt 2 -or $metrics.socks5_bind_rejected_total -lt 1 -or
+        $metrics.socks5_udp_fragmentation_unsupported_total -lt 1 -or
         $proxyStats.udp_datagrams_from_public -lt 1 -or $proxyStats.udp_datagrams_to_public -lt 1 -or
         $proxyStats.udp_dropped_datagrams -lt 1 -or $metrics.socks5_udp_datagrams_from_public -lt 1) {
         throw 'SOCKS5 policy or aggregate metrics were not updated as expected.'
+    }
+    if (-not $metrics.socks5_capabilities.connect -or
+        -not $metrics.socks5_capabilities.udp_associate -or
+        $metrics.socks5_capabilities.bind -or
+        $metrics.socks5_capabilities.udp_fragmentation) {
+        throw 'The aggregate SOCKS5 capability contract is incorrect.'
     }
 
     Invoke-RestMethod -Method Delete -Uri "$baseUrl/api/v1/socks5-proxies/$($created.id)" -Headers $headers
@@ -490,7 +520,7 @@ managed_config_path = "$managedTomlPath"
         -not ($remaining | Where-Object { $_.id -eq $created.id })
     }
 
-    Write-Host 'SOCKS5 TCP/UDP E2E passed: managed exit, one-time password, mandatory auth, CONNECT, UDP ASSOCIATE, fragmentation rejection, limits, lifecycle, and metrics.'
+    Write-Host 'SOCKS5 TCP/UDP E2E passed: CONNECT and UDP ASSOCIATE, explicit BIND/FRAG boundaries, control-connection cleanup, lifecycle, capabilities, and metrics.'
 } finally {
     foreach ($process in $processes) {
         if ($process -and -not $process.HasExited) {

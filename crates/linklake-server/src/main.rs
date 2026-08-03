@@ -765,10 +765,12 @@ struct MetricsResponse {
     tcp_rejected_policy_limit: u64,
     tcp_rejected_global_limit: u64,
     tcp_rejected_pending_limit: u64,
+    socks5_capabilities: Socks5CapabilitiesView,
     socks5_active_connections: usize,
     socks5_requests_total: u64,
     socks5_authentication_failures: u64,
     socks5_rejected_connections: u64,
+    socks5_bind_rejected_total: u64,
     socks5_bytes_from_public: u64,
     socks5_bytes_to_public: u64,
     socks5_handshake_errors: u64,
@@ -783,6 +785,7 @@ struct MetricsResponse {
     socks5_udp_bytes_to_public: u64,
     socks5_udp_dropped_datagrams: u64,
     socks5_udp_dropped_bandwidth_limit: u64,
+    socks5_udp_fragmentation_unsupported_total: u64,
     http_proxy_active_connections: usize,
     http_proxy_requests_total: u64,
     http_proxy_connect_requests: u64,
@@ -1178,17 +1181,38 @@ struct SecretTunnelView {
     lifetime_timeouts: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+struct Socks5CapabilitiesView {
+    connect: bool,
+    udp_associate: bool,
+    bind: bool,
+    udp_fragmentation: bool,
+}
+
+impl Socks5CapabilitiesView {
+    const fn new(udp_associate: bool) -> Self {
+        Self {
+            connect: true,
+            udp_associate,
+            bind: false,
+            udp_fragmentation: false,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct Socks5ProxyView {
     #[serde(flatten)]
     policy: Socks5ProxyPolicy,
     online: bool,
+    capabilities: Socks5CapabilitiesView,
     active_connections: usize,
     connections_total: u64,
     requests_total: u64,
     authentication_failures: u64,
     rejected_connections: u64,
     unsupported_commands: u64,
+    bind_rejected_total: u64,
     handshake_errors: u64,
     handshake_timeouts: u64,
     bytes_from_public: u64,
@@ -1204,6 +1228,7 @@ struct Socks5ProxyView {
     udp_bytes_to_public: u64,
     udp_dropped_datagrams: u64,
     udp_dropped_bandwidth_limit: u64,
+    udp_fragmentation_unsupported_total: u64,
 }
 
 #[derive(Serialize)]
@@ -2657,6 +2682,7 @@ async fn metrics(
             .metrics
             .p2p_relay_fallbacks_total
             .load(Ordering::Relaxed),
+        socks5_capabilities: Socks5CapabilitiesView::new(state.udp_data_plane.is_some()),
         socks5_active_connections: socks5_statistics
             .values()
             .map(|statistics| statistics.active_connections.load(Ordering::Relaxed))
@@ -2669,6 +2695,9 @@ async fn metrics(
         }),
         socks5_rejected_connections: sum_socks5_u64(|statistics| {
             statistics.rejected_connections.load(Ordering::Relaxed)
+        }),
+        socks5_bind_rejected_total: sum_socks5_u64(|statistics| {
+            statistics.bind_rejected_total.load(Ordering::Relaxed)
         }),
         socks5_bytes_from_public: sum_socks5_u64(|statistics| {
             statistics.bytes_from_public.load(Ordering::Relaxed)
@@ -2713,6 +2742,11 @@ async fn metrics(
         socks5_udp_dropped_bandwidth_limit: sum_socks5_u64(|statistics| {
             statistics
                 .udp_dropped_bandwidth_limit
+                .load(Ordering::Relaxed)
+        }),
+        socks5_udp_fragmentation_unsupported_total: sum_socks5_u64(|statistics| {
+            statistics
+                .udp_fragmentation_unsupported_total
                 .load(Ordering::Relaxed)
         }),
         http_proxy_active_connections: http_proxy_statistics
@@ -6783,6 +6817,7 @@ async fn list_socks5_proxies(
         .socks5_proxy_statistics
         .lock()
         .expect("SOCKS5 statistics lock poisoned");
+    let capabilities = Socks5CapabilitiesView::new(state.udp_data_plane.is_some());
     Ok(Json(
         policies
             .into_iter()
@@ -6792,6 +6827,7 @@ async fn list_socks5_proxies(
                     online: online.get(&policy.id).is_some_and(|registration| {
                         socks5_tunnel::online_public_port(registration) == policy.public_port
                     }),
+                    capabilities,
                     active_connections: current
                         .map_or(0, |value| value.active_connections.load(Ordering::Relaxed)),
                     connections_total: current
@@ -6807,6 +6843,8 @@ async fn list_socks5_proxies(
                     unsupported_commands: current.map_or(0, |value| {
                         value.unsupported_commands.load(Ordering::Relaxed)
                     }),
+                    bind_rejected_total: current
+                        .map_or(0, |value| value.bind_rejected_total.load(Ordering::Relaxed)),
                     handshake_errors: current
                         .map_or(0, |value| value.handshake_errors.load(Ordering::Relaxed)),
                     handshake_timeouts: current
@@ -6842,6 +6880,11 @@ async fn list_socks5_proxies(
                     }),
                     udp_dropped_bandwidth_limit: current.map_or(0, |value| {
                         value.udp_dropped_bandwidth_limit.load(Ordering::Relaxed)
+                    }),
+                    udp_fragmentation_unsupported_total: current.map_or(0, |value| {
+                        value
+                            .udp_fragmentation_unsupported_total
+                            .load(Ordering::Relaxed)
                     }),
                     policy,
                 }
@@ -9710,8 +9753,8 @@ mod tests {
         reserve_certificate_job_slot, select_certificate_maintenance_operation,
         session_cookie_header, tcp_history_error_total, udp_history_error_total,
         udp_metrics_response, CertificateOperation, HistoryCounters, LoginResponse, LoginThrottle,
-        MetricsHistory, MetricsHistoryProtocol, MetricsHistorySample, UserRole,
-        LOGIN_THROTTLE_MAX_IDENTITIES, MANAGEMENT_UI, METRICS_HISTORY_ARCHIVE_CAPACITY,
+        MetricsHistory, MetricsHistoryProtocol, MetricsHistorySample, Socks5CapabilitiesView,
+        UserRole, LOGIN_THROTTLE_MAX_IDENTITIES, MANAGEMENT_UI, METRICS_HISTORY_ARCHIVE_CAPACITY,
         METRICS_HISTORY_ARCHIVE_SAMPLE_INTERVAL_SECONDS, METRICS_HISTORY_CAPACITY,
         METRICS_HISTORY_RECENT_RETENTION_SECONDS, METRICS_HISTORY_RETENTION_SECONDS,
         METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS,
@@ -9842,6 +9885,23 @@ mod tests {
         assert!(output.contains("linklake_active_connections 3\n"));
         assert!(!output.contains("optional"));
         assert!(!output.contains("label"));
+    }
+
+    #[test]
+    fn socks5_capabilities_are_explicit_and_follow_udp_relay_availability() {
+        let tcp_only = serde_json::to_value(Socks5CapabilitiesView::new(false))
+            .expect("SOCKS5 capabilities should serialize");
+        assert_eq!(tcp_only["connect"], true);
+        assert_eq!(tcp_only["udp_associate"], false);
+        assert_eq!(tcp_only["bind"], false);
+        assert_eq!(tcp_only["udp_fragmentation"], false);
+
+        let tcp_and_udp = serde_json::to_value(Socks5CapabilitiesView::new(true))
+            .expect("SOCKS5 capabilities should serialize");
+        assert_eq!(tcp_and_udp["connect"], true);
+        assert_eq!(tcp_and_udp["udp_associate"], true);
+        assert_eq!(tcp_and_udp["bind"], false);
+        assert_eq!(tcp_and_udp["udp_fragmentation"], false);
     }
 
     #[test]
@@ -10335,6 +10395,16 @@ mod tests {
         assert!(MANAGEMENT_UI.contains("'edit-policy'"));
         assert!(MANAGEMENT_UI.contains("actionButton(t('editPolicy')"));
         assert!(MANAGEMENT_UI.contains("beginPolicyEdit(type, policy)"));
+    }
+
+    #[test]
+    fn web_ui_explains_socks5_capabilities_without_unsupported_controls() {
+        assert!(MANAGEMENT_UI.contains("socks5CapabilityText"));
+        assert!(MANAGEMENT_UI.contains("socks5CapabilitiesWithUdp"));
+        assert!(MANAGEMENT_UI.contains("socks5CapabilitiesTcpOnly"));
+        assert!(MANAGEMENT_UI.contains("BIND and UDP FRAG are intentionally unsupported"));
+        assert!(!MANAGEMENT_UI.contains("{ name: 'bind'"));
+        assert!(!MANAGEMENT_UI.contains("{ name: 'udp_fragmentation'"));
     }
 
     #[test]

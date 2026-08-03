@@ -107,7 +107,9 @@ extension PolicyKindInfo on PolicyKind {
     PolicyKind.secret =>
       zh ? '使用一次性访问密钥的私密转发' : 'Private forwarding protected by an access key',
     PolicyKind.socks5 =>
-      zh ? '带独立凭据的 SOCKS5 代理' : 'SOCKS5 proxy with generated credentials',
+      zh
+          ? '支持 CONNECT 与可选 UDP ASSOCIATE 的 SOCKS5 代理'
+          : 'SOCKS5 CONNECT with optional UDP ASSOCIATE',
     PolicyKind.proxy =>
       zh
           ? '支持普通请求和 CONNECT 的 HTTP 代理'
@@ -556,6 +558,16 @@ class _PolicyPageState extends State<PolicyPage> {
             ),
             const SizedBox(height: 6),
             SelectableText(_endpoint(policy)),
+            if (widget.kind == PolicyKind.socks5) ...[
+              const SizedBox(height: 8),
+              Text(
+                _socks5CapabilityText(policy),
+                key: Key('socks5-capabilities-${policy['id']}'),
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ],
             const SizedBox(height: 10),
             Wrap(
               spacing: 18,
@@ -911,6 +923,22 @@ class _PolicyPageState extends State<PolicyPage> {
     PolicyKind.socks5 || PolicyKind.proxy =>
       '${_clientName(policy['client_id'])} · ${policy['username']}@:${policy['public_port']}',
   };
+
+  String _socks5CapabilityText(Map<String, dynamic> policy) {
+    final capabilities = policy['capabilities'] is Map
+        ? Map<String, dynamic>.from(policy['capabilities'] as Map)
+        : const <String, dynamic>{};
+    if (capabilities['udp_associate'] == true) {
+      return t(
+        'CONNECT 与 UDP ASSOCIATE 当前可用；BIND 与 UDP FRAG 按设计不受支持。',
+        'CONNECT and UDP ASSOCIATE are available. BIND and UDP FRAG are intentionally unsupported.',
+      );
+    }
+    return t(
+      'CONNECT 当前可用；UDP relay 未启用，因此 UDP ASSOCIATE 不可用；BIND 与 UDP FRAG 按设计不受支持。',
+      'CONNECT is available. UDP ASSOCIATE is unavailable because the UDP relay is disabled. BIND and UDP FRAG are intentionally unsupported.',
+    );
+  }
 
   List<(String, String)> _stats(
     Map<String, dynamic> policy,
