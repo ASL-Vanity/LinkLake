@@ -9,6 +9,7 @@ mod database;
 mod database_migrations;
 mod database_tools;
 mod fleet;
+pub mod http_backend_pool;
 mod http_proxy_tunnel;
 mod http_route_catalog;
 mod http_tunnel;
