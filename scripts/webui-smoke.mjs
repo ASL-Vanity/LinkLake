@@ -1,28 +1,38 @@
 import { createRequire } from 'node:module';
+import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 const require = createRequire(import.meta.url);
-const { chromium } = require('playwright');
+const { chromium, firefox, webkit } = require('playwright');
 
 const baseUrl = process.env.LINKLAKE_SMOKE_BASE_URL;
 const username = process.env.LINKLAKE_SMOKE_USERNAME;
 const password = process.env.LINKLAKE_SMOKE_PASSWORD;
 const chromePath = process.env.LINKLAKE_SMOKE_CHROME;
 const outputDir = process.env.LINKLAKE_SMOKE_OUTPUT;
+const browserEngine = process.env.LINKLAKE_SMOKE_BROWSER_ENGINE || 'chromium';
+const browserLabel = process.env.LINKLAKE_SMOKE_BROWSER_LABEL || browserEngine;
 
-if (!baseUrl || !username || !password || !chromePath || !outputDir) {
+if (!baseUrl || !username || !password || !outputDir) {
   throw new Error('缺少 LinkLake WebUI 冒烟测试环境变量');
 }
+if (!['chromium', 'firefox', 'webkit'].includes(browserEngine)) throw new Error(`不支持的浏览器引擎：${browserEngine}`);
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-const browser = await chromium.launch({ headless: true, executablePath: chromePath });
+await mkdir(outputDir, { recursive: true });
+const browserType = { chromium, firefox, webkit }[browserEngine];
+const launchOptions = { headless: true };
+if (chromePath) launchOptions.executablePath = chromePath;
+const browser = await browserType.launch(launchOptions);
 const context = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
 const page = await context.newPage();
 const pageErrors = [];
+const consoleErrors = [];
 page.on('pageerror', error => pageErrors.push(error.message));
+page.on('console', message => { if (message.type() === 'error') consoleErrors.push(message.text()); });
 
 async function waitForWorkspace() {
   await page.locator('#workspace:not(.hidden)').waitFor({ timeout: 15_000 });
@@ -64,6 +74,146 @@ async function pageApi(targetPage, url, options = {}) {
   }, { url, options });
 }
 
+function parseRgb(value) {
+  const channels = value.match(/[\d.]+/g)?.map(Number);
+  if (!channels || channels.length < 3) throw new Error(`无法解析颜色：${value}`);
+  return channels.slice(0, 3);
+}
+
+function relativeLuminance(value) {
+  const channels = parseRgb(value).map(channel => {
+    const normalized = channel / 255;
+    return normalized <= 0.04045 ? normalized / 12.92 : ((normalized + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2];
+}
+
+function contrastRatio(foreground, background) {
+  const first = relativeLuminance(foreground);
+  const second = relativeLuminance(background);
+  return (Math.max(first, second) + 0.05) / (Math.min(first, second) + 0.05);
+}
+
+const acceptanceManifest = {
+  schemaVersion: 1,
+  generatedAt: new Date().toISOString(),
+  browser: { engine: browserEngine, label: browserLabel },
+  combinations: [],
+  preferenceChecks: {},
+  switchStress: {},
+};
+
+async function captureThemeAcceptance({ palette, scheme, viewportName, viewport }) {
+  await page.setViewportSize(viewport);
+  await openRoute('#/overview');
+  await page.locator('#traffic-chart').waitFor({ state: 'visible' });
+  const screenshotName = `theme-${palette}-${scheme}-${viewportName}-${viewport.width}x${viewport.height}.png`;
+  const snapshot = await page.evaluate(() => {
+    const root = document.documentElement;
+    const rootStyle = getComputedStyle(root);
+    const panelStyle = getComputedStyle(document.querySelector('.chart-panel'));
+    const topbarStyle = getComputedStyle(document.querySelector('.utility-bar'));
+    const sidebarStyle = getComputedStyle(document.querySelector('.sidebar'));
+    const menuStyle = getComputedStyle(document.querySelector('.popover'));
+    const inputStyle = getComputedStyle(document.querySelector('input'));
+    const tableHeaderStyle = getComputedStyle(document.querySelector('.data-table th'));
+    const bodyStyle = getComputedStyle(document.body);
+    const bodyTexture = getComputedStyle(document.body, '::after');
+    const probe = document.createElement('span');
+    probe.style.cssText = 'position:fixed;left:-10000px;top:-10000px;';
+    document.body.append(probe);
+    const resolveColor = value => {
+      probe.className = '';
+      probe.removeAttribute('style');
+      probe.style.cssText = `position:fixed;left:-10000px;top:-10000px;color:${value}`;
+      return getComputedStyle(probe).color;
+    };
+    const probeClass = className => {
+      probe.removeAttribute('style');
+      probe.style.cssText = 'position:fixed;left:-10000px;top:-10000px;';
+      probe.className = className;
+      const style = getComputedStyle(probe);
+      return { color: style.color, background: style.backgroundColor };
+    };
+    const primaryButton = probeClass('primary-button');
+    const dangerButton = probeClass('danger-button');
+    const successStatus = probeClass('badge online');
+    const warningStatus = probeClass('badge warning');
+    const colors = {
+      text: resolveColor('var(--text)'),
+      background: resolveColor('var(--bg)'),
+      card: resolveColor('var(--surface)'),
+      statusSurface: resolveColor('var(--surface-3)'),
+      danger: resolveColor('var(--danger)'),
+      primaryButton,
+      dangerButton,
+      successStatus,
+      warningStatus,
+    };
+    probe.remove();
+    return {
+      palette: root.dataset.palette,
+      scheme: root.dataset.scheme,
+      material: rootStyle.getPropertyValue('--material-name').trim(),
+      supports: {
+        colorMix: CSS.supports('color', 'color-mix(in srgb, #000 50%, #fff)'),
+        backdropFilter: CSS.supports('backdrop-filter', 'blur(1px)') || CSS.supports('-webkit-backdrop-filter', 'blur(1px)'),
+        layeredGradient: CSS.supports('background', 'radial-gradient(circle, #000, transparent), linear-gradient(#000, #fff)'),
+      },
+      viewport: { width: innerWidth, height: innerHeight, deviceScaleFactor: devicePixelRatio },
+      overflow: {
+        html: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+        body: document.body.scrollWidth - document.body.clientWidth,
+      },
+      styles: {
+        bodyColor: bodyStyle.color,
+        bodyBackgroundColor: bodyStyle.backgroundColor,
+        bodyBackgroundImage: bodyStyle.backgroundImage,
+        texture: bodyTexture.backgroundImage,
+        cardBackgroundColor: panelStyle.backgroundColor,
+        cardBackgroundImage: panelStyle.backgroundImage,
+        cardBorder: `${panelStyle.borderWidth} ${panelStyle.borderStyle} ${panelStyle.borderColor}`,
+        cardRadius: panelStyle.borderRadius,
+        cardShadow: panelStyle.boxShadow,
+        cardBackdropFilter: panelStyle.backdropFilter || panelStyle.webkitBackdropFilter,
+        topbarBackground: `${topbarStyle.backgroundImage} ${topbarStyle.backgroundColor}`,
+        sidebarBackground: `${sidebarStyle.backgroundImage} ${sidebarStyle.backgroundColor}`,
+        menuBackground: `${menuStyle.backgroundImage} ${menuStyle.backgroundColor}`,
+        inputBackground: `${inputStyle.backgroundImage} ${inputStyle.backgroundColor}`,
+        tableHeaderBackground: `${tableHeaderStyle.backgroundImage} ${tableHeaderStyle.backgroundColor}`,
+        chartGridDash: rootStyle.getPropertyValue('--chart-grid-dash').trim(),
+        chartStrokeWidth: rootStyle.getPropertyValue('--chart-stroke-width').trim(),
+        density: rootStyle.getPropertyValue('--density-space').trim(),
+        hoverLift: rootStyle.getPropertyValue('--hover-lift').trim(),
+      },
+      colors,
+    };
+  });
+
+  assert(snapshot.palette === palette && snapshot.scheme === scheme, `主题组合未正确应用：${palette}/${scheme}`);
+  assert(snapshot.overflow.html === 0 && snapshot.overflow.body === 0, `${palette}/${scheme}/${viewportName} 横向溢出：${JSON.stringify(snapshot.overflow)}`);
+  const threshold = palette === 'contrast' ? 7 : 4.5;
+  const contrastChecks = [
+    ['backgroundText', snapshot.colors.text, snapshot.colors.background],
+    ['cardText', snapshot.colors.text, snapshot.colors.card],
+    ['primaryButton', snapshot.colors.primaryButton.color, snapshot.colors.primaryButton.background],
+    ['dangerButton', snapshot.colors.dangerButton.color, snapshot.colors.dangerButton.background],
+    ['successStatus', snapshot.colors.successStatus.color, snapshot.colors.successStatus.background],
+    ['warningStatus', snapshot.colors.warningStatus.color, snapshot.colors.warningStatus.background],
+    ['dangerStatus', snapshot.colors.danger, snapshot.colors.statusSurface],
+  ].map(([name, foreground, background]) => ({
+    name,
+    foreground,
+    background,
+    ratio: Number(contrastRatio(foreground, background).toFixed(2)),
+    threshold,
+    passed: contrastRatio(foreground, background) >= threshold,
+  }));
+  await page.screenshot({ path: path.join(outputDir, screenshotName), fullPage: true });
+  acceptanceManifest.combinations.push({ ...snapshot, viewportName, contrastChecks, screenshot: screenshotName });
+  return snapshot;
+}
+
 try {
   await page.goto(`${baseUrl}/#/overview`, { waitUntil: 'domcontentloaded' });
   assert(await page.locator('link[rel~="icon"]').count() > 0, '页面缺少 favicon');
@@ -84,6 +234,9 @@ try {
   await page.reload({ waitUntil: 'domcontentloaded' });
   await waitForWorkspace();
   assert((await page.locator('#account-name').textContent())?.trim() === username, '刷新后未恢复当前账户');
+  acceptanceManifest.preAuthenticationConsoleErrors = [...consoleErrors];
+  pageErrors.length = 0;
+  consoleErrors.length = 0;
 
   await page.locator('#global-search').fill('smoke-tcp');
   await page.locator('#global-search-results button').first().waitFor({ timeout: 15_000 });
@@ -115,33 +268,115 @@ try {
   await page.locator('#clients-list tr').filter({ hasText: 'unused-client' }).getByRole('button', { name: /Delete|删除/ }).click();
   await page.waitForFunction(() => !document.querySelector('#clients-list')?.textContent?.includes('unused-client'));
 
-  // 验证五套完整视觉风格、明暗模式和持久化。
-  await page.locator('#appearance-button').click();
-  await page.locator('[data-theme-choice="light"]').click();
-  const visualStyles = [];
-  for (const palette of ['lake', 'ocean', 'jade', 'violet', 'contrast']) {
+  // 验证五套完整材质语言、明暗模式独立性、系统跟随、降级动效和持久化。
+  const palettes = ['lake', 'ocean', 'jade', 'violet', 'contrast'];
+  async function chooseAppearance(mode, palette, keepOpen = false) {
+    if (await page.locator('#appearance-popover').evaluate(node => node.classList.contains('hidden'))) {
+      await page.locator('#appearance-button').click();
+    }
+    await page.locator(`[data-theme-choice="${mode}"]`).click();
     await page.locator(`[data-palette-choice="${palette}"]`).click();
-    visualStyles.push(await page.evaluate(() => {
-      const rootStyle = getComputedStyle(document.documentElement);
-      const panelStyle = getComputedStyle(document.querySelector('.chart-panel'));
-      return {
-        palette: document.documentElement.dataset.palette,
-        background: rootStyle.getPropertyValue('--bg').trim(),
-        surface: rootStyle.getPropertyValue('--surface').trim(),
-        line: rootStyle.getPropertyValue('--line').trim(),
-        radius: panelStyle.borderRadius,
-        shadow: panelStyle.boxShadow,
-      };
-    }));
+    if (!keepOpen) await page.locator('#appearance-button').click();
+    await page.waitForTimeout(320);
   }
-  assert(new Set(visualStyles.map(style => style.background)).size === 5, '五套视觉风格没有分别改变页面背景');
-  assert(new Set(visualStyles.map(style => style.radius)).size >= 4, '视觉风格仍只是换色，没有改变结构质感');
-  await page.locator('[data-theme-choice="dark"]').click();
+
+  const acceptanceViewports = {
+    desktop: { width: 1920, height: 1080 },
+    mobile: { width: 390, height: 844 },
+  };
+  const visualStyles = [];
+  for (const scheme of ['light', 'dark']) {
+    for (const palette of palettes) {
+      await chooseAppearance(scheme, palette);
+      const desktopSnapshot = await captureThemeAcceptance({ palette, scheme, viewportName: 'desktop', viewport: acceptanceViewports.desktop });
+      await captureThemeAcceptance({ palette, scheme, viewportName: 'mobile', viewport: acceptanceViewports.mobile });
+      if (scheme === 'light') {
+        visualStyles.push({
+          palette,
+          material: desktopSnapshot.material,
+          cardBackground: `${desktopSnapshot.styles.cardBackgroundImage}${desktopSnapshot.styles.cardBackgroundColor}`,
+          topbarBackground: desktopSnapshot.styles.topbarBackground,
+          sidebarBackground: desktopSnapshot.styles.sidebarBackground,
+          menuBackground: desktopSnapshot.styles.menuBackground,
+          inputBackground: desktopSnapshot.styles.inputBackground,
+          tableHeaderBackground: desktopSnapshot.styles.tableHeaderBackground,
+          radius: desktopSnapshot.styles.cardRadius,
+          border: desktopSnapshot.styles.cardBorder,
+          shadow: desktopSnapshot.styles.cardShadow,
+          backdropFilter: desktopSnapshot.styles.cardBackdropFilter,
+          chartGridDash: desktopSnapshot.styles.chartGridDash,
+          chartStrokeWidth: desktopSnapshot.styles.chartStrokeWidth,
+        });
+      }
+    }
+  }
+  assert(acceptanceManifest.combinations.length === 20, `视觉验收组合数量异常：${acceptanceManifest.combinations.length}`);
+  const contrastFailures = acceptanceManifest.combinations.flatMap(item => item.contrastChecks
+    .filter(check => !check.passed)
+    .map(check => `${item.palette}/${item.scheme}/${check.name}=${check.ratio}<${check.threshold}`));
+  assert(contrastFailures.length === 0, `WCAG 对比检查失败：${contrastFailures.join(', ')}`);
+
+  await page.setViewportSize(acceptanceViewports.desktop);
+  await chooseAppearance('light', 'lake', true);
+  await page.screenshot({ path: path.join(outputDir, 'theme-picker-material-previews.png') });
+  await page.locator('#appearance-button').click();
+
+  assert(new Set(visualStyles.map(style => style.material)).size === 5, '五套主题缺少唯一的材质身份 token');
+  assert(new Set(visualStyles.map(style => style.cardBackground)).size === 5, '五套主题的卡片材质没有实质差异');
+  assert(new Set(visualStyles.map(style => style.topbarBackground)).size >= 4, '顶栏材质差异不足');
+  assert(new Set(visualStyles.map(style => style.sidebarBackground)).size >= 4, '侧栏材质差异不足');
+  assert(new Set(visualStyles.map(style => style.menuBackground)).size >= 4, '菜单材质差异不足');
+  assert(new Set(visualStyles.map(style => style.inputBackground)).size >= 4, '输入框材质差异不足');
+  assert(new Set(visualStyles.map(style => style.tableHeaderBackground)).size >= 4, '表格材质差异不足');
+  assert(new Set(visualStyles.map(style => style.radius)).size >= 4, '视觉风格仍只是换色，没有改变圆角体系');
+  assert(new Set(visualStyles.map(style => style.shadow)).size >= 4, '视觉风格没有建立不同阴影层级');
+  assert(new Set(visualStyles.map(style => style.backdropFilter)).size >= 3, '玻璃、实体和辉光主题的滤镜差异不足');
+  assert(new Set(visualStyles.map(style => style.chartGridDash)).size === 5, '五套主题没有独立图表网格节奏');
+  assert(new Set(visualStyles.map(style => style.chartStrokeWidth)).size === 5, '五套主题没有独立图表线条粗细');
+  assert(new Set(visualStyles.map(style => style.border)).size >= 2, '高对比主题没有使用更强边框');
+  assert(await page.locator('.theme-preview .preview-card').count() === 5, '主题选择器缺少卡片材质缩略预览');
+  assert(await page.locator('.theme-preview .preview-chart').count() === 5, '主题选择器缺少图表材质缩略预览');
+
+  await chooseAppearance('dark', 'contrast');
   await page.waitForTimeout(250);
   const contrastOnPrimary = await page.locator('.nav-link.active').evaluate(node => ({ color: getComputedStyle(node).color, background: getComputedStyle(node).backgroundColor }));
   assert(contrastOnPrimary.color === 'rgb(0, 0, 0)' && contrastOnPrimary.background === 'rgb(255, 230, 0)', `高对比深色主题主色文字不可读：${JSON.stringify(contrastOnPrimary)}`);
-  await page.locator('[data-theme-choice="light"]').click();
-  await page.locator('[data-palette-choice="violet"]').click();
+
+  await page.emulateMedia({ colorScheme: 'dark', reducedMotion: 'reduce' });
+  await chooseAppearance('system', 'jade');
+  assert(await page.evaluate(() => document.documentElement.dataset.scheme === 'dark'), '跟随系统未响应深色偏好');
+  assert(await page.evaluate(() => document.documentElement.dataset.palette === 'jade'), '切换跟随系统时材质主题被意外改变');
+  const reducedMotion = await page.locator('#overview-view').evaluate(node => getComputedStyle(node).animationDuration);
+  assert(Number.parseFloat(reducedMotion) <= 0.01, `reduced-motion 未关闭主题动效：${reducedMotion}`);
+  acceptanceManifest.preferenceChecks.reducedMotion = { requested: 'reduce', animationDuration: reducedMotion, passed: true };
+  acceptanceManifest.preferenceChecks.systemDark = { requested: 'dark', resolved: 'dark', palette: 'jade', passed: true };
+  await page.emulateMedia({ colorScheme: 'light', reducedMotion: 'no-preference' });
+  await page.waitForFunction(() => document.documentElement.dataset.scheme === 'light');
+  assert(await page.evaluate(() => document.documentElement.dataset.palette === 'jade'), '系统明暗变化不应改变材质主题');
+  acceptanceManifest.preferenceChecks.systemLight = { requested: 'light', resolved: 'light', palette: 'jade', passed: true };
+
+  const switchStress = await page.evaluate(() => {
+    const modes = ['light', 'dark', 'system'];
+    const palettes = ['lake', 'ocean', 'jade', 'violet', 'contrast'];
+    const started = performance.now();
+    let finalMode = modes[0];
+    let finalPalette = palettes[0];
+    for (let index = 0; index < 75; index += 1) {
+      finalMode = modes[index % modes.length];
+      finalPalette = palettes[index % palettes.length];
+      document.querySelector(`[data-theme-choice="${finalMode}"]`).click();
+      document.querySelector(`[data-palette-choice="${finalPalette}"]`).click();
+    }
+    return { count: 75, durationMs: Number((performance.now() - started).toFixed(2)), finalMode, finalPalette };
+  });
+  await page.waitForTimeout(400);
+  const finalTheme = await page.evaluate(() => ({ mode: document.documentElement.dataset.themeMode, palette: document.documentElement.dataset.palette }));
+  assert(finalTheme.mode === switchStress.finalMode && finalTheme.palette === switchStress.finalPalette, `快速主题切换最终状态错误：${JSON.stringify({ switchStress, finalTheme })}`);
+  assert(pageErrors.length === 0 && consoleErrors.length === 0, `快速主题切换产生错误：${[...pageErrors, ...consoleErrors].join(' | ')}`);
+  acceptanceManifest.switchStress = { ...switchStress, finalTheme, passed: true };
+
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await chooseAppearance('light', 'violet');
   assert(await page.evaluate(() => document.documentElement.dataset.scheme === 'light'), '浅色主题未生效');
   assert(await page.evaluate(() => document.documentElement.dataset.palette === 'violet'), '紫罗兰配色未生效');
   await page.reload({ waitUntil: 'domcontentloaded' });
@@ -289,7 +524,19 @@ try {
   assert(serviceOverflow.html === 0 && serviceOverflow.body === 0, `协议页移动端横向溢出：${JSON.stringify(serviceOverflow)}`);
 
   assert(pageErrors.length === 0, `浏览器出现脚本异常：${pageErrors.join(' | ')}`);
-  console.log(JSON.stringify({ ok: true, editedPolicies: policies.length, rbac: true, themeSurfaces: true, visualStyles, pageErrors, overflow, userOverflow, serviceOverflow, wideLayout }, null, 2));
+  assert(consoleErrors.length === 0, `浏览器控制台出现错误：${consoleErrors.join(' | ')}`);
+  acceptanceManifest.summary = {
+    ok: true,
+    combinations: acceptanceManifest.combinations.length,
+    screenshots: acceptanceManifest.combinations.length + 5,
+    contrastChecks: acceptanceManifest.combinations.reduce((total, item) => total + item.contrastChecks.length, 0),
+    pageErrors: pageErrors.length,
+    consoleErrors: consoleErrors.length,
+  };
+  console.log(JSON.stringify({ ok: true, browser: acceptanceManifest.browser, editedPolicies: policies.length, rbac: true, themeSurfaces: true, visualStyles, manifest: path.join(outputDir, 'theme-acceptance-manifest.json'), pageErrors, consoleErrors, overflow, userOverflow, serviceOverflow, wideLayout }, null, 2));
 } finally {
+  acceptanceManifest.pageErrors = pageErrors;
+  acceptanceManifest.consoleErrors = consoleErrors;
+  await writeFile(path.join(outputDir, 'theme-acceptance-manifest.json'), `${JSON.stringify(acceptanceManifest, null, 2)}\n`, 'utf8');
   await browser.close();
 }
