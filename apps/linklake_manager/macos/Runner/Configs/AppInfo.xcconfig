@@ -12,3 +12,6 @@ PRODUCT_BUNDLE_IDENTIFIER = io.linklake.manager
 
 // The copyright displayed in application information
 PRODUCT_COPYRIGHT = Copyright © 2026 LinkLake contributors.
+
+// macOS 10.15-12 的 LaunchAtLogin helper 复制脚本尚不兼容 Xcode 用户脚本沙箱。
+ENABLE_USER_SCRIPT_SANDBOXING = NO

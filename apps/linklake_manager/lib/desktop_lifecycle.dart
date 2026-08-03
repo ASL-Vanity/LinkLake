@@ -72,7 +72,7 @@ class NativeDesktopPlatformAdapter implements DesktopPlatformAdapter {
       return const DesktopCapabilities(
         windowLifecycle: true,
         tray: true,
-        launchAtStartup: false,
+        launchAtStartup: true,
       );
     }
     return const DesktopCapabilities.none();

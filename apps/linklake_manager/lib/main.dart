@@ -874,16 +874,21 @@ class _DashboardPageState extends State<DashboardPage> {
                       !desktopCapabilities.launchAtStartup
                           ? t(
                               Platform.isMacOS
-                                  ? '当前 macOS 工程未集成 LaunchAtLogin，功能已禁用'
+                                  ? 'macOS 登录项不可用，请检查系统设置中的登录项权限'
                                   : '当前平台不支持开机自启',
                               Platform.isMacOS
-                                  ? 'This macOS build does not integrate LaunchAtLogin, so the setting is disabled'
+                                  ? 'The macOS login item is unavailable; check Login Items permissions in System Settings'
                                   : 'Launch at startup is unavailable on this platform',
                             )
                           : Platform.isLinux
                           ? t(
                               '取决于桌面环境的自启动和托盘支持',
                               'Depends on desktop autostart and tray support',
+                            )
+                          : Platform.isMacOS
+                          ? t(
+                              '登录 macOS 后自动启动',
+                              'Start automatically after macOS login',
                             )
                           : t(
                               '登录 Windows 后自动启动',
