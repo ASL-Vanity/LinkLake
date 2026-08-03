@@ -1,0 +1,11 @@
+LinkLake has been installed as a single-replica Deployment.
+
+Management service:
+  {{ include "linklake.fullname" . }}-management:{{ .Values.server.managementPort }}
+
+Data service:
+  {{ include "linklake.fullname" . }}-data
+
+Before exposing management publicly, restrict it with a private LoadBalancer, ingress allowlist,
+VPN, or NetworkPolicy. Invoke POST /api/v1/lifecycle/drain before planned node or cluster
+maintenance, wait until GET /api/v1/lifecycle reports drained=true, then terminate the pod.

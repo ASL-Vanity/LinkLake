@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "replicaCount": { "type": "integer", "const": 1 },
+    "auth": {
+      "type": "object",
+      "required": ["existingSecret"],
+      "properties": {
+        "existingSecret": { "type": "string" }
+      }
+    },
+    "tls": {
+      "type": "object",
+      "required": ["managementSecret", "controlSecret"],
+      "properties": {
+        "managementSecret": { "type": "string" },
+        "controlSecret": { "type": "string" }
+      }
+    },
+    "server": {
+      "type": "object",
+      "properties": {
+        "udpPublicBindMode": {
+          "type": "string",
+          "enum": ["auto", "ipv4_only", "dual_stack_required"]
+        }
+      }
+    },
+    "services": {
+      "type": "object",
+      "properties": {
+        "data": {
+          "type": "object",
+          "properties": {
+            "publicTcpPorts": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": { "type": "integer", "minimum": 1, "maximum": 65535 }
+            },
+            "publicUdpPorts": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": { "type": "integer", "minimum": 1, "maximum": 65535 }
+            }
+          }
+        }
+      }
+    }
+  }
+}
