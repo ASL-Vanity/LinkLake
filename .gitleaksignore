@@ -1,0 +1,12 @@
+# reason: Dart policy enum label named secret, not credential material; expires: 2026-09-03
+201d7e77a35222e38c6a9bdd2a6284f20530e36e:apps/linklake_manager/lib/policy_pages.dart:generic-api-key:55
+# reason: English display label for the secret policy kind, not credential material; expires: 2026-09-03
+201d7e77a35222e38c6a9bdd2a6284f20530e36e:apps/linklake_manager/lib/policy_pages.dart:generic-api-key:87
+# reason: User-facing access-key description contains no actual key or credential; expires: 2026-09-03
+201d7e77a35222e38c6a9bdd2a6284f20530e36e:apps/linklake_manager/lib/policy_pages.dart:generic-api-key:108
+# reason: Cargo package names containing crypto and secretbox are dependency metadata; expires: 2026-09-03
+ab95ad9ed570cfaaeb78999e693ea7697dd4abeb:Cargo.lock:generic-api-key:776
+# reason: API documentation mentions secret authentication without embedding a credential; expires: 2026-09-03
+ab95ad9ed570cfaaeb78999e693ea7697dd4abeb:README.en.md:generic-api-key:337
+# reason: Parallel UDP documentation mentions one-time passwords and secret authentication without embedding a credential; expires: 2026-09-03
+d384cb70554685ab8a50a0b2708336ac73e42032:README.en.md:generic-api-key:433

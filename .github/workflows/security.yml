@@ -1,0 +1,183 @@
+name: Security baseline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  schedule:
+    - cron: "17 19 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_AUDIT_VERSION: "0.22.2"
+  CARGO_DENY_VERSION: "0.20.2"
+  OSV_SCANNER_VERSION: "2.4.0"
+  GITLEAKS_VERSION: "8.30.1"
+  ACTIONLINT_VERSION: "1.7.12"
+  ZIZMOR_VERSION: "1.29.0"
+  TRIVY_VERSION: "v0.72.0"
+
+jobs:
+  rust-supply-chain:
+    name: Rust supply-chain policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Select pinned Rust toolchain
+        run: rustup default 1.88.0
+      - name: Validate exact and unexpired security exceptions
+        run: node scripts/check-security-exceptions.mjs
+      - name: Install pinned Rust security tools
+        run: |
+          cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked --root "$RUNNER_TEMP/security-tools"
+          cargo install cargo-deny --version "$CARGO_DENY_VERSION" --locked --root "$RUNNER_TEMP/security-tools"
+          echo "$RUNNER_TEMP/security-tools/bin" >> "$GITHUB_PATH"
+      - name: Audit Rust advisories
+        run: cargo audit --deny warnings
+      - name: Enforce Rust dependency policy
+        # 四个既有工作区 path 依赖由上一步逐项校验并设置到期日；其他 bans 仍保持 deny。
+        run: cargo deny check advisories bans licenses sources --warn wildcard
+
+  dependency-vulnerabilities:
+    name: OSV dependency scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install checksum-verified OSV Scanner
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}"
+          curl --proto '=https' --tlsv1.2 --fail --show-error --location --retry 3 \
+            --output osv-scanner "$base/osv-scanner_linux_amd64"
+          curl --proto '=https' --tlsv1.2 --fail --show-error --location --retry 3 \
+            --output osv-scanner_SHA256SUMS "$base/osv-scanner_SHA256SUMS"
+          expected="$(awk '$2 == "osv-scanner_linux_amd64" { print $1 }' osv-scanner_SHA256SUMS)"
+          test "$expected" = "15314940c10d26af9c6649f150b8a47c1262e8fc7e17b1d1029b0e479e8ed8a0"
+          printf '%s  %s\n' "$expected" osv-scanner | sha256sum --check --strict -
+          install -m 0755 osv-scanner "$RUNNER_TEMP/osv-scanner"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Scan all supported lockfiles recursively
+        run: osv-scanner scan source --recursive --config osv-scanner.toml .
+
+  repository-secrets:
+    name: Repository secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out full history without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install checksum-verified gitleaks
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          checksums="gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          curl --proto '=https' --tlsv1.2 --fail --show-error --location --retry 3 --output "$archive" "$base/$archive"
+          curl --proto '=https' --tlsv1.2 --fail --show-error --location --retry 3 --output "$checksums" "$base/$checksums"
+          expected="$(awk -v file="$archive" '$2 == file { print $1 }' "$checksums")"
+          test "$expected" = "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+          printf '%s  %s\n' "$expected" "$archive" | sha256sum --check --strict -
+          tar -xzf "$archive" gitleaks
+          install -m 0755 gitleaks "$RUNNER_TEMP/gitleaks"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Scan the complete Git history with redacted output
+        run: gitleaks git --redact --no-banner --verbose .
+
+  workflow-security:
+    name: Workflow syntax and security
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install checksum-verified actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          checksums="actionlint_${ACTIONLINT_VERSION}_checksums.txt"
+          base="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}"
+          curl --proto '=https' --tlsv1.2 --fail --show-error --location --retry 3 --output "$archive" "$base/$archive"
+          curl --proto '=https' --tlsv1.2 --fail --show-error --location --retry 3 --output "$checksums" "$base/$checksums"
+          expected="$(awk -v file="$archive" '$2 == file { print $1 }' "$checksums")"
+          test "$expected" = "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+          printf '%s  %s\n' "$expected" "$archive" | sha256sum --check --strict -
+          tar -xzf "$archive" actionlint
+          install -m 0755 actionlint "$RUNNER_TEMP/actionlint"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Validate GitHub Actions workflows
+        run: actionlint -color
+      - name: Audit workflows and Dependabot configuration
+        uses: zizmorcore/zizmor-action@3dc1ecc9bcb9e94e9b2c709687979e1298497054 # v0.6.2
+        with:
+          version: ${{ env.ZIZMOR_VERSION }}
+          inputs: .
+          collect: all
+          online-audits: false
+          persona: regular
+          advanced-security: false
+          annotations: true
+          token: ""
+          config: .github/zizmor.yml
+
+  filesystem-vulnerabilities:
+    name: Filesystem vulnerability and misconfiguration scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Scan repository with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,misconfig,secret
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          exit-code: "1"
+          format: table
+          hide-progress: true
+          cache: false
+          token-setup-trivy: ""
+          trivyignores: .trivyignore.yaml

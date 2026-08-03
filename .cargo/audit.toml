@@ -1,0 +1,18 @@
+[advisories]
+# 以下例外均由 security/exceptions.toml 统一管理，并由 CI 校验原因与到期日。
+# RUSTSEC-2026-0118：iroh 0.92.0 的传递依赖，暂无兼容的稳定修复版本；2026-09-03 到期。
+# RUSTSEC-2026-0119：修复需要 hickory-proto >=0.26.1 及上游 iroh 升级；2026-08-17 到期。
+# RUSTSEC-2023-0089：iroh 指标/中继链上的停止维护依赖；2026-09-03 到期。
+# RUSTSEC-2024-0384：iroh 0.92.0 的停止维护传递依赖；2026-09-03 到期。
+# RUSTSEC-2024-0436：iroh -> stun-rs 的停止维护传递依赖；2026-09-03 到期。
+# RUSTSEC-2025-0134：直接依赖及 axum-server 依赖均需专门迁移；2026-08-17 到期。
+# RUSTSEC-2026-0002：iroh-relay/pkarr 引入的 lru 不健全实现；2026-08-17 到期。
+ignore = [
+    "RUSTSEC-2026-0118",
+    "RUSTSEC-2026-0119",
+    "RUSTSEC-2023-0089",
+    "RUSTSEC-2024-0384",
+    "RUSTSEC-2024-0436",
+    "RUSTSEC-2025-0134",
+    "RUSTSEC-2026-0002",
+]

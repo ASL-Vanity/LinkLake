@@ -1,0 +1,35 @@
+# 与 security/exceptions.toml 保持逐项一致；OSV 会同时忽略同一漏洞的 GHSA 别名。
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0118"
+reason = "Transitive through iroh 0.92.0 -> hickory-resolver 0.25.2; no compatible stable patched release is available, so the iroh/hickory upgrade must be tracked upstream."
+ignoreUntil = 2026-09-03
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0119"
+reason = "Transitive through iroh 0.92.0 -> hickory-resolver 0.25.2; the fix requires hickory-proto >=0.26.1 and an upstream iroh dependency update outside this baseline branch."
+ignoreUntil = 2026-08-17
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2023-0089"
+reason = "Unmaintained transitive dependency through iroh metrics/relay -> postcard -> heapless; remove it by upgrading the iroh dependency chain."
+ignoreUntil = 2026-09-03
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0384"
+reason = "Unmaintained transitive dependency from iroh 0.92.0; remove it by upgrading iroh after compatibility validation."
+ignoreUntil = 2026-09-03
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0436"
+reason = "Unmaintained transitive dependency through iroh 0.92.0 -> stun-rs; remove it by upgrading the upstream networking stack."
+ignoreUntil = 2026-09-03
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0134"
+reason = "Unmaintained direct and axum-server dependency; migrate PEM parsing and upgrade axum-server in a dedicated dependency change."
+ignoreUntil = 2026-08-17
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0002"
+reason = "Unsound IterMut implementation in lru 0.13.0 via iroh-relay/pkarr; the fix in >=0.16.3 requires an upstream iroh update."
+ignoreUntil = 2026-08-17

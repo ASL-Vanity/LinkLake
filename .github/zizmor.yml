@@ -1,0 +1,56 @@
+rules:
+  artipacked:
+    ignore:
+      - ci.yml:23 # reason: Existing CI checkout persists credentials and is frozen in this baseline branch; expires: 2026-08-17
+      - ci.yml:47 # reason: Existing CI checkout persists credentials and is frozen in this baseline branch; expires: 2026-08-17
+      - ci.yml:95 # reason: Existing CI checkout persists credentials and is frozen in this baseline branch; expires: 2026-08-17
+      - ci.yml:163 # reason: Existing CI checkout persists credentials and is frozen in this baseline branch; expires: 2026-08-17
+      - ci.yml:195 # reason: Existing CI checkout persists credentials and is frozen in this baseline branch; expires: 2026-08-17
+      - ci.yml:222 # reason: Existing CI checkout persists credentials and is frozen in this baseline branch; expires: 2026-08-17
+      - release.yml:20 # reason: Existing release checkout persists credentials and requires a dedicated workflow-hardening change; expires: 2026-08-17
+      - release.yml:63 # reason: Existing release checkout persists credentials and requires a dedicated workflow-hardening change; expires: 2026-08-17
+      - release.yml:112 # reason: Existing release checkout persists credentials and requires a dedicated workflow-hardening change; expires: 2026-08-17
+      - release.yml:156 # reason: Existing release checkout persists credentials and requires a dedicated workflow-hardening change; expires: 2026-08-17
+      - soak.yml:27 # reason: Existing soak checkout persists credentials and is frozen in this baseline branch; expires: 2026-08-17
+
+  unpinned-uses:
+    ignore:
+      - ci.yml:23 # reason: Existing CI action tag must be converted to an immutable commit in a dedicated workflow change; expires: 2026-08-17
+      - ci.yml:28 # reason: Existing CI action tag must be converted to an immutable commit in a dedicated workflow change; expires: 2026-08-17
+      - ci.yml:47 # reason: Existing CI action tag must be converted to an immutable commit in a dedicated workflow change; expires: 2026-08-17
+      - ci.yml:52 # reason: Existing CI action tag must be converted to an immutable commit in a dedicated workflow change; expires: 2026-08-17
+      - ci.yml:95 # reason: Existing CI action tag must be converted to an immutable commit in a dedicated workflow change; expires: 2026-08-17
+      - ci.yml:102 # reason: Existing CI action tag must be converted to an immutable commit in a dedicated workflow change; expires: 2026-08-17
+      - ci.yml:163 # reason: Existing CI action tag must be converted to an immutable commit in a dedicated workflow change; expires: 2026-08-17
+      - ci.yml:168 # reason: Existing CI action tag must be converted to an immutable commit in a dedicated workflow change; expires: 2026-08-17
+      - ci.yml:195 # reason: Existing CI action tag must be converted to an immutable commit in a dedicated workflow change; expires: 2026-08-17
+      - ci.yml:199 # reason: Existing Flutter action tag must be pinned after its upstream commit is reviewed; expires: 2026-08-17
+      - ci.yml:222 # reason: Existing CI action tag must be converted to an immutable commit in a dedicated workflow change; expires: 2026-08-17
+      - ci.yml:227 # reason: Existing CI action tag must be converted to an immutable commit in a dedicated workflow change; expires: 2026-08-17
+      - release.yml:20 # reason: Existing release action tag requires a coordinated workflow-hardening change; expires: 2026-08-17
+      - release.yml:27 # reason: Existing release action tag requires a coordinated workflow-hardening change; expires: 2026-08-17
+      - release.yml:35 # reason: Existing Flutter release action tag requires upstream commit review before pinning; expires: 2026-08-17
+      - release.yml:52 # reason: Existing release artifact action tag requires a coordinated workflow-hardening change; expires: 2026-08-17
+      - release.yml:63 # reason: Existing release action tag requires a coordinated workflow-hardening change; expires: 2026-08-17
+      - release.yml:68 # reason: Existing release action tag requires a coordinated workflow-hardening change; expires: 2026-08-17
+      - release.yml:78 # reason: Existing Flutter release action tag requires upstream commit review before pinning; expires: 2026-08-17
+      - release.yml:97 # reason: Existing release artifact action tag requires a coordinated workflow-hardening change; expires: 2026-08-17
+      - release.yml:112 # reason: Existing release action tag requires a coordinated workflow-hardening change; expires: 2026-08-17
+      - release.yml:117 # reason: Existing release action tag requires a coordinated workflow-hardening change; expires: 2026-08-17
+      - release.yml:125 # reason: Existing Flutter release action tag requires upstream commit review before pinning; expires: 2026-08-17
+      - release.yml:138 # reason: Existing release artifact action tag requires a coordinated workflow-hardening change; expires: 2026-08-17
+      - release.yml:156 # reason: Existing release action tag requires a coordinated workflow-hardening change; expires: 2026-08-17
+      - release.yml:161 # reason: Existing release artifact action tag requires a coordinated workflow-hardening change; expires: 2026-08-17
+      - soak.yml:27 # reason: Existing soak action tag must be converted to an immutable commit in a dedicated change; expires: 2026-08-17
+      - soak.yml:34 # reason: Existing soak action tag must be converted to an immutable commit in a dedicated change; expires: 2026-08-17
+      - soak.yml:50 # reason: Existing soak artifact action tag must be pinned in a dedicated workflow change; expires: 2026-08-17
+
+  template-injection:
+    ignore:
+      - release.yml:92 # reason: Existing release tag interpolation must move through an environment variable in a dedicated release change; expires: 2026-08-17
+
+  cache-poisoning:
+    ignore:
+      - release.yml:27 # reason: Existing release cache needs read-only or isolated cache semantics in a coordinated release change; expires: 2026-08-17
+      - release.yml:68 # reason: Existing release cache needs read-only or isolated cache semantics in a coordinated release change; expires: 2026-08-17
+      - release.yml:117 # reason: Existing release cache needs read-only or isolated cache semantics in a coordinated release change; expires: 2026-08-17
