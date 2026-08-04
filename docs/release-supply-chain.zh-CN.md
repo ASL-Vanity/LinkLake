@@ -4,8 +4,8 @@ LinkLake 正式发布使用三层独立证据：平台打包脚本生成的 SHA-
 
 ## 发布顺序
 
-1. Windows、Linux、macOS 分别构建并验证核心包和 Manager 包；Linux 额外生成 DEB 与 RPM。
-2. 发布任务合并资产并重新计算所有 `.sha256`，拒绝缺失平台、错误版本、重复文件名、符号链接或被篡改的包。
+1. 同一标签提交上的完整 CI、安全扫描以及 Windows、Linux、macOS 打包任务并行执行；任一门禁失败都会阻止发布任务。三个系统分别构建并验证核心包和 Manager 包；Linux 额外生成 DEB 与 RPM。
+2. 只有全部 CI、安全与平台打包任务成功后，发布任务才合并资产并重新计算所有 `.sha256`，拒绝缺失平台、错误版本、重复文件名、符号链接或被篡改的包。
 3. 固定版本的 Syft 逐个扫描每个 ZIP、tar.gz、DEB 和 RPM，生成一对一的 SPDX 2.x 详细 SBOM；脚本校验格式、大小和非空软件包集合，并为每份 SBOM 生成 SHA-256。
 4. `scripts/prepare-release-attestations.mjs` 将详细 SBOM 通过 SPDX `externalDocumentRefs` 连接成发布集合文档，并生成排序稳定的 `linklake-<version>-release-subjects.sha256`。build provenance 与 SBOM 证明必须引用这同一份主体清单。
 5. `linklake-release-sign` 从 CI secret 读取生产 Ed25519 种子，生成并立即验证 `linklake-release-manifest-v1.json` 与分离签名。私钥不会进入命令行、仓库、制品或日志。
@@ -18,6 +18,7 @@ LinkLake 正式发布使用三层独立证据：平台打包脚本生成的 SHA-
 - 正式发布只使用 `actions/cache/restore`，不会从具有写权限的任务保存缓存。
 - Shell 命令只能读取显式环境变量，禁止把 GitHub expression 直接拼进命令正文。
 - GitHub 证明任务只在 `v*` 标签发布时获得 `id-token: write`、`attestations: write` 和 `artifact-metadata: write`。
+- CI 与安全工作流通过 `workflow_call` 被标签发布复用；普通分支推送仍独立运行 CI，标签不会再触发第二套重复 CI。
 - `.github/zizmor.yml` 不保留工作流安全豁免；`scripts/check-workflow-hardening.mjs`、actionlint 和 zizmor 共同守门。
 
 ## 下载方验证

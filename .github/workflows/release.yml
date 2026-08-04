@@ -19,6 +19,18 @@ env:
   SYFT_VERSION: v1.50.0
 
 jobs:
+  ci-gate:
+    name: Reuse CI gates
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  security-gate:
+    name: Reuse security gates
+    uses: ./.github/workflows/security.yml
+    permissions:
+      contents: read
+
   windows-package:
     name: Windows release packages
     runs-on: windows-latest
@@ -163,6 +175,8 @@ jobs:
     name: Sign, attest, and publish
     if: startsWith(github.ref, 'refs/tags/v')
     needs:
+      - ci-gate
+      - security-gate
       - windows-package
       - linux-package
       - macos-package
