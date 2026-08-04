@@ -13626,8 +13626,11 @@ mod tests {
         assert!(MANAGEMENT_UI.contains("drawClientInsightCharts()"));
         assert!(MANAGEMENT_UI.contains("drawGroupedHorizontalChart"));
         assert!(MANAGEMENT_UI.contains("data-i18n-aria-label"));
+        assert!(MANAGEMENT_UI.contains("resizeFrame = requestAnimationFrame(() => {"));
         assert!(MANAGEMENT_UI
-            .contains("requestAnimationFrame(() => { resizeFrame = null; drawCharts(); })"));
+            .contains("if (!elements.appearance_popover.classList.contains('hidden'))"));
+        assert!(MANAGEMENT_UI
+            .contains("positionPopover(elements.appearance_popover, elements.appearance_button);"));
         assert!(!MANAGEMENT_UI.contains("resizeTimer = setTimeout(drawCharts"));
         for id in [
             "workspace-service-actions",

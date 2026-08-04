@@ -1216,10 +1216,21 @@
         document.querySelectorAll('[data-palette-choice]').forEach(button => button.classList.toggle('active', button.dataset.paletteChoice === root.dataset.palette));
       }
 
+      function positionPopover(popover, button) {
+        const margin = 14;
+        const trigger = button.getBoundingClientRect();
+        const top = Math.ceil(trigger.bottom + 8);
+        popover.style.top = `${top}px`;
+        popover.style.right = `${Math.max(margin, Math.ceil(window.innerWidth - trigger.right))}px`;
+        popover.style.maxHeight = `${Math.max(160, Math.floor(window.innerHeight - top - margin))}px`;
+        popover.style.overflowY = 'auto';
+      }
+
       function togglePopover(popover, button, force) {
         const show = force ?? popover.classList.contains('hidden');
         popover.classList.toggle('hidden', !show);
         if (button) button.setAttribute('aria-expanded', String(show));
+        if (show && button && popover.classList.contains('popover')) positionPopover(popover, button);
       }
 
       function formatBytes(value) {
@@ -4159,7 +4170,13 @@
         let resizeFrame = null;
         window.addEventListener('resize', () => {
           if (resizeFrame) cancelAnimationFrame(resizeFrame);
-          resizeFrame = requestAnimationFrame(() => { resizeFrame = null; drawCharts(); });
+          resizeFrame = requestAnimationFrame(() => {
+            resizeFrame = null;
+            if (!elements.appearance_popover.classList.contains('hidden')) {
+              positionPopover(elements.appearance_popover, elements.appearance_button);
+            }
+            drawCharts();
+          });
         });
         document.addEventListener('visibilitychange', () => {
           if (!document.hidden && state.identity) loadManagementData({ forceHistory: false }).catch(() => {});
