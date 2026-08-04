@@ -142,6 +142,9 @@ jobs:
           ./tests/update-e2e.ps1 -Product client
           ./tests/update-e2e.ps1 -Product server
           ./tests/manager-update-e2e.ps1 -SkipBuild
+      - name: Run encrypted disaster-recovery end-to-end tests
+        shell: pwsh
+        run: ./tests/disaster-recovery-e2e.ps1 -SkipBuild
       - name: Run TCP end-to-end tests
         shell: powershell
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\tcp-e2e.ps1
