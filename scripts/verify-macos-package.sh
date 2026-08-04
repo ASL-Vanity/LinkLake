@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-project_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+project_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 output_directory="${1:-$project_root/dist}"
 version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' "$project_root/Cargo.toml" | head -n 1)"
 archive="$(find "$output_directory" -maxdepth 1 -name "linklake-$version-macos-*.tar.gz" -print | head -n 1)"
@@ -18,4 +18,12 @@ package_root="$(find "$verify_root" -mindepth 1 -maxdepth 1 -type d | head -n 1)
 "$package_root/bin/linklake-server" --version | grep -F "$version" | grep -F 'target=macos-' >/dev/null
 "$package_root/bin/linklake-client" --version | grep -F "$version" | grep -F 'target=macos-' >/dev/null
 grep -F '"commit"' "$package_root/release.json" >/dev/null
+case "${LINKLAKE_MACOS_SIGNING_REQUIRED:-false}" in
+  1|true|TRUE|yes|YES)
+    for binary in "$package_root/bin/linklake-server" "$package_root/bin/linklake-client"; do
+      codesign --verify --strict --verbose=2 "$binary"
+      spctl --assess --type execute --verbose=4 "$binary"
+    done
+    ;;
+esac
 echo "Verified $archive"

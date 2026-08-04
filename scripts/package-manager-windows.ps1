@@ -63,6 +63,14 @@ Copy-Item -LiteralPath (Join-Path $projectRoot 'README.md'), `
 Copy-Item -LiteralPath (Join-Path $managerRoot 'README.md') `
     -Destination (Join-Path $stage 'MANAGER_README.md')
 
+$windowsSigningRequired = $env:LINKLAKE_WINDOWS_SIGNING_REQUIRED -match '^(?i:1|true|yes)$'
+$peArtifacts = @(Get-ChildItem -LiteralPath $stage -Recurse -File | Where-Object {
+        $_.Extension.ToLowerInvariant() -in @('.exe', '.dll')
+    } | ForEach-Object FullName)
+& (Join-Path $projectRoot 'scripts\sign-windows-artifacts.ps1') `
+    -Required:$windowsSigningRequired `
+    -Path $peArtifacts
+
 $releaseManifest = [ordered]@{
     product = 'LinkLake Manager'
     component = 'manager'

@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-project_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+project_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 output_directory="${1:-$project_root/dist}"
 version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' "$project_root/Cargo.toml" | head -n 1)"
 architecture="$(uname -m)"
@@ -27,6 +27,31 @@ cp examples/* "$stage/examples/"
 cp README.md README.en.md CHANGELOG.md LICENSE NOTICE THIRD_PARTY_NOTICES.md THIRD_PARTY_LICENSES.html TRADEMARKS.md "$stage/"
 printf '{"product":"LinkLake","version":"%s","target":"macos-%s","built_unix_seconds":%s,"commit":"%s"}\n' \
   "$version" "$architecture" "$source_date_epoch" "$commit" >"$stage/release.json"
+
+signing_required="${LINKLAKE_MACOS_SIGNING_REQUIRED:-false}"
+signing_active="${LINKLAKE_MACOS_SIGNING_ACTIVE:-false}"
+case "$signing_required" in 1|true|TRUE|yes|YES) signing_required=true;; *) signing_required=false;; esac
+case "$signing_active" in 1|true|TRUE|yes|YES) signing_active=true;; *) signing_active=false;; esac
+if [ "$signing_required" = true ] && [ "$signing_active" != true ]; then
+  echo 'macOS production signing is required but the temporary signing context is inactive.' >&2
+  exit 1
+fi
+if [ "$signing_active" = true ]; then
+  test -n "${LINKLAKE_MACOS_SIGNING_IDENTITY:-}"
+  test -f "${LINKLAKE_MACOS_KEYCHAIN_PATH:-}"
+  for binary in "$stage/bin/linklake-server" "$stage/bin/linklake-client"; do
+    codesign --force --timestamp --options runtime \
+      --sign "$LINKLAKE_MACOS_SIGNING_IDENTITY" \
+      --keychain "$LINKLAKE_MACOS_KEYCHAIN_PATH" "$binary"
+    codesign --verify --strict --verbose=2 "$binary"
+  done
+  notary_dir="$(mktemp -d)"
+  trap 'rm -rf -- "$notary_dir"' EXIT HUP INT TERM
+  notary_archive="$notary_dir/$package_name.zip"
+  ditto -c -k --keepParent "$stage" "$notary_archive"
+  sh "$project_root/scripts/notarize-macos-artifact.sh" "$notary_archive"
+fi
+
 find "$stage" -exec touch -t "$(date -r "$source_date_epoch" +%Y%m%d%H%M.%S)" {} +
 tar -C "$output_directory" -czf "$archive" "$package_name"
 (cd "$output_directory" && shasum -a 256 "$(basename "$archive")" >"$(basename "$archive").sha256")

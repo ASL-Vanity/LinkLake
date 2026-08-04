@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-project_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+project_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 manager_root="$project_root/apps/linklake_manager"
 output_directory="${1:-$project_root/dist}"
 version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' "$project_root/Cargo.toml" | head -n 1)"
@@ -27,8 +27,45 @@ bundle="$(find "$manager_root/build/macos/Build/Products/Release" -maxdepth 1 -t
 test -n "$bundle"
 cp "$project_root/target/release/linklake-client" "$bundle/Contents/Resources/linklake-client"
 chmod 0755 "$bundle/Contents/Resources/linklake-client"
-codesign --force --deep --sign - "$bundle"
-codesign --verify --deep --strict "$bundle"
+
+signing_required="${LINKLAKE_MACOS_SIGNING_REQUIRED:-false}"
+signing_active="${LINKLAKE_MACOS_SIGNING_ACTIVE:-false}"
+case "$signing_required" in 1|true|TRUE|yes|YES) signing_required=true;; *) signing_required=false;; esac
+case "$signing_active" in 1|true|TRUE|yes|YES) signing_active=true;; *) signing_active=false;; esac
+if [ "$signing_required" = true ] && [ "$signing_active" != true ]; then
+  echo 'macOS production signing is required but the temporary signing context is inactive.' >&2
+  exit 1
+fi
+if [ "$signing_active" = true ]; then
+  test -n "${LINKLAKE_MACOS_SIGNING_IDENTITY:-}"
+  test -f "${LINKLAKE_MACOS_KEYCHAIN_PATH:-}"
+  sign_macos_code() {
+    codesign --force --timestamp --options runtime \
+      --sign "$LINKLAKE_MACOS_SIGNING_IDENTITY" \
+      --keychain "$LINKLAKE_MACOS_KEYCHAIN_PATH" "$1"
+  }
+  if [ -d "$bundle/Contents/Frameworks" ]; then
+    find "$bundle/Contents/Frameworks" -depth -type f | while IFS= read -r item; do
+      if file "$item" | grep -q 'Mach-O'; then sign_macos_code "$item"; fi
+    done
+    find "$bundle/Contents/Frameworks" -depth -type d \( -name '*.framework' -o -name '*.xpc' -o -name '*.app' \) | \
+      while IFS= read -r item; do sign_macos_code "$item"; done
+  fi
+  sign_macos_code "$bundle/Contents/Resources/linklake-client"
+  codesign --force --timestamp --options runtime \
+    --entitlements "$manager_root/macos/Runner/Release.entitlements" \
+    --sign "$LINKLAKE_MACOS_SIGNING_IDENTITY" \
+    --keychain "$LINKLAKE_MACOS_KEYCHAIN_PATH" "$bundle"
+  codesign --verify --deep --strict --verbose=2 "$bundle"
+  notary_dir="$(mktemp -d)"
+  trap 'rm -rf -- "$notary_dir"' EXIT HUP INT TERM
+  notary_archive="$notary_dir/$package_name.zip"
+  ditto -c -k --keepParent "$bundle" "$notary_archive"
+  sh "$project_root/scripts/notarize-macos-artifact.sh" "$notary_archive" "$bundle"
+else
+  codesign --force --deep --sign - "$bundle"
+  codesign --verify --deep --strict "$bundle"
+fi
 
 rm -rf -- "$stage"
 rm -f -- "$archive" "$archive.sha256"

@@ -66,6 +66,17 @@ const release = fs.readFileSync(path.join(workflowDirectory, 'release.yml'), 'ut
 const ci = fs.readFileSync(path.join(workflowDirectory, 'ci.yml'), 'utf8');
 const security = fs.readFileSync(path.join(workflowDirectory, 'security.yml'), 'utf8');
 const webuiSmoke = fs.readFileSync(path.join(root, 'scripts', 'run-webui-smoke.ps1'), 'utf8');
+const windowsSigner = fs.readFileSync(path.join(root, 'scripts', 'sign-windows-artifacts.ps1'), 'utf8');
+const linuxSigner = fs.readFileSync(path.join(root, 'scripts', 'sign-linux-artifacts.sh'), 'utf8');
+const macosSetup = fs.readFileSync(path.join(root, 'scripts', 'setup-macos-signing.sh'), 'utf8');
+const macosImporter = fs.readFileSync(path.join(root, 'scripts', 'import-macos-p12.swift'), 'utf8');
+const windowsPackage = fs.readFileSync(path.join(root, 'scripts', 'package-windows.ps1'), 'utf8');
+const windowsManagerPackage = fs.readFileSync(
+  path.join(root, 'scripts', 'package-manager-windows.ps1'),
+  'utf8',
+);
+const macosPackage = fs.readFileSync(path.join(root, 'scripts', 'package-macos.sh'), 'utf8');
+const macosManagerPackage = fs.readFileSync(path.join(root, 'scripts', 'package-manager-macos.sh'), 'utf8');
 const packageJson = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
 const packageLock = JSON.parse(fs.readFileSync(path.join(root, 'package-lock.json'), 'utf8'));
 if (!/^\s*workflow_call:\s*$/m.test(ci) || !/^\s*workflow_call:\s*$/m.test(security)) {
@@ -77,9 +88,15 @@ for (const reusable of ['./.github/workflows/ci.yml', './.github/workflows/secur
   }
 }
 const publishJob = workflowJob(release, 'publish');
-for (const gate of ['ci-gate', 'security-gate']) {
+for (const gate of ['ci-gate', 'security-gate', 'container-package']) {
   if (!new RegExp(`^      - ${gate}\\s*$`, 'm').test(publishJob)) {
     fail(`release publication does not depend on ${gate}`);
+  }
+}
+const containerJob = workflowJob(release, 'container-package');
+for (const gate of ['ci-gate', 'security-gate', 'windows-package', 'linux-package', 'macos-package']) {
+  if (!new RegExp(`^      - ${gate}\\s*$`, 'm').test(containerJob)) {
+    fail(`container publication does not depend on ${gate}`);
   }
 }
 for (const marker of [
@@ -119,6 +136,19 @@ for (const required of [
   'generate-package-sboms.mjs',
   'prepare-release-attestations.mjs',
   'release-subjects.sha256',
+  'LINKLAKE_WINDOWS_SIGNING_REQUIRED',
+  'LINKLAKE_LINUX_SIGNING_REQUIRED',
+  'sign-linux-artifacts.sh',
+  'verify-linux-release-signatures.sh',
+  'LINKLAKE_MACOS_SIGNING_REQUIRED',
+  'setup-macos-signing.sh',
+  'container-package:',
+  'packages: write',
+  'docker/build-push-action@',
+  'sigstore/cosign-installer@',
+  'actions/attest-build-provenance@',
+  'cosign sign --yes',
+  'cosign verify',
 ]) {
   if (!release.includes(required)) fail(`release workflow is missing ${required}`);
 }
@@ -127,6 +157,7 @@ if ((release.match(/uses:\s*actions\/attest@[0-9a-f]{40}/g) ?? []).length !== 2)
 }
 
 const order = [
+  'Reverify Linux OpenPGP signatures after artifact transfer',
   'Generate per-package SPDX SBOMs',
   'Verify packages and prepare attestation subjects',
   'Create and verify production Ed25519 release manifest',
@@ -136,6 +167,31 @@ const order = [
 ].map((marker) => release.indexOf(marker));
 if (order.some((value) => value < 0) || order.some((value, index) => index > 0 && value <= order[index - 1])) {
   fail('release evidence, signing, attestation, and publication steps are in an unsafe order');
+}
+
+if (!windowsSigner.includes('Import-PfxCertificate') || !windowsSigner.includes('/tr $timestampUri.AbsoluteUri')) {
+  fail('Windows release signing must import a temporary PFX and require an RFC 3161 timestamp');
+}
+if (
+  !windowsPackage.includes('sign-windows-artifacts.ps1') ||
+  !windowsManagerPackage.includes('sign-windows-artifacts.ps1')
+) {
+  fail('Windows core and Manager packages must invoke the shared Authenticode signer');
+}
+if (/\/(?:p|p7)\s+\$env:LINKLAKE_WINDOWS_SIGNING_PFX_PASSWORD/i.test(windowsSigner)) {
+  fail('Windows signing password must not be passed to SignTool arguments');
+}
+if (!linuxSigner.includes('--passphrase-fd 0') || /--passphrase(?:=|\s+)["']?\$LINKLAKE_LINUX_GPG_PASSPHRASE/.test(linuxSigner)) {
+  fail('Linux signing passphrase must be supplied through standard input');
+}
+if (!macosImporter.includes('SecPKCS12Import') || /security\s+import/.test(macosSetup)) {
+  fail('macOS P12 import must use Security.framework without a password-bearing security command');
+}
+if (
+  !macosPackage.includes('notarize-macos-artifact.sh') ||
+  !macosManagerPackage.includes('notarize-macos-artifact.sh')
+) {
+  fail('macOS core and Manager packages must pass Apple notarization');
 }
 
 const releaseLines = release.split(/\r?\n/);

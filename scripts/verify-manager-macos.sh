@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-project_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+project_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 output_directory="${1:-$project_root/dist}"
 version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' "$project_root/Cargo.toml" | head -n 1)"
 archive="$(find "$output_directory" -maxdepth 1 -name "linklake-manager-$version-macos-*.tar.gz" -print | head -n 1)"
@@ -21,4 +21,13 @@ client="$(find "$verify_root" -path '*.app/Contents/Resources/linklake-client' -
 "$client" --version | grep -F "$version" | grep -F 'target=macos-' >/dev/null
 release="$(find "$verify_root" -name release.json -maxdepth 3 -type f | head -n 1)"
 grep -F '"commit"' "$release" >/dev/null
+case "${LINKLAKE_MACOS_SIGNING_REQUIRED:-false}" in
+  1|true|TRUE|yes|YES)
+    app="$(find "$verify_root" -maxdepth 3 -type d -name '*.app' -print | head -n 1)"
+    test -n "$app"
+    codesign --verify --deep --strict --verbose=2 "$app"
+    xcrun stapler validate "$app"
+    spctl --assess --type execute --verbose=4 "$app"
+    ;;
+esac
 echo "Verified $archive"

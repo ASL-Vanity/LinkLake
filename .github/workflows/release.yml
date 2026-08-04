@@ -17,6 +17,7 @@ env:
   CARGO_TERM_COLOR: always
   LINKLAKE_GIT_COMMIT: ${{ github.sha }}
   SYFT_VERSION: v1.50.0
+  COSIGN_VERSION: v3.0.5
 
 jobs:
   ci-gate:
@@ -34,6 +35,8 @@ jobs:
   windows-package:
     name: Windows release packages
     runs-on: windows-latest
+    env:
+      LINKLAKE_WINDOWS_SIGNING_REQUIRED: ${{ startsWith(github.ref, 'refs/tags/v') && 'true' || 'false' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -59,16 +62,28 @@ jobs:
           cache: true
       - name: Build Windows package
         shell: powershell
+        env:
+          LINKLAKE_WINDOWS_SIGNING_PFX_B64: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.LINKLAKE_WINDOWS_SIGNING_PFX_B64 || '' }}
+          LINKLAKE_WINDOWS_SIGNING_PFX_PASSWORD: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.LINKLAKE_WINDOWS_SIGNING_PFX_PASSWORD || '' }}
+          LINKLAKE_WINDOWS_SIGNING_CERT_SHA256: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.LINKLAKE_WINDOWS_SIGNING_CERT_SHA256 || '' }}
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\package-windows.ps1
       - name: Verify Windows package
         shell: powershell
-        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-windows-package.ps1
+        run: |
+          $required = $env:LINKLAKE_WINDOWS_SIGNING_REQUIRED -eq 'true'
+          .\scripts\verify-windows-package.ps1 -RequireAuthenticode:$required
       - name: Build Flutter manager Windows package
         shell: powershell
+        env:
+          LINKLAKE_WINDOWS_SIGNING_PFX_B64: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.LINKLAKE_WINDOWS_SIGNING_PFX_B64 || '' }}
+          LINKLAKE_WINDOWS_SIGNING_PFX_PASSWORD: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.LINKLAKE_WINDOWS_SIGNING_PFX_PASSWORD || '' }}
+          LINKLAKE_WINDOWS_SIGNING_CERT_SHA256: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.LINKLAKE_WINDOWS_SIGNING_CERT_SHA256 || '' }}
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\package-manager-windows.ps1
       - name: Verify Flutter manager Windows package
         shell: powershell
-        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-manager-windows.ps1
+        run: |
+          $required = $env:LINKLAKE_WINDOWS_SIGNING_REQUIRED -eq 'true'
+          .\scripts\verify-manager-windows.ps1 -RequireAuthenticode:$required
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linklake-windows-x86_64
@@ -80,6 +95,8 @@ jobs:
   linux-package:
     name: Linux release packages
     runs-on: ubuntu-latest
+    env:
+      LINKLAKE_LINUX_SIGNING_REQUIRED: ${{ startsWith(github.ref, 'refs/tags/v') && 'true' || 'false' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -119,6 +136,18 @@ jobs:
         run: sh scripts/package-manager-linux.sh
       - name: Verify Flutter manager Linux package
         run: sh scripts/verify-manager-linux.sh
+      - name: Sign Linux release packages with OpenPGP
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          LINKLAKE_LINUX_GPG_PRIVATE_KEY_B64: ${{ secrets.LINKLAKE_LINUX_GPG_PRIVATE_KEY_B64 }}
+          LINKLAKE_LINUX_GPG_PASSPHRASE: ${{ secrets.LINKLAKE_LINUX_GPG_PASSPHRASE }}
+          LINKLAKE_LINUX_GPG_FINGERPRINT: ${{ secrets.LINKLAKE_LINUX_GPG_FINGERPRINT }}
+        run: sh scripts/sign-linux-artifacts.sh
+      - name: Verify Linux OpenPGP signatures without the private key
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          LINKLAKE_LINUX_GPG_FINGERPRINT: ${{ secrets.LINKLAKE_LINUX_GPG_FINGERPRINT }}
+        run: sh scripts/verify-linux-release-signatures.sh dist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linklake-linux-x86_64
@@ -129,11 +158,16 @@ jobs:
             dist/*.deb.sha256
             dist/*.rpm
             dist/*.rpm.sha256
+            dist/*.asc
+            dist/*.asc.sha256
           if-no-files-found: error
 
   macos-package:
     name: macOS release packages
     runs-on: macos-latest
+    timeout-minutes: 120
+    env:
+      LINKLAKE_MACOS_SIGNING_REQUIRED: ${{ startsWith(github.ref, 'refs/tags/v') && 'true' || 'false' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -155,6 +189,17 @@ jobs:
           channel: stable
           flutter-version: '3.44.8'
           cache: true
+      - name: Prepare temporary Developer ID and notarization credentials
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          LINKLAKE_MACOS_SIGNING_CERT_P12_B64: ${{ secrets.LINKLAKE_MACOS_SIGNING_CERT_P12_B64 }}
+          LINKLAKE_MACOS_SIGNING_CERT_PASSWORD: ${{ secrets.LINKLAKE_MACOS_SIGNING_CERT_PASSWORD }}
+          LINKLAKE_MACOS_SIGNING_IDENTITY: ${{ secrets.LINKLAKE_MACOS_SIGNING_IDENTITY }}
+          LINKLAKE_MACOS_SIGNING_CERT_SHA256: ${{ secrets.LINKLAKE_MACOS_SIGNING_CERT_SHA256 }}
+          LINKLAKE_APPLE_API_KEY_P8_B64: ${{ secrets.LINKLAKE_APPLE_API_KEY_P8_B64 }}
+          LINKLAKE_APPLE_API_KEY_ID: ${{ secrets.LINKLAKE_APPLE_API_KEY_ID }}
+          LINKLAKE_APPLE_API_ISSUER_ID: ${{ secrets.LINKLAKE_APPLE_API_ISSUER_ID }}
+        run: sh scripts/setup-macos-signing.sh
       - name: Build macOS package
         run: sh scripts/package-macos.sh
       - name: Verify macOS package
@@ -163,12 +208,110 @@ jobs:
         run: sh scripts/package-manager-macos.sh
       - name: Verify Flutter manager macOS package
         run: sh scripts/verify-manager-macos.sh
+      - name: Remove temporary macOS signing credentials
+        if: always()
+        run: sh scripts/cleanup-macos-signing.sh
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linklake-macos
           path: |
             dist/*-macos-*.tar.gz
             dist/*-macos-*.tar.gz.sha256
+          if-no-files-found: error
+
+  container-package:
+    name: Publish signed GHCR image
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - ci-gate
+      - security-gate
+      - windows-package
+      - linux-package
+      - macos-package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up pinned Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: Log in to GHCR with the job token
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Resolve immutable image names
+        id: image
+        env:
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          case "$TAG" in v*) version="${TAG#v}";; *) echo 'release tag must start with v' >&2; exit 1;; esac
+          image="ghcr.io/$(printf '%s' "$REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          {
+            printf 'image=%s\n' "$image"
+            printf 'version=%s\n' "$version"
+            printf 'tags<<EOF\n%s:%s\n%s:sha-%s\n' "$image" "$version" "$image" "$GITHUB_SHA"
+            case "$version" in *-*) :;; *) printf '%s:latest\n' "$image";; esac
+            printf 'EOF\n'
+          } >>"$GITHUB_OUTPUT"
+      - name: Build and push OCI image with SBOM and provenance
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.image.outputs.tags }}
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha,scope=linklake-release-image
+      - name: Install pinned Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+      - name: Create GitHub image provenance attestation
+        uses: actions/attest-build-provenance@62fc1d596301d0ab9914e1fec14dc5c8d93f65cd # v3.2.0
+        with:
+          subject-name: ${{ steps.image.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+      - name: Keyless-sign and verify the immutable image digest
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -eu
+          cosign sign --yes "$IMAGE@$DIGEST"
+          identity="https://github.com/$REPOSITORY/.github/workflows/release.yml@$GITHUB_REF"
+          cosign verify \
+            --certificate-identity "$identity" \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+            "$IMAGE@$DIGEST"
+      - name: Record immutable container evidence
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          VERSION: ${{ steps.image.outputs.version }}
+        run: |
+          set -eu
+          mkdir -p container-evidence
+          evidence="container-evidence/container-image-$VERSION.txt"
+          printf '%s@%s\n' "$IMAGE" "$DIGEST" >"$evidence"
+          (cd container-evidence && sha256sum "$(basename "$evidence")" >"$(basename "$evidence").sha256")
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linklake-container-image
+          path: container-evidence/*
           if-no-files-found: error
 
   publish:
@@ -180,6 +323,7 @@ jobs:
       - windows-package
       - linux-package
       - macos-package
+      - container-package
     runs-on: ubuntu-latest
     permissions:
       contents: write # 创建或更新由当前标签标识的 GitHub Release。
@@ -215,6 +359,10 @@ jobs:
         uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           syft-version: ${{ env.SYFT_VERSION }}
+      - name: Reverify Linux OpenPGP signatures after artifact transfer
+        env:
+          LINKLAKE_LINUX_GPG_FINGERPRINT: ${{ secrets.LINKLAKE_LINUX_GPG_FINGERPRINT }}
+        run: sh scripts/verify-linux-release-signatures.sh dist "$RELEASE_VERSION"
       - name: Generate per-package SPDX SBOMs
         env:
           SYFT_CMD: ${{ steps.syft.outputs.cmd }}

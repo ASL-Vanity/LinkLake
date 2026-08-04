@@ -53,6 +53,14 @@ Copy-Item -LiteralPath (Join-Path $projectRoot 'README.md'), (Join-Path $project
     (Join-Path $projectRoot 'THIRD_PARTY_LICENSES.html'), (Join-Path $projectRoot 'TRADEMARKS.md') `
     -Destination $stage
 
+$windowsSigningRequired = $env:LINKLAKE_WINDOWS_SIGNING_REQUIRED -match '^(?i:1|true|yes)$'
+& (Join-Path $projectRoot 'scripts\sign-windows-artifacts.ps1') `
+    -Required:$windowsSigningRequired `
+    -Path @(
+        (Join-Path $stage 'bin\linklake-server.exe'),
+        (Join-Path $stage 'bin\linklake-client.exe')
+    )
+
 $manifestData = [ordered]@{
     product = 'LinkLake'
     version = $version

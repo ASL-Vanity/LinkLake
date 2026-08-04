@@ -488,6 +488,30 @@ try {
         'Registry values and security descriptors are not restored in least-privilege order.'
     Assert-True (-not $commonScript.Contains("if (-not `$Snapshot.RequiredPrivileges.Exists -and (Test-LinkLakeServiceExists `$ServiceName))")) `
         'Missing RequiredPrivileges still causes destructive service recreation.'
+
+    $signingScript = Join-Path $projectRoot 'scripts\sign-windows-artifacts.ps1'
+    $signingVariables = @(
+        'LINKLAKE_WINDOWS_SIGNING_REQUIRED',
+        'LINKLAKE_WINDOWS_SIGNING_PFX_B64',
+        'LINKLAKE_WINDOWS_SIGNING_PFX_PASSWORD',
+        'LINKLAKE_WINDOWS_SIGNING_CERT_SHA256'
+    )
+    $signingSnapshot = @{}
+    foreach ($name in $signingVariables) {
+        $signingSnapshot[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+        [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+    }
+    try {
+        & $signingScript -Path (Join-Path $env:WINDIR 'System32\notepad.exe')
+        Assert-Throws {
+            & $signingScript -Required -Path (Join-Path $env:WINDIR 'System32\notepad.exe')
+        } 'requires environment variable'
+    }
+    finally {
+        foreach ($name in $signingVariables) {
+            [Environment]::SetEnvironmentVariable($name, $signingSnapshot[$name], 'Process')
+        }
+    }
 }
 finally {
     if (Test-Path -LiteralPath $testRoot) { Remove-Item -LiteralPath $testRoot -Recurse -Force }
@@ -509,4 +533,5 @@ finally {
     local_service_acl_tested = $true
     registry_acl_restore_tested = $true
     uninstall_residual_reporting_tested = $true
+    authenticode_fail_closed_tested = $true
 } | ConvertTo-Json

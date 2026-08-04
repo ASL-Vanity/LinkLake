@@ -482,7 +482,7 @@ macOS 使用 `scripts/package-macos.sh`、`scripts/verify-macos-package.sh`、`s
 
 打包脚本支持 `SOURCE_DATE_EPOCH`。设置相同时间戳并使用相同源码、工具链、目标平台和锁定依赖时，归档内的文件顺序、时间和发布清单保持稳定。Windows 生成 ZIP 和 SHA-256，Linux/macOS 生成 tar.gz 和 SHA-256；三个平台均同时生成 LinkLake 核心包和 LinkLake Manager 包。
 
-`.github/workflows/ci.yml` 会在推送和拉取请求中执行格式、Clippy、单元测试、脚本语法检查、使用锁定 Playwright/Chromium 的真实 WebUI 浏览器冒烟测试、Windows TCP/UDP/HTTP/TLS SNI/Secret-P2P/SOCKS5 E2E、Linux Pebble HTTP-01/Cloudflare DNS-01 E2E，以及 Flutter Manager 的 Windows/Linux/macOS 分析、测试和 Release 构建。WebUI 测试运行时生成一次性 localhost 证书，失败时保留截图和服务日志，不依赖开发者机器上的 Node 路径、浏览器模块或固定测试私钥。`.github/workflows/soak.yml` 每周或手动运行长稳、弱网、崩溃、重启、并发与吞吐矩阵。`.github/workflows/release.yml` 会构建三个平台的核心包和管理客户端包；正式标签发布还会校验全部 SHA-256 旁车文件，生成 SPDX SBOM，并为同一组发布资产创建 GitHub build provenance 与 SBOM 证明，最后才生成 LinkLake Ed25519 清单并上传 Release。全部 GitHub Actions 都固定到完整提交 SHA，发布任务只恢复缓存且不写入缓存，checkout 不保留 Git 凭据。完整说明见 [`docs/release-supply-chain.zh-CN.md`](docs/release-supply-chain.zh-CN.md)。
+`.github/workflows/ci.yml` 会在推送和拉取请求中执行格式、Clippy、单元测试、脚本语法检查、使用锁定 Playwright/Chromium 的真实 WebUI 浏览器冒烟测试、Windows TCP/UDP/HTTP/TLS SNI/Secret-P2P/SOCKS5 E2E、Linux Pebble HTTP-01/Cloudflare DNS-01 E2E，以及 Flutter Manager 的 Windows/Linux/macOS 分析、测试和 Release 构建。WebUI 测试运行时生成一次性 localhost 证书，失败时保留截图和服务日志，不依赖开发者机器上的 Node 路径、浏览器模块或固定测试私钥。`.github/workflows/soak.yml` 每周或手动运行长稳、弱网、崩溃、重启、并发与吞吐矩阵。正式标签还必须通过 Windows Authenticode、macOS Developer ID/Apple 公证、Linux OpenPGP、GHCR OCI SBOM/provenance 与 Cosign 摘要签名，再生成文件级 SPDX/GitHub 证明和 LinkLake Ed25519 更新清单。全部 GitHub Actions 都固定到完整提交 SHA，发布任务只恢复缓存且不写入缓存，checkout 不保留 Git 凭据。完整说明与必需 Secret 清单见 [`docs/release-supply-chain.zh-CN.md`](docs/release-supply-chain.zh-CN.md)。
 
 ## 后续路线
 

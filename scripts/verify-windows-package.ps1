@@ -1,6 +1,7 @@
 param(
     [string]$OutputDirectory = (Join-Path $PSScriptRoot '..\dist'),
-    [string]$ExpectedSha256
+    [string]$ExpectedSha256,
+    [switch]$RequireAuthenticode
 )
 
 $ErrorActionPreference = 'Stop'
@@ -56,6 +57,16 @@ try {
     Assert-LinkLakePackageChecksums $verifyRoot
     $null = Assert-LinkLakePackageBinary (Join-Path $verifyRoot 'bin\linklake-server.exe') 'LinkLake Server' $release
     $null = Assert-LinkLakePackageBinary (Join-Path $verifyRoot 'bin\linklake-client.exe') 'LinkLake Client' $release
+    if ($RequireAuthenticode) {
+        foreach ($binary in @('bin\linklake-server.exe', 'bin\linklake-client.exe')) {
+            $signature = Get-AuthenticodeSignature -LiteralPath (Join-Path $verifyRoot $binary)
+            if ($signature.Status -ne [Management.Automation.SignatureStatus]::Valid -or
+                $null -eq $signature.SignerCertificate -or
+                $null -eq $signature.TimeStamperCertificate) {
+                throw "The required Authenticode signature or timestamp is invalid: $binary"
+            }
+        }
+    }
 }
 finally {
     if (Test-Path -LiteralPath $verifyRoot) { Remove-Item -LiteralPath $verifyRoot -Recurse -Force }

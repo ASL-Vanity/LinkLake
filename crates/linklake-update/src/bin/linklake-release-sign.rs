@@ -198,7 +198,9 @@ fn collect_assets(dist: &Path, version: &Version) -> anyhow::Result<Vec<SignedAs
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.ends_with(".sha256") || name.ends_with(".deb") || name.ends_with(".rpm") {
+        // 更新清单只描述客户端和服务端实际可安装的 ZIP/TAR 包；平台签名、
+        // SBOM、容器证据和原生包由各自的验证链负责，不能被误解析为更新目标。
+        if !(name.ends_with(".zip") || name.ends_with(".tar.gz")) {
             continue;
         }
         let (components, target) = if let Some(rest) = name.strip_prefix(&manager_prefix) {
@@ -237,4 +239,33 @@ fn archive_target(value: &str) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("unsupported updater archive name: {value}"))?;
     anyhow::ensure!(!target.is_empty(), "release asset target is empty");
     Ok(target.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn platform_signatures_and_supply_chain_evidence_are_not_update_assets() {
+        let directory = tempfile::tempdir().unwrap();
+        let version = Version::parse("1.0.0-rc.1").unwrap();
+        for name in [
+            "linklake-1.0.0-rc.1-windows-x86_64.zip",
+            "linklake-manager-1.0.0-rc.1-windows-x86_64.zip",
+            "linklake-1.0.0-rc.1-windows-x86_64.zip.asc",
+            "linklake-1.0.0-rc.1-windows-x86_64.zip.spdx.json",
+            "linklake_1.0.0-rc.1_amd64.deb",
+            "linklake-1.0.0-0.rc.1.x86_64.rpm",
+            "linklake-linux-release-public-key.asc",
+            "container-image-1.0.0-rc.1.txt",
+        ] {
+            fs::write(directory.path().join(name), name).unwrap();
+        }
+
+        let assets = collect_assets(directory.path(), &version).unwrap();
+        assert_eq!(assets.len(), 3);
+        assert!(assets
+            .iter()
+            .all(|asset| { asset.name.ends_with(".zip") && !asset.name.ends_with(".zip.asc") }));
+    }
 }

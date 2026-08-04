@@ -102,9 +102,11 @@ jobs:
             exit 1
           fi
       - name: Check shell scripts
-        run: find packaging scripts -name '*.sh' -print0 | xargs -0 -n1 bash -n
+        run: find packaging scripts tests -name '*.sh' -print0 | xargs -0 -n1 bash -n
       - name: Verify macOS Manager host integration contract
-        run: node --test tests/manager-macos-contract.test.mjs
+        run: node --test tests/manager-macos-contract.test.mjs tests/macos-signing-contract.test.mjs
+      - name: Verify runtime-generated Linux package signing contract
+        run: sh tests/linux-signing-contract.sh
 
   windows-test:
     name: Windows test and tunnel E2E
@@ -150,6 +152,8 @@ jobs:
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\windows-installer-contract.ps1
       - name: Run unit tests
         run: cargo test --workspace --locked
+      - name: Type-check the password-safe P12 importer
+        run: swiftc -typecheck scripts/import-macos-p12.swift
       - name: Run updater replacement and rollback end-to-end tests
         shell: pwsh
         run: |

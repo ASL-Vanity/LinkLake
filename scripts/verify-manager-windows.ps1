@@ -1,5 +1,6 @@
 param(
-    [string]$OutputDirectory = (Join-Path $PSScriptRoot '..\dist')
+    [string]$OutputDirectory = (Join-Path $PSScriptRoot '..\dist'),
+    [switch]$RequireAuthenticode
 )
 
 $ErrorActionPreference = 'Stop'
@@ -33,6 +34,20 @@ try {
     }
     $release = Get-Content -Raw -LiteralPath (Join-Path $verifyRoot 'release.json') | ConvertFrom-Json
     if ($release.component -ne 'manager' -or -not $release.commit) { throw 'Invalid Manager release identity.' }
+    if ($RequireAuthenticode) {
+        $peArtifacts = @(Get-ChildItem -LiteralPath $verifyRoot -Recurse -File | Where-Object {
+                $_.Extension.ToLowerInvariant() -in @('.exe', '.dll')
+            })
+        if ($peArtifacts.Count -eq 0) { throw 'The Manager package contains no PE artifacts to verify.' }
+        foreach ($artifact in $peArtifacts) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $artifact.FullName
+            if ($signature.Status -ne [Management.Automation.SignatureStatus]::Valid -or
+                $null -eq $signature.SignerCertificate -or
+                $null -eq $signature.TimeStamperCertificate) {
+                throw "The required Authenticode signature or timestamp is invalid: $($artifact.Name)"
+            }
+        }
+    }
 }
 finally {
     if (Test-Path -LiteralPath $verifyRoot) { Remove-Item -LiteralPath $verifyRoot -Recurse -Force }
