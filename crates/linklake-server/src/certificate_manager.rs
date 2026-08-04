@@ -1,4 +1,8 @@
-use crate::http_route_catalog::normalize_hostname;
+use crate::{
+    certificate_catalog::{normalize_certificate_identifier, AcmeChallengeType},
+    cloudflare_dns::CloudflareDnsClient,
+    http_route_catalog::normalize_hostname,
+};
 use arc_swap::ArcSwap;
 use instant_acme::{
     Account, AccountBuilder, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier,
@@ -35,6 +39,7 @@ const RETAINED_CERTIFICATE_GENERATIONS: usize = 3;
 pub(crate) struct AcmeIssueConfig {
     pub(crate) directory_url: String,
     pub(crate) contact_email: String,
+    pub(crate) challenge_type: AcmeChallengeType,
     pub(crate) root_ca_path: Option<PathBuf>,
 }
 
@@ -48,7 +53,8 @@ pub(crate) struct CertificateMetadata {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CertificateIssueResult {
     pub(crate) metadata: CertificateMetadata,
-    pub(crate) challenges_completed: u64,
+    pub(crate) http01_challenges_completed: u64,
+    pub(crate) dns01_challenges_completed: u64,
 }
 
 #[derive(Clone)]
@@ -56,6 +62,7 @@ pub(crate) struct CertificateManager {
     data_dir: PathBuf,
     resolver: Arc<DynamicCertResolver>,
     challenges: Arc<Http01ChallengeStore>,
+    cloudflare_dns: Option<CloudflareDnsClient>,
     account_lock: Arc<AsyncMutex<()>>,
     order_permits: Arc<Semaphore>,
 }
@@ -66,10 +73,12 @@ impl CertificateManager {
         fs::create_dir_all(data_dir.join("acme"))?;
         crate::disaster_recovery::restrict_directory_permissions(&data_dir.join("certificates"))?;
         crate::disaster_recovery::restrict_directory_permissions(&data_dir.join("acme"))?;
+        let cloudflare_dns = CloudflareDnsClient::from_environment(&data_dir)?;
         Ok(Self {
             data_dir,
             resolver: Arc::new(DynamicCertResolver::default()),
             challenges: Arc::new(Http01ChallengeStore::default()),
+            cloudflare_dns,
             account_lock: Arc::new(AsyncMutex::new(())),
             order_permits: Arc::new(Semaphore::new(MAX_PARALLEL_ORDERS)),
         })
@@ -102,12 +111,16 @@ impl CertificateManager {
                 .is_file()
     }
 
+    pub(crate) fn cloudflare_token_configured(&self) -> bool {
+        self.cloudflare_dns.is_some()
+    }
+
     pub(crate) fn remove_certificate(&self, hostname: &str) {
         self.resolver.remove(hostname);
     }
 
     pub(crate) fn delete_certificate(&self, hostname: &str) -> anyhow::Result<()> {
-        let hostname = normalize_hostname(hostname)?;
+        let hostname = normalize_certificate_identifier(hostname)?;
         self.resolver.remove(&hostname);
         let directory = self.certificate_directory(&hostname);
         if directory.is_dir() {
@@ -117,7 +130,7 @@ impl CertificateManager {
     }
 
     pub(crate) fn load_certificate(&self, hostname: &str) -> anyhow::Result<CertificateMetadata> {
-        let hostname = normalize_hostname(hostname)?;
+        let hostname = normalize_certificate_identifier(hostname)?;
         let directory = self.certificate_directory(&hostname);
         let mut last_error = None;
         for (certificate_pem, private_key_pem) in committed_certificate_pairs(&directory)? {
@@ -147,7 +160,15 @@ impl CertificateManager {
         hostname: &str,
         config: &AcmeIssueConfig,
     ) -> anyhow::Result<CertificateIssueResult> {
-        let hostname = normalize_hostname(hostname)?;
+        let hostname = normalize_certificate_identifier(hostname)?;
+        anyhow::ensure!(
+            !hostname.starts_with("*.") || config.challenge_type == AcmeChallengeType::Dns01,
+            "wildcard certificates require DNS-01"
+        );
+        anyhow::ensure!(
+            config.challenge_type != AcmeChallengeType::Dns01 || self.cloudflare_dns.is_some(),
+            "Cloudflare DNS-01 credentials are not configured"
+        );
         self.issue_certificate_with_timeout(&hostname, config, ACME_OPERATION_TIMEOUT)
             .await
     }
@@ -180,36 +201,72 @@ impl CertificateManager {
         let account = self.load_or_create_account(config).await?;
         let identifiers = [Identifier::Dns(hostname.to_owned())];
         let mut order = account.new_order(&NewOrder::new(&identifiers)).await?;
-        let mut challenge_guards = Vec::new();
-        let mut challenges_completed = 0_u64;
-        let mut authorizations = order.authorizations();
-        while let Some(result) = authorizations.next().await {
-            let mut authorization = result?;
-            match authorization.status {
-                AuthorizationStatus::Valid => continue,
-                AuthorizationStatus::Pending => {}
-                status => anyhow::bail!("ACME authorization entered unexpected status: {status:?}"),
+        let mut http01_guards = Vec::new();
+        let mut dns01_guards = Vec::new();
+        let mut http01_challenges_completed = 0_u64;
+        let mut dns01_challenges_completed = 0_u64;
+        let order_result = async {
+            let mut authorizations = order.authorizations();
+            while let Some(result) = authorizations.next().await {
+                let mut authorization = result?;
+                match authorization.status {
+                    AuthorizationStatus::Valid => continue,
+                    AuthorizationStatus::Pending => {}
+                    status => {
+                        anyhow::bail!("ACME authorization entered unexpected status: {status:?}")
+                    }
+                }
+                match config.challenge_type {
+                    AcmeChallengeType::Http01 => {
+                        let mut challenge = authorization
+                            .challenge(ChallengeType::Http01)
+                            .ok_or_else(|| anyhow::anyhow!("ACME server did not offer HTTP-01"))?;
+                        let token = challenge.token.clone();
+                        let key_authorization = challenge.key_authorization().as_str().to_owned();
+                        let guard = self
+                            .challenges
+                            .publish(hostname, &token, key_authorization)?;
+                        http01_guards.push(guard);
+                        challenge.set_ready().await?;
+                        http01_challenges_completed = http01_challenges_completed.saturating_add(1);
+                    }
+                    AcmeChallengeType::Dns01 => {
+                        let client = self.cloudflare_dns.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!("Cloudflare DNS-01 credentials are not configured")
+                        })?;
+                        let mut challenge = authorization
+                            .challenge(ChallengeType::Dns01)
+                            .ok_or_else(|| anyhow::anyhow!("ACME server did not offer DNS-01"))?;
+                        let value = challenge.key_authorization().dns_value();
+                        let guard = client.publish(hostname, value).await?;
+                        dns01_guards.push(guard);
+                        dns01_guards
+                            .last()
+                            .expect("DNS-01 guard was just appended")
+                            .wait_for_propagation()
+                            .await?;
+                        challenge.set_ready().await?;
+                        dns01_challenges_completed = dns01_challenges_completed.saturating_add(1);
+                    }
+                }
             }
-            let mut challenge = authorization
-                .challenge(ChallengeType::Http01)
-                .ok_or_else(|| anyhow::anyhow!("ACME server did not offer HTTP-01"))?;
-            let token = challenge.token.clone();
-            let key_authorization = challenge.key_authorization().as_str().to_owned();
-            let guard = self
-                .challenges
-                .publish(hostname, &token, key_authorization)?;
-            challenge.set_ready().await?;
-            challenge_guards.push(guard);
-            challenges_completed = challenges_completed.saturating_add(1);
+            let retry = RetryPolicy::default().timeout(ACME_OPERATION_TIMEOUT);
+            let status = order.poll_ready(&retry).await?;
+            if status != OrderStatus::Ready {
+                anyhow::bail!("ACME order did not become ready: {status:?}");
+            }
+            let private_key_pem = order.finalize().await?;
+            let certificate_pem = order.poll_certificate(&retry).await?;
+            Ok::<_, anyhow::Error>((certificate_pem, private_key_pem))
         }
-        let retry = RetryPolicy::default().timeout(ACME_OPERATION_TIMEOUT);
-        let status = order.poll_ready(&retry).await?;
-        if status != OrderStatus::Ready {
-            anyhow::bail!("ACME order did not become ready: {status:?}");
+        .await;
+        drop(http01_guards);
+        for guard in dns01_guards {
+            if let Err(error) = guard.cleanup().await {
+                tracing::warn!("could not clean up a Cloudflare DNS-01 TXT record: {error}");
+            }
         }
-        let private_key_pem = order.finalize().await?;
-        let certificate_pem = order.poll_certificate(&retry).await?;
-        drop(challenge_guards);
+        let (certificate_pem, private_key_pem) = order_result?;
         let metadata = validate_certificate(
             hostname,
             certificate_pem.as_bytes(),
@@ -228,7 +285,8 @@ impl CertificateManager {
         )?;
         Ok(CertificateIssueResult {
             metadata,
-            challenges_completed,
+            http01_challenges_completed,
+            dns01_challenges_completed,
         })
     }
 
@@ -315,7 +373,11 @@ impl CertificateManager {
     }
 
     fn certificate_directory(&self, hostname: &str) -> PathBuf {
-        self.data_dir.join("certificates").join(hostname)
+        let directory_name = hostname.strip_prefix("*.").map_or_else(
+            || hostname.to_owned(),
+            |suffix| format!("_wildcard_.{suffix}"),
+        );
+        self.data_dir.join("certificates").join(directory_name)
     }
 
     fn account_credentials_path(&self, directory_url: &str) -> PathBuf {
@@ -399,7 +461,7 @@ impl DynamicCertResolver {
     }
 
     fn remove(&self, hostname: &str) {
-        let Ok(hostname) = normalize_hostname(hostname) else {
+        let Ok(hostname) = normalize_certificate_identifier(hostname) else {
             return;
         };
         let _guard = self
@@ -412,9 +474,18 @@ impl DynamicCertResolver {
     }
 
     fn contains(&self, hostname: &str) -> bool {
-        normalize_hostname(hostname)
-            .ok()
-            .is_some_and(|hostname| self.certificates.load().contains_key(&hostname))
+        let Ok(identifier) = normalize_certificate_identifier(hostname) else {
+            return false;
+        };
+        let certificates = self.certificates.load();
+        if certificates.contains_key(&identifier) {
+            return true;
+        }
+        if identifier.starts_with("*.") {
+            return false;
+        }
+        wildcard_identifier_for_hostname(&identifier)
+            .is_some_and(|wildcard| certificates.contains_key(&wildcard))
     }
 
     fn len(&self) -> usize {
@@ -425,8 +496,17 @@ impl DynamicCertResolver {
 impl ResolvesServerCert for DynamicCertResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         let hostname = normalize_hostname(client_hello.server_name()?).ok()?;
-        self.certificates.load().get(&hostname).cloned()
+        let certificates = self.certificates.load();
+        certificates.get(&hostname).cloned().or_else(|| {
+            wildcard_identifier_for_hostname(&hostname)
+                .and_then(|wildcard| certificates.get(&wildcard).cloned())
+        })
     }
+}
+
+fn wildcard_identifier_for_hostname(hostname: &str) -> Option<String> {
+    let (_, suffix) = hostname.split_once('.')?;
+    Some(format!("*.{suffix}"))
 }
 
 #[derive(Default)]
@@ -537,10 +617,10 @@ fn validate_certificate(
     let certified_key = Arc::new(CertifiedKey::new(certificates.clone(), signing_key));
     let (_, parsed) = parse_x509_certificate(certificates[0].as_ref())
         .map_err(|_| anyhow::anyhow!("could not parse leaf certificate"))?;
-    let hostname = normalize_hostname(hostname)?;
+    let hostname = normalize_certificate_identifier(hostname)?;
     let matches_hostname = parsed.subject_alternative_name()?.is_some_and(|extension| {
         extension.value.general_names.iter().any(|name| {
-                matches!(name, GeneralName::DNSName(value) if value.eq_ignore_ascii_case(&hostname))
+                matches!(name, GeneralName::DNSName(value) if value.trim_end_matches('.').eq_ignore_ascii_case(&hostname))
             })
     });
     anyhow::ensure!(
@@ -647,7 +727,7 @@ fn sync_directory(_directory: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn write_secret_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn write_secret_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("secret file has no parent directory"))?;
@@ -735,9 +815,9 @@ fn replace_file_atomically(temporary: &Path, destination: &Path) -> anyhow::Resu
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_certificate, validate_challenge_token, write_secret_file, AcmeIssueConfig,
-        CertificateManager, DynamicCertResolver, Http01ChallengeStore, CERTIFICATE_COMMIT_MARKER,
-        CERTIFICATE_GENERATIONS_DIRECTORY, MAX_PARALLEL_ORDERS,
+        validate_certificate, validate_challenge_token, write_secret_file, AcmeChallengeType,
+        AcmeIssueConfig, CertificateManager, DynamicCertResolver, Http01ChallengeStore,
+        CERTIFICATE_COMMIT_MARKER, CERTIFICATE_GENERATIONS_DIRECTORY, MAX_PARALLEL_ORDERS,
     };
     use rcgen::{generate_simple_self_signed, CertifiedKey};
     use std::{
@@ -972,6 +1052,48 @@ mod tests {
     }
 
     #[test]
+    fn wildcard_certificate_is_persisted_and_matches_only_one_label() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let directory = std::env::temp_dir().join(format!(
+            "linklake-wildcard-certificate-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let identifier = "*.example.com";
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec![identifier.to_owned()])
+                .expect("wildcard test certificate should generate");
+        let manager = CertificateManager::new(directory.clone()).expect("manager should open");
+        manager
+            .install_certificate(
+                identifier,
+                cert.pem().as_bytes(),
+                signing_key.serialize_pem().as_bytes(),
+            )
+            .expect("wildcard certificate should install");
+        assert!(manager.has_certificate(identifier));
+        assert!(manager.has_certificate("node.example.com"));
+        assert!(!manager.has_certificate("nested.node.example.com"));
+        manager
+            .persist_certificate(
+                identifier,
+                cert.pem().as_bytes(),
+                signing_key.serialize_pem().as_bytes(),
+            )
+            .expect("wildcard certificate should persist");
+
+        let restored = CertificateManager::new(directory.clone()).expect("manager should reopen");
+        restored
+            .load_certificate(identifier)
+            .expect("wildcard certificate should reload");
+        assert!(restored.has_certificate("node.example.com"));
+        restored
+            .delete_certificate(identifier)
+            .expect("wildcard certificate should delete");
+        assert!(!restored.has_certificate("node.example.com"));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn certificate_for_another_hostname_is_rejected() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let CertifiedKey { cert, signing_key } =
@@ -1075,6 +1197,7 @@ mod tests {
         let config = AcmeIssueConfig {
             directory_url: "https://unused.invalid/directory".to_owned(),
             contact_email: "test@example.com".to_owned(),
+            challenge_type: AcmeChallengeType::Http01,
             root_ca_path: None,
         };
         let held_permits = manager

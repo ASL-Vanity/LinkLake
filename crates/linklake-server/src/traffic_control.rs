@@ -217,6 +217,11 @@ impl TrafficControlCatalog {
         )? > 0)
     }
 
+    /// Fleet 原子提交后丢弃进程内速率窗口；持久化日配额仍保留在 SQLite 中。
+    pub(crate) fn reset_runtime_state(&mut self) {
+        self.connection_windows.clear();
+    }
+
     pub(crate) fn authorize(
         &mut self,
         kind: TrafficPolicyKind,

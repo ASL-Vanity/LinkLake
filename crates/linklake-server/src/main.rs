@@ -5,12 +5,14 @@ mod audit_log;
 mod certificate_catalog;
 mod certificate_manager;
 mod client_registry;
+mod cloudflare_dns;
 mod database;
 mod database_migrations;
 mod database_tools;
 mod disaster_recovery;
 mod dual_stack_udp;
 mod fleet;
+mod fleet_health;
 mod http2_backend;
 pub mod http_backend_pool;
 mod http_proxy_tunnel;
@@ -20,6 +22,7 @@ mod lifecycle;
 mod notifications;
 mod p2p_control;
 mod p2p_node_catalog;
+mod policy_service;
 mod public_port_policy;
 mod secret_tunnel;
 mod secret_tunnel_catalog;
@@ -52,6 +55,7 @@ use axum::{
 };
 use axum_server::tls_rustls::RustlsConfig as ManagementTlsConfig;
 use certificate_catalog::{
+    certificate_identifier_covers_hostname, normalize_certificate_identifier, AcmeChallengeType,
     AcmeConfig, CertificateCatalog, CertificateCatalogError, CertificateState, CertificateStatus,
     RouteTlsMode, RouteTlsPolicy, UpdateAcmeConfig, UpdateRouteTlsPolicy,
 };
@@ -60,20 +64,30 @@ use clap::{Args, Parser, Subcommand};
 use client_registry::{Authentication, ClientRegistry, UpdateClient};
 use database::Database;
 use dual_stack_udp::{DualStackUdpSocket, PublicUdpBindMode};
+use ed25519_dalek::{Signature, VerifyingKey};
 use fleet::{FleetCatalog, FleetImportResult, FleetPeer, FleetPolicyBundle, UpsertFleetPeer};
+use fleet_health::{
+    FleetDnsChangeResult, FleetDnsFailover, FleetDnsSwitchEvent, FleetHealthCatalog,
+    FleetHealthConfig, FleetHealthMetrics, FleetHealthSnapshot, FleetHealthState, FleetPeerHealth,
+    FleetProbeObservation, FreezeFleetDnsFailover, UpdateFleetHealthConfig, UpsertFleetDnsFailover,
+};
 use http_route_catalog::{
     CreateHttpRouteError, CreateHttpRoutePolicy, HttpRouteCatalog, HttpRoutePolicy,
     UpdateHttpRoutePolicy,
 };
 use lifecycle::{LifecycleController, LifecyclePhase, LifecycleSnapshot, LifecycleTransitionError};
 use linklake_core::{
-    managed_config_revision, BoxedIo, BuildInfo, ClientEnrollmentRequest, ClientEnrollmentResponse,
-    ManagedClientConfig, ManagedHttpProxy, ManagedHttpRoute, ManagedSecretTunnel,
-    ManagedSocks5Proxy, ManagedTcpTunnel, ManagedTlsRoute, ManagedUdpTunnel, API_VERSION,
-    PRODUCT_NAME,
+    agent_enrollment_message, agent_instance_id_from_public_key, managed_config_revision, BoxedIo,
+    BuildInfo, ClientEnrollmentRequest, ClientEnrollmentResponse, ManagedClientConfig,
+    ManagedHttpProxy, ManagedHttpRoute, ManagedSecretTunnel, ManagedSocks5Proxy, ManagedTcpTunnel,
+    ManagedTlsRoute, ManagedUdpTunnel, API_VERSION, PRODUCT_NAME,
 };
 use linklake_update::{SignaturePolicy, UpdateChannel, UpdateProduct};
 use p2p_node_catalog::{P2pNodeCatalog, P2pNodeRecord};
+use policy_service::{
+    BindFleetCredential, FleetCredentialBinding, FleetPolicyKind, FleetReconcileRequest,
+    FleetReconcileResult, FleetRuntimeInvalidation, FleetSourceStatus, PolicyService,
+};
 use public_port_policy::{PublicPortPolicy, PublicPortPolicyView};
 use rusqlite::{params, Connection};
 use secret_tunnel_catalog::{
@@ -366,6 +380,9 @@ struct AppState {
     audit: Mutex<AuditLog>,
     alerts: Mutex<AlertCatalog>,
     fleet: Mutex<FleetCatalog>,
+    policy_service: PolicyService,
+    policy_mutation_lock: AsyncMutex<()>,
+    fleet_health: Mutex<FleetHealthCatalog>,
     traffic_controls: Mutex<TrafficControlCatalog>,
     management_cookies_secure: bool,
     public_port_policy: PublicPortPolicy,
@@ -425,6 +442,7 @@ struct ServerCounters {
     acme_renewals_total: AtomicU64,
     acme_renewal_failures_total: AtomicU64,
     acme_http01_challenges_total: AtomicU64,
+    acme_dns01_challenges_total: AtomicU64,
     sni_client_hello_errors_total: AtomicU64,
     sni_unknown_hostname_total: AtomicU64,
     p2p_session_offers_total: AtomicU64,
@@ -434,6 +452,11 @@ struct ServerCounters {
     udp_public_ipv6_bind_successes_total: AtomicU64,
     udp_public_ipv6_bind_fallbacks_total: AtomicU64,
     udp_public_bind_failures_total: AtomicU64,
+    fleet_reconcile_attempts_total: AtomicU64,
+    fleet_reconcile_successes_total: AtomicU64,
+    fleet_reconcile_failures_total: AtomicU64,
+    fleet_reconcile_conflicts_total: AtomicU64,
+    fleet_reconcile_replays_total: AtomicU64,
 }
 
 #[derive(Clone, Copy)]
@@ -909,6 +932,11 @@ struct MetricsResponse {
     registration_rejections_total: u64,
     authentication_failures_total: u64,
     http_transport_capabilities: HttpTransportCapabilitiesView,
+    fleet_reconcile_attempts_total: u64,
+    fleet_reconcile_successes_total: u64,
+    fleet_reconcile_failures_total: u64,
+    fleet_reconcile_conflicts_total: u64,
+    fleet_reconcile_replays_total: u64,
     http_active_connections: usize,
     http_requests_total: u64,
     http_failed_requests: u64,
@@ -955,6 +983,9 @@ struct MetricsResponse {
     acme_renewals_total: u64,
     acme_renewal_failures_total: u64,
     acme_http01_challenges_total: u64,
+    acme_dns01_challenges_total: u64,
+    #[serde(flatten)]
+    fleet_health: FleetHealthMetrics,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -1071,7 +1102,10 @@ struct SearchResult {
 struct FleetPeerStatus {
     #[serde(flatten)]
     peer: FleetPeer,
+    health_config: FleetHealthConfig,
+    health: FleetPeerHealth,
     online: bool,
+    dns_eligible: bool,
     latency_millis: Option<u64>,
     error: Option<String>,
     active_connections: u64,
@@ -1086,6 +1120,13 @@ struct FleetOverview {
     failover_order: Vec<Uuid>,
     conflicts: Vec<String>,
     peers: Vec<FleetPeerStatus>,
+    dns_failovers: Vec<FleetDnsFailover>,
+    health_metrics: FleetHealthMetrics,
+}
+
+#[derive(Serialize)]
+struct FleetDnsReconcileResponse {
+    results: Vec<FleetDnsChangeResult>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1112,7 +1153,12 @@ struct FleetPeerSyncResult {
     peer_id: Uuid,
     peer_name: String,
     created: usize,
+    updated: usize,
+    deleted: usize,
     unchanged: usize,
+    generation: Option<u64>,
+    revision: Option<String>,
+    idempotent: bool,
     conflicts: Vec<String>,
     error: Option<String>,
 }
@@ -1412,6 +1458,7 @@ struct HttpProxyView {
 struct RouteTlsView {
     mode: RouteTlsMode,
     redirect_http_to_https: bool,
+    certificate_identifier: String,
     https_online: bool,
     status: CertificateStatus,
     issuer: Option<String>,
@@ -1432,7 +1479,8 @@ struct AcmeConfigView {
     directory_url: String,
     contact_email: Option<String>,
     terms_accepted: bool,
-    challenge_type: &'static str,
+    challenge_type: AcmeChallengeType,
+    cloudflare_token_configured: bool,
     renew_before_days: u8,
     account_registered: bool,
     updated_at_unix_seconds: Option<i64>,
@@ -1604,7 +1652,8 @@ fn coded_certificate_catalog_error(error: CertificateCatalogError) -> CodedApiEr
         | CertificateCatalogError::InvalidContactEmail
         | CertificateCatalogError::TermsNotAccepted
         | CertificateCatalogError::InvalidRenewalWindow
-        | CertificateCatalogError::InvalidRedirectPolicy => StatusCode::BAD_REQUEST,
+        | CertificateCatalogError::InvalidRedirectPolicy
+        | CertificateCatalogError::InvalidCertificateIdentifier => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     CodedApiError(status, error.code(), "certificate configuration is invalid")
@@ -1621,11 +1670,76 @@ fn acme_config_view(state: &AppState, config: AcmeConfig) -> AcmeConfigView {
         directory_url: config.directory_url,
         contact_email: (!config.contact_email.is_empty()).then_some(config.contact_email),
         terms_accepted: config.terms_accepted,
-        challenge_type: "http-01",
+        challenge_type: config.challenge_type,
+        cloudflare_token_configured: state
+            .certificate_manager
+            .as_ref()
+            .is_some_and(CertificateManager::cloudflare_token_configured),
         renew_before_days: config.renew_before_days,
         account_registered,
         updated_at_unix_seconds: (config.updated_at > 0).then_some(config.updated_at),
     }
+}
+
+fn effective_certificate_identifier(hostname: &str, policy: Option<&RouteTlsPolicy>) -> String {
+    policy
+        .and_then(|policy| policy.certificate_identifier.clone())
+        .unwrap_or_else(|| hostname.to_owned())
+}
+
+fn resolve_certificate_identifier_update(
+    hostname: &str,
+    old_policy: Option<&RouteTlsPolicy>,
+    requested: Option<&str>,
+    mode: RouteTlsMode,
+) -> anyhow::Result<(String, Option<String>)> {
+    if mode == RouteTlsMode::Disabled {
+        return Ok((hostname.to_owned(), None));
+    }
+    let requested = requested
+        .or_else(|| old_policy.and_then(|policy| policy.certificate_identifier.as_deref()))
+        .unwrap_or(hostname);
+    let identifier = normalize_certificate_identifier(requested)?;
+    let stored = (identifier != hostname).then_some(identifier.clone());
+    Ok((identifier, stored))
+}
+
+fn certificate_identifier_used_by_other_route(
+    state: &AppState,
+    certificate_identifier: &str,
+    excluded_route_id: Uuid,
+) -> Result<bool, CodedApiError> {
+    let routes = state
+        .http_route_catalog
+        .lock()
+        .expect("HTTP route catalog lock poisoned")
+        .list()
+        .map_err(|_| {
+            CodedApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "could not read HTTP routes",
+            )
+        })?;
+    let catalog = state
+        .certificate_catalog
+        .lock()
+        .expect("certificate catalog lock poisoned");
+    for route in routes
+        .into_iter()
+        .filter(|route| route.id != excluded_route_id)
+    {
+        let policy = catalog
+            .get_route_tls(route.id)
+            .map_err(coded_certificate_catalog_error)?;
+        if policy.as_ref().map(|policy| policy.mode) == Some(RouteTlsMode::Acme)
+            && effective_certificate_identifier(&route.hostname, policy.as_ref())
+                == certificate_identifier
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn route_tls_view(
@@ -1634,6 +1748,7 @@ fn route_tls_view(
     policy: Option<RouteTlsPolicy>,
     certificate: Option<CertificateState>,
 ) -> RouteTlsView {
+    let certificate_identifier = effective_certificate_identifier(hostname, policy.as_ref());
     let mode = policy
         .as_ref()
         .map_or(RouteTlsMode::Disabled, |policy| policy.mode);
@@ -1648,10 +1763,11 @@ fn route_tls_view(
     let https_online = state
         .certificate_manager
         .as_ref()
-        .is_some_and(|manager| manager.has_certificate(hostname));
+        .is_some_and(|manager| manager.has_certificate(&certificate_identifier));
     RouteTlsView {
         mode,
         redirect_http_to_https,
+        certificate_identifier,
         https_online,
         status,
         issuer: certificate.as_ref().and_then(|value| value.issuer.clone()),
@@ -2332,15 +2448,20 @@ async fn run_server(
             );
         }
     }
+    if let Some(plan) = migration_plan {
+        plan.finish()?;
+    }
     let certificate_manager = data_dir
         .as_ref()
         .map(|data_dir| CertificateManager::new(data_dir.clone()))
         .transpose()?;
     let management_cookies_secure = management_tls.is_some();
+    let policy_service = PolicyService::open_with_database(&database, public_port_policy.clone())?;
+    let instance_id = policy_service.local_instance_id()?.to_string();
     let state = Arc::new(AppState {
         _database: database.clone(),
         started_at: Instant::now(),
-        instance_id: uuid::Uuid::new_v4().to_string(),
+        instance_id,
         lifecycle: LifecycleController::new(unix_seconds()),
         enrollment_token,
         management_token: configured_management_token,
@@ -2351,6 +2472,9 @@ async fn run_server(
         audit: Mutex::new(AuditLog::open_with_database(&database)?),
         alerts: Mutex::new(AlertCatalog::open_with_database(&database)?),
         fleet: Mutex::new(FleetCatalog::open_with_database(&database)?),
+        policy_service,
+        policy_mutation_lock: AsyncMutex::new(()),
+        fleet_health: Mutex::new(FleetHealthCatalog::open_with_database(&database)?),
         traffic_controls: Mutex::new(TrafficControlCatalog::open_with_database(&database)?),
         management_cookies_secure,
         public_port_policy: public_port_policy.clone(),
@@ -2398,9 +2522,6 @@ async fn run_server(
             METRICS_HISTORY_ARCHIVE_CAPACITY,
         )?),
     });
-    if let Some(plan) = migration_plan {
-        plan.finish()?;
-    }
     restore_managed_certificates(&state)?;
     let app = Router::new()
         .route("/", get(management_ui))
@@ -2494,9 +2615,55 @@ async fn run_server(
             "/api/v1/fleet/peers/:peer_id",
             put(update_fleet_peer).delete(delete_fleet_peer),
         )
+        .route(
+            "/api/v1/fleet/peers/:peer_id/health-config",
+            get(get_fleet_health_config).put(update_fleet_health_config),
+        )
         .route("/api/v1/fleet/overview", get(fleet_overview))
         .route("/api/v1/fleet/import", post(import_fleet_policies))
         .route("/api/v1/fleet/sync", post(sync_fleet_policies))
+        .route("/api/v1/fleet/v2/bundle", post(export_fleet_bundle_v2))
+        .route(
+            "/api/v1/fleet/v2/reconcile",
+            post(reconcile_fleet_bundle_v2),
+        )
+        .route("/api/v1/fleet/v2/sources", get(list_fleet_sources_v2))
+        .route(
+            "/api/v1/fleet/v2/sources/:source_instance_id",
+            axum::routing::delete(reset_fleet_source_v2),
+        )
+        .route(
+            "/api/v1/fleet/v2/credentials",
+            get(list_fleet_credential_bindings).put(bind_fleet_credential),
+        )
+        .route(
+            "/api/v1/fleet/v2/credentials/:source_instance_id/:kind/:credential_ref",
+            axum::routing::delete(delete_fleet_credential_binding),
+        )
+        .route(
+            "/api/v1/fleet/dns-failovers",
+            get(list_fleet_dns_failovers).post(create_fleet_dns_failover),
+        )
+        .route(
+            "/api/v1/fleet/dns-failovers/:failover_id",
+            put(update_fleet_dns_failover).delete(delete_fleet_dns_failover),
+        )
+        .route(
+            "/api/v1/fleet/dns-failovers/:failover_id/events",
+            get(list_fleet_dns_switch_events),
+        )
+        .route(
+            "/api/v1/fleet/dns-failovers/:failover_id/freeze",
+            post(freeze_fleet_dns_failover),
+        )
+        .route(
+            "/api/v1/fleet/dns-failovers/:failover_id/resume",
+            post(resume_fleet_dns_failover),
+        )
+        .route(
+            "/api/v1/fleet/dns-failovers/:failover_id/reconcile",
+            post(reconcile_fleet_dns_failover),
+        )
         .route(
             "/api/v1/traffic-controls/:kind/:policy_id",
             get(get_traffic_control)
@@ -2614,6 +2781,10 @@ async fn run_server(
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
             state.clone(),
+            enforce_fleet_ownership,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
             enforce_management_role,
         ))
         .layer(TraceLayer::new_for_http())
@@ -2671,6 +2842,7 @@ async fn run_server(
         state.clone(),
         shutdown_rx.clone(),
     ));
+    tokio::spawn(run_fleet_health_monitor(state.clone(), shutdown_rx.clone()));
     let shutdown_state = state.clone();
     tokio::spawn(async move {
         match service_shutdown {
@@ -3189,6 +3361,17 @@ async fn metrics(
     headers: HeaderMap,
 ) -> Result<Json<MetricsResponse>, ApiError> {
     authorize_management(&state, &headers)?;
+    let fleet_health = state
+        .fleet_health
+        .lock()
+        .expect("fleet health catalog lock poisoned")
+        .metrics()
+        .map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not read fleet health metrics",
+            )
+        })?;
     let statistics = state
         .tunnel_statistics
         .lock()
@@ -3502,6 +3685,26 @@ async fn metrics(
             .authentication_failures_total
             .load(Ordering::Relaxed),
         http_transport_capabilities: HttpTransportCapabilitiesView::default(),
+        fleet_reconcile_attempts_total: state
+            .metrics
+            .fleet_reconcile_attempts_total
+            .load(Ordering::Relaxed),
+        fleet_reconcile_successes_total: state
+            .metrics
+            .fleet_reconcile_successes_total
+            .load(Ordering::Relaxed),
+        fleet_reconcile_failures_total: state
+            .metrics
+            .fleet_reconcile_failures_total
+            .load(Ordering::Relaxed),
+        fleet_reconcile_conflicts_total: state
+            .metrics
+            .fleet_reconcile_conflicts_total
+            .load(Ordering::Relaxed),
+        fleet_reconcile_replays_total: state
+            .metrics
+            .fleet_reconcile_replays_total
+            .load(Ordering::Relaxed),
         http_active_connections: http_statistics
             .values()
             .map(|statistics| statistics.active_connections.load(Ordering::Relaxed))
@@ -3621,6 +3824,11 @@ async fn metrics(
             .metrics
             .acme_http01_challenges_total
             .load(Ordering::Relaxed),
+        acme_dns01_challenges_total: state
+            .metrics
+            .acme_dns01_challenges_total
+            .load(Ordering::Relaxed),
+        fleet_health,
     }))
 }
 
@@ -5062,9 +5270,68 @@ async fn get_acme_config(
 async fn update_acme_config(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(request): Json<UpdateAcmeConfig>,
+    Json(mut request): Json<UpdateAcmeConfig>,
 ) -> Result<Json<AcmeConfigView>, CodedApiError> {
     authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let challenge_type = request.challenge_type.unwrap_or(
+        state
+            .certificate_catalog
+            .lock()
+            .expect("certificate catalog lock poisoned")
+            .get_acme_config()
+            .map_err(coded_certificate_catalog_error)?
+            .challenge_type,
+    );
+    request.challenge_type = Some(challenge_type);
+    if request.enabled
+        && challenge_type == AcmeChallengeType::Dns01
+        && !state
+            .certificate_manager
+            .as_ref()
+            .is_some_and(CertificateManager::cloudflare_token_configured)
+    {
+        return Err(CodedApiError(
+            StatusCode::CONFLICT,
+            "cloudflare_token_not_configured",
+            "Cloudflare API token is required for DNS-01",
+        ));
+    }
+    if challenge_type == AcmeChallengeType::Http01 {
+        let routes = state
+            .http_route_catalog
+            .lock()
+            .expect("HTTP route catalog lock poisoned")
+            .list()
+            .map_err(|_| {
+                CodedApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "could not read HTTP routes",
+                )
+            })?;
+        let catalog = state
+            .certificate_catalog
+            .lock()
+            .expect("certificate catalog lock poisoned");
+        let wildcard_configured = routes.into_iter().any(|route| {
+            catalog
+                .get_route_tls(route.id)
+                .ok()
+                .flatten()
+                .is_some_and(|policy| {
+                    policy.mode == RouteTlsMode::Acme
+                        && effective_certificate_identifier(&route.hostname, Some(&policy))
+                            .starts_with("*.")
+                })
+        });
+        if wildcard_configured {
+            return Err(CodedApiError(
+                StatusCode::CONFLICT,
+                "wildcard_certificate_requires_dns01",
+                "wildcard certificate identifiers require DNS-01",
+            ));
+        }
+    }
     let config = state
         .certificate_catalog
         .lock()
@@ -5076,8 +5343,8 @@ async fn update_acme_config(
         "acme.config.updated",
         "global",
         &format!(
-            "enabled={}; environment={:?}; renew_before_days={}",
-            config.enabled, config.environment, config.renew_before_days
+            "enabled={}; environment={:?}; challenge_type={:?}; renew_before_days={}",
+            config.enabled, config.environment, config.challenge_type, config.renew_before_days
         ),
     );
     Ok(Json(acme_config_view(&state, config)))
@@ -5087,7 +5354,7 @@ async fn set_http_route_tls(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(route_id): Path<Uuid>,
-    Json(request): Json<UpdateRouteTlsPolicy>,
+    Json(mut request): Json<UpdateRouteTlsPolicy>,
 ) -> Result<Json<RouteTlsPolicy>, CodedApiError> {
     authorize_management(&state, &headers).map_err(coded_management_error)?;
     let route = http_route_policy_for_id(&state, route_id)?.ok_or(CodedApiError(
@@ -5095,11 +5362,83 @@ async fn set_http_route_tls(
         "unknown_http_route",
         "HTTP route does not exist",
     ))?;
+    let (old_policy, acme_config) = {
+        let catalog = state
+            .certificate_catalog
+            .lock()
+            .expect("certificate catalog lock poisoned");
+        (
+            catalog
+                .get_route_tls(route_id)
+                .map_err(coded_certificate_catalog_error)?,
+            catalog
+                .get_acme_config()
+                .map_err(coded_certificate_catalog_error)?,
+        )
+    };
+    let (certificate_identifier, stored_certificate_identifier) =
+        resolve_certificate_identifier_update(
+            &route.hostname,
+            old_policy.as_ref(),
+            request.certificate_identifier.as_deref(),
+            request.mode,
+        )
+        .map_err(|_| {
+            CodedApiError(
+                StatusCode::BAD_REQUEST,
+                "invalid_certificate_identifier",
+                "certificate identifier is invalid",
+            )
+        })?;
+    if request.mode == RouteTlsMode::Acme
+        && !certificate_identifier_covers_hostname(&certificate_identifier, &route.hostname)
+    {
+        return Err(CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "certificate_identifier_does_not_cover_route",
+            "certificate identifier does not cover the route hostname",
+        ));
+    }
+    if request.mode == RouteTlsMode::Acme
+        && certificate_identifier.starts_with("*.")
+        && acme_config.challenge_type != AcmeChallengeType::Dns01
+    {
+        return Err(CodedApiError(
+            StatusCode::CONFLICT,
+            "wildcard_certificate_requires_dns01",
+            "wildcard certificate identifiers require DNS-01",
+        ));
+    }
+    if request.mode == RouteTlsMode::Acme
+        && certificate_identifier_used_by_other_route(&state, &certificate_identifier, route_id)?
+    {
+        return Err(CodedApiError(
+            StatusCode::CONFLICT,
+            "duplicate_certificate_identifier",
+            "certificate identifier is already assigned to another route",
+        ));
+    }
+    request.certificate_identifier = stored_certificate_identifier;
+    let old_certificate_identifier =
+        effective_certificate_identifier(&route.hostname, old_policy.as_ref());
     let certificate_jobs = state
         .certificate_jobs
         .lock()
         .expect("certificate jobs lock poisoned");
-    if request.mode == RouteTlsMode::Disabled && certificate_jobs.contains_key(&route.hostname) {
+    if (request.mode == RouteTlsMode::Disabled
+        || old_certificate_identifier != certificate_identifier)
+        && certificate_jobs.contains_key(&old_certificate_identifier)
+    {
+        return Err(CodedApiError(
+            StatusCode::CONFLICT,
+            "certificate_operation_in_progress",
+            "certificate operation is already in progress",
+        ));
+    }
+    if certificate_jobs
+        .get(&certificate_identifier)
+        .is_some_and(|owner| *owner != route_id)
+    {
         return Err(CodedApiError(
             StatusCode::CONFLICT,
             "certificate_operation_in_progress",
@@ -5114,6 +5453,7 @@ async fn set_http_route_tls(
         .expect("certificate catalog lock poisoned")
         .set_route_tls(route_id, request, unix_seconds() as i64)
         .map_err(coded_certificate_catalog_error)?;
+    let certificate_identifier = effective_certificate_identifier(&route.hostname, Some(&policy));
     {
         let mut redirects = state
             .https_redirect_hosts
@@ -5125,9 +5465,24 @@ async fn set_http_route_tls(
             redirects.remove(&route.hostname);
         }
     }
+    if old_certificate_identifier != certificate_identifier {
+        if let Some(manager) = &state.certificate_manager {
+            if let Err(error) = manager.delete_certificate(&old_certificate_identifier) {
+                tracing::warn!(
+                    "could not delete superseded certificate {old_certificate_identifier}: {error}"
+                );
+            }
+        }
+        state
+            .certificate_catalog
+            .lock()
+            .expect("certificate catalog lock poisoned")
+            .delete_certificate_state(route_id)
+            .map_err(coded_certificate_catalog_error)?;
+    }
     if mode == RouteTlsMode::Disabled {
         if let Some(manager) = &state.certificate_manager {
-            manager.remove_certificate(&route.hostname);
+            manager.remove_certificate(&certificate_identifier);
         }
         set_persisted_certificate_status(&state, route_id, CertificateStatus::Disabled)?;
     } else {
@@ -5143,7 +5498,7 @@ async fn set_http_route_tls(
             && state
                 .certificate_manager
                 .as_ref()
-                .is_some_and(|manager| manager.load_certificate(&route.hostname).is_ok());
+                .is_some_and(|manager| manager.load_certificate(&certificate_identifier).is_ok());
         if restored {
             set_persisted_certificate_status(&state, route_id, CertificateStatus::Active)?;
         } else {
@@ -5163,8 +5518,8 @@ async fn set_http_route_tls(
         "http_route.tls.updated",
         &route_id.to_string(),
         &format!(
-            "hostname={}; mode={:?}; redirect={}",
-            route.hostname, policy.mode, policy.redirect_http_to_https
+            "hostname={}; certificate_identifier={}; mode={:?}; redirect={}",
+            route.hostname, certificate_identifier, policy.mode, policy.redirect_http_to_https
         ),
     );
     if issue_automatically {
@@ -5374,6 +5729,26 @@ fn queue_certificate_operation(
             "certificate storage is unavailable",
         ));
     };
+    let certificate_identifier =
+        effective_certificate_identifier(&route.hostname, tls_policy.as_ref());
+    if certificate_identifier.starts_with("*.")
+        && acme_config.challenge_type != AcmeChallengeType::Dns01
+    {
+        return Err(CodedApiError(
+            StatusCode::CONFLICT,
+            "wildcard_certificate_requires_dns01",
+            "wildcard certificate identifiers require DNS-01",
+        ));
+    }
+    if acme_config.challenge_type == AcmeChallengeType::Dns01
+        && !manager.cloudflare_token_configured()
+    {
+        return Err(CodedApiError(
+            StatusCode::CONFLICT,
+            "cloudflare_token_not_configured",
+            "Cloudflare API token is required for DNS-01",
+        ));
+    }
     match operation {
         CertificateOperation::Issue
             if certificate.as_ref().is_some_and(|certificate| {
@@ -5387,7 +5762,7 @@ fn queue_certificate_operation(
                 "certificate is already valid",
             ));
         }
-        CertificateOperation::Renew if !manager.has_certificate(&route.hostname) => {
+        CertificateOperation::Renew if !manager.has_certificate(&certificate_identifier) => {
             return Err(CodedApiError(
                 StatusCode::CONFLICT,
                 "certificate_not_available",
@@ -5410,7 +5785,7 @@ fn queue_certificate_operation(
             "certificate operation was attempted too recently",
         ));
     }
-    if !reserve_certificate_job(&state, &route)? {
+    if !reserve_certificate_job(&state, &route, &certificate_identifier)? {
         return Err(CodedApiError(
             StatusCode::CONFLICT,
             "certificate_operation_in_progress",
@@ -5422,7 +5797,7 @@ fn queue_certificate_operation(
         CertificateOperation::Renew => CertificateStatus::Renewing,
     };
     if let Err(error) = mark_certificate_operation_status(&state, route_id, target_status) {
-        release_certificate_job(&state, &route.hostname, route_id);
+        release_certificate_job(&state, &certificate_identifier, route_id);
         return Err(error);
     }
     state
@@ -5442,12 +5817,16 @@ fn queue_certificate_operation(
             CertificateOperation::Renew => "certificate.renew.started",
         },
         &route_id.to_string(),
-        &format!("hostname={}", route.hostname),
+        &format!(
+            "hostname={}; certificate_identifier={}",
+            route.hostname, certificate_identifier
+        ),
     );
     tokio::spawn(run_certificate_operation(
         state,
         manager,
         route,
+        certificate_identifier,
         acme_config,
         operation,
     ));
@@ -5457,12 +5836,13 @@ fn queue_certificate_operation(
 fn reserve_certificate_job(
     state: &AppState,
     expected: &HttpRoutePolicy,
+    expected_certificate_identifier: &str,
 ) -> Result<bool, CodedApiError> {
     let mut jobs = state
         .certificate_jobs
         .lock()
         .expect("certificate jobs lock poisoned");
-    if jobs.contains_key(&expected.hostname) {
+    if jobs.contains_key(expected_certificate_identifier) {
         return Ok(false);
     }
     let current = http_route_policy_for_id(state, expected.id)?.ok_or(CodedApiError(
@@ -5497,9 +5877,18 @@ fn reserve_certificate_job(
             "automatic TLS is not enabled for this route",
         ));
     }
+    if effective_certificate_identifier(&current.hostname, tls_policy.as_ref())
+        != expected_certificate_identifier
+    {
+        return Err(CodedApiError(
+            StatusCode::CONFLICT,
+            "certificate_target_changed",
+            "certificate target changed before the operation started",
+        ));
+    }
     Ok(reserve_certificate_job_slot(
         &mut jobs,
-        &expected.hostname,
+        expected_certificate_identifier,
         expected.id,
     ))
 }
@@ -5534,16 +5923,18 @@ async fn run_certificate_operation(
     state: Arc<AppState>,
     manager: CertificateManager,
     route: HttpRoutePolicy,
+    certificate_identifier: String,
     acme_config: AcmeConfig,
     operation: CertificateOperation,
 ) {
     let issue_config = certificate_manager::AcmeIssueConfig {
         directory_url: acme_config.directory_url,
         contact_email: acme_config.contact_email,
+        challenge_type: acme_config.challenge_type,
         root_ca_path: std::env::var_os("LINKLAKE_ACME_ROOT_CA_PATH").map(PathBuf::from),
     };
     let result = manager
-        .issue_certificate(&route.hostname, &issue_config)
+        .issue_certificate(&certificate_identifier, &issue_config)
         .await;
     let now = unix_seconds() as i64;
     match result {
@@ -5551,10 +5942,15 @@ async fn run_certificate_operation(
             state
                 .metrics
                 .acme_http01_challenges_total
-                .fetch_add(result.challenges_completed, Ordering::Relaxed);
+                .fetch_add(result.http01_challenges_completed, Ordering::Relaxed);
+            state
+                .metrics
+                .acme_dns01_challenges_total
+                .fetch_add(result.dns01_challenges_completed, Ordering::Relaxed);
             let current = record_certificate_success_if_current(
                 &state,
                 &route,
+                &certificate_identifier,
                 &result.metadata.issuer,
                 result.metadata.not_before_unix_seconds as i64,
                 result.metadata.not_after_unix_seconds as i64,
@@ -5570,13 +5966,25 @@ async fn run_certificate_operation(
                     &route.id.to_string(),
                     &format!("hostname={}", route.hostname),
                 ),
-                Ok(false) => discard_stale_certificate_result(&state, &manager, &route, operation),
+                Ok(false) => discard_stale_certificate_result(
+                    &state,
+                    &manager,
+                    &route,
+                    &certificate_identifier,
+                    operation,
+                ),
                 Err(error) => {
                     tracing::error!(
                         "could not verify or persist certificate metadata for {}: {error}",
                         route.hostname
                     );
-                    discard_stale_certificate_result(&state, &manager, &route, operation);
+                    discard_stale_certificate_result(
+                        &state,
+                        &manager,
+                        &route,
+                        &certificate_identifier,
+                        operation,
+                    );
                 }
             }
         }
@@ -5595,6 +6003,7 @@ async fn run_certificate_operation(
             match record_certificate_failure_if_current(
                 &state,
                 &route,
+                &certificate_identifier,
                 match operation {
                     CertificateOperation::Issue => "certificate_issue_failed",
                     CertificateOperation::Renew => "certificate_renew_failed",
@@ -5630,11 +6039,12 @@ async fn run_certificate_operation(
             }
         }
     }
-    release_certificate_job(&state, &route.hostname, route.id);
+    release_certificate_job(&state, &certificate_identifier, route.id);
 }
 
 fn certificate_target_matches(
     expected: &HttpRoutePolicy,
+    expected_certificate_identifier: &str,
     current: Option<&HttpRoutePolicy>,
     tls_policy: Option<&RouteTlsPolicy>,
 ) -> bool {
@@ -5643,7 +6053,10 @@ fn certificate_target_matches(
             && current.hostname == expected.hostname
             && current.enabled
             && tls_policy.is_some_and(|policy| {
-                policy.route_id == expected.id && policy.mode == RouteTlsMode::Acme
+                policy.route_id == expected.id
+                    && policy.mode == RouteTlsMode::Acme
+                    && effective_certificate_identifier(&current.hostname, Some(policy))
+                        == expected_certificate_identifier
             })
     })
 }
@@ -5651,6 +6064,7 @@ fn certificate_target_matches(
 fn record_certificate_success_if_current(
     state: &AppState,
     expected: &HttpRoutePolicy,
+    expected_certificate_identifier: &str,
     issuer: &str,
     not_before: i64,
     not_after: i64,
@@ -5667,7 +6081,12 @@ fn record_certificate_success_if_current(
         .lock()
         .expect("certificate catalog lock poisoned");
     let tls_policy = certificate_catalog.get_route_tls(expected.id)?;
-    if !certificate_target_matches(expected, current, tls_policy.as_ref()) {
+    if !certificate_target_matches(
+        expected,
+        expected_certificate_identifier,
+        current,
+        tls_policy.as_ref(),
+    ) {
         return Ok(false);
     }
     certificate_catalog.record_certificate_success(
@@ -5685,6 +6104,7 @@ fn record_certificate_success_if_current(
 fn record_certificate_failure_if_current(
     state: &AppState,
     expected: &HttpRoutePolicy,
+    expected_certificate_identifier: &str,
     error_code: &str,
     error_message: &str,
     attempted_at: i64,
@@ -5700,7 +6120,12 @@ fn record_certificate_failure_if_current(
         .lock()
         .expect("certificate catalog lock poisoned");
     let tls_policy = certificate_catalog.get_route_tls(expected.id)?;
-    if !certificate_target_matches(expected, current, tls_policy.as_ref()) {
+    if !certificate_target_matches(
+        expected,
+        expected_certificate_identifier,
+        current,
+        tls_policy.as_ref(),
+    ) {
         return Ok(false);
     }
     certificate_catalog.record_certificate_failure(
@@ -5718,9 +6143,10 @@ fn discard_stale_certificate_result(
     state: &AppState,
     manager: &CertificateManager,
     route: &HttpRoutePolicy,
+    certificate_identifier: &str,
     operation: CertificateOperation,
 ) {
-    if let Err(error) = manager.delete_certificate(&route.hostname) {
+    if let Err(error) = manager.delete_certificate(certificate_identifier) {
         tracing::warn!(
             "could not remove stale certificate result for {}: {error}",
             route.hostname
@@ -5786,6 +6212,8 @@ fn restore_managed_certificates(state: &Arc<AppState>) -> anyhow::Result<()> {
         if tls_policy.mode != RouteTlsMode::Acme {
             continue;
         }
+        let certificate_identifier =
+            effective_certificate_identifier(&route.hostname, Some(&tls_policy));
         if certificate
             .as_ref()
             .is_some_and(|certificate| certificate.expired_at(now))
@@ -5799,7 +6227,7 @@ fn restore_managed_certificates(state: &Arc<AppState>) -> anyhow::Result<()> {
             .and_then(|value| value.not_after)
             .is_some()
         {
-            match manager.load_certificate(&route.hostname) {
+            match manager.load_certificate(&certificate_identifier) {
                 Ok(_) => {
                     if certificate.as_ref().is_some_and(|certificate| {
                         matches!(
@@ -5903,11 +6331,13 @@ fn scan_certificate_maintenance(state: Arc<AppState>) {
         if tls_policy.as_ref().map(|policy| policy.mode) != Some(RouteTlsMode::Acme) {
             continue;
         }
+        let certificate_identifier =
+            effective_certificate_identifier(&route.hostname, tls_policy.as_ref());
         if certificate.as_ref().is_some_and(|certificate| {
             certificate.status != CertificateStatus::Error && certificate.expired_at(now)
         }) {
             if let Some(manager) = &state.certificate_manager {
-                manager.remove_certificate(&route.hostname);
+                manager.remove_certificate(&certificate_identifier);
             }
             let _ = set_persisted_certificate_status(&state, route.id, CertificateStatus::Expired);
         } else if certificate
@@ -5915,13 +6345,13 @@ fn scan_certificate_maintenance(state: Arc<AppState>) {
             .is_some_and(|certificate| certificate.expired_at(now))
         {
             if let Some(manager) = &state.certificate_manager {
-                manager.remove_certificate(&route.hostname);
+                manager.remove_certificate(&certificate_identifier);
             }
         }
         let has_certificate = state
             .certificate_manager
             .as_ref()
-            .is_some_and(|manager| manager.has_certificate(&route.hostname));
+            .is_some_and(|manager| manager.has_certificate(&certificate_identifier));
         let operation =
             select_certificate_maintenance_operation(certificate.as_ref(), has_certificate, now);
         if let Some(operation) = operation {
@@ -6194,6 +6624,13 @@ async fn rotate_client_token(
             "unknown_client",
             "client does not exist",
         ))?;
+    let agent_instance_id = state
+        .clients
+        .lock()
+        .expect("client registry lock poisoned")
+        .summary_by_id(client_id)
+        .expect("rotated client still exists")
+        .agent_instance_id;
     record_audit(
         &state,
         "client.token.rotated",
@@ -6202,6 +6639,7 @@ async fn rotate_client_token(
     );
     Ok(Json(ClientEnrollmentResponse {
         client_id,
+        agent_instance_id: Some(agent_instance_id),
         client_token,
     }))
 }
@@ -6581,6 +7019,16 @@ async fn alert_notification_channels(
     Ok(Json(notifications::channel_view()))
 }
 
+fn fleet_peer_exists(state: &AppState, peer_id: Uuid) -> anyhow::Result<bool> {
+    Ok(state
+        .fleet
+        .lock()
+        .expect("fleet catalog lock poisoned")
+        .list()?
+        .iter()
+        .any(|peer| peer.id == peer_id))
+}
+
 async fn list_fleet_peers(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -6607,6 +7055,12 @@ async fn create_fleet_peer(
         .lock()
         .expect("fleet catalog lock poisoned")
         .create(request, unix_seconds())
+        .map_err(coded_fleet_error)?;
+    state
+        .fleet_health
+        .lock()
+        .expect("fleet health catalog lock poisoned")
+        .ensure_peer(peer.id, unix_seconds())
         .map_err(coded_fleet_error)?;
     record_audit(
         &state,
@@ -6672,6 +7126,312 @@ async fn delete_fleet_peer(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn get_fleet_health_config(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(peer_id): Path<Uuid>,
+) -> Result<Json<FleetHealthSnapshot>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    if !fleet_peer_exists(&state, peer_id).map_err(coded_fleet_error)? {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_fleet_peer",
+            "fleet peer does not exist",
+        ));
+    }
+    state
+        .fleet_health
+        .lock()
+        .expect("fleet health catalog lock poisoned")
+        .ensure_peer(peer_id, unix_seconds())
+        .map_err(coded_fleet_error)?;
+    state
+        .fleet_health
+        .lock()
+        .expect("fleet health catalog lock poisoned")
+        .snapshot(peer_id)
+        .map_err(coded_fleet_error)?
+        .map(Json)
+        .ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_fleet_peer",
+            "fleet peer does not exist",
+        ))
+}
+
+async fn update_fleet_health_config(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(peer_id): Path<Uuid>,
+    Json(request): Json<UpdateFleetHealthConfig>,
+) -> Result<Json<FleetHealthSnapshot>, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    if !fleet_peer_exists(&state, peer_id).map_err(coded_fleet_error)? {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_fleet_peer",
+            "fleet peer does not exist",
+        ));
+    }
+    let snapshot = state
+        .fleet_health
+        .lock()
+        .expect("fleet health catalog lock poisoned")
+        .update_health_config(peer_id, request, unix_seconds())
+        .map_err(coded_fleet_error)?
+        .ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_fleet_peer",
+            "fleet peer does not exist",
+        ))?;
+    record_audit(
+        &state,
+        "fleet.peer.health_config_updated",
+        &peer_id.to_string(),
+        &format!(
+            "actor={}; success_threshold={}; failure_threshold={}; cooldown_seconds={}",
+            principal.username,
+            snapshot.config.success_threshold,
+            snapshot.config.failure_threshold,
+            snapshot.config.cooldown_seconds
+        ),
+    );
+    Ok(Json(snapshot))
+}
+
+async fn list_fleet_dns_failovers(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<FleetDnsFailover>>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    Ok(Json(
+        state
+            .fleet_health
+            .lock()
+            .expect("fleet health catalog lock poisoned")
+            .list_dns_failovers()
+            .map_err(coded_fleet_error)?,
+    ))
+}
+
+async fn list_fleet_dns_switch_events(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(failover_id): Path<Uuid>,
+) -> Result<Json<Vec<FleetDnsSwitchEvent>>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let fleet_health = state
+        .fleet_health
+        .lock()
+        .expect("fleet health catalog lock poisoned");
+    if fleet_health
+        .get_dns_failover(failover_id)
+        .map_err(coded_fleet_error)?
+        .is_none()
+    {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_fleet_dns_failover",
+            "fleet DNS failover does not exist",
+        ));
+    }
+    Ok(Json(
+        fleet_health
+            .list_dns_switch_events(failover_id, 100)
+            .map_err(coded_fleet_error)?,
+    ))
+}
+
+async fn create_fleet_dns_failover(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<UpsertFleetDnsFailover>,
+) -> Result<(StatusCode, Json<FleetDnsFailover>), CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    let peers = state
+        .fleet
+        .lock()
+        .expect("fleet catalog lock poisoned")
+        .list()
+        .map_err(coded_fleet_error)?;
+    let failover = state
+        .fleet_health
+        .lock()
+        .expect("fleet health catalog lock poisoned")
+        .create_dns_failover(request, &peers, unix_seconds())
+        .map_err(coded_fleet_error)?;
+    record_audit(
+        &state,
+        "fleet.dns_failover.created",
+        &failover.id.to_string(),
+        &format!(
+            "actor={}; hostname={}; record_type={}; targets={}; token_env={}",
+            principal.username,
+            failover.hostname,
+            failover.record_type.as_str(),
+            failover.targets.len(),
+            failover.token_env
+        ),
+    );
+    Ok((StatusCode::CREATED, Json(failover)))
+}
+
+async fn update_fleet_dns_failover(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(failover_id): Path<Uuid>,
+    Json(request): Json<UpsertFleetDnsFailover>,
+) -> Result<Json<FleetDnsFailover>, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    let peers = state
+        .fleet
+        .lock()
+        .expect("fleet catalog lock poisoned")
+        .list()
+        .map_err(coded_fleet_error)?;
+    let failover = state
+        .fleet_health
+        .lock()
+        .expect("fleet health catalog lock poisoned")
+        .update_dns_failover(failover_id, request, &peers, unix_seconds())
+        .map_err(coded_fleet_error)?
+        .ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_fleet_dns_failover",
+            "fleet DNS failover does not exist",
+        ))?;
+    record_audit(
+        &state,
+        "fleet.dns_failover.updated",
+        &failover_id.to_string(),
+        &format!(
+            "actor={}; hostname={}; targets={}; token_env={}",
+            principal.username,
+            failover.hostname,
+            failover.targets.len(),
+            failover.token_env
+        ),
+    );
+    Ok(Json(failover))
+}
+
+async fn delete_fleet_dns_failover(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(failover_id): Path<Uuid>,
+) -> Result<StatusCode, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    if !state
+        .fleet_health
+        .lock()
+        .expect("fleet health catalog lock poisoned")
+        .delete_dns_failover(failover_id)
+        .map_err(coded_fleet_error)?
+    {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_fleet_dns_failover",
+            "fleet DNS failover does not exist",
+        ));
+    }
+    record_audit(
+        &state,
+        "fleet.dns_failover.deleted",
+        &failover_id.to_string(),
+        &format!("actor={}", principal.username),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn freeze_fleet_dns_failover(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(failover_id): Path<Uuid>,
+    Json(request): Json<FreezeFleetDnsFailover>,
+) -> Result<Json<FleetDnsFailover>, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    let failover = state
+        .fleet_health
+        .lock()
+        .expect("fleet health catalog lock poisoned")
+        .set_dns_frozen(failover_id, true, Some(&request.reason), unix_seconds())
+        .map_err(coded_fleet_error)?
+        .ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_fleet_dns_failover",
+            "fleet DNS failover does not exist",
+        ))?;
+    record_audit(
+        &state,
+        "fleet.dns_failover.frozen",
+        &failover_id.to_string(),
+        &format!(
+            "actor={}; reason={}",
+            principal.username,
+            failover.freeze_reason.as_deref().unwrap_or("manual freeze")
+        ),
+    );
+    Ok(Json(failover))
+}
+
+async fn resume_fleet_dns_failover(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(failover_id): Path<Uuid>,
+) -> Result<Json<FleetDnsFailover>, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    let failover = state
+        .fleet_health
+        .lock()
+        .expect("fleet health catalog lock poisoned")
+        .set_dns_frozen(failover_id, false, None, unix_seconds())
+        .map_err(coded_fleet_error)?
+        .ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_fleet_dns_failover",
+            "fleet DNS failover does not exist",
+        ))?;
+    record_audit(
+        &state,
+        "fleet.dns_failover.resumed",
+        &failover_id.to_string(),
+        &format!("actor={}", principal.username),
+    );
+    Ok(Json(failover))
+}
+
+async fn reconcile_fleet_dns_failover(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(failover_id): Path<Uuid>,
+) -> Result<Json<FleetDnsReconcileResponse>, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    if state
+        .fleet_health
+        .lock()
+        .expect("fleet health catalog lock poisoned")
+        .get_dns_failover(failover_id)
+        .map_err(coded_fleet_error)?
+        .is_none()
+    {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_fleet_dns_failover",
+            "fleet DNS failover does not exist",
+        ));
+    }
+    let results = execute_fleet_dns_reconciliation(&state, Some(failover_id))
+        .await
+        .map_err(coded_fleet_error)?;
+    record_audit(
+        &state,
+        "fleet.dns_failover.reconciled",
+        &failover_id.to_string(),
+        &format!("actor={}; operations={}", principal.username, results.len()),
+    );
+    Ok(Json(FleetDnsReconcileResponse { results }))
+}
+
 async fn fleet_overview(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -6683,17 +7443,48 @@ async fn fleet_overview(
         .expect("fleet catalog lock poisoned")
         .list()
         .map_err(coded_fleet_error)?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .build()
-        .map_err(|error| coded_fleet_error(error.into()))?;
+    let now = unix_seconds();
+    let fleet_health = state
+        .fleet_health
+        .lock()
+        .expect("fleet health catalog lock poisoned");
+    for peer in &peers {
+        fleet_health
+            .ensure_peer(peer.id, now)
+            .map_err(coded_fleet_error)?;
+    }
+    let snapshots = fleet_health.snapshots().map_err(coded_fleet_error)?;
+    let dns_failovers = fleet_health
+        .list_dns_failovers()
+        .map_err(coded_fleet_error)?;
+    let health_metrics = fleet_health.metrics().map_err(coded_fleet_error)?;
+    drop(fleet_health);
     let mut statuses = Vec::with_capacity(peers.len());
     for peer in peers {
-        statuses.push(probe_fleet_peer(&client, peer).await);
+        let snapshot = snapshots.get(&peer.id).cloned().ok_or(CodedApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "fleet_health_state_missing",
+            "fleet peer health state is missing",
+        ))?;
+        let online = peer.enabled && snapshot.health.state == FleetHealthState::Healthy;
+        let dns_eligible = snapshot.health.dns_eligible(peer.enabled, now);
+        statuses.push(FleetPeerStatus {
+            latency_millis: snapshot.health.last_latency_millis,
+            error: snapshot.health.last_error_summary.clone(),
+            active_connections: snapshot.health.active_connections,
+            bytes_total: snapshot.health.bytes_total,
+            clients: snapshot.health.clients,
+            policies: snapshot.health.policies,
+            health_config: snapshot.config,
+            health: snapshot.health,
+            peer,
+            online,
+            dns_eligible,
+        });
     }
     let mut available = statuses
         .iter()
-        .filter(|status| status.peer.enabled && status.online)
+        .filter(|status| status.dns_eligible)
         .collect::<Vec<_>>();
     available.sort_by_key(|status| (status.peer.priority, std::cmp::Reverse(status.peer.weight)));
     let failover_order = available
@@ -6720,7 +7511,240 @@ async fn fleet_overview(
         failover_order,
         conflicts,
         peers: statuses,
+        dns_failovers,
+        health_metrics,
     }))
+}
+
+async fn export_fleet_bundle_v2(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<linklake_core::fleet_protocol::FleetBundleV2>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    state
+        .policy_service
+        .export_bundle(unix_seconds())
+        .map(Json)
+        .map_err(coded_policy_service_error)
+}
+
+async fn reconcile_fleet_bundle_v2(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<FleetReconcileRequest>,
+) -> Result<Json<FleetReconcileResult>, CodedApiError> {
+    let source_instance_id = request.bundle.source_instance_id;
+    let principal = require_fleet_source(&state, &headers, source_instance_id)?;
+    // 与普通策略写入串行化，避免 ownership 检查和实际 CRUD 之间出现竞态窗口。
+    let _mutation_guard = state.policy_mutation_lock.lock().await;
+    state
+        .metrics
+        .fleet_reconcile_attempts_total
+        .fetch_add(1, Ordering::Relaxed);
+    let result = match state.policy_service.reconcile(request, unix_seconds()) {
+        Ok(result) => result,
+        Err(error) => {
+            state
+                .metrics
+                .fleet_reconcile_failures_total
+                .fetch_add(1, Ordering::Relaxed);
+            record_audit(
+                &state,
+                "fleet.v2.reconcile.failed",
+                &source_instance_id.to_string(),
+                &format!("actor={}; {}", principal.username, error),
+            );
+            return Err(coded_policy_service_error(error));
+        }
+    };
+    if !result.conflicts.is_empty() {
+        state
+            .metrics
+            .fleet_reconcile_conflicts_total
+            .fetch_add(result.conflicts.len() as u64, Ordering::Relaxed);
+        record_audit(
+            &state,
+            "fleet.v2.reconcile.conflicted",
+            &result.source_instance_id.to_string(),
+            &format!(
+                "generation={}; revision={}; conflicts={}; dry_run={}",
+                result.generation,
+                result.revision,
+                result.conflicts.len(),
+                result.dry_run
+            ),
+        );
+    } else if result.idempotent {
+        state
+            .metrics
+            .fleet_reconcile_replays_total
+            .fetch_add(1, Ordering::Relaxed);
+    } else if result.applied {
+        apply_fleet_runtime_invalidations(&state, &result.runtime_invalidations);
+        state
+            .traffic_controls
+            .lock()
+            .expect("traffic control catalog lock poisoned")
+            .reset_runtime_state();
+        state
+            .metrics
+            .fleet_reconcile_successes_total
+            .fetch_add(1, Ordering::Relaxed);
+        record_audit(
+            &state,
+            "fleet.v2.reconcile.applied",
+            &result.source_instance_id.to_string(),
+            &format!(
+                "generation={}; revision={}; created={}; updated={}; deleted={}; unchanged={}",
+                result.generation,
+                result.revision,
+                result.created,
+                result.updated,
+                result.deleted,
+                result.unchanged
+            ),
+        );
+    }
+    Ok(Json(result))
+}
+
+async fn list_fleet_sources_v2(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<FleetSourceStatus>>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    state
+        .policy_service
+        .list_sources()
+        .map(Json)
+        .map_err(coded_policy_service_error)
+}
+
+async fn reset_fleet_source_v2(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(source_instance_id): Path<Uuid>,
+) -> Result<StatusCode, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    if !state
+        .policy_service
+        .reset_source_state(source_instance_id)
+        .map_err(coded_policy_service_error)?
+    {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "fleet_source_not_found",
+            "Fleet source state does not exist",
+        ));
+    }
+    record_audit(
+        &state,
+        "fleet.v2.source.reset",
+        &source_instance_id.to_string(),
+        &format!(
+            "actor={}; ownership retained; the next authorized bundle establishes generation again",
+            principal.username
+        ),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_fleet_credential_bindings(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<FleetCredentialBinding>>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    state
+        .policy_service
+        .list_credential_bindings()
+        .map(Json)
+        .map_err(coded_policy_service_error)
+}
+
+async fn bind_fleet_credential(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<BindFleetCredential>,
+) -> Result<Json<FleetCredentialBinding>, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    let binding = state
+        .policy_service
+        .bind_credential(request, unix_seconds())
+        .map_err(coded_policy_service_error)?;
+    record_audit(
+        &state,
+        "fleet.v2.credential.bound",
+        &binding.credential_ref.to_string(),
+        &format!(
+            "actor={}; source={}; kind={}; policy_id={}",
+            principal.username,
+            binding.source_instance_id,
+            binding.kind.as_str(),
+            binding.policy_id
+        ),
+    );
+    Ok(Json(binding))
+}
+
+async fn delete_fleet_credential_binding(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((source_instance_id, kind, credential_ref)): Path<(Uuid, String, Uuid)>,
+) -> Result<StatusCode, CodedApiError> {
+    let principal = require_administrator(&state, &headers)?;
+    let kind = FleetPolicyKind::parse(&kind).map_err(coded_policy_service_error)?;
+    if !state
+        .policy_service
+        .delete_credential_binding(source_instance_id, kind, credential_ref)
+        .map_err(coded_policy_service_error)?
+    {
+        return Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "fleet_credential_binding_not_found",
+            "Fleet credential binding does not exist",
+        ));
+    }
+    record_audit(
+        &state,
+        "fleet.v2.credential.unbound",
+        &credential_ref.to_string(),
+        &format!(
+            "actor={}; source={}; kind={}",
+            principal.username,
+            source_instance_id,
+            kind.as_str()
+        ),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn apply_fleet_runtime_invalidations(state: &AppState, invalidations: &[FleetRuntimeInvalidation]) {
+    let mut seen = HashSet::new();
+    for invalidation in invalidations {
+        let key = format!("{invalidation:?}");
+        if !seen.insert(key) {
+            continue;
+        }
+        match invalidation {
+            FleetRuntimeInvalidation::TcpPort(port) => tcp_tunnel::stop_public_port(state, *port),
+            FleetRuntimeInvalidation::UdpPort(port) => udp_tunnel::stop_public_port(state, *port),
+            FleetRuntimeInvalidation::HttpHostname(hostname) => {
+                http_tunnel::stop_hostname(state, hostname)
+            }
+            FleetRuntimeInvalidation::SniHostname(hostname) => {
+                sni_tunnel::stop_hostname(state, hostname)
+            }
+            FleetRuntimeInvalidation::SecretTunnel(policy_id) => {
+                secret_tunnel::stop_policy(state, *policy_id)
+            }
+            FleetRuntimeInvalidation::Socks5Proxy(policy_id) => {
+                socks5_tunnel::stop_policy(state, *policy_id)
+            }
+            FleetRuntimeInvalidation::HttpProxy(policy_id) => {
+                http_proxy_tunnel::stop_policy(state, *policy_id)
+            }
+        }
+    }
 }
 
 async fn import_fleet_policies(
@@ -6774,7 +7798,7 @@ async fn sync_fleet_policies(
         .lock()
         .expect("client registry lock poisoned")
         .summaries();
-    let bundle = fleet::export_policy_bundle(
+    let legacy_bundle = fleet::export_policy_bundle(
         &clients,
         &state
             .tunnel_catalog
@@ -6782,6 +7806,10 @@ async fn sync_fleet_policies(
             .expect("tunnel catalog lock poisoned"),
     )
     .map_err(coded_fleet_error)?;
+    let bundle = state
+        .policy_service
+        .export_bundle(unix_seconds())
+        .map_err(coded_policy_service_error)?;
     let peers = state
         .fleet
         .lock()
@@ -6806,39 +7834,130 @@ async fn sync_fleet_policies(
                 peer_id: peer.id,
                 peer_name: peer.name,
                 created: 0,
+                updated: 0,
+                deleted: 0,
                 unchanged: 0,
+                generation: None,
+                revision: None,
+                idempotent: false,
                 conflicts: Vec::new(),
                 error: Some("management token environment variable is not configured".to_owned()),
             });
             continue;
         };
         let response = client
-            .post(format!("{}/api/v1/fleet/import", peer.url))
-            .bearer_auth(token)
-            .json(&FleetImportRequest {
+            .post(format!("{}/api/v1/fleet/v2/reconcile", peer.url))
+            .bearer_auth(&token)
+            .json(&FleetReconcileRequest {
                 bundle: bundle.clone(),
                 dry_run: request.dry_run,
+                expected_generation: None,
+                expected_revision: None,
             })
             .send()
             .await;
         match response {
             Ok(response) if response.status().is_success() => {
-                match response.json::<FleetImportResult>().await {
-                    Ok(imported) => results.push(FleetPeerSyncResult {
+                match response.json::<FleetReconcileResult>().await {
+                    Ok(reconciled) => results.push(FleetPeerSyncResult {
                         peer_id: peer.id,
                         peer_name: peer.name,
-                        created: imported.created,
-                        unchanged: imported.unchanged,
-                        conflicts: imported.conflicts,
+                        created: reconciled.created,
+                        updated: reconciled.updated,
+                        deleted: reconciled.deleted,
+                        unchanged: reconciled.unchanged,
+                        generation: Some(reconciled.generation),
+                        revision: Some(reconciled.revision),
+                        idempotent: reconciled.idempotent,
+                        conflicts: reconciled
+                            .conflicts
+                            .into_iter()
+                            .map(|conflict| conflict.message)
+                            .collect(),
                         error: None,
                     }),
                     Err(error) => results.push(FleetPeerSyncResult {
                         peer_id: peer.id,
                         peer_name: peer.name,
                         created: 0,
+                        updated: 0,
+                        deleted: 0,
                         unchanged: 0,
+                        generation: None,
+                        revision: None,
+                        idempotent: false,
                         conflicts: Vec::new(),
                         error: Some(format!("invalid peer response: {error}")),
+                    }),
+                }
+            }
+            Ok(response) if response.status() == StatusCode::NOT_FOUND => {
+                // 旧 RC 节点没有 v2 路由时，仅回退到原 TCP/UDP 导入；不会把任何秘密塞进兼容负载。
+                let legacy = client
+                    .post(format!("{}/api/v1/fleet/import", peer.url))
+                    .bearer_auth(&token)
+                    .json(&FleetImportRequest {
+                        bundle: legacy_bundle.clone(),
+                        dry_run: request.dry_run,
+                    })
+                    .send()
+                    .await;
+                match legacy {
+                    Ok(response) if response.status().is_success() => {
+                        match response.json::<FleetImportResult>().await {
+                            Ok(imported) => results.push(FleetPeerSyncResult {
+                                peer_id: peer.id,
+                                peer_name: peer.name,
+                                created: imported.created,
+                                updated: 0,
+                                deleted: 0,
+                                unchanged: imported.unchanged,
+                                generation: None,
+                                revision: None,
+                                idempotent: false,
+                                conflicts: imported.conflicts,
+                                error: None,
+                            }),
+                            Err(error) => results.push(FleetPeerSyncResult {
+                                peer_id: peer.id,
+                                peer_name: peer.name,
+                                created: 0,
+                                updated: 0,
+                                deleted: 0,
+                                unchanged: 0,
+                                generation: None,
+                                revision: None,
+                                idempotent: false,
+                                conflicts: Vec::new(),
+                                error: Some(format!("invalid legacy peer response: {error}")),
+                            }),
+                        }
+                    }
+                    Ok(response) => results.push(FleetPeerSyncResult {
+                        peer_id: peer.id,
+                        peer_name: peer.name,
+                        created: 0,
+                        updated: 0,
+                        deleted: 0,
+                        unchanged: 0,
+                        generation: None,
+                        revision: None,
+                        idempotent: false,
+                        conflicts: Vec::new(),
+                        error: Some(format!("legacy peer returned HTTP {}", response.status())),
+                    }),
+                    Err(error) => results.push(FleetPeerSyncResult {
+                        peer_id: peer.id,
+                        peer_name: peer.name,
+                        created: 0,
+                        updated: 0,
+                        deleted: 0,
+                        unchanged: 0,
+                        generation: None,
+                        revision: None,
+                        idempotent: false,
+                        conflicts: Vec::new(),
+                        error: Some(error.to_string()),
                     }),
                 }
             }
@@ -6846,7 +7965,12 @@ async fn sync_fleet_policies(
                 peer_id: peer.id,
                 peer_name: peer.name,
                 created: 0,
+                updated: 0,
+                deleted: 0,
                 unchanged: 0,
+                generation: None,
+                revision: None,
+                idempotent: false,
                 conflicts: Vec::new(),
                 error: Some(format!("peer returned HTTP {}", response.status())),
             }),
@@ -6854,7 +7978,12 @@ async fn sync_fleet_policies(
                 peer_id: peer.id,
                 peer_name: peer.name,
                 created: 0,
+                updated: 0,
+                deleted: 0,
                 unchanged: 0,
+                generation: None,
+                revision: None,
+                idempotent: false,
                 conflicts: Vec::new(),
                 error: Some(error.to_string()),
             }),
@@ -6946,27 +8075,119 @@ async fn delete_traffic_control(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn probe_fleet_peer(client: &reqwest::Client, peer: FleetPeer) -> FleetPeerStatus {
-    let started = Instant::now();
-    if !peer.enabled {
-        return FleetPeerStatus {
-            peer,
-            online: false,
-            latency_millis: None,
-            error: Some("peer disabled".to_owned()),
-            active_connections: 0,
-            bytes_total: 0,
-            clients: 0,
-            policies: 0,
-        };
+fn fleet_probe_interval_seconds() -> u64 {
+    std::env::var("LINKLAKE_FLEET_PROBE_INTERVAL_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(15)
+        .clamp(5, 3_600)
+}
+
+async fn run_fleet_health_monitor(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::error!("Could not initialize Fleet health HTTP client: {error}");
+            return;
+        }
+    };
+    let mut interval = tokio::time::interval(Duration::from_secs(fleet_probe_interval_seconds()));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            _ = interval.tick() => {
+                if let Err(error) = run_fleet_probe_round(&state, &client).await {
+                    tracing::error!("Fleet health probe round failed: {error}");
+                }
+            }
+        }
     }
+}
+
+async fn run_fleet_probe_round(
+    state: &Arc<AppState>,
+    client: &reqwest::Client,
+) -> anyhow::Result<()> {
+    let peers = state
+        .fleet
+        .lock()
+        .expect("fleet catalog lock poisoned")
+        .list()?
+        .into_iter()
+        .filter(|peer| peer.enabled)
+        .collect::<Vec<_>>();
+    let permits = Arc::new(Semaphore::new(16));
+    let mut probes = tokio::task::JoinSet::new();
+    for peer in peers {
+        let client = client.clone();
+        let permits = permits.clone();
+        probes.spawn(async move {
+            let _permit = permits
+                .acquire_owned()
+                .await
+                .expect("Fleet probe semaphore closed unexpectedly");
+            let peer_id = peer.id;
+            (peer_id, probe_fleet_peer(&client, peer).await)
+        });
+    }
+    while let Some(result) = probes.join_next().await {
+        let (peer_id, observation) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::warn!("Fleet health probe task failed: {error}");
+                continue;
+            }
+        };
+        let result = state
+            .fleet_health
+            .lock()
+            .expect("fleet health catalog lock poisoned")
+            .record_probe(peer_id, observation)?;
+        if result.duplicate {
+            tracing::debug!(peer_id = %result.peer_id, "Ignored duplicate Fleet probe event");
+        }
+        if result.accepted && result.previous_state != result.health.state {
+            record_audit(
+                state,
+                "fleet.peer.health_changed",
+                &result.peer_id.to_string(),
+                &format!(
+                    "from={}; to={}; reason={}; revision={}",
+                    result.previous_state.as_str(),
+                    result.health.state.as_str(),
+                    result.transition_reason,
+                    result.health.revision
+                ),
+            );
+        }
+    }
+    if let Err(error) = execute_fleet_dns_reconciliation(state, None).await {
+        tracing::error!("Fleet DNS reconciliation failed: {error}");
+    }
+    Ok(())
+}
+
+async fn probe_fleet_peer(client: &reqwest::Client, peer: FleetPeer) -> FleetProbeObservation {
+    let started = Instant::now();
     let Some(token) = std::env::var_os(&peer.token_env).and_then(|value| value.into_string().ok())
     else {
-        return FleetPeerStatus {
-            peer,
-            online: false,
+        return FleetProbeObservation {
+            event_id: Uuid::new_v4(),
+            observed_unix_seconds: unix_seconds(),
+            success: false,
             latency_millis: None,
-            error: Some("management token environment variable is not configured".to_owned()),
+            error_summary: Some(
+                "management token environment variable is not configured".to_owned(),
+            ),
             active_connections: 0,
             bytes_total: 0,
             clients: 0,
@@ -6991,7 +8212,25 @@ async fn probe_fleet_peer(client: &reqwest::Client, peer: FleetPeer) -> FleetPee
             .error_for_status()?
             .json::<serde_json::Value>()
             .await?;
-        Ok::<_, reqwest::Error>((status, metrics))
+        anyhow::ensure!(
+            status["product"].as_str() == Some(PRODUCT_NAME),
+            "peer status response has an unexpected product"
+        );
+        anyhow::ensure!(
+            status["api_version"].as_str() == Some(API_VERSION),
+            "peer status response has an incompatible API version"
+        );
+        anyhow::ensure!(
+            status["instance_id"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "peer status response is missing its instance identity"
+        );
+        anyhow::ensure!(
+            metrics["uptime_seconds"].is_number(),
+            "peer metrics response is incomplete"
+        );
+        Ok::<_, anyhow::Error>((status, metrics))
     }
     .await;
     match result {
@@ -7029,28 +8268,86 @@ async fn probe_fleet_peer(client: &reqwest::Client, peer: FleetPeer) -> FleetPee
             .iter()
             .map(|key| status[*key].as_u64().unwrap_or(0))
             .sum();
-            FleetPeerStatus {
+            FleetProbeObservation {
+                event_id: Uuid::new_v4(),
+                observed_unix_seconds: unix_seconds(),
+                success: true,
                 clients: status["clients"].as_u64().unwrap_or(0),
-                peer,
-                online: true,
                 latency_millis: Some(started.elapsed().as_millis() as u64),
-                error: None,
+                error_summary: None,
                 active_connections,
                 bytes_total,
                 policies,
             }
         }
-        Err(error) => FleetPeerStatus {
-            peer,
-            online: false,
+        Err(error) => FleetProbeObservation {
+            event_id: Uuid::new_v4(),
+            observed_unix_seconds: unix_seconds(),
+            success: false,
             latency_millis: Some(started.elapsed().as_millis() as u64),
-            error: Some(error.to_string()),
+            error_summary: Some(error.to_string()),
             active_connections: 0,
             bytes_total: 0,
             clients: 0,
             policies: 0,
         },
     }
+}
+
+async fn execute_fleet_dns_reconciliation(
+    state: &Arc<AppState>,
+    only: Option<Uuid>,
+) -> anyhow::Result<Vec<FleetDnsChangeResult>> {
+    let plans = state
+        .fleet_health
+        .lock()
+        .expect("fleet health catalog lock poisoned")
+        .plan_dns_changes(unix_seconds(), only)?;
+    if plans.is_empty() {
+        return Ok(Vec::new());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let mut results = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let apply_error = fleet_health::apply_cloudflare_dns_change(&client, &plan)
+            .await
+            .err()
+            .map(|error| error.to_string());
+        let completion = state
+            .fleet_health
+            .lock()
+            .expect("fleet health catalog lock poisoned")
+            .complete_dns_change(
+                &plan,
+                apply_error.as_deref().map_or(Ok(()), Err),
+                unix_seconds(),
+            )?;
+        record_audit(
+            state,
+            if completion.applied {
+                "fleet.dns_failover.switched"
+            } else {
+                "fleet.dns_failover.switch_failed"
+            },
+            &plan.failover_id.to_string(),
+            &format!(
+                "operation_id={}; failover={}; peer_id={}; peer={}; target={}; reason={}; applied={}; error={}",
+                plan.operation_id,
+                plan.failover_name,
+                plan.peer_id,
+                plan.peer_name,
+                plan.target,
+                plan.reason,
+                completion.applied,
+                completion.error_summary.as_deref().unwrap_or("")
+            ),
+        );
+        results.push(completion);
+    }
+    Ok(results)
 }
 
 async fn list_tcp_tunnels(
@@ -9017,6 +10314,14 @@ async fn update_http_route(
     Json(request): Json<UpdateHttpRoutePolicy>,
 ) -> Result<Json<HttpRoutePolicy>, CodedApiError> {
     authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let requested_hostname =
+        http_route_catalog::normalize_hostname(&request.hostname).map_err(|_| {
+            CodedApiError(
+                StatusCode::BAD_REQUEST,
+                "invalid_hostname",
+                "HTTP route hostname is invalid",
+            )
+        })?;
     if !state
         .clients
         .lock()
@@ -9029,10 +10334,6 @@ async fn update_http_route(
             "unknown client for HTTP route",
         ));
     }
-    let certificate_jobs = state
-        .certificate_jobs
-        .lock()
-        .expect("certificate jobs lock poisoned");
     let (old_policy, tls_policy) = {
         let catalog = state
             .http_route_catalog
@@ -9046,13 +10347,6 @@ async fn update_http_route(
                 "unknown_http_route",
                 "unknown HTTP route",
             ))?;
-        if certificate_jobs.contains_key(&old.hostname) {
-            return Err(CodedApiError(
-                StatusCode::CONFLICT,
-                "certificate_operation_in_progress",
-                "certificate operation is already in progress",
-            ));
-        }
         let tls_policy = state
             .certificate_catalog
             .lock()
@@ -9061,6 +10355,48 @@ async fn update_http_route(
             .map_err(coded_certificate_catalog_error)?;
         (old, tls_policy)
     };
+    let old_certificate_identifier =
+        effective_certificate_identifier(&old_policy.hostname, tls_policy.as_ref());
+    let new_certificate_identifier =
+        effective_certificate_identifier(&requested_hostname, tls_policy.as_ref());
+    if tls_policy.as_ref().map(|policy| policy.mode) == Some(RouteTlsMode::Acme)
+        && !certificate_identifier_covers_hostname(&new_certificate_identifier, &requested_hostname)
+    {
+        return Err(CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "certificate_identifier_does_not_cover_route",
+            "certificate identifier does not cover the updated route hostname",
+        ));
+    }
+    if old_certificate_identifier != new_certificate_identifier
+        && tls_policy.as_ref().map(|policy| policy.mode) == Some(RouteTlsMode::Acme)
+        && certificate_identifier_used_by_other_route(
+            &state,
+            &new_certificate_identifier,
+            route_id,
+        )?
+    {
+        return Err(CodedApiError(
+            StatusCode::CONFLICT,
+            "duplicate_certificate_identifier",
+            "certificate identifier is already assigned to another route",
+        ));
+    }
+    let certificate_jobs = state
+        .certificate_jobs
+        .lock()
+        .expect("certificate jobs lock poisoned");
+    if certificate_jobs.contains_key(&old_certificate_identifier)
+        || certificate_jobs
+            .get(&new_certificate_identifier)
+            .is_some_and(|owner| *owner != route_id)
+    {
+        return Err(CodedApiError(
+            StatusCode::CONFLICT,
+            "certificate_operation_in_progress",
+            "certificate operation is already in progress",
+        ));
+    }
     let policy = state
         .http_route_catalog
         .lock()
@@ -9082,16 +10418,12 @@ async fn update_http_route(
             .lock()
             .expect("HTTP route statistics lock poisoned")
             .remove(&old_policy.hostname);
-        state
-            .https_redirect_hosts
-            .lock()
-            .expect("HTTPS redirect registry lock poisoned")
-            .remove(&old_policy.hostname);
+    }
+    if old_certificate_identifier != new_certificate_identifier {
         if let Some(manager) = &state.certificate_manager {
-            if let Err(error) = manager.delete_certificate(&old_policy.hostname) {
+            if let Err(error) = manager.delete_certificate(&old_certificate_identifier) {
                 tracing::warn!(
-                    "could not delete certificate files for {}: {error}",
-                    old_policy.hostname
+                    "could not delete certificate files for {old_certificate_identifier}: {error}"
                 );
             }
         }
@@ -9102,16 +10434,19 @@ async fn update_http_route(
             .delete_certificate_state(route_id)
             .map_err(coded_certificate_catalog_error)?;
     }
-    // 主机名未更换时保留现有证书；更换主机名后由证书维护任务重新签发。
-    if old_policy.hostname != policy.hostname
-        && tls_policy.is_some_and(|tls| tls.mode == RouteTlsMode::Disabled)
+    let mut redirects = state
+        .https_redirect_hosts
+        .lock()
+        .expect("HTTPS redirect registry lock poisoned");
+    redirects.remove(&old_policy.hostname);
+    if policy.enabled
+        && tls_policy
+            .as_ref()
+            .is_some_and(|tls| tls.mode == RouteTlsMode::Acme && tls.redirect_http_to_https)
     {
-        state
-            .https_redirect_hosts
-            .lock()
-            .expect("HTTPS redirect registry lock poisoned")
-            .remove(&policy.hostname);
+        redirects.insert(policy.hostname.clone());
     }
+    drop(redirects);
     record_audit(
         &state,
         "http_route.policy.updated",
@@ -9131,26 +10466,24 @@ async fn set_http_route_enabled(
     Json(request): Json<EnableTunnelRequest>,
 ) -> Result<StatusCode, CodedApiError> {
     authorize_management(&state, &headers).map_err(coded_management_error)?;
-    let hostname = state
-        .http_route_catalog
+    let route = http_route_policy_for_id(&state, route_id)?;
+    let tls_policy = state
+        .certificate_catalog
         .lock()
-        .expect("HTTP route catalog lock poisoned")
-        .hostname_for_id(route_id)
-        .map_err(|_| {
-            CodedApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                "could not read HTTP route policy",
-            )
-        })?;
+        .expect("certificate catalog lock poisoned")
+        .get_route_tls(route_id)
+        .map_err(coded_certificate_catalog_error)?;
+    let certificate_identifier = route
+        .as_ref()
+        .map(|route| effective_certificate_identifier(&route.hostname, tls_policy.as_ref()));
     let certificate_jobs = state
         .certificate_jobs
         .lock()
         .expect("certificate jobs lock poisoned");
     if !request.enabled
-        && hostname
+        && certificate_identifier
             .as_deref()
-            .is_some_and(|hostname| certificate_jobs.contains_key(hostname))
+            .is_some_and(|identifier| certificate_jobs.contains_key(identifier))
     {
         return Err(CodedApiError(
             StatusCode::CONFLICT,
@@ -9178,7 +10511,8 @@ async fn set_http_route_enabled(
         ));
     }
     if !request.enabled {
-        if let Some(hostname) = hostname.as_deref() {
+        if let Some(route) = route.as_ref() {
+            let hostname = &route.hostname;
             http_tunnel::stop_hostname(&state, hostname);
             state
                 .https_redirect_hosts
@@ -9186,10 +10520,13 @@ async fn set_http_route_enabled(
                 .expect("HTTPS redirect registry lock poisoned")
                 .remove(hostname);
             if let Some(manager) = &state.certificate_manager {
-                manager.remove_certificate(hostname);
+                if let Some(identifier) = certificate_identifier.as_deref() {
+                    manager.remove_certificate(identifier);
+                }
             }
         }
-    } else if let Some(hostname) = hostname.as_deref() {
+    } else if let Some(route) = route.as_ref() {
+        let hostname = &route.hostname;
         let should_load = {
             let catalog = state
                 .certificate_catalog
@@ -9208,7 +10545,8 @@ async fn set_http_route_enabled(
         };
         if should_load {
             if let Some(manager) = &state.certificate_manager {
-                if let Err(error) = manager.load_certificate(hostname) {
+                let identifier = certificate_identifier.as_deref().unwrap_or(hostname);
+                if let Err(error) = manager.load_certificate(identifier) {
                     tracing::warn!("could not reload certificate for {hostname}: {error}");
                 }
             }
@@ -9251,25 +10589,23 @@ async fn delete_http_route(
     Path(route_id): Path<Uuid>,
 ) -> Result<StatusCode, CodedApiError> {
     authorize_management(&state, &headers).map_err(coded_management_error)?;
-    let hostname = state
-        .http_route_catalog
+    let route = http_route_policy_for_id(&state, route_id)?;
+    let tls_policy = state
+        .certificate_catalog
         .lock()
-        .expect("HTTP route catalog lock poisoned")
-        .hostname_for_id(route_id)
-        .map_err(|_| {
-            CodedApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                "could not read HTTP route policy",
-            )
-        })?;
+        .expect("certificate catalog lock poisoned")
+        .get_route_tls(route_id)
+        .map_err(coded_certificate_catalog_error)?;
+    let certificate_identifier = route
+        .as_ref()
+        .map(|route| effective_certificate_identifier(&route.hostname, tls_policy.as_ref()));
     let certificate_jobs = state
         .certificate_jobs
         .lock()
         .expect("certificate jobs lock poisoned");
-    if hostname
+    if certificate_identifier
         .as_deref()
-        .is_some_and(|hostname| certificate_jobs.contains_key(hostname))
+        .is_some_and(|identifier| certificate_jobs.contains_key(identifier))
     {
         return Err(CodedApiError(
             StatusCode::CONFLICT,
@@ -9296,7 +10632,8 @@ async fn delete_http_route(
             "unknown HTTP route",
         ));
     }
-    if let Some(hostname) = hostname {
+    if let Some(route) = route {
+        let hostname = route.hostname;
         http_tunnel::stop_hostname(&state, &hostname);
         state
             .http_route_statistics
@@ -9309,8 +10646,9 @@ async fn delete_http_route(
             .expect("HTTPS redirect registry lock poisoned")
             .remove(&hostname);
         if let Some(manager) = &state.certificate_manager {
-            if let Err(error) = manager.delete_certificate(&hostname) {
-                tracing::warn!("could not delete certificate files for {hostname}: {error}");
+            let identifier = certificate_identifier.as_deref().unwrap_or(&hostname);
+            if let Err(error) = manager.delete_certificate(identifier) {
+                tracing::warn!("could not delete certificate files for {identifier}: {error}");
             }
         }
     }
@@ -9351,25 +10689,102 @@ async fn enroll_client(
     request
         .validate()
         .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid client registration"))?;
+    let verified_public_key = verify_agent_enrollment_identity(&request)?;
 
     let client_name = request.name.clone();
     let platform = request.platform.clone();
-    let (client_id, client_token) = state
+    let (client_id, agent_instance_id, client_token) = state
         .clients
         .lock()
         .expect("client registry lock poisoned")
-        .enroll(request.name, request.platform)
+        .enroll_with_identity(
+            request.name,
+            request.platform,
+            request.agent_instance_id,
+            verified_public_key.clone(),
+        )
         .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "could not store client"))?;
     record_audit(
         &state,
         "client.enrolled",
         &client_id.to_string(),
-        &format!("name={client_name}; platform={platform}"),
+        &format!(
+            "name={client_name}; platform={platform}; identity_verified={}",
+            verified_public_key.is_some()
+        ),
     );
     Ok(Json(ClientEnrollmentResponse {
         client_id,
+        agent_instance_id: Some(agent_instance_id),
         client_token,
     }))
+}
+
+fn verify_agent_enrollment_identity(
+    request: &ClientEnrollmentRequest,
+) -> Result<Option<String>, ApiError> {
+    let (Some(agent_instance_id), Some(public_key_hex), Some(signature_hex)) = (
+        request.agent_instance_id,
+        request.agent_identity_public_key.as_deref(),
+        request.agent_identity_signature.as_deref(),
+    ) else {
+        if request.agent_identity_public_key.is_none() && request.agent_identity_signature.is_none()
+        {
+            return Ok(None);
+        }
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "incomplete agent identity proof",
+        ));
+    };
+    if !is_lower_hex(public_key_hex, 32) || !is_lower_hex(signature_hex, 64) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid agent identity proof encoding",
+        ));
+    }
+    let public_key = decode_fixed_hex::<32>(public_key_hex)
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid agent identity public key"))?;
+    if agent_instance_id != agent_instance_id_from_public_key(&public_key) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "agent instance ID does not match its public key",
+        ));
+    }
+    let signature = Signature::from_bytes(
+        &decode_fixed_hex::<64>(signature_hex)
+            .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid agent identity signature"))?,
+    );
+    let verifying_key = VerifyingKey::from_bytes(&public_key)
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid agent identity public key"))?;
+    verifying_key
+        .verify_strict(
+            &agent_enrollment_message(
+                agent_instance_id,
+                public_key_hex,
+                &request.name,
+                &request.platform,
+            ),
+            &signature,
+        )
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid agent identity signature"))?;
+    Ok(Some(public_key_hex.to_owned()))
+}
+
+fn is_lower_hex(value: &str, bytes: usize) -> bool {
+    value.len() == bytes * 2
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn decode_fixed_hex<const N: usize>(value: &str) -> anyhow::Result<[u8; N]> {
+    anyhow::ensure!(value.len() == N * 2, "invalid hexadecimal length");
+    let mut decoded = [0_u8; N];
+    for (index, output) in decoded.iter_mut().enumerate() {
+        *output = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)?;
+    }
+    Ok(decoded)
 }
 
 async fn login(
@@ -10054,6 +11469,7 @@ struct ManagementPrincipal {
     username: String,
     role: UserRole,
     session_id: Option<Uuid>,
+    fleet_source_instance_id: Option<Uuid>,
 }
 
 fn management_principal(
@@ -10069,6 +11485,7 @@ fn management_principal(
             username: "management-token".to_owned(),
             role: UserRole::Administrator,
             session_id: None,
+            fleet_source_instance_id: None,
         });
     }
     if let Some(token) = bearer_token(headers) {
@@ -10093,6 +11510,7 @@ fn management_principal(
                 username: format!("api-token:{}", record.name),
                 role,
                 session_id: None,
+                fleet_source_instance_id: record.fleet_source_instance_id,
             });
         }
     }
@@ -10129,7 +11547,39 @@ fn management_principal(
         username: identity.username,
         role: identity.role,
         session_id: Some(identity.session_id),
+        fleet_source_instance_id: None,
     })
+}
+
+fn require_fleet_source(
+    state: &AppState,
+    headers: &HeaderMap,
+    source_instance_id: Uuid,
+) -> Result<ManagementPrincipal, CodedApiError> {
+    let principal = management_principal(state, headers).map_err(coded_management_error)?;
+    validate_fleet_source_binding(&principal, source_instance_id)?;
+    Ok(principal)
+}
+
+fn validate_fleet_source_binding(
+    principal: &ManagementPrincipal,
+    source_instance_id: Uuid,
+) -> Result<(), CodedApiError> {
+    let Some(bound_source) = principal.fleet_source_instance_id else {
+        return Err(CodedApiError(
+            StatusCode::FORBIDDEN,
+            "fleet_source_binding_required",
+            "Fleet reconcile requires an API token bound to one source instance",
+        ));
+    };
+    if bound_source != source_instance_id {
+        return Err(CodedApiError(
+            StatusCode::FORBIDDEN,
+            "fleet_source_binding_mismatch",
+            "Fleet API token is not authorized for this source instance",
+        ));
+    }
+    Ok(())
 }
 
 fn require_administrator(
@@ -10229,6 +11679,83 @@ async fn enforce_management_role(
     next.run(request).await
 }
 
+async fn enforce_fleet_ownership(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some((kind, policy_id)) = fleet_mutation_target(request.method(), request.uri().path())
+    else {
+        return next.run(request).await;
+    };
+    // 持锁直到处理器完成，使 ownership 检查与随后写入成为进程内原子序列。
+    let _mutation_guard = state.policy_mutation_lock.lock().await;
+    match state.policy_service.is_policy_managed(kind, policy_id) {
+        Ok(false) => next.run(request).await,
+        Ok(true) => CodedApiError(
+            StatusCode::CONFLICT,
+            "fleet_managed_policy",
+            "Fleet-managed policies must be changed by their owning source bundle",
+        )
+        .into_response(),
+        Err(error) => {
+            tracing::error!(%error, %policy_id, kind = kind.as_str(), "could not verify Fleet policy ownership");
+            CodedApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "fleet_ownership_check_failed",
+                "could not verify Fleet policy ownership",
+            )
+            .into_response()
+        }
+    }
+}
+
+fn fleet_mutation_target(method: &Method, path: &str) -> Option<(FleetPolicyKind, Uuid)> {
+    if !matches!(*method, Method::PUT | Method::DELETE | Method::POST) {
+        return None;
+    }
+    let segments = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    if segments.len() >= 5
+        && segments[..3] == ["api", "v1", "traffic-controls"]
+        && matches!(*method, Method::PUT | Method::DELETE)
+    {
+        let kind = match segments[3] {
+            "tcp" => FleetPolicyKind::Tcp,
+            "udp" => FleetPolicyKind::Udp,
+            "port_group" | "ports" => FleetPolicyKind::PortGroup,
+            "http" => FleetPolicyKind::HttpRoute,
+            "sni" => FleetPolicyKind::SniRoute,
+            "secret" => FleetPolicyKind::SecretTunnel,
+            "socks5" => FleetPolicyKind::Socks5Proxy,
+            "http_proxy" | "http-proxy" => FleetPolicyKind::HttpProxy,
+            _ => return None,
+        };
+        let policy_id = Uuid::parse_str(segments[4]).ok()?;
+        return Some((kind, policy_id));
+    }
+    if segments.len() < 4 || segments[..2] != ["api", "v1"] {
+        return None;
+    }
+    let kind = match segments[2] {
+        "tcp-tunnels" => FleetPolicyKind::Tcp,
+        "udp-tunnels" => FleetPolicyKind::Udp,
+        "port-groups" => FleetPolicyKind::PortGroup,
+        "http-routes" => FleetPolicyKind::HttpRoute,
+        "sni-routes" => FleetPolicyKind::SniRoute,
+        "secret-tunnels" => FleetPolicyKind::SecretTunnel,
+        "socks5-proxies" => FleetPolicyKind::Socks5Proxy,
+        "http-proxies" => FleetPolicyKind::HttpProxy,
+        _ => return None,
+    };
+    let direct_mutation = segments.len() == 4 && matches!(*method, Method::PUT | Method::DELETE);
+    let enable_mutation =
+        segments.len() == 5 && segments[4] == "enabled" && *method == Method::POST;
+    if !direct_mutation && !enable_mutation {
+        return None;
+    }
+    Some((kind, Uuid::parse_str(segments[3]).ok()?))
+}
+
 fn authorize_management(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
     management_principal(state, headers).map(|_| ())
 }
@@ -10308,11 +11835,22 @@ fn coded_alert_error(error: anyhow::Error) -> CodedApiError {
 
 fn coded_fleet_error(error: anyhow::Error) -> CodedApiError {
     let message = error.to_string();
-    if message.contains("fleet peer") || message.contains("UNIQUE constraint") {
+    if message.contains("operation is pending") || message.contains("operation is stale") {
+        CodedApiError(
+            StatusCode::CONFLICT,
+            "fleet_operation_conflict",
+            "a conflicting fleet operation is already in progress",
+        )
+    } else if message.contains("fleet peer")
+        || message.contains("fleet health")
+        || message.contains("fleet DNS")
+        || message.contains("Cloudflare")
+        || message.contains("UNIQUE constraint")
+    {
         CodedApiError(
             StatusCode::BAD_REQUEST,
-            "invalid_fleet_peer",
-            "fleet peer configuration is invalid or duplicated",
+            "invalid_fleet_configuration",
+            "fleet health, peer, or DNS failover configuration is invalid or duplicated",
         )
     } else {
         tracing::error!("Fleet catalog operation failed: {message}");
@@ -10320,6 +11858,44 @@ fn coded_fleet_error(error: anyhow::Error) -> CodedApiError {
             StatusCode::INTERNAL_SERVER_ERROR,
             "fleet_storage_error",
             "fleet catalog operation failed",
+        )
+    }
+}
+
+fn coded_policy_service_error(error: anyhow::Error) -> CodedApiError {
+    let message = error.to_string();
+    if message.contains("stale")
+        || message.contains("expected generation")
+        || message.contains("expected revision")
+        || message.contains("already used")
+        || message.contains("generation advances too far")
+        || message.contains("initial generation is unreasonably high")
+        || message.contains("generation exceeds the persistent database range")
+    {
+        CodedApiError(
+            StatusCode::CONFLICT,
+            "fleet_revision_conflict",
+            "Fleet generation or revision precondition failed",
+        )
+    } else if message.contains("not enrolled")
+        || message.contains("disabled")
+        || message.contains("credential")
+        || message.contains("nil ID")
+        || message.contains("does not exist")
+        || message.contains("invalid")
+        || message.contains("identity")
+    {
+        CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_fleet_bundle",
+            "Fleet bundle or credential binding is invalid",
+        )
+    } else {
+        tracing::error!("Fleet policy service operation failed: {message}");
+        CodedApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "fleet_policy_storage_error",
+            "Fleet policy operation failed",
         )
     }
 }
@@ -10562,16 +12138,19 @@ mod tests {
     use super::{
         apply_cache_control, auth_me_response, build_metrics_history_response,
         certificate_target_matches, coded_http_route_creation_error, coded_tcp_policy_error,
-        login_throttle_identity, management_session_cookie, normalize_metrics_history_step,
-        parse_metrics_history_range, release_certificate_job_slot, render_prometheus_metrics,
-        reserve_certificate_job_slot, select_certificate_maintenance_operation,
+        fleet_mutation_target, login_throttle_identity, management_session_cookie,
+        normalize_metrics_history_step, parse_metrics_history_range, release_certificate_job_slot,
+        render_prometheus_metrics, reserve_certificate_job_slot,
+        resolve_certificate_identifier_update, select_certificate_maintenance_operation,
         session_cookie_header, tcp_history_error_total, udp_history_error_total,
-        udp_metrics_response, CertificateOperation, HistoryCounters, HttpTransportCapabilitiesView,
-        LoginResponse, LoginThrottle, MetricsHistory, MetricsHistoryProtocol, MetricsHistorySample,
-        Socks5CapabilitiesView, UserRole, LOGIN_THROTTLE_MAX_IDENTITIES, MANAGEMENT_UI,
-        METRICS_HISTORY_ARCHIVE_CAPACITY, METRICS_HISTORY_ARCHIVE_SAMPLE_INTERVAL_SECONDS,
-        METRICS_HISTORY_CAPACITY, METRICS_HISTORY_RECENT_RETENTION_SECONDS,
-        METRICS_HISTORY_RETENTION_SECONDS, METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS,
+        udp_metrics_response, validate_fleet_source_binding, verify_agent_enrollment_identity,
+        CertificateOperation, FleetPolicyKind, HistoryCounters, HttpTransportCapabilitiesView,
+        LoginResponse, LoginThrottle, ManagementPrincipal, MetricsHistory, MetricsHistoryProtocol,
+        MetricsHistorySample, Socks5CapabilitiesView, UserRole, LOGIN_THROTTLE_MAX_IDENTITIES,
+        MANAGEMENT_UI, METRICS_HISTORY_ARCHIVE_CAPACITY,
+        METRICS_HISTORY_ARCHIVE_SAMPLE_INTERVAL_SECONDS, METRICS_HISTORY_CAPACITY,
+        METRICS_HISTORY_RECENT_RETENTION_SECONDS, METRICS_HISTORY_RETENTION_SECONDS,
+        METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS,
     };
     use crate::{
         admin_auth::SessionIdentity,
@@ -10581,6 +12160,10 @@ mod tests {
         udp_tunnel::UdpTunnelStatisticsSnapshot,
     };
     use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+    use ed25519_dalek::{Signer, SigningKey};
+    use linklake_core::{
+        agent_enrollment_message, agent_instance_id_from_public_key, ClientEnrollmentRequest,
+    };
     use std::{
         collections::HashMap,
         fs,
@@ -10599,6 +12182,116 @@ mod tests {
             max_connections: 64,
             enabled,
         }
+    }
+
+    #[test]
+    fn fleet_policy_mutation_paths_are_fail_closed_for_every_owned_kind() {
+        let id = Uuid::new_v4();
+        for (path, kind) in [
+            (format!("/api/v1/tcp-tunnels/{id}"), FleetPolicyKind::Tcp),
+            (format!("/api/v1/udp-tunnels/{id}"), FleetPolicyKind::Udp),
+            (
+                format!("/api/v1/port-groups/{id}"),
+                FleetPolicyKind::PortGroup,
+            ),
+            (
+                format!("/api/v1/http-routes/{id}"),
+                FleetPolicyKind::HttpRoute,
+            ),
+            (
+                format!("/api/v1/sni-routes/{id}"),
+                FleetPolicyKind::SniRoute,
+            ),
+            (
+                format!("/api/v1/secret-tunnels/{id}"),
+                FleetPolicyKind::SecretTunnel,
+            ),
+            (
+                format!("/api/v1/socks5-proxies/{id}"),
+                FleetPolicyKind::Socks5Proxy,
+            ),
+            (
+                format!("/api/v1/http-proxies/{id}"),
+                FleetPolicyKind::HttpProxy,
+            ),
+        ] {
+            assert_eq!(
+                fleet_mutation_target(&axum::http::Method::PUT, &path),
+                Some((kind, id))
+            );
+            assert_eq!(
+                fleet_mutation_target(&axum::http::Method::DELETE, &path),
+                Some((kind, id))
+            );
+            assert_eq!(
+                fleet_mutation_target(&axum::http::Method::POST, &format!("{path}/enabled")),
+                Some((kind, id))
+            );
+        }
+        assert!(fleet_mutation_target(
+            &axum::http::Method::PUT,
+            &format!("/api/v1/http-routes/{id}/tls")
+        )
+        .is_none());
+        assert_eq!(
+            fleet_mutation_target(
+                &axum::http::Method::PUT,
+                &format!("/api/v1/traffic-controls/http/{id}")
+            ),
+            Some((FleetPolicyKind::HttpRoute, id))
+        );
+    }
+
+    #[test]
+    fn enrollment_identity_proof_binds_id_key_and_request_fields() {
+        let signing_key = SigningKey::from_bytes(&[9_u8; 32]);
+        let public_key = signing_key.verifying_key().to_bytes();
+        let public_key_hex = public_key
+            .iter()
+            .map(|value| format!("{value:02x}"))
+            .collect::<String>();
+        let agent_instance_id = agent_instance_id_from_public_key(&public_key);
+        let signature = signing_key.sign(&agent_enrollment_message(
+            agent_instance_id,
+            &public_key_hex,
+            "agent",
+            "windows",
+        ));
+        let signature_hex = signature
+            .to_bytes()
+            .iter()
+            .map(|value| format!("{value:02x}"))
+            .collect::<String>();
+        let request = ClientEnrollmentRequest {
+            name: "agent".into(),
+            platform: "windows".into(),
+            agent_instance_id: Some(agent_instance_id),
+            agent_identity_public_key: Some(public_key_hex),
+            agent_identity_signature: Some(signature_hex),
+        };
+        assert!(matches!(
+            verify_agent_enrollment_identity(&request),
+            Ok(Some(_))
+        ));
+        let mut tampered = request;
+        tampered.name = "other-agent".into();
+        assert!(verify_agent_enrollment_identity(&tampered).is_err());
+    }
+
+    #[test]
+    fn fleet_source_binding_rejects_unbound_and_mismatched_tokens() {
+        let source = Uuid::new_v4();
+        let mut principal = ManagementPrincipal {
+            username: "api-token:fleet".into(),
+            role: UserRole::Operator,
+            session_id: None,
+            fleet_source_instance_id: None,
+        };
+        assert!(validate_fleet_source_binding(&principal, source).is_err());
+        principal.fleet_source_instance_id = Some(Uuid::new_v4());
+        assert!(validate_fleet_source_binding(&principal, source).is_err());
+        principal.fleet_source_instance_id = Some(source);
+        assert!(validate_fleet_source_binding(&principal, source).is_ok());
     }
 
     fn certificate_state(
@@ -11164,6 +12857,25 @@ mod tests {
     }
 
     #[test]
+    fn web_ui_displays_fleet_health_and_dns_failover_state() {
+        for marker in [
+            "health_config",
+            "consecutive_successes",
+            "consecutive_failures",
+            "fleet_peers_healthy",
+            "dns_failovers",
+            "freeze_reason",
+            "last_switch_reason",
+            "recovering",
+        ] {
+            assert!(
+                MANAGEMENT_UI.contains(marker),
+                "Web UI does not consume Fleet health or DNS field {marker}"
+            );
+        }
+    }
+
+    #[test]
     fn web_ui_displays_tls_sni_and_p2p_runtime_state() {
         for field in [
             "sni_connections_total",
@@ -11446,6 +13158,47 @@ mod tests {
     }
 
     #[test]
+    fn omitted_certificate_identifier_preserves_an_existing_wildcard() {
+        let route_id = Uuid::new_v4();
+        let policy = RouteTlsPolicy {
+            route_id,
+            mode: RouteTlsMode::Acme,
+            redirect_http_to_https: false,
+            certificate_identifier: Some("*.example.com".to_owned()),
+            updated_at: 1,
+        };
+        let (identifier, stored) = resolve_certificate_identifier_update(
+            "node.example.com",
+            Some(&policy),
+            None,
+            RouteTlsMode::Acme,
+        )
+        .expect("an omitted identifier should preserve the current wildcard");
+        assert_eq!(identifier, "*.example.com");
+        assert_eq!(stored.as_deref(), Some("*.example.com"));
+
+        let (identifier, stored) = resolve_certificate_identifier_update(
+            "node.example.com",
+            Some(&policy),
+            Some("node.example.com"),
+            RouteTlsMode::Acme,
+        )
+        .expect("an explicit route hostname should reset wildcard selection");
+        assert_eq!(identifier, "node.example.com");
+        assert!(stored.is_none());
+
+        let (identifier, stored) = resolve_certificate_identifier_update(
+            "node.example.com",
+            Some(&policy),
+            Some("*.example.com"),
+            RouteTlsMode::Disabled,
+        )
+        .expect("disabling TLS should clear the certificate identifier");
+        assert_eq!(identifier, "node.example.com");
+        assert!(stored.is_none());
+    }
+
+    #[test]
     fn certificate_target_requires_the_same_enabled_route_and_acme_policy() {
         let route_id = Uuid::new_v4();
         let expected = http_route(route_id, "secure.example.com", true);
@@ -11454,10 +13207,12 @@ mod tests {
             route_id,
             mode: RouteTlsMode::Acme,
             redirect_http_to_https: true,
+            certificate_identifier: None,
             updated_at: 1,
         };
         assert!(certificate_target_matches(
             &expected,
+            "secure.example.com",
             Some(&current),
             Some(&policy)
         ));
@@ -11465,6 +13220,7 @@ mod tests {
         let disabled = http_route(route_id, "secure.example.com", false);
         assert!(!certificate_target_matches(
             &expected,
+            "secure.example.com",
             Some(&disabled),
             Some(&policy)
         ));
@@ -11472,6 +13228,7 @@ mod tests {
         let replacement = http_route(Uuid::new_v4(), "secure.example.com", true);
         assert!(!certificate_target_matches(
             &expected,
+            "secure.example.com",
             Some(&replacement),
             Some(&policy)
         ));
@@ -11482,6 +13239,7 @@ mod tests {
         };
         assert!(!certificate_target_matches(
             &expected,
+            "secure.example.com",
             Some(&current),
             Some(&disabled_tls)
         ));

@@ -4,6 +4,12 @@
 
 ## 0.8.0-rc.1 - 2026-08-03
 
+### Cloudflare DNS-01 与通配符证书
+
+- 保持 HTTP-01 默认行为并新增 Cloudflare DNS-01、最长后缀 Zone 发现、TXT 传播确认、失败清理和重启后 cleanup journal 恢复。
+- HTTP 路由可使用 `certificate_identifier=*.example.com`，仅 DNS-01 接受通配符，并按一层子域名范围完成 SNI 选证书。
+- Cloudflare Token 只从环境变量或 secret file 读取；管理 API、SQLite、审计与状态仅暴露布尔配置状态，不接收、持久化或回显原始 Token。
+
 ### 签名更新与发行身份
 
 - 客户端、服务端和 Manager 共享同一更新核心，发行清单使用 Ed25519 签名并绑定产品、版本、平台、资产摘要、密钥轮换范围和最低更新器版本。

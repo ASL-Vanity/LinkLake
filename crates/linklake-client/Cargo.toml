@@ -10,7 +10,9 @@ repository.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
 clap.workspace = true
+ed25519-dalek.workspace = true
 flate2.workspace = true
+getrandom.workspace = true
 iroh.workspace = true
 linklake-core = { path = "../linklake-core" }
 linklake-update = { path = "../linklake-update" }

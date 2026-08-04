@@ -624,8 +624,10 @@ fn schedule_manager(
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000 | 0x0000_0008 | 0x0000_0200);
     }
+    #[cfg(windows)]
     let inheritance_guard = disable_standard_handle_inheritance()?;
     let child_result = command.spawn();
+    #[cfg(windows)]
     drop(inheritance_guard);
     let child = match child_result {
         Ok(child) => child,

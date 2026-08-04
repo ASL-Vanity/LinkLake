@@ -13,6 +13,20 @@ function fail(message) {
   process.exit(1);
 }
 
+function workflowJob(text, jobId) {
+  const lines = text.split(/\r?\n/);
+  const start = lines.findIndex((line) => line === `  ${jobId}:`);
+  if (start < 0) fail(`workflow is missing job ${jobId}`);
+  let end = lines.length;
+  for (let index = start + 1; index < lines.length; index += 1) {
+    if (/^  [A-Za-z0-9_-]+:\s*$/.test(lines[index])) {
+      end = index;
+      break;
+    }
+  }
+  return lines.slice(start, end).join('\n');
+}
+
 const workflowFiles = fs
   .readdirSync(workflowDirectory)
   .filter((name) => name.endsWith('.yml') || name.endsWith('.yaml'))
@@ -23,7 +37,11 @@ for (const name of workflowFiles) {
   const lines = text.split(/\r?\n/);
   lines.forEach((line, index) => {
     const uses = line.match(/^\s*-?\s*uses:\s*([^\s#]+)(?:\s+#.*)?$/);
-    if (uses && !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)?@[0-9a-f]{40}$/.test(uses[1])) {
+    const localWorkflow = /^\.\/\.github\/workflows\/[A-Za-z0-9_.-]+\.ya?ml$/.test(uses?.[1] ?? '');
+    const pinnedAction = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)?@[0-9a-f]{40}$/.test(
+      uses?.[1] ?? '',
+    );
+    if (uses && !localWorkflow && !pinnedAction) {
       fail(`${name}:${index + 1} must pin uses to a full 40-character commit SHA`);
     }
   });
@@ -45,6 +63,22 @@ for (const name of workflowFiles) {
 }
 
 const release = fs.readFileSync(path.join(workflowDirectory, 'release.yml'), 'utf8');
+const ci = fs.readFileSync(path.join(workflowDirectory, 'ci.yml'), 'utf8');
+const security = fs.readFileSync(path.join(workflowDirectory, 'security.yml'), 'utf8');
+if (!/^\s*workflow_call:\s*$/m.test(ci) || !/^\s*workflow_call:\s*$/m.test(security)) {
+  fail('CI and security workflows must remain reusable by the release workflow');
+}
+for (const reusable of ['./.github/workflows/ci.yml', './.github/workflows/security.yml']) {
+  if (!release.includes(`uses: ${reusable}`)) {
+    fail(`release workflow does not reuse ${reusable}`);
+  }
+}
+const publishJob = workflowJob(release, 'publish');
+for (const gate of ['ci-gate', 'security-gate']) {
+  if (!new RegExp(`^      - ${gate}\\s*$`, 'm').test(publishJob)) {
+    fail(`release publication does not depend on ${gate}`);
+  }
+}
 if (/uses:\s*actions\/cache@[0-9a-f]{40}/.test(release)) {
   fail('release workflow must use actions/cache/restore and never save a privileged cache');
 }

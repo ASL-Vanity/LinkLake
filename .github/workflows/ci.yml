@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
+    branches:
+      - '**'
   pull_request:
+  workflow_call:
   workflow_dispatch:
 
 permissions:
@@ -83,7 +86,8 @@ jobs:
           mkdir -p "$fixture"
           printf 'core package fixture\n' >"$fixture/linklake-$version-linux-x86_64.tar.gz"
           printf 'manager package fixture\n' >"$fixture/linklake-manager-$version-linux-x86_64.tar.gz"
-          export LINKLAKE_TEST_SIGNING_KEY_B64="$(jq -r .seed_base64 security/test-fixtures/development-signing-key.json)"
+          LINKLAKE_TEST_SIGNING_KEY_B64="$(jq -r .seed_base64 security/test-fixtures/development-signing-key.json)"
+          export LINKLAKE_TEST_SIGNING_KEY_B64
           cargo run --locked -p linklake-update --bin linklake-release-sign -- \
             generate --dist "$fixture" --version "$version" \
             --key-id linklake-development-rfc8032-1 \
@@ -243,7 +247,7 @@ jobs:
         run: flutter build "$FLUTTER_TARGET" --release
 
   linux-https-acme-e2e:
-    name: Linux HTTPS/ACME E2E
+    name: Linux HTTPS/ACME HTTP-01 and DNS-01 E2E
     runs-on: ubuntu-latest
     needs: linux-quality
     steps:
@@ -265,3 +269,8 @@ jobs:
       - name: Run HTTPS and ACME end-to-end tests with Pebble
         shell: pwsh
         run: ./tests/https-e2e.ps1
+      - name: Test the local Cloudflare API and DoH fixture
+        run: python3 tests/cloudflare_dns_mock_test.py
+      - name: Run Cloudflare DNS-01 and wildcard certificate end-to-end tests
+        shell: pwsh
+        run: ./tests/dns01-e2e.ps1

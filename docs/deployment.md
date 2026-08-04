@@ -21,6 +21,38 @@ Compose 健康检查通过 `linklake-client check --ca-cert` 严格校验管理�
 - DNS 自动化建议创建最小权限 API Token，仅授予目标 Zone 的 `DNS Edit`。不要使用全账户 Global API Key。
 - `scripts/cloudflare-dns-upsert.ps1` 使用 Zone ID 和最小权限 API Token 幂等创建或覆盖 A、AAAA、CNAME 记录；Token 只通过参数传入，不写入文件。
 
+## ACME DNS-01 与 Cloudflare
+
+HTTP-01 仍是默认挑战类型，不配置 Cloudflare 凭据时行为与旧版本一致。需要通配符证书或无法开放公网 80/tcp 时，可为服务端配置 Cloudflare DNS-01：
+
+```bash
+install -m 0600 /dev/stdin /run/secrets/linklake_cloudflare_token <<'EOF'
+replace-with-a-zone-scoped-token
+EOF
+export LINKLAKE_CLOUDFLARE_API_TOKEN_FILE=/run/secrets/linklake_cloudflare_token
+```
+
+也可使用 `LINKLAKE_CLOUDFLARE_API_TOKEN` 环境变量，但不得同时配置两个来源。生产 Token 应限制到所需 Zone，并只授予 Zone 读取与 DNS 编辑权限；不要使用 Global API Key，也不要把 Token 放入 systemd 命令行、ACME API JSON、SQLite 或仓库。Unix secret file 必须禁止 group/other 访问，否则服务端启动失败。
+
+管理 API 的 `PUT /api/v1/acme/config` 只接受 `challenge_type: "http-01" | "dns-01"`，只读响应最多返回 `cloudflare_token_configured`。它故意不提供 Token 写入、清除或回显字段。通配符由逐路由 TLS 策略声明，例如：
+
+```json
+{
+  "mode": "acme",
+  "redirect_http_to_https": true,
+  "certificate_identifier": "*.example.com"
+}
+```
+
+`certificate_identifier` 必须是路由域名本身，或只覆盖一层子域名的通配符；通配符只允许在 DNS-01 模式使用。省略该字段会为新路由使用路由域名，并在更新既有通配符路由时保留当前值；若要恢复精确证书，应显式传入该路由域名。
+
+LinkLake 会查找最长匹配的 Cloudflare Zone，创建 `_acme-challenge` TXT，确认 DoH 可见后通知 ACME 服务，并在成功、失败或超时后删除记录。清理信息保存在 `LINKLAKE_DATA_DIR/acme/dns01-records`，只包含 Zone/Record ID；删除暂时失败时会在下一次 DNS-01 操作前重试。可选的超时参数为：
+
+- `LINKLAKE_ACME_DNS_PROPAGATION_TIMEOUT_SECONDS`：默认 `60`，范围 `1-300`。
+- `LINKLAKE_ACME_DNS_PROPAGATION_INTERVAL_MILLISECONDS`：默认 `1000`，范围 `50-10000`。
+
+`LINKLAKE_CLOUDFLARE_API_BASE_URL` 与 `LINKLAKE_ACME_DNS_LOOKUP_URL` 仅用于受控测试或私有兼容端点；生产应保留 HTTPS 默认值。
+
 ## Prometheus
 
 抓取端点为 `/api/v1/metrics/prometheus`，必须携带管理 Bearer Token。建议创建 `read` scope API Token。端点使用 Prometheus text exposition 0.0.4 格式，指标统一以 `linklake_` 开头。Compose 示例在隔离的容器网络内加密抓取，但为兼容外部域名证书暂时关闭了服务端证书校验；生产部署内部 CA 时，应把 `insecure_skip_verify` 替换为 `ca_file` 和正确的 `server_name`。
@@ -55,7 +87,7 @@ sudo linklake-server backup-full \
   --password-file /run/secrets/linklake_backup_password
 ```
 
-恢复必须先停止服务。数据目录必须提前由安装器或管理员安全创建，不能是符号链接或重解析点；Linux 应归服务账户所有并设为 `0700`，Windows 仅授权 SYSTEM、Administrators、LocalService 和目录所有者。`restore-full` 不会替管理员临时创建或推断这个权限边界。命令会取得与服务端相同的数据库进程锁，验证加密终止记录、TAR 白名单、文件数量/大小、SHA-256 清单、SQLite 完整性、架构版本和迁移账本，并在暂存区迁移受支持的旧数据库后才替换数据；更高产品版本或数据库架构版本会失败关闭。旧状态保存在数据目录内的 `.pre-restore-*`，任一替换失败会回滚。持久 restore journal 同时覆盖进程崩溃和断电窗口：服务下次持锁启动时会根据已同步的提交标记幂等回滚旧状态或完成新状态。明文暂存只位于数据目录安全边界内，异常残留由活动锁协调后清理。
+恢复必须先停止服务。数据目录必须提前由安装器或管理员安全创建，不能是符号链接或重解析点；Linux 应归服务账户所有并设为 `0700`，Windows 仅授权 SYSTEM、Administrators、LocalService 和目录所有者。`restore-full` 不会替管理员临时创建或推断这个权限边界。Unix 恢复会在替换前分别记录原数据库文件、`acme/` 和 `certificates/` 的 uid/gid，并递归应用到对应恢复树；目标原本不存在时才回退 data-dir owner。命令会取得与服务端相同的数据库进程锁，验证加密终止记录、TAR 白名单、文件数量/大小、SHA-256 清单、SQLite 完整性、架构版本和迁移账本，并在暂存区迁移受支持的旧数据库后才替换数据；更高产品版本或数据库架构版本会失败关闭。旧状态保存在数据目录内的 `.pre-restore-*`，任一替换失败会回滚。持久 restore journal 同时覆盖进程崩溃和断电窗口：服务下次持锁启动时会根据已同步的提交标记幂等回滚旧状态或完成新状态。明文暂存只位于数据目录安全边界内，异常残留由活动锁协调后清理。
 
 归档只覆盖 LinkLake 数据目录中的托管状态，不包含服务环境变量、Enrollment Token、数据目录外 TLS 私钥、服务定义、防火墙、反向代理、DNS、容器编排或生产签名密钥。必须为这些外部配置和 Secret 建立独立备份，不能把 `.llb` 当作整机镜像。
 
@@ -72,7 +104,7 @@ sudo systemctl start linklake-server
 
 ---
 
-The same rules apply in English: enable trusted TLS for management and control listeners, inject secrets at runtime, preserve Host for ACME HTTP-01, use layer-4 pass-through when LinkLake terminates business TLS, and use DNS-only records for arbitrary TCP/UDP unless an appropriate Cloudflare proxy product is configured.
+The same rules apply in English: enable trusted TLS for management and control listeners, inject secrets at runtime, preserve Host for ACME HTTP-01, use layer-4 pass-through when LinkLake terminates business TLS, and use DNS-only records for arbitrary TCP/UDP unless an appropriate Cloudflare proxy product is configured. HTTP-01 remains the default. For DNS-01, provide a zone-scoped Cloudflare token through `LINKLAKE_CLOUDFLARE_API_TOKEN_FILE` (preferred, mode `0600`) or `LINKLAKE_CLOUDFLARE_API_TOKEN`, never both. The management API accepts only the challenge selection and returns only `cloudflare_token_configured`; wildcard `certificate_identifier` values are accepted only with DNS-01.
 
 For upgrades, verify `--version-json`, then use `update download/apply/status/rollback` with service-control privileges. The updater replaces only the selected executable and leaves `/etc/linklake`, `/var/lib/linklake`, ProgramData configuration/databases/certificates, and logs unchanged. A previously running service must become stably active or the old executable is restored automatically. Formal releases require the Ed25519 manifest and signature; the development signature path must never be treated as production.
 

@@ -83,11 +83,23 @@ pub struct TunnelSpec {
 pub struct ClientEnrollmentRequest {
     pub name: String,
     pub platform: String,
+    /// 跨服务端稳定的本机实例 ID。旧客户端可以省略，但未验证身份不能参与 Fleet。
+    #[serde(default)]
+    pub agent_instance_id: Option<Uuid>,
+    /// Ed25519 公钥的小写十六进制编码。与签名同时出现时，服务端验证实例 ID 的持有权。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_identity_public_key: Option<String>,
+    /// 对规范 enrollment 消息的 Ed25519 签名，小写十六进制编码。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_identity_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ClientEnrollmentResponse {
     pub client_id: Uuid,
+    /// 客户端应持久化并在注册其他 Fleet 节点时复用该 ID。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_instance_id: Option<Uuid>,
     /// 仅在客户端注册时返回，必须作为密钥安全保存。
     pub client_token: String,
 }
@@ -95,6 +107,9 @@ pub struct ClientEnrollmentResponse {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ClientSummary {
     pub client_id: Uuid,
+    pub agent_instance_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_identity_public_key: Option<String>,
     pub name: String,
     pub platform: String,
     pub group_name: Option<String>,
@@ -217,8 +232,18 @@ pub enum CoreError {
     EmptyTunnelName,
     #[error("client name must not be blank")]
     EmptyClientName,
+    #[error(
+        "client name must contain at most 80 visible UTF-8 bytes without surrounding whitespace"
+    )]
+    InvalidClientName,
     #[error("client platform must not be blank")]
     EmptyClientPlatform,
+    #[error("client platform must contain at most 80 visible UTF-8 bytes without surrounding whitespace")]
+    InvalidClientPlatform,
+    #[error("agent instance ID must not be nil")]
+    InvalidAgentInstanceId,
+    #[error("agent identity proof is incomplete")]
+    IncompleteAgentIdentityProof,
 }
 
 impl ClientEnrollmentRequest {
@@ -226,11 +251,63 @@ impl ClientEnrollmentRequest {
         if self.name.trim().is_empty() {
             return Err(CoreError::EmptyClientName);
         }
+        if !valid_enrollment_label(&self.name) {
+            return Err(CoreError::InvalidClientName);
+        }
         if self.platform.trim().is_empty() {
             return Err(CoreError::EmptyClientPlatform);
         }
+        if !valid_enrollment_label(&self.platform) {
+            return Err(CoreError::InvalidClientPlatform);
+        }
+        if self.agent_instance_id.is_some_and(|value| value.is_nil()) {
+            return Err(CoreError::InvalidAgentInstanceId);
+        }
+        if self.agent_identity_public_key.is_some() != self.agent_identity_signature.is_some() {
+            return Err(CoreError::IncompleteAgentIdentityProof);
+        }
+        if self.agent_identity_public_key.is_some() && self.agent_instance_id.is_none() {
+            return Err(CoreError::IncompleteAgentIdentityProof);
+        }
         Ok(())
     }
+}
+
+fn valid_enrollment_label(value: &str) -> bool {
+    value == value.trim() && value.len() <= 80 && !value.chars().any(char::is_control)
+}
+
+/// 生成客户端 enrollment 持有证明的唯一规范消息。
+pub fn agent_enrollment_message(
+    agent_instance_id: Uuid,
+    public_key_hex: &str,
+    name: &str,
+    platform: &str,
+) -> Vec<u8> {
+    let mut message = b"linklake-agent-enrollment-v1\0".to_vec();
+    message.extend_from_slice(agent_instance_id.as_bytes());
+    for field in [
+        public_key_hex.as_bytes(),
+        name.as_bytes(),
+        platform.as_bytes(),
+    ] {
+        message.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        message.extend_from_slice(field);
+    }
+    message
+}
+
+/// 从 Ed25519 公钥派生稳定实例 ID，避免调用者任意抢注其他实例 ID。
+pub fn agent_instance_id_from_public_key(public_key: &[u8; 32]) -> Uuid {
+    let mut digest = Sha256::new();
+    digest.update(b"linklake-agent-instance-v1");
+    digest.update(public_key);
+    let digest = digest.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -540,22 +617,78 @@ mod tests {
     fn enrollment_requires_name_and_platform() {
         assert!(ClientEnrollmentRequest {
             name: "".to_owned(),
-            platform: "linux".to_owned()
+            platform: "linux".to_owned(),
+            agent_instance_id: None,
+            agent_identity_public_key: None,
+            agent_identity_signature: None,
         }
         .validate()
         .is_err());
         assert!(ClientEnrollmentRequest {
             name: "node-1".to_owned(),
-            platform: "".to_owned()
+            platform: "".to_owned(),
+            agent_instance_id: None,
+            agent_identity_public_key: None,
+            agent_identity_signature: None,
         }
         .validate()
         .is_err());
         assert!(ClientEnrollmentRequest {
             name: "node-1".to_owned(),
-            platform: "linux".to_owned()
+            platform: "linux".to_owned(),
+            agent_instance_id: Some(Uuid::new_v4()),
+            agent_identity_public_key: None,
+            agent_identity_signature: None,
         }
         .validate()
         .is_ok());
+        assert!(ClientEnrollmentRequest {
+            name: "node-1".to_owned(),
+            platform: "linux".to_owned(),
+            agent_instance_id: Some(Uuid::new_v4()),
+            agent_identity_public_key: Some("00".repeat(32)),
+            agent_identity_signature: None,
+        }
+        .validate()
+        .is_err());
+        for (name, platform) in [
+            (" node-1", "linux"),
+            ("node-1\nother", "linux"),
+            ("node-1", "linux\rwindows"),
+        ] {
+            assert!(ClientEnrollmentRequest {
+                name: name.to_owned(),
+                platform: platform.to_owned(),
+                agent_instance_id: None,
+                agent_identity_public_key: None,
+                agent_identity_signature: None,
+            }
+            .validate()
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn agent_enrollment_message_is_length_delimited() {
+        let agent_instance_id = Uuid::new_v4();
+        let public_key = "11".repeat(32);
+        assert_ne!(
+            agent_enrollment_message(agent_instance_id, &public_key, "node\nlinux", "windows"),
+            agent_enrollment_message(agent_instance_id, &public_key, "node", "linux\nwindows")
+        );
+    }
+
+    #[test]
+    fn agent_instance_id_is_stably_derived_from_public_key() {
+        let public_key = [7_u8; 32];
+        assert_eq!(
+            agent_instance_id_from_public_key(&public_key),
+            agent_instance_id_from_public_key(&public_key)
+        );
+        assert_ne!(
+            agent_instance_id_from_public_key(&public_key),
+            agent_instance_id_from_public_key(&[8_u8; 32])
+        );
     }
 
     #[tokio::test]
