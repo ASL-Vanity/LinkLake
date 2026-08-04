@@ -1,5 +1,6 @@
 /target/
 /dist/
+/node_modules/
 /data/
 /logs/
 /.idea/
@@ -10,6 +11,7 @@
 .env.*
 !.env.example
 /.tmp-tls-test/
+/.tmp-webui-smoke-tls/
 /.tmp-webui-smoke-data/
 /linklake-client.toml
 /deploy/linklake.env
