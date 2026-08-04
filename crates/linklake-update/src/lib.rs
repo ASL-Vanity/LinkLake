@@ -74,6 +74,7 @@ impl UpdateProduct {
         }
     }
 
+    #[cfg(windows)]
     fn service_name(self) -> &'static str {
         match self {
             Self::Client => "LinkLakeClient",
@@ -1358,8 +1359,10 @@ fn schedule_update(
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000 | 0x0000_0008 | 0x0000_0200);
     }
+    #[cfg(windows)]
     let inheritance_guard = disable_standard_handle_inheritance()?;
     let child_result = command.spawn();
+    #[cfg(windows)]
     drop(inheritance_guard);
     let child = match child_result {
         Ok(child) => child,
@@ -2178,11 +2181,6 @@ fn disable_standard_handle_inheritance() -> anyhow::Result<StandardHandleInherit
         }
     }
     Ok(StandardHandleInheritanceGuard(changed))
-}
-
-#[cfg(not(windows))]
-fn disable_standard_handle_inheritance() -> anyhow::Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]

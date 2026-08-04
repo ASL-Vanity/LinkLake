@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
+    branches:
+      - '**'
   pull_request:
+  workflow_call:
   workflow_dispatch:
 
 permissions:
@@ -75,7 +78,8 @@ jobs:
           mkdir -p "$fixture"
           printf 'core package fixture\n' >"$fixture/linklake-$version-linux-x86_64.tar.gz"
           printf 'manager package fixture\n' >"$fixture/linklake-manager-$version-linux-x86_64.tar.gz"
-          export LINKLAKE_TEST_SIGNING_KEY_B64="$(jq -r .seed_base64 security/test-fixtures/development-signing-key.json)"
+          LINKLAKE_TEST_SIGNING_KEY_B64="$(jq -r .seed_base64 security/test-fixtures/development-signing-key.json)"
+          export LINKLAKE_TEST_SIGNING_KEY_B64
           cargo run --locked -p linklake-update --bin linklake-release-sign -- \
             generate --dist "$fixture" --version "$version" \
             --key-id linklake-development-rfc8032-1 \

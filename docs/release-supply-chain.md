@@ -4,8 +4,8 @@ Formal LinkLake releases carry three independent evidence layers: package SHA-25
 
 ## Release order
 
-1. Windows, Linux, and macOS build and verify both core and Manager packages; Linux also produces DEB and RPM packages.
-2. The publish job merges the artifacts, recalculates every `.sha256`, and rejects missing platforms, wrong versions, duplicate names, symbolic links, and tampered packages.
+1. Full CI, security scanning, and Windows, Linux, and macOS packaging run concurrently for the same tagged commit. Any failed gate prevents publication. Each platform builds and verifies both core and Manager packages; Linux also produces DEB and RPM packages.
+2. Only after every CI, security, and platform-packaging job succeeds does the publish job merge the artifacts, recalculate every `.sha256`, and reject missing platforms, wrong versions, duplicate names, symbolic links, and tampered packages.
 3. A pinned Syft version scans every ZIP, tar.gz, DEB, and RPM independently and creates a one-to-one detailed SPDX 2.x SBOM. LinkLake verifies each document's structure, size, and non-empty package set, then writes its SHA-256 sidecar.
 4. `scripts/prepare-release-attestations.mjs` links those detailed documents into a release collection through SPDX `externalDocumentRefs` and creates a deterministically sorted `linklake-<version>-release-subjects.sha256`. Both build-provenance and SBOM attestations must use exactly that subject set.
 5. `linklake-release-sign` reads the production Ed25519 seed from a CI secret, creates `linklake-release-manifest-v1.json` plus its detached signature, and immediately verifies them. The private key is never passed as a command argument or written to the repository, artifacts, or logs.
@@ -18,6 +18,7 @@ Formal LinkLake releases carry three independent evidence layers: package SHA-25
 - Formal release jobs use `actions/cache/restore` and never save a privileged cache.
 - Shell commands consume explicit environment variables instead of interpolating GitHub expressions into command text.
 - Only the `v*` tag publish job receives `id-token: write`, `attestations: write`, and `artifact-metadata: write`.
+- Tag releases reuse CI and security through `workflow_call`. Ordinary branch pushes still run CI directly, while tags no longer start a second duplicate CI run.
 - There are no zizmor workflow-security suppressions. `scripts/check-workflow-hardening.mjs`, actionlint, and zizmor enforce the contract.
 
 ## Consumer verification
