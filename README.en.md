@@ -385,9 +385,15 @@ ACME account credentials and certificate private keys live under `LINKLAKE_DATA_
 
 Windows release package:
 
-- `windows/install-server.ps1` installs and starts `LinkLakeServer`
-- `windows/install-client.ps1` installs and starts `LinkLakeClient`
-- `windows/uninstall.ps1` removes services while preserving programs and data
+- `windows/install-server.ps1` installs or transactionally upgrades `LinkLakeServer` as `LocalService`; TLS certificates and keys are copied into a read-only managed directory, and startup or validation failure restores the previous binary, service configuration, and runtime state
+- `windows/install-client.ps1` installs or transactionally upgrades `LinkLakeClient` as `LocalService`; the existing configuration is preserved unless `-ReplaceConfig` is explicit
+- `windows/uninstall.ps1` transactionally removes the selected services and program binaries while preserving configuration, state, logs, and server data by default; permanent cleanup additionally requires `-PurgeData -ConfirmPurge LINKLAKE-PURGE`
+
+Windows installers accept only local absolute destination paths and reject reparse points, overlapping privilege boundaries, malformed service environments, and package contents that do not match the internal SHA-256 inventory. Only one install, upgrade, or uninstall transaction can run at a time. For a package obtained over the network, first obtain its trusted SHA-256 from the signed release manifest, then run:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-windows-package.ps1 -ExpectedSha256 <64-hex-SHA-256-from-signed-manifest>
+```
 
 Linux release package:
 
@@ -422,6 +428,7 @@ cargo test --workspace --locked
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\tcp-e2e.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\udp-e2e.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\http-e2e.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\windows-installer-contract.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\package-windows.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-windows-package.ps1
 $env:FLUTTER_BIN = 'F:\Tools\flutter\bin\flutter.bat'

@@ -137,6 +137,9 @@ jobs:
             }
           }
           if ($failed) { throw 'PowerShell syntax validation failed.' }
+      - name: Verify Windows installer lifecycle contract
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\windows-installer-contract.ps1
       - name: Run unit tests
         run: cargo test --workspace --locked
       - name: Run updater replacement and rollback end-to-end tests
