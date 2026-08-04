@@ -45,6 +45,7 @@ LinkLake 正式发布使用相互独立的证据链：SHA-256 旁车文件、Win
 - 所有 `uses:` 都固定到完整的 40 位提交 SHA；版本号只作为旁注，不能作为可变执行引用。
 - checkout 统一设置 `persist-credentials: false`。
 - 正式发布只使用 `actions/cache/restore`，不会从具有写权限的任务保存缓存。
+- 发布汇总任务只下载名称匹配 `linklake-*` 的产物；CI 证据和 Buildx 调试记录不能进入 `dist` 或 GitHub Release。
 - Shell 命令只能读取显式环境变量，禁止把 GitHub expression 直接拼进命令正文。
 - 文件证明任务只在 `v*` 标签发布时获得 `id-token: write`、`attestations: write` 和 `artifact-metadata: write`；容器任务另外只获得推送 GHCR 所需的 `packages: write`。
 - CI 与安全工作流通过 `workflow_call` 被标签发布复用；普通分支推送仍独立运行 CI，标签不会再触发第二套重复 CI。

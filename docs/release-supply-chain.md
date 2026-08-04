@@ -45,6 +45,7 @@ The optional `scripts/generate-linux-release-key.sh` helper is intended only for
 - Every `uses:` reference is pinned to an immutable 40-character commit SHA; human-readable versions are comments only.
 - Every checkout uses `persist-credentials: false`.
 - Formal release jobs use `actions/cache/restore` and never save a privileged cache.
+- The aggregate job downloads only artifacts named `linklake-*`; CI evidence and Buildx diagnostic records cannot enter `dist` or a GitHub Release.
 - Shell commands consume explicit environment variables instead of interpolating GitHub expressions into command text.
 - Only `v*` tag evidence jobs receive OIDC/attestation permissions. The container job additionally receives only the `packages: write` permission needed for GHCR.
 - Tag releases reuse CI and security through `workflow_call`. Ordinary branch pushes still run CI directly, while tags no longer start a second duplicate CI run.

@@ -163,6 +163,9 @@ if (!release.includes("LINKLAKE_LINUX_SIGNING_REQUIRED: ${{ startsWith(github.re
 if (!release.includes('Create and verify production Ed25519 release manifest')) {
   fail('every tagged release must retain the production updater signing gate');
 }
+if (!release.includes("pattern: 'linklake-*'")) {
+  fail('release aggregation must download only LinkLake publication artifacts');
+}
 if ((release.match(/uses:\s*actions\/attest@[0-9a-f]{40}/g) ?? []).length !== 2) {
   fail('release workflow must create exactly one provenance and one SBOM attestation');
 }
