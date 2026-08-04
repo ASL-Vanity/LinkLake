@@ -39,8 +39,10 @@ use admin_auth::{
     UpdateUser, UserRecord, UserRole,
 };
 use alerting::{
-    AlertCatalog, AlertEvent, AlertMetric, AlertNotification, AlertRule, AlertSignal,
-    CreateAlertRule, UpdateAlertRule,
+    AlertCatalog, AlertEvent, AlertMetric, AlertRule, AlertSignal, CreateAlertRule,
+    NotificationChannel, NotificationDelivery, NotificationDeliveryMetrics,
+    NotificationDeliveryRetryOutcome, NotificationDeliveryState, NotificationDeliveryView,
+    UpdateAlertRule,
 };
 use api_tokens::{ApiTokenCatalog, ApiTokenScope, CreateApiToken, CreatedApiToken};
 use audit_log::{AuditEvent, AuditLog};
@@ -133,6 +135,9 @@ use uuid::Uuid;
 const MANAGEMENT_UI: &str = include_str!("../web/index.html");
 const GLOBAL_CONNECTION_LIMIT: usize = 1024;
 const PENDING_CONNECTION_LIMIT: usize = 256;
+const NOTIFICATION_DELIVERY_INTERVAL_SECONDS: u64 = 1;
+const NOTIFICATION_DELIVERY_BATCH_SIZE: usize = 16;
+const NOTIFICATION_DELIVERY_CONCURRENCY: usize = 4;
 const GLOBAL_UDP_SESSION_LIMIT: usize = 16_384;
 const SESSION_AUTHENTICATION_TYPE: &str = "session";
 const METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS: u64 = 5;
@@ -934,6 +939,8 @@ struct MetricsResponse {
     acme_http01_challenges_total: u64,
     acme_dns01_challenges_total: u64,
     #[serde(flatten)]
+    notification_deliveries: NotificationDeliveryMetrics,
+    #[serde(flatten)]
     fleet_health: FleetHealthMetrics,
 }
 
@@ -1031,6 +1038,21 @@ struct AuditQuery {
 struct AlertEventsQuery {
     active: Option<bool>,
     limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct NotificationDeliveriesQuery {
+    limit: Option<usize>,
+    state: Option<NotificationDeliveryState>,
+    channel: Option<NotificationChannel>,
+}
+
+#[derive(Serialize)]
+struct AlertNotificationChannelsResponse {
+    #[serde(flatten)]
+    channels: notifications::NotificationChannelView,
+    #[serde(flatten)]
+    deliveries: NotificationDeliveryMetrics,
 }
 
 #[derive(Deserialize)]
@@ -2320,6 +2342,14 @@ async fn run_server(
         .route("/api/v1/alerts/events", get(list_alert_events))
         .route("/api/v1/alerts/channels", get(alert_notification_channels))
         .route(
+            "/api/v1/alerts/deliveries",
+            get(list_alert_notification_deliveries),
+        )
+        .route(
+            "/api/v1/alerts/deliveries/:delivery_id/retry",
+            post(retry_alert_notification_delivery),
+        )
+        .route(
             "/api/v1/fleet/peers",
             get(list_fleet_peers).post(create_fleet_peer),
         )
@@ -2550,6 +2580,10 @@ async fn run_server(
         shutdown_rx.clone(),
     ));
     tokio::spawn(run_alert_evaluator(state.clone(), shutdown_rx.clone()));
+    tokio::spawn(run_notification_delivery_worker(
+        state.clone(),
+        shutdown_rx.clone(),
+    ));
     tokio::spawn(run_certificate_maintenance(
         state.clone(),
         shutdown_rx.clone(),
@@ -3073,6 +3107,17 @@ async fn metrics(
     headers: HeaderMap,
 ) -> Result<Json<MetricsResponse>, ApiError> {
     authorize_management(&state, &headers)?;
+    let notification_deliveries = state
+        .alerts
+        .lock()
+        .expect("alert catalog lock poisoned")
+        .notification_delivery_metrics(unix_seconds())
+        .map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not read notification delivery metrics",
+            )
+        })?;
     let fleet_health = state
         .fleet_health
         .lock()
@@ -3540,6 +3585,7 @@ async fn metrics(
             .metrics
             .acme_dns01_challenges_total
             .load(Ordering::Relaxed),
+        notification_deliveries,
         fleet_health,
     }))
 }
@@ -3952,6 +3998,130 @@ async fn run_metrics_history_sampler(state: Arc<AppState>, mut shutdown: watch::
     }
 }
 
+async fn run_notification_delivery_worker(
+    state: Arc<AppState>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut interval =
+        tokio::time::interval(Duration::from_secs(NOTIFICATION_DELIVERY_INTERVAL_SECONDS));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            _ = interval.tick() => deliver_due_alert_notifications(&state).await,
+        }
+    }
+}
+
+async fn deliver_due_alert_notifications(state: &Arc<AppState>) {
+    // 只领取本轮能够立即执行的数量，避免任务在并发槽外等待到租约过期。
+    let claim_limit = NOTIFICATION_DELIVERY_BATCH_SIZE.min(NOTIFICATION_DELIVERY_CONCURRENCY);
+    let deliveries = match state
+        .alerts
+        .lock()
+        .expect("alert catalog lock poisoned")
+        .claim_notification_deliveries(unix_seconds(), claim_limit)
+    {
+        Ok(deliveries) => deliveries,
+        Err(error) => {
+            tracing::error!(%error, "Could not claim alert notification deliveries");
+            return;
+        }
+    };
+    let mut jobs = tokio::task::JoinSet::new();
+    for delivery in deliveries {
+        jobs.spawn(async move {
+            let result = notifications::deliver(&delivery).await;
+            (delivery, result)
+        });
+    }
+    while let Some(result) = jobs.join_next().await {
+        let Ok((delivery, delivery_result)) = result else {
+            // 子任务异常时保留 delivering 状态；租约到期后会使用同一幂等键重新领取。
+            tracing::error!("Alert notification delivery task terminated unexpectedly");
+            continue;
+        };
+        complete_alert_notification_delivery(state, &delivery, delivery_result);
+    }
+}
+
+fn complete_alert_notification_delivery(
+    state: &AppState,
+    delivery: &NotificationDelivery,
+    result: anyhow::Result<()>,
+) {
+    let now = unix_seconds();
+    match result {
+        Ok(()) => match state
+            .alerts
+            .lock()
+            .expect("alert catalog lock poisoned")
+            .acknowledge_notification_delivery(delivery, now)
+        {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(
+                delivery_id = delivery.id,
+                "Ignored stale alert notification acknowledgement"
+            ),
+            Err(error) => tracing::error!(
+                %error,
+                delivery_id = delivery.id,
+                "Could not acknowledge alert notification delivery"
+            ),
+        },
+        Err(error) => {
+            let failed = state
+                .alerts
+                .lock()
+                .expect("alert catalog lock poisoned")
+                .fail_notification_delivery(delivery, now, &error.to_string());
+            match failed {
+                Ok(Some(NotificationDeliveryState::DeadLetter)) => {
+                    tracing::error!(
+                        delivery_id = delivery.id,
+                        channel = %delivery.channel,
+                        attempts = delivery.attempts,
+                        "Alert notification delivery moved to the dead-letter queue"
+                    );
+                    record_audit(
+                        state,
+                        "alert.delivery.dead_letter",
+                        &delivery.id.to_string(),
+                        &format!(
+                            "channel={}; attempts={}",
+                            delivery.channel, delivery.attempts
+                        ),
+                    );
+                }
+                Ok(Some(NotificationDeliveryState::Pending)) => tracing::warn!(
+                    delivery_id = delivery.id,
+                    channel = %delivery.channel,
+                    attempts = delivery.attempts,
+                    "Alert notification delivery failed and was scheduled for retry"
+                ),
+                Ok(Some(delivery_state)) => tracing::error!(
+                    delivery_id = delivery.id,
+                    state = %delivery_state,
+                    "Alert notification delivery entered an unexpected state"
+                ),
+                Ok(None) => tracing::warn!(
+                    delivery_id = delivery.id,
+                    "Ignored stale alert notification failure result"
+                ),
+                Err(storage_error) => tracing::error!(
+                    error = %storage_error,
+                    delivery_id = delivery.id,
+                    "Could not persist alert notification delivery failure"
+                ),
+            }
+        }
+    }
+}
+
 async fn run_alert_evaluator(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
     let start = tokio::time::Instant::now() + Duration::from_secs(2);
     let mut interval = tokio::time::interval_at(
@@ -4016,7 +4186,6 @@ async fn evaluate_alerts(state: &Arc<AppState>) {
                 notification.event.message
             ),
         );
-        dispatch_alert_notification(notification).await;
     }
 }
 
@@ -4328,10 +4497,6 @@ fn push_policy_unavailable(
         message: format!("policy {name} is unavailable ({value:.0} missing endpoints)"),
         window_seconds: None,
     });
-}
-
-async fn dispatch_alert_notification(notification: AlertNotification) {
-    notifications::dispatch(notification).await;
 }
 
 fn collect_metrics_history_sample(
@@ -6726,9 +6891,79 @@ async fn list_alert_events(
 async fn alert_notification_channels(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-) -> Result<Json<notifications::NotificationChannelView>, CodedApiError> {
+) -> Result<Json<AlertNotificationChannelsResponse>, CodedApiError> {
     authorize_management(&state, &headers).map_err(coded_management_error)?;
-    Ok(Json(notifications::channel_view()))
+    let deliveries = state
+        .alerts
+        .lock()
+        .expect("alert catalog lock poisoned")
+        .notification_delivery_metrics(unix_seconds())
+        .map_err(coded_alert_error)?;
+    Ok(Json(AlertNotificationChannelsResponse {
+        channels: notifications::channel_view(),
+        deliveries,
+    }))
+}
+
+async fn list_alert_notification_deliveries(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<NotificationDeliveriesQuery>,
+) -> Result<Json<Vec<NotificationDeliveryView>>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let deliveries = state
+        .alerts
+        .lock()
+        .expect("alert catalog lock poisoned")
+        .list_notification_deliveries(query.limit.unwrap_or(100), query.state, query.channel)
+        .map_err(coded_alert_error)?;
+    Ok(Json(deliveries))
+}
+
+async fn retry_alert_notification_delivery(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(delivery_id): Path<i64>,
+) -> Result<Json<NotificationDeliveryView>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let outcome = state
+        .alerts
+        .lock()
+        .expect("alert catalog lock poisoned")
+        .retry_notification_delivery(delivery_id, unix_seconds())
+        .map_err(coded_alert_error)?;
+    match outcome {
+        NotificationDeliveryRetryOutcome::Retried(delivery) => {
+            record_audit(
+                &state,
+                "alert.delivery.retried",
+                &delivery_id.to_string(),
+                &format!("channel={}; previous_attempts_reset=true", delivery.channel),
+            );
+            Ok(Json(delivery))
+        }
+        NotificationDeliveryRetryOutcome::NotFound => Err(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_notification_delivery",
+            "notification delivery does not exist",
+        )),
+        NotificationDeliveryRetryOutcome::NotDeadLetter(delivery_state) => Err(CodedApiError(
+            StatusCode::CONFLICT,
+            "notification_delivery_not_dead_letter",
+            match delivery_state {
+                NotificationDeliveryState::Pending => "notification delivery is already pending",
+                NotificationDeliveryState::Delivering => {
+                    "notification delivery is currently in flight"
+                }
+                NotificationDeliveryState::Delivered => {
+                    "delivered notifications cannot be retried manually"
+                }
+                NotificationDeliveryState::DeadLetter => {
+                    "notification delivery retry state changed concurrently"
+                }
+            },
+        )),
+    }
 }
 
 fn fleet_peer_exists(state: &AppState, peer_id: Uuid) -> anyhow::Result<bool> {

@@ -7,6 +7,15 @@ use uuid::Uuid;
 
 use crate::database::Database;
 
+const MAX_OUTSTANDING_NOTIFICATION_DELIVERIES: u64 = 10_000;
+const NOTIFICATION_DELIVERY_LEASE_SECONDS: u64 = 60;
+const NOTIFICATION_DELIVERY_MAX_ATTEMPTS: u32 = 10;
+const NOTIFICATION_DELIVERY_BACKOFF_BASE_SECONDS: u64 = 5;
+const NOTIFICATION_DELIVERY_BACKOFF_MAX_SECONDS: u64 = 3_600;
+const NOTIFICATION_DELIVERY_ERROR_MAX_CHARS: usize = 512;
+const NOTIFICATION_DELIVERY_PAYLOAD_MAX_BYTES: usize = 64 * 1024;
+const NOTIFICATION_DELIVERY_RETENTION_SECONDS: u64 = 30 * 24 * 60 * 60;
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AlertMetric {
@@ -176,7 +185,7 @@ pub(crate) struct AlertSignal {
     pub(crate) window_seconds: Option<u64>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub(crate) struct AlertEvent {
     pub(crate) id: i64,
     pub(crate) rule_id: Uuid,
@@ -193,12 +202,122 @@ pub(crate) struct AlertEvent {
     pub(crate) last_notified_unix_seconds: Option<u64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct AlertNotification {
     pub(crate) event: AlertEvent,
     pub(crate) resolved: bool,
     pub(crate) webhook: bool,
     pub(crate) email: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NotificationChannel {
+    Webhook,
+    Email,
+}
+
+impl fmt::Display for NotificationChannel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Webhook => "webhook",
+            Self::Email => "email",
+        })
+    }
+}
+
+impl FromStr for NotificationChannel {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "webhook" => Ok(Self::Webhook),
+            "email" => Ok(Self::Email),
+            _ => anyhow::bail!("unknown notification channel"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NotificationDeliveryState {
+    Pending,
+    Delivering,
+    Delivered,
+    DeadLetter,
+}
+
+impl fmt::Display for NotificationDeliveryState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Pending => "pending",
+            Self::Delivering => "delivering",
+            Self::Delivered => "delivered",
+            Self::DeadLetter => "dead_letter",
+        })
+    }
+}
+
+impl FromStr for NotificationDeliveryState {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "delivering" => Ok(Self::Delivering),
+            "delivered" => Ok(Self::Delivered),
+            "dead_letter" => Ok(Self::DeadLetter),
+            _ => anyhow::bail!("unknown notification delivery state"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NotificationDelivery {
+    pub(crate) id: i64,
+    pub(crate) idempotency_key: String,
+    pub(crate) lease_token: String,
+    pub(crate) channel: NotificationChannel,
+    pub(crate) notification: AlertNotification,
+    pub(crate) attempts: u32,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct NotificationDeliveryView {
+    pub(crate) id: i64,
+    pub(crate) idempotency_key: String,
+    pub(crate) event_id: i64,
+    pub(crate) rule_name: String,
+    pub(crate) subject: String,
+    pub(crate) resolved: bool,
+    pub(crate) channel: NotificationChannel,
+    pub(crate) state: NotificationDeliveryState,
+    pub(crate) attempts: u32,
+    pub(crate) next_attempt_unix_seconds: u64,
+    pub(crate) lease_expires_unix_seconds: Option<u64>,
+    pub(crate) last_error: Option<String>,
+    pub(crate) created_unix_seconds: u64,
+    pub(crate) updated_unix_seconds: u64,
+    pub(crate) delivered_unix_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum NotificationDeliveryRetryOutcome {
+    Retried(NotificationDeliveryView),
+    NotFound,
+    NotDeadLetter(NotificationDeliveryState),
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
+pub(crate) struct NotificationDeliveryMetrics {
+    pub(crate) notification_deliveries_pending: u64,
+    pub(crate) notification_deliveries_retrying: u64,
+    pub(crate) notification_deliveries_in_flight: u64,
+    pub(crate) notification_deliveries_dead_letter: u64,
+    pub(crate) notification_deliveries_delivered_total: u64,
+    pub(crate) notification_delivery_failures_total: u64,
+    pub(crate) notification_delivery_dead_letters_total: u64,
+    pub(crate) notification_oldest_pending_age_seconds: u64,
 }
 
 pub(crate) struct AlertCatalog {
@@ -251,7 +370,45 @@ impl AlertCatalog {
                 ON alert_events(rule_id, subject) WHERE active = 1;
             CREATE INDEX IF NOT EXISTS alert_events_updated
                 ON alert_events(updated_unix_seconds DESC);
+            CREATE TABLE IF NOT EXISTS alert_notification_deliveries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                idempotency_key TEXT NOT NULL,
+                event_id INTEGER NOT NULL,
+                rule_name TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                resolved INTEGER NOT NULL,
+                channel TEXT NOT NULL CHECK(channel IN ('webhook', 'email')),
+                payload_json TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('pending', 'delivering', 'delivered', 'dead_letter')),
+                attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+                next_attempt_unix_seconds INTEGER NOT NULL,
+                lease_expires_unix_seconds INTEGER,
+                lease_token TEXT,
+                last_error TEXT,
+                created_unix_seconds INTEGER NOT NULL,
+                updated_unix_seconds INTEGER NOT NULL,
+                delivered_unix_seconds INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS alert_notification_deliveries_due
+                ON alert_notification_deliveries(state, next_attempt_unix_seconds, id);
+            CREATE INDEX IF NOT EXISTS alert_notification_deliveries_updated
+                ON alert_notification_deliveries(updated_unix_seconds DESC, id DESC);
+            CREATE TABLE IF NOT EXISTS alert_notification_delivery_counters (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                delivered_total INTEGER NOT NULL,
+                failed_attempts_total INTEGER NOT NULL,
+                dead_letter_total INTEGER NOT NULL
+            );
+            INSERT OR IGNORE INTO alert_notification_delivery_counters
+                (singleton, delivered_total, failed_attempts_total, dead_letter_total)
+                VALUES (1, 0, 0, 0);
             ",
+        )?;
+        ensure_notification_delivery_columns(&database)?;
+        database.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS alert_notification_deliveries_idempotency
+             ON alert_notification_deliveries(idempotency_key)",
+            [],
         )?;
         let mut catalog = Self { database };
         catalog.ensure_defaults()?;
@@ -456,8 +613,282 @@ impl AlertCatalog {
                 });
             }
         }
+        for notification in &notifications {
+            enqueue_notification_deliveries(&transaction, notification, now)?;
+        }
         transaction.commit()?;
         Ok(notifications)
+    }
+
+    pub(crate) fn claim_notification_deliveries(
+        &mut self,
+        now: u64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<NotificationDelivery>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let transaction = self.database.transaction()?;
+        transaction.execute(
+            "UPDATE alert_notification_deliveries
+             SET state = 'pending', lease_expires_unix_seconds = NULL,
+                 lease_token = NULL,
+                 updated_unix_seconds = ?1,
+                 last_error = COALESCE(last_error, 'delivery lease expired before acknowledgement')
+             WHERE state = 'delivering'
+               AND lease_expires_unix_seconds IS NOT NULL
+               AND lease_expires_unix_seconds <= ?1",
+            [now as i64],
+        )?;
+        transaction.execute(
+            "DELETE FROM alert_notification_deliveries
+             WHERE state IN ('delivered', 'dead_letter')
+               AND updated_unix_seconds < ?1",
+            [now.saturating_sub(NOTIFICATION_DELIVERY_RETENTION_SECONDS) as i64],
+        )?;
+
+        let ids = {
+            let mut statement = transaction.prepare(
+                "SELECT id FROM alert_notification_deliveries
+                 WHERE state = 'pending' AND next_attempt_unix_seconds <= ?1
+                 ORDER BY next_attempt_unix_seconds, id
+                 LIMIT ?2",
+            )?;
+            let ids = statement
+                .query_map(params![now as i64, limit.clamp(1, 64) as i64], |row| {
+                    row.get::<_, i64>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            ids
+        };
+
+        let lease_expires = now.saturating_add(NOTIFICATION_DELIVERY_LEASE_SECONDS);
+        let mut deliveries = Vec::with_capacity(ids.len());
+        for id in ids {
+            let lease_token = Uuid::new_v4().to_string();
+            let updated = transaction.execute(
+                "UPDATE alert_notification_deliveries
+                 SET state = 'delivering', attempts = attempts + 1,
+                     lease_expires_unix_seconds = ?2, lease_token = ?3,
+                     updated_unix_seconds = ?4
+                 WHERE id = ?1 AND state = 'pending'",
+                params![id, lease_expires as i64, lease_token, now as i64],
+            )?;
+            if updated == 0 {
+                continue;
+            }
+            deliveries.push(transaction.query_row(
+                "SELECT id, idempotency_key, lease_token, channel, payload_json, attempts
+                 FROM alert_notification_deliveries WHERE id = ?1",
+                [id],
+                parse_notification_delivery,
+            )?);
+        }
+        transaction.commit()?;
+        Ok(deliveries)
+    }
+
+    pub(crate) fn acknowledge_notification_delivery(
+        &mut self,
+        delivery: &NotificationDelivery,
+        now: u64,
+    ) -> anyhow::Result<bool> {
+        let transaction = self.database.transaction()?;
+        let updated = transaction.execute(
+            "UPDATE alert_notification_deliveries
+             SET state = 'delivered', lease_expires_unix_seconds = NULL,
+                 lease_token = NULL, last_error = NULL,
+                 updated_unix_seconds = ?3, delivered_unix_seconds = ?3
+             WHERE id = ?1 AND state = 'delivering' AND lease_token = ?2",
+            params![delivery.id, delivery.lease_token, now as i64],
+        )?;
+        if updated == 0 {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        transaction.execute(
+            "UPDATE alert_notification_delivery_counters
+             SET delivered_total = delivered_total + 1 WHERE singleton = 1",
+            [],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub(crate) fn fail_notification_delivery(
+        &mut self,
+        delivery: &NotificationDelivery,
+        now: u64,
+        error: &str,
+    ) -> anyhow::Result<Option<NotificationDeliveryState>> {
+        let transaction = self.database.transaction()?;
+        let attempts = transaction
+            .query_row(
+                "SELECT attempts FROM alert_notification_deliveries
+             WHERE id = ?1 AND state = 'delivering' AND lease_token = ?2",
+                params![delivery.id, delivery.lease_token],
+                |row| Ok(row.get::<_, i64>(0)?.max(0) as u32),
+            )
+            .optional()?;
+        let Some(attempts) = attempts else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let dead_letter = attempts >= NOTIFICATION_DELIVERY_MAX_ATTEMPTS;
+        let state = if dead_letter {
+            NotificationDeliveryState::DeadLetter
+        } else {
+            NotificationDeliveryState::Pending
+        };
+        let next_attempt = if dead_letter {
+            now
+        } else {
+            now.saturating_add(notification_retry_delay_seconds(attempts))
+        };
+        transaction.execute(
+            "UPDATE alert_notification_deliveries
+             SET state = ?2, next_attempt_unix_seconds = ?3,
+                 lease_expires_unix_seconds = NULL, lease_token = NULL,
+                 last_error = ?4, updated_unix_seconds = ?5
+             WHERE id = ?1 AND state = 'delivering' AND lease_token = ?6",
+            params![
+                delivery.id,
+                state.to_string(),
+                next_attempt as i64,
+                sanitize_delivery_error(error),
+                now as i64,
+                delivery.lease_token,
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE alert_notification_delivery_counters
+             SET failed_attempts_total = failed_attempts_total + 1,
+                 dead_letter_total = dead_letter_total + ?1
+             WHERE singleton = 1",
+            [i64::from(dead_letter)],
+        )?;
+        transaction.commit()?;
+        Ok(Some(state))
+    }
+
+    pub(crate) fn retry_notification_delivery(
+        &mut self,
+        id: i64,
+        now: u64,
+    ) -> anyhow::Result<NotificationDeliveryRetryOutcome> {
+        let transaction = self.database.transaction()?;
+        let state = transaction
+            .query_row(
+                "SELECT state FROM alert_notification_deliveries WHERE id = ?1",
+                [id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| value.parse::<NotificationDeliveryState>())
+            .transpose()?;
+        let Some(state) = state else {
+            transaction.commit()?;
+            return Ok(NotificationDeliveryRetryOutcome::NotFound);
+        };
+        if state != NotificationDeliveryState::DeadLetter {
+            transaction.commit()?;
+            return Ok(NotificationDeliveryRetryOutcome::NotDeadLetter(state));
+        }
+        transaction.execute(
+            "UPDATE alert_notification_deliveries
+             SET state = 'pending', attempts = 0, next_attempt_unix_seconds = ?2,
+                 lease_expires_unix_seconds = NULL, lease_token = NULL,
+                 last_error = NULL,
+                 updated_unix_seconds = ?2, delivered_unix_seconds = NULL
+             WHERE id = ?1 AND state = 'dead_letter'",
+            params![id, now as i64],
+        )?;
+        let delivery = query_notification_delivery_view(&transaction, id)?
+            .ok_or_else(|| anyhow::anyhow!("notification delivery disappeared after retry"))?;
+        transaction.commit()?;
+        Ok(NotificationDeliveryRetryOutcome::Retried(delivery))
+    }
+
+    pub(crate) fn list_notification_deliveries(
+        &self,
+        limit: usize,
+        state: Option<NotificationDeliveryState>,
+        channel: Option<NotificationChannel>,
+    ) -> anyhow::Result<Vec<NotificationDeliveryView>> {
+        let mut statement = self.database.prepare(
+            "SELECT id, idempotency_key, event_id, rule_name, subject, resolved, channel, state,
+                    attempts, next_attempt_unix_seconds, lease_expires_unix_seconds,
+                    last_error, created_unix_seconds, updated_unix_seconds,
+                    delivered_unix_seconds
+             FROM alert_notification_deliveries
+             WHERE (?1 IS NULL OR state = ?1) AND (?2 IS NULL OR channel = ?2)
+             ORDER BY updated_unix_seconds DESC, id DESC LIMIT ?3",
+        )?;
+        let state = state.map(|value| value.to_string());
+        let channel = channel.map(|value| value.to_string());
+        let deliveries = statement
+            .query_map(
+                params![state, channel, limit.clamp(1, 1_000) as i64],
+                parse_notification_delivery_view,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(deliveries)
+    }
+
+    pub(crate) fn notification_delivery_metrics(
+        &self,
+        now: u64,
+    ) -> anyhow::Result<NotificationDeliveryMetrics> {
+        let (pending, retrying, in_flight, dead_letter, oldest_pending): (
+            u64,
+            u64,
+            u64,
+            u64,
+            Option<u64>,
+        ) = self.database.query_row(
+            "SELECT
+                 COALESCE(SUM(CASE WHEN state = 'pending' AND attempts = 0 THEN 1 ELSE 0 END), 0),
+                 COALESCE(SUM(CASE WHEN state = 'pending' AND attempts > 0 THEN 1 ELSE 0 END), 0),
+                 COALESCE(SUM(CASE WHEN state = 'delivering' THEN 1 ELSE 0 END), 0),
+                 COALESCE(SUM(CASE WHEN state = 'dead_letter' THEN 1 ELSE 0 END), 0),
+                 MIN(CASE WHEN state IN ('pending', 'delivering') THEN created_unix_seconds END)
+             FROM alert_notification_deliveries",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?.max(0) as u64,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                    row.get::<_, i64>(2)?.max(0) as u64,
+                    row.get::<_, i64>(3)?.max(0) as u64,
+                    row.get::<_, Option<i64>>(4)?
+                        .map(|value| value.max(0) as u64),
+                ))
+            },
+        )?;
+        let (delivered_total, failures_total, dead_letters_total): (u64, u64, u64) =
+            self.database.query_row(
+                "SELECT delivered_total, failed_attempts_total, dead_letter_total
+                 FROM alert_notification_delivery_counters WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?.max(0) as u64,
+                        row.get::<_, i64>(1)?.max(0) as u64,
+                        row.get::<_, i64>(2)?.max(0) as u64,
+                    ))
+                },
+            )?;
+        Ok(NotificationDeliveryMetrics {
+            notification_deliveries_pending: pending,
+            notification_deliveries_retrying: retrying,
+            notification_deliveries_in_flight: in_flight,
+            notification_deliveries_dead_letter: dead_letter,
+            notification_deliveries_delivered_total: delivered_total,
+            notification_delivery_failures_total: failures_total,
+            notification_delivery_dead_letters_total: dead_letters_total,
+            notification_oldest_pending_age_seconds: oldest_pending
+                .map_or(0, |created| now.saturating_sub(created)),
+        })
     }
 
     fn ensure_defaults(&mut self) -> anyhow::Result<()> {
@@ -568,6 +999,196 @@ impl AlertCatalog {
         )?;
         Ok(())
     }
+}
+
+fn ensure_notification_delivery_columns(database: &Connection) -> anyhow::Result<()> {
+    let has_idempotency_key: bool = database.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM pragma_table_info('alert_notification_deliveries')
+             WHERE name = 'idempotency_key'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_idempotency_key {
+        database.execute(
+            "ALTER TABLE alert_notification_deliveries ADD COLUMN idempotency_key TEXT",
+            [],
+        )?;
+    }
+    let has_lease_token: bool = database.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM pragma_table_info('alert_notification_deliveries')
+             WHERE name = 'lease_token'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_lease_token {
+        database.execute(
+            "ALTER TABLE alert_notification_deliveries ADD COLUMN lease_token TEXT",
+            [],
+        )?;
+    }
+
+    let missing_ids = {
+        let mut statement = database.prepare(
+            "SELECT id FROM alert_notification_deliveries
+             WHERE idempotency_key IS NULL OR TRIM(idempotency_key) = ''",
+        )?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids
+    };
+    for id in missing_ids {
+        database.execute(
+            "UPDATE alert_notification_deliveries SET idempotency_key = ?2 WHERE id = ?1",
+            params![id, Uuid::new_v4().to_string()],
+        )?;
+    }
+    Ok(())
+}
+
+fn enqueue_notification_deliveries(
+    transaction: &rusqlite::Transaction<'_>,
+    notification: &AlertNotification,
+    now: u64,
+) -> anyhow::Result<()> {
+    let channels = [
+        (NotificationChannel::Webhook, notification.webhook),
+        (NotificationChannel::Email, notification.email),
+    ]
+    .into_iter()
+    .filter_map(|(channel, enabled)| enabled.then_some(channel))
+    .collect::<Vec<_>>();
+    if channels.is_empty() {
+        return Ok(());
+    }
+    let outstanding: u64 = transaction.query_row(
+        "SELECT COUNT(*) FROM alert_notification_deliveries
+         WHERE state IN ('pending', 'delivering')",
+        [],
+        |row| Ok(row.get::<_, i64>(0)?.max(0) as u64),
+    )?;
+    anyhow::ensure!(
+        outstanding.saturating_add(channels.len() as u64)
+            <= MAX_OUTSTANDING_NOTIFICATION_DELIVERIES,
+        "notification delivery queue is full"
+    );
+    let payload = serde_json::to_string(notification)?;
+    anyhow::ensure!(
+        payload.len() <= NOTIFICATION_DELIVERY_PAYLOAD_MAX_BYTES,
+        "notification delivery payload is too large"
+    );
+    for channel in channels {
+        transaction.execute(
+            "INSERT INTO alert_notification_deliveries
+             (idempotency_key, event_id, rule_name, subject, resolved, channel, payload_json,
+              state, attempts, next_attempt_unix_seconds,
+              created_unix_seconds, updated_unix_seconds)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', 0, ?8, ?8, ?8)",
+            params![
+                Uuid::new_v4().to_string(),
+                notification.event.id,
+                notification.event.rule_name,
+                notification.event.subject,
+                i64::from(notification.resolved),
+                channel.to_string(),
+                payload,
+                now as i64,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn notification_retry_delay_seconds(attempts: u32) -> u64 {
+    let exponent = attempts.saturating_sub(1).min(31);
+    NOTIFICATION_DELIVERY_BACKOFF_BASE_SECONDS
+        .saturating_mul(1_u64 << exponent)
+        .min(NOTIFICATION_DELIVERY_BACKOFF_MAX_SECONDS)
+}
+
+fn sanitize_delivery_error(error: &str) -> String {
+    error
+        .chars()
+        .map(|value| {
+            if matches!(value, '\r' | '\n' | '\t') {
+                ' '
+            } else {
+                value
+            }
+        })
+        .take(NOTIFICATION_DELIVERY_ERROR_MAX_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+fn parse_notification_delivery(row: &rusqlite::Row<'_>) -> rusqlite::Result<NotificationDelivery> {
+    let channel: String = row.get(3)?;
+    let payload: String = row.get(4)?;
+    Ok(NotificationDelivery {
+        id: row.get(0)?,
+        idempotency_key: row.get(1)?,
+        lease_token: row.get(2)?,
+        channel: channel.parse().map_err(conversion_error)?,
+        notification: serde_json::from_str(&payload).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        attempts: row.get::<_, i64>(5)?.max(0) as u32,
+    })
+}
+
+fn parse_notification_delivery_view(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<NotificationDeliveryView> {
+    let channel: String = row.get(6)?;
+    let state: String = row.get(7)?;
+    Ok(NotificationDeliveryView {
+        id: row.get(0)?,
+        idempotency_key: row.get(1)?,
+        event_id: row.get(2)?,
+        rule_name: row.get(3)?,
+        subject: row.get(4)?,
+        resolved: row.get::<_, i64>(5)? != 0,
+        channel: channel.parse().map_err(conversion_error)?,
+        state: state.parse().map_err(conversion_error)?,
+        attempts: row.get::<_, i64>(8)?.max(0) as u32,
+        next_attempt_unix_seconds: row.get::<_, i64>(9)?.max(0) as u64,
+        lease_expires_unix_seconds: row
+            .get::<_, Option<i64>>(10)?
+            .map(|value| value.max(0) as u64),
+        last_error: row.get(11)?,
+        created_unix_seconds: row.get::<_, i64>(12)?.max(0) as u64,
+        updated_unix_seconds: row.get::<_, i64>(13)?.max(0) as u64,
+        delivered_unix_seconds: row
+            .get::<_, Option<i64>>(14)?
+            .map(|value| value.max(0) as u64),
+    })
+}
+
+fn query_notification_delivery_view(
+    database: &Connection,
+    id: i64,
+) -> anyhow::Result<Option<NotificationDeliveryView>> {
+    database
+        .query_row(
+            "SELECT id, idempotency_key, event_id, rule_name, subject, resolved, channel, state,
+                    attempts, next_attempt_unix_seconds, lease_expires_unix_seconds,
+                    last_error, created_unix_seconds, updated_unix_seconds,
+                    delivered_unix_seconds
+             FROM alert_notification_deliveries WHERE id = ?1",
+            [id],
+            parse_notification_delivery_view,
+        )
+        .optional()
+        .map_err(Into::into)
 }
 
 fn validate_rule(rule: &CreateAlertRule) -> anyhow::Result<()> {

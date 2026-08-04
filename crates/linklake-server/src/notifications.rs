@@ -1,6 +1,8 @@
 //! 告警 Webhook 与 SMTP 通知发送器。
 
-use crate::alerting::{AlertNotification, AlertSeverity};
+use crate::alerting::{
+    AlertNotification, AlertSeverity, NotificationChannel, NotificationDelivery,
+};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use linklake_core::BoxedIo;
 use serde::Serialize;
@@ -135,30 +137,29 @@ pub(crate) fn channel_view() -> NotificationChannelView {
     NotificationConfig::from_env().view()
 }
 
-pub(crate) async fn dispatch(notification: AlertNotification) {
+pub(crate) async fn deliver(delivery: &NotificationDelivery) -> anyhow::Result<()> {
     let config = NotificationConfig::from_env();
-    if notification.webhook {
-        if let Some(url) = config.webhook_url {
-            let notification = notification.clone();
-            tokio::spawn(async move {
-                if let Err(error) = send_webhook(&url, &notification).await {
-                    tracing::error!("Could not deliver alert webhook: {error}");
-                }
-            });
+    match delivery.channel {
+        NotificationChannel::Webhook => {
+            let url = config
+                .webhook_url
+                .ok_or_else(|| anyhow::anyhow!("alert webhook is not configured"))?;
+            send_webhook(&url, &delivery.notification, &delivery.idempotency_key).await
         }
-    }
-    if notification.email {
-        if let Some(smtp) = config.smtp {
-            tokio::spawn(async move {
-                if let Err(error) = send_email(&smtp, &notification).await {
-                    tracing::error!("Could not deliver alert email: {error}");
-                }
-            });
+        NotificationChannel::Email => {
+            let smtp = config
+                .smtp
+                .ok_or_else(|| anyhow::anyhow!("alert SMTP channel is not configured"))?;
+            send_email(&smtp, &delivery.notification, &delivery.idempotency_key).await
         }
     }
 }
 
-async fn send_webhook(url: &str, notification: &AlertNotification) -> anyhow::Result<()> {
+async fn send_webhook(
+    url: &str,
+    notification: &AlertNotification,
+    idempotency_key: &str,
+) -> anyhow::Result<()> {
     #[derive(Serialize)]
     struct Payload<'a> {
         product: &'static str,
@@ -170,6 +171,10 @@ async fn send_webhook(url: &str, notification: &AlertNotification) -> anyhow::Re
         reqwest::Client::new()
             .post(url)
             .header("User-Agent", "LinkLake-Alert/1")
+            .header(
+                "Idempotency-Key",
+                format!("linklake-alert-{idempotency_key}"),
+            )
             .json(&Payload {
                 product: linklake_core::PRODUCT_NAME,
                 event: &notification.event,
@@ -191,15 +196,23 @@ async fn send_webhook(url: &str, notification: &AlertNotification) -> anyhow::Re
     Ok(())
 }
 
-async fn send_email(config: &SmtpConfig, notification: &AlertNotification) -> anyhow::Result<()> {
-    timeout(NOTIFICATION_TIMEOUT, send_email_inner(config, notification))
-        .await
-        .map_err(|_| anyhow::anyhow!("SMTP delivery timed out"))?
+async fn send_email(
+    config: &SmtpConfig,
+    notification: &AlertNotification,
+    idempotency_key: &str,
+) -> anyhow::Result<()> {
+    timeout(
+        NOTIFICATION_TIMEOUT,
+        send_email_inner(config, notification, idempotency_key),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("SMTP delivery timed out"))?
 }
 
 async fn send_email_inner(
     config: &SmtpConfig,
     notification: &AlertNotification,
+    idempotency_key: &str,
 ) -> anyhow::Result<()> {
     let tcp = TcpStream::connect((config.host.as_str(), config.port)).await?;
     let mut stream: BoxedIo = match config.tls {
@@ -252,7 +265,7 @@ async fn send_email_inner(
     );
     let recipients = config.recipients.join(", ");
     let message = format!(
-        "From: {}\r\nTo: {}\r\nSubject: {}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n{}",
+        "From: {}\r\nTo: {}\r\nSubject: {}\r\nMessage-ID: <linklake-alert-{idempotency_key}@linklake.invalid>\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n{}",
         config.from,
         recipients,
         subject,
