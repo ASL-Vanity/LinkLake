@@ -35,6 +35,7 @@ hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 hmac = "0.12"
 instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls", "rcgen"] }
 iroh = { version = "0.92.0", default-features = false }
+libc = "0.2"
 quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 semver = "1.0"

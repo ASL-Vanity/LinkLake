@@ -102,6 +102,7 @@ pub(crate) fn stage_restore(input_path: &Path, staged_path: &Path) -> anyhow::Re
     );
     if let Some(parent) = staged_path.parent() {
         fs::create_dir_all(parent)?;
+        crate::disaster_recovery::restrict_directory_permissions(parent)?;
     }
     let mut pending = PendingDatabaseFile::new(staged_path.to_path_buf());
     copy_database_snapshot(
@@ -129,20 +130,15 @@ fn copy_database_snapshot(
         let initial_pages = pragma_u64(&source, "page_count")?;
         ensure_page_budget(initial_pages, page_size, limit)?;
 
-        drop(
-            fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(output_path)?,
-        );
-        match permissions {
+        let output = match permissions {
             SnapshotPermissions::ManagedState => {
-                crate::disaster_recovery::restrict_file_permissions(output_path)?
+                crate::disaster_recovery::create_managed_new_file(output_path)?
             }
             SnapshotPermissions::ExternalBackup => {
-                crate::disaster_recovery::restrict_external_backup_permissions(output_path)?
+                crate::disaster_recovery::create_external_backup_new_file(output_path)?
             }
-        }
+        };
+        drop(output);
         let mut destination =
             Connection::open_with_flags(output_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         let backup = Backup::new(&source, &mut destination)?;

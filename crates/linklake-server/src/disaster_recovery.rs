@@ -67,6 +67,13 @@ const RESTORE_COMMIT_MARKER: &[u8; 4] = b"CMT1";
 const RESTORE_ROLLED_BACK_MARKER: &[u8; 4] = b"RBK1";
 const BACKUP_STAGING_PREFIX: &str = ".linklake-backup-staging-";
 const RESTORE_STAGING_PREFIX: &str = ".linklake-restore-staging-";
+#[cfg(windows)]
+const WINDOWS_MANAGED_FILE_SDDL: &str = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;LS)(A;;FA;;;OW)";
+#[cfg(windows)]
+const WINDOWS_EXTERNAL_FILE_SDDL: &str = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)";
+#[cfg(windows)]
+const WINDOWS_MANAGED_DIRECTORY_SDDL: &str =
+    "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;LS)(A;OICI;FA;;;OW)";
 pub(crate) const MIN_PASSWORD_BYTES: usize = 16;
 pub(crate) const MAX_PASSWORD_BYTES: usize = 4096;
 
@@ -200,6 +207,40 @@ struct TemporaryDirectory {
     cleanup_on_drop: bool,
 }
 
+struct PendingFile {
+    path: PathBuf,
+    armed: bool,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy)]
+struct ManagedOwnership {
+    uid: u32,
+    gid: u32,
+}
+
+#[cfg(not(unix))]
+#[derive(Debug, Clone, Copy)]
+struct ManagedOwnership;
+
+impl PendingFile {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingFile {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 impl TemporaryDirectory {
     fn create_in(parent: &Path, prefix: &str) -> Result<Self> {
         fs::create_dir_all(parent)
@@ -210,12 +251,7 @@ impl TemporaryDirectory {
                 Ok(()) => {
                     restrict_directory_permissions(&path)?;
                     let activity_path = path.join(".active.lock");
-                    let activity_lock = OpenOptions::new()
-                        .create_new(true)
-                        .read(true)
-                        .write(true)
-                        .open(&activity_path)?;
-                    restrict_file_permissions(&activity_path)?;
+                    let activity_lock = create_managed_new_file(&activity_path)?;
                     activity_lock.try_lock_exclusive()?;
                     return Ok(Self {
                         path,
@@ -249,19 +285,7 @@ impl Drop for TemporaryDirectory {
 }
 
 pub(crate) fn acquire_offline_data_directory(data_dir: &Path) -> Result<OfflineDataDirectory> {
-    let unresolved = resolve_path_with_missing_components(data_dir)?;
-    anyhow::ensure!(
-        unresolved.is_dir(),
-        "data directory must already exist and be secured before restore: {}",
-        unresolved.display()
-    );
-    let path = fs::canonicalize(&unresolved)
-        .with_context(|| format!("cannot resolve data directory {}", unresolved.display()))?;
-    anyhow::ensure!(
-        path.is_dir(),
-        "data directory is not a directory: {}",
-        path.display()
-    );
+    let path = resolve_existing_data_directory(data_dir)?;
 
     let lock_path = path.join("linklake.sqlite3.lock");
     let mut lock = OpenOptions::new()
@@ -271,6 +295,7 @@ pub(crate) fn acquire_offline_data_directory(data_dir: &Path) -> Result<OfflineD
         .write(true)
         .open(&lock_path)
         .with_context(|| format!("cannot open LinkLake process lock {}", lock_path.display()))?;
+    restrict_file_permissions(&lock_path)?;
     lock.try_lock_exclusive().map_err(|error| {
         anyhow::anyhow!(
             "LinkLake server must be stopped before restore; {} is locked: {error}",
@@ -305,6 +330,7 @@ fn acquire_maintenance(data_dir: &Path, exclusive: bool) -> Result<MaintenanceGu
         .write(true)
         .open(&path)
         .with_context(|| format!("cannot open backup/restore lock {}", path.display()))?;
+    restrict_file_permissions(&path)?;
     let result = if exclusive {
         FileExt::try_lock_exclusive(&lock)
     } else {
@@ -432,21 +458,29 @@ pub(crate) fn backup_full(
         "backup archive is too large"
     );
 
-    let encrypted_temporary = temporary_sibling(&output_path, "encrypt");
-    let encryption_result = encrypt_archive(&tar_path, &encrypted_temporary, password, created_at);
-    if let Err(error) = encryption_result {
-        let _ = fs::remove_file(&encrypted_temporary);
-        return Err(error);
-    }
-    install_no_replace(&encrypted_temporary, &output_path)?;
-    restrict_external_backup_permissions(&output_path)?;
-    sync_parent(output_path.parent().unwrap_or_else(|| Path::new(".")))?;
+    encrypt_and_install_archive(&tar_path, &output_path, password, created_at)?;
 
     Ok(FullBackupReport {
         output: output_path,
         file_count: manifest.files.len(),
         plaintext_bytes: total_bytes,
     })
+}
+
+fn encrypt_and_install_archive(
+    input_path: &Path,
+    output_path: &Path,
+    password: &[u8],
+    created_at: u64,
+) -> Result<()> {
+    let encrypted_temporary = temporary_sibling(output_path, "encrypt");
+    let mut pending_encrypted = PendingFile::new(encrypted_temporary.clone());
+    encrypt_archive(input_path, &encrypted_temporary, password, created_at)?;
+    install_no_replace(&encrypted_temporary, output_path)?;
+    pending_encrypted.disarm();
+    restrict_external_backup_permissions(output_path)?;
+    sync_parent(output_path.parent().unwrap_or_else(|| Path::new(".")))?;
+    Ok(())
 }
 
 pub(crate) fn backup_database(data_dir: &Path, output_path: &Path) -> Result<PathBuf> {
@@ -735,11 +769,7 @@ fn create_tar_archive(
     manifest: &BackupManifest,
     tar_path: &Path,
 ) -> Result<()> {
-    let tar_file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(tar_path)?;
-    restrict_file_permissions(tar_path)?;
+    let tar_file = create_managed_new_file(tar_path)?;
     let writer = BufWriter::new(tar_file);
     let mut builder = tar::Builder::new(writer);
 
@@ -844,11 +874,7 @@ fn encrypt_archive(
 
     let input = File::open(input_path)?;
     let mut reader = BufReader::new(input);
-    let output = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(output_path)?;
-    restrict_external_backup_permissions(output_path)?;
+    let output = create_external_backup_new_file(output_path)?;
     let mut writer = BufWriter::new(output);
     writer.write_all(MAGIC)?;
     writer.write_all(&header_length.to_le_bytes())?;
@@ -1001,11 +1027,7 @@ fn decrypt_archive(input_path: &Path, output_path: &Path, password: &[u8]) -> Re
         .map_err(|_| anyhow::anyhow!("unsupported backup cipher"))?;
     let aad_prefix = associated_data_prefix(header_length, &header_bytes);
 
-    let output = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(output_path)?;
-    restrict_file_permissions(output_path)?;
+    let output = create_managed_new_file(output_path)?;
     let mut writer = BufWriter::new(output);
     let mut expected_counter = 0_u32;
     let mut total_plaintext = 0_u64;
@@ -1358,6 +1380,10 @@ fn apply_validated_payload(
         validate_existing_target(&certificates_target, true)?;
     }
 
+    let database_ownership = capture_restore_ownership(&database_target, data_dir)?;
+    let acme_ownership = capture_restore_ownership(&acme_target, data_dir)?;
+    let certificates_ownership = capture_restore_ownership(&certificates_target, data_dir)?;
+
     let staging_name = staging_root
         .file_name()
         .and_then(|name| name.to_str())
@@ -1413,13 +1439,16 @@ fn apply_validated_payload(
 
         durable_rename(&database_source, &database_target)
             .context("cannot install restored SQLite database")?;
+        apply_restore_ownership(&database_target, database_ownership)?;
         if manage_acme && payload.has_acme {
             durable_rename(&payload.root.join("acme"), &acme_target)
                 .context("cannot install restored ACME state")?;
+            apply_restore_ownership(&acme_target, acme_ownership)?;
         }
         if manage_certificates && payload.has_certificates {
             durable_rename(&payload.root.join("certificates"), &certificates_target)
                 .context("cannot install restored certificates")?;
+            apply_restore_ownership(&certificates_target, certificates_ownership)?;
         }
         database_tools::validate_database(&database_target)
             .context("installed SQLite database failed integrity validation")?;
@@ -1831,11 +1860,7 @@ fn directory_is_empty(path: &Path) -> Result<bool> {
 }
 
 fn write_tar_entry<R: Read>(reader: &mut R, destination: &Path) -> Result<(u64, String)> {
-    let output = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(destination)?;
-    restrict_file_permissions(destination)?;
+    let output = create_managed_new_file(destination)?;
     let mut writer = BufWriter::new(output);
     let mut digest = Sha256::new();
     let mut length = 0_u64;
@@ -1879,6 +1904,68 @@ fn validate_existing_target(path: &Path, directory: bool) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("cannot inspect {}", path.display())),
     }
+}
+
+#[cfg(unix)]
+fn capture_restore_ownership(target: &Path, data_dir: &Path) -> Result<ManagedOwnership> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = match fs::symlink_metadata(target) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::metadata(data_dir)
+            .with_context(|| {
+                format!(
+                    "cannot inspect fallback restore ownership for {}",
+                    data_dir.display()
+                )
+            })?,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot inspect restore owner for {}", target.display()));
+        }
+    };
+    Ok(ManagedOwnership {
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+    })
+}
+
+#[cfg(not(unix))]
+fn capture_restore_ownership(_target: &Path, _data_dir: &Path) -> Result<ManagedOwnership> {
+    Ok(ManagedOwnership)
+}
+
+#[cfg(unix)]
+fn apply_restore_ownership(path: &Path, ownership: ManagedOwnership) -> Result<()> {
+    use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+
+    let metadata = safe_symlink_metadata(path)?;
+    reject_reparse_point(path, &metadata)?;
+    let file = File::open(path)
+        .with_context(|| format!("cannot open restored path {}", path.display()))?;
+    let actual = file.metadata()?;
+    if actual.uid() != ownership.uid || actual.gid() != ownership.gid {
+        // SAFETY: fd remains valid for the call and uid/gid were captured from a validated
+        // pre-restore managed target or from the already-open data directory.
+        let result = unsafe { libc::fchown(file.as_raw_fd(), ownership.uid, ownership.gid) };
+        anyhow::ensure!(
+            result == 0,
+            "cannot restore managed ownership for {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path)? {
+            apply_restore_ownership(&entry?.path(), ownership)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn apply_restore_ownership(_path: &Path, _ownership: ManagedOwnership) -> Result<()> {
+    Ok(())
 }
 
 fn ensure_regular_file(path: &Path) -> Result<()> {
@@ -1998,6 +2085,28 @@ fn cleanup_restore_journal_temporaries(data_dir: &Path) -> Result<()> {
 }
 
 fn resolve_existing_data_directory(path: &Path) -> Result<PathBuf> {
+    let requested = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let requested_metadata = fs::symlink_metadata(&requested).with_context(|| {
+        format!(
+            "data directory must already exist and be secured: {}",
+            requested.display()
+        )
+    })?;
+    anyhow::ensure!(
+        !requested_metadata.file_type().is_symlink(),
+        "data directory must not be a symbolic link or reparse point: {}",
+        requested.display()
+    );
+    reject_reparse_point(&requested, &requested_metadata)?;
+    anyhow::ensure!(
+        requested_metadata.is_dir(),
+        "data directory is not a directory: {}",
+        requested.display()
+    );
     let resolved = resolve_path_with_missing_components(path)?;
     anyhow::ensure!(
         resolved.is_dir(),
@@ -2048,7 +2157,7 @@ pub(crate) fn resolve_external_password_file(
     data_dir: &Path,
     password_file: &Path,
 ) -> Result<PathBuf> {
-    let data_dir = resolve_path_with_missing_components(data_dir)?;
+    let data_dir = resolve_existing_data_directory(data_dir)?;
     let password_file = resolve_path_with_missing_components(password_file)?;
     ensure_external_to_data_directory(&data_dir, &password_file)?;
     anyhow::ensure!(
@@ -2401,11 +2510,7 @@ fn copy_file_and_hash(
         restrict_directory_permissions(parent)?;
     }
     let input = File::open(source)?;
-    let output = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(destination)?;
-    restrict_file_permissions(destination)?;
+    let output = create_managed_new_file(destination)?;
     let mut reader = BufReader::new(input);
     let mut writer = BufWriter::new(output);
     let mut digest = Sha256::new();
@@ -2481,8 +2586,7 @@ fn validate_single_file_length(length: u64) -> Result<()> {
 }
 
 fn write_new_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
-    restrict_file_permissions(path)?;
+    let mut file = create_managed_new_file(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
@@ -2576,20 +2680,25 @@ pub(crate) fn durable_rename(source: &Path, destination: &Path) -> Result<()> {
 #[cfg(unix)]
 pub(crate) fn restrict_file_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
+
+    inherit_parent_ownership(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
 #[cfg(unix)]
 pub(crate) fn restrict_external_backup_permissions(path: &Path) -> Result<()> {
-    restrict_file_permissions(path)
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
 }
 
 #[cfg(not(unix))]
 pub(crate) fn restrict_file_permissions(path: &Path) -> Result<()> {
     #[cfg(windows)]
     {
-        apply_windows_dacl(path, "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;LS)(A;;FA;;;OW)")
+        apply_windows_dacl(path, WINDOWS_MANAGED_FILE_SDDL)
     }
     #[cfg(not(windows))]
     Ok(())
@@ -2599,7 +2708,7 @@ pub(crate) fn restrict_file_permissions(path: &Path) -> Result<()> {
 pub(crate) fn restrict_external_backup_permissions(path: &Path) -> Result<()> {
     #[cfg(windows)]
     {
-        apply_windows_dacl(path, "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)")
+        apply_windows_dacl(path, WINDOWS_EXTERNAL_FILE_SDDL)
     }
     #[cfg(not(windows))]
     Ok(())
@@ -2608,6 +2717,8 @@ pub(crate) fn restrict_external_backup_permissions(path: &Path) -> Result<()> {
 #[cfg(unix)]
 pub(crate) fn restrict_directory_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
+
+    inherit_parent_ownership(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
@@ -2616,13 +2727,164 @@ pub(crate) fn restrict_directory_permissions(path: &Path) -> Result<()> {
 pub(crate) fn restrict_directory_permissions(_path: &Path) -> Result<()> {
     #[cfg(windows)]
     {
-        apply_windows_dacl(
-            _path,
-            "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;LS)(A;OICI;FA;;;OW)",
-        )
+        apply_windows_dacl(_path, WINDOWS_MANAGED_DIRECTORY_SDDL)
     }
     #[cfg(not(windows))]
     Ok(())
+}
+
+#[cfg(unix)]
+fn inherit_parent_ownership(path: &Path) -> Result<()> {
+    use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("managed path has no parent directory"))?;
+    let expected = fs::metadata(parent)
+        .with_context(|| format!("cannot inspect managed parent {}", parent.display()))?;
+    let file =
+        File::open(path).with_context(|| format!("cannot open managed path {}", path.display()))?;
+    let actual = file.metadata()?;
+    if actual.uid() == expected.uid() && actual.gid() == expected.gid() {
+        return Ok(());
+    }
+    // SAFETY: fd 在调用期间有效；uid/gid 来自已打开父目录的元数据。
+    let result = unsafe { libc::fchown(file.as_raw_fd(), expected.uid(), expected.gid()) };
+    anyhow::ensure!(
+        result == 0,
+        "cannot inherit managed ownership for {}: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn create_managed_new_file(path: &Path) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    restrict_file_permissions(path)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+pub(crate) fn create_external_backup_new_file(path: &Path) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    restrict_external_backup_permissions(path)?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+pub(crate) fn create_managed_new_file(path: &Path) -> Result<File> {
+    create_windows_file_with_dacl(path, WINDOWS_MANAGED_FILE_SDDL)
+}
+
+#[cfg(windows)]
+pub(crate) fn create_external_backup_new_file(path: &Path) -> Result<File> {
+    create_windows_file_with_dacl(path, WINDOWS_EXTERNAL_FILE_SDDL)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn create_managed_new_file(path: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    restrict_file_permissions(path)?;
+    Ok(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn create_external_backup_new_file(path: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    restrict_external_backup_permissions(path)?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn create_windows_file_with_dacl(path: &Path, sddl: &str) -> Result<File> {
+    use std::{ffi::c_void, mem::size_of, os::windows::io::FromRawHandle, ptr::null_mut};
+    use windows_sys::Win32::{
+        Foundation::{LocalFree, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE},
+        Security::{
+            Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+            },
+            SECURITY_ATTRIBUTES,
+        },
+        Storage::FileSystem::{
+            CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        },
+    };
+
+    let encoded_path = encode_destination_windows_path(path)?;
+    let encoded_sddl = sddl
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut descriptor: *mut c_void = null_mut();
+    // SAFETY: 输入字符串以 NUL 结尾，输出描述符由 LocalFree 释放。
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            encoded_sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            null_mut(),
+        )
+    };
+    anyhow::ensure!(
+        converted != 0,
+        "cannot build secure Windows DACL: {}",
+        std::io::Error::last_os_error()
+    );
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    // SAFETY: 路径与 SECURITY_ATTRIBUTES 在调用期间有效；CREATE_NEW 禁止覆盖现有目标。
+    let handle = unsafe {
+        CreateFileW(
+            encoded_path.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            &attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            null_mut(),
+        )
+    };
+    let error = std::io::Error::last_os_error();
+    // SAFETY: descriptor 由 ConvertStringSecurityDescriptorToSecurityDescriptorW 分配。
+    unsafe {
+        LocalFree(descriptor);
+    }
+    anyhow::ensure!(
+        handle != INVALID_HANDLE_VALUE,
+        "cannot securely create {}: {error}",
+        path.display()
+    );
+    // SAFETY: CreateFileW 成功后返回唯一拥有的有效句柄，所有权转交给 File。
+    Ok(unsafe { File::from_raw_handle(handle) })
 }
 
 #[cfg(windows)]
@@ -2744,8 +3006,20 @@ mod tests {
     const PASSWORD: &[u8] = b"correct horse battery staple";
 
     fn test_root(name: &str) -> TemporaryDirectory {
-        TemporaryDirectory::create_in(&std::env::temp_dir(), &format!("linklake-{name}-test"))
-            .expect("temporary test directory should be created")
+        let path = std::env::temp_dir().join(format!("linklake-{name}-test-{}", Uuid::new_v4()));
+        fs::create_dir(&path).expect("temporary test directory should be created");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        #[cfg(not(unix))]
+        restrict_directory_permissions(&path).unwrap();
+        TemporaryDirectory {
+            path,
+            activity_lock: None,
+            cleanup_on_drop: true,
+        }
     }
 
     fn create_database(path: &Path, value: &str) {
@@ -3145,6 +3419,48 @@ mod tests {
             .contains("outside the LinkLake data directory"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn final_data_directory_symlink_is_rejected_before_backup_or_restore() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_root("data-dir-symlink");
+        let real = root.path.join("real-data");
+        let alias = root.path.join("data-alias");
+        fs::create_dir(&real).unwrap();
+        create_database(&real.join("linklake.sqlite3"), "value");
+        symlink(&real, &alias).unwrap();
+
+        let error = backup_full(&alias, &root.path.join("alias.llb"), PASSWORD).unwrap_err();
+        assert!(error.to_string().contains("symbolic link"));
+        assert!(acquire_offline_data_directory(&alias).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn final_data_directory_junction_is_rejected_before_backup_or_restore() {
+        let root = test_root("data-dir-junction");
+        let real = root.path.join("real-data");
+        let alias = root.path.join("data-alias");
+        fs::create_dir(&real).unwrap();
+        create_database(&real.join("linklake.sqlite3"), "value");
+        let status = std::process::Command::new("cmd")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&alias)
+            .arg(&real)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "could not create a test directory junction"
+        );
+
+        let error = backup_full(&alias, &root.path.join("alias.llb"), PASSWORD).unwrap_err();
+        assert!(error.to_string().contains("reparse point"));
+        assert!(acquire_offline_data_directory(&alias).is_err());
+        fs::remove_dir(&alias).unwrap();
+    }
+
     #[test]
     fn maintenance_lock_allows_parallel_backups_and_excludes_restore() {
         let root = test_root("maintenance-lock");
@@ -3174,12 +3490,15 @@ mod tests {
         let managed_file = managed_directory.join("secret.bin");
         let external_file = root.path.join("external.llb");
         fs::create_dir(&managed_directory).unwrap();
-        fs::write(&managed_file, b"managed").unwrap();
-        fs::write(&external_file, b"external").unwrap();
-
         restrict_directory_permissions(&managed_directory).unwrap();
-        restrict_file_permissions(&managed_file).unwrap();
-        restrict_external_backup_permissions(&external_file).unwrap();
+        let mut managed = create_managed_new_file(&managed_file).unwrap();
+        managed.write_all(b"managed").unwrap();
+        managed.sync_all().unwrap();
+        drop(managed);
+        let mut external = create_external_backup_new_file(&external_file).unwrap();
+        external.write_all(b"external").unwrap();
+        external.sync_all().unwrap();
+        drop(external);
 
         let directory_sddl = windows_dacl_sddl(&managed_directory);
         let managed_sddl = windows_dacl_sddl(&managed_file);
@@ -3234,6 +3553,191 @@ mod tests {
         backup_full(&data_dir, &archive, PASSWORD).unwrap();
         let archive_mode = fs::metadata(&archive).unwrap().permissions().mode() & 0o777;
         assert_eq!(archive_mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_database_restore_preserves_database_owner_and_uses_data_owner_when_missing() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+
+        fn change_owner(path: &Path, uid: u32, gid: u32) {
+            use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+            let encoded = CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: encoded 以 NUL 结尾并在调用期间有效；测试以 root 运行。
+            let result = unsafe { libc::chown(encoded.as_ptr(), uid, gid) };
+            assert_eq!(
+                result,
+                0,
+                "could not chown {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            );
+        }
+
+        fn assert_owner(path: &Path, uid: u32, gid: u32) {
+            let metadata = fs::symlink_metadata(path).unwrap();
+            assert_eq!(metadata.uid(), uid, "unexpected uid for {}", path.display());
+            assert_eq!(metadata.gid(), gid, "unexpected gid for {}", path.display());
+        }
+
+        const DATA_UID: u32 = 42_400;
+        const DATA_GID: u32 = 42_401;
+        const DATABASE_UID: u32 = 42_410;
+        const DATABASE_GID: u32 = 42_411;
+        let root = test_root("root-database-restore-ownership");
+        let data_dir = root.path.join("data");
+        fs::create_dir(&data_dir).unwrap();
+        create_database(&data_dir.join("linklake.sqlite3"), "before");
+        change_owner(&data_dir, DATA_UID, DATA_GID);
+        change_owner(
+            &data_dir.join("linklake.sqlite3"),
+            DATABASE_UID,
+            DATABASE_GID,
+        );
+        fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let archive = root.path.join("database.sqlite3");
+        backup_database(&data_dir, &archive).unwrap();
+        restore_database(&data_dir, &archive).unwrap();
+        assert_owner(
+            &data_dir.join("linklake.sqlite3"),
+            DATABASE_UID,
+            DATABASE_GID,
+        );
+
+        let missing_data_dir = root.path.join("missing-data");
+        fs::create_dir(&missing_data_dir).unwrap();
+        change_owner(&missing_data_dir, DATA_UID, DATA_GID);
+        fs::set_permissions(&missing_data_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        restore_database(&missing_data_dir, &archive).unwrap();
+        assert_owner(
+            &missing_data_dir.join("linklake.sqlite3"),
+            DATA_UID,
+            DATA_GID,
+        );
+        assert_owner(
+            &missing_data_dir.join(MAINTENANCE_LOCK_NAME),
+            DATA_UID,
+            DATA_GID,
+        );
+        assert_owner(
+            &missing_data_dir.join("linklake.sqlite3.lock"),
+            DATA_UID,
+            DATA_GID,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_full_restore_preserves_each_managed_owner_for_nested_files() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+
+        fn change_owner(path: &Path, uid: u32, gid: u32) {
+            use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+            let encoded = CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: the path is NUL-terminated and this test only mutates its temporary tree.
+            let result = unsafe { libc::chown(encoded.as_ptr(), uid, gid) };
+            assert_eq!(
+                result,
+                0,
+                "could not chown {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            );
+        }
+
+        fn change_tree_owner(path: &Path, uid: u32, gid: u32) {
+            let metadata = fs::symlink_metadata(path).unwrap();
+            if metadata.is_dir() {
+                for entry in fs::read_dir(path).unwrap() {
+                    change_tree_owner(&entry.unwrap().path(), uid, gid);
+                }
+            }
+            change_owner(path, uid, gid);
+        }
+
+        fn assert_tree_owner(path: &Path, uid: u32, gid: u32) {
+            let metadata = fs::symlink_metadata(path).unwrap();
+            assert_eq!(metadata.uid(), uid, "unexpected uid for {}", path.display());
+            assert_eq!(metadata.gid(), gid, "unexpected gid for {}", path.display());
+            if metadata.is_dir() {
+                for entry in fs::read_dir(path).unwrap() {
+                    assert_tree_owner(&entry.unwrap().path(), uid, gid);
+                }
+            }
+        }
+
+        const DATA_OWNER: (u32, u32) = (42_500, 42_501);
+        const DATABASE_OWNER: (u32, u32) = (42_510, 42_511);
+        const ACME_OWNER: (u32, u32) = (42_520, 42_521);
+        const CERTIFICATES_OWNER: (u32, u32) = (42_530, 42_531);
+        let root = test_root("root-full-restore-ownership");
+        let data_dir = root.path.join("data");
+        let acme = data_dir.join("acme");
+        let certificates = data_dir.join("certificates");
+        fs::create_dir_all(acme.join("accounts/production")).unwrap();
+        fs::create_dir_all(certificates.join("example.com/generations/1")).unwrap();
+        create_database(&data_dir.join("linklake.sqlite3"), "before");
+        fs::write(acme.join("accounts/production/account.json"), b"account").unwrap();
+        let (fullchain, private_key) = test_certificate_pair("example.com");
+        fs::write(
+            certificates.join("example.com/generations/1/fullchain.pem"),
+            fullchain,
+        )
+        .unwrap();
+        fs::write(
+            certificates.join("example.com/generations/1/private-key.pem"),
+            private_key,
+        )
+        .unwrap();
+        fs::write(certificates.join("example.com/current"), b"1\n").unwrap();
+
+        change_owner(&data_dir, DATA_OWNER.0, DATA_OWNER.1);
+        change_owner(
+            &data_dir.join("linklake.sqlite3"),
+            DATABASE_OWNER.0,
+            DATABASE_OWNER.1,
+        );
+        change_tree_owner(&acme, ACME_OWNER.0, ACME_OWNER.1);
+        change_tree_owner(&certificates, CERTIFICATES_OWNER.0, CERTIFICATES_OWNER.1);
+        fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let archive = root.path.join("managed-state.llb");
+        backup_full(&data_dir, &archive, PASSWORD).unwrap();
+        fs::write(acme.join("accounts/production/account.json"), b"mutated").unwrap();
+        restore_full(&data_dir, &archive, PASSWORD).unwrap();
+
+        assert_tree_owner(
+            &data_dir.join("linklake.sqlite3"),
+            DATABASE_OWNER.0,
+            DATABASE_OWNER.1,
+        );
+        assert_tree_owner(&data_dir.join("acme"), ACME_OWNER.0, ACME_OWNER.1);
+        assert_tree_owner(
+            &data_dir.join("certificates"),
+            CERTIFICATES_OWNER.0,
+            CERTIFICATES_OWNER.1,
+        );
+        assert_tree_owner(
+            &data_dir.join(MAINTENANCE_LOCK_NAME),
+            DATA_OWNER.0,
+            DATA_OWNER.1,
+        );
+        assert_tree_owner(
+            &data_dir.join("linklake.sqlite3.lock"),
+            DATA_OWNER.0,
+            DATA_OWNER.1,
+        );
     }
 
     #[test]
@@ -3568,6 +4072,25 @@ mod tests {
         assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
         let installed = fs::read(&concurrent_destination).unwrap();
         assert!(installed == b"first" || installed == b"second");
+    }
+
+    #[test]
+    fn encrypted_output_collision_removes_its_temporary_file() {
+        let root = test_root("encrypted-output-cleanup");
+        let plaintext = root.path.join("payload.tar");
+        let output = root.path.join("archive.llb");
+        fs::write(&plaintext, b"authenticated plaintext").unwrap();
+        fs::write(&output, b"preexisting archive").unwrap();
+
+        let error = encrypt_and_install_archive(&plaintext, &output, PASSWORD, 1).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("without replacing an existing file"));
+        assert_eq!(fs::read(&output).unwrap(), b"preexisting archive");
+        assert!(!fs::read_dir(&root.path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().contains(".encrypt-")));
     }
 
     #[test]

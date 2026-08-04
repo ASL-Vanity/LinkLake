@@ -2345,6 +2345,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "instant-acme",
+ "libc",
  "linklake-core",
  "linklake-update",
  "quinn",

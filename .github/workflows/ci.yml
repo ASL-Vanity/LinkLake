@@ -67,6 +67,14 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Run unit tests
         run: cargo test --workspace --locked
+      - name: Verify root restore preserves each service-owned state root
+        run: |
+          set -eu
+          cargo test -p linklake-server --no-run --locked
+          test_bin="$(find target/debug/deps -maxdepth 1 -type f -name 'linklake_server-*' -perm -111 -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+          test -n "$test_bin"
+          sudo "$test_bin" disaster_recovery::tests::root_database_restore_preserves_database_owner_and_uses_data_owner_when_missing --exact
+          sudo "$test_bin" disaster_recovery::tests::root_full_restore_preserves_each_managed_owner_for_nested_files --exact
       - name: Verify development release-signing fixture
         run: |
           set -eu
