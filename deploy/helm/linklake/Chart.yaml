@@ -2,8 +2,8 @@ apiVersion: v2
 name: linklake
 description: Production-oriented single-replica deployment for the LinkLake server
 type: application
-version: 0.1.0
-appVersion: "0.8.0-rc.1"
+version: 1.0.0-rc.1
+appVersion: "1.0.0-rc.1"
 home: https://github.com/ASL-Vanity/LinkLake
 sources:
   - https://github.com/ASL-Vanity/LinkLake

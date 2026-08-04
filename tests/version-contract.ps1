@@ -24,11 +24,11 @@ $env:LINKLAKE_LOG_DIR = $blockedLogPath
 try {
     foreach ($binary in @($server, $client)) {
         $text = (& $binary --version).Trim()
-        if ($LASTEXITCODE -ne 0 -or $text -notmatch '0\.8\.0-rc\.1' -or $text -notmatch 'target=') {
+        if ($LASTEXITCODE -ne 0 -or $text -notmatch '1\.0\.0-rc\.1' -or $text -notmatch 'target=') {
             throw "Invalid side-effect-free version output from $binary`: $text"
         }
         $json = ((& $binary --version-json) -join "`n") | ConvertFrom-Json
-        if ($LASTEXITCODE -ne 0 -or $json.version -ne '0.8.0-rc.1' -or -not $json.product -or -not $json.target) {
+        if ($LASTEXITCODE -ne 0 -or $json.version -ne '1.0.0-rc.1' -or -not $json.product -or -not $json.target) {
             throw "Invalid side-effect-free version JSON from $binary."
         }
     }
@@ -44,7 +44,7 @@ finally {
 
 [ordered]@{
     ok = $true
-    version = '0.8.0-rc.1'
+    version = '1.0.0-rc.1'
     logging_untouched = $true
     server = $server
     client = $client

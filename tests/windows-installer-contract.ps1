@@ -268,7 +268,7 @@ try {
     }
     $release = [ordered]@{
         product = 'LinkLake'
-        version = '0.8.0-rc.1'
+        version = '1.0.0-rc.1'
         target = 'windows-x86_64'
         built_unix_seconds = 1785686400
         commit = '0123456789ab'
@@ -281,7 +281,7 @@ try {
     Write-TestChecksumManifest $packageRoot
     Assert-LinkLakePackageChecksums $packageRoot
     $identity = Read-LinkLakeReleaseIdentity $packageRoot 'windows-x86_64'
-    Assert-True ($identity.version -eq '0.8.0-rc.1') 'Release identity version was not read.'
+    Assert-True ($identity.version -eq '1.0.0-rc.1') 'Release identity version was not read.'
 
     Add-Content -LiteralPath (Join-Path $packageRoot 'bin\linklake-server.exe') -Value 'tampered'
     Assert-Throws { Assert-LinkLakePackageChecksums $packageRoot } 'failed SHA-256 validation'
@@ -337,7 +337,7 @@ try {
     $fakeServer = Join-Path $testRoot 'fake-server.cmd'
     [IO.File]::WriteAllLines($fakeServer, @(
             '@echo off',
-            'echo {"product":"LinkLake Server","version":"0.8.0-rc.1","target":"windows-x86_64","commit":"0123456789ab"}'
+            'echo {"product":"LinkLake Server","version":"1.0.0-rc.1","target":"windows-x86_64","commit":"0123456789ab"}'
         ), [Text.Encoding]::ASCII)
     $null = Assert-LinkLakePackageBinary $fakeServer 'LinkLake Server' $identity
     Assert-Throws { Assert-LinkLakePackageBinary $fakeServer 'LinkLake Client' $identity } 'does not match'

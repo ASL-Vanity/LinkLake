@@ -82,7 +82,7 @@ jobs:
         run: |
           set -eu
           fixture=target/release-signing-fixture
-          version=0.8.0-rc.1
+          version=1.0.0-rc.1
           mkdir -p "$fixture"
           printf 'core package fixture\n' >"$fixture/linklake-$version-linux-x86_64.tar.gz"
           printf 'manager package fixture\n' >"$fixture/linklake-manager-$version-linux-x86_64.tar.gz"

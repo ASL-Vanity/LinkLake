@@ -2153,7 +2153,7 @@ dependencies = [
 
 [[package]]
 name = "linklake-client"
-version = "0.8.0-rc.1"
+version = "1.0.0-rc.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2187,7 +2187,7 @@ dependencies = [
 
 [[package]]
 name = "linklake-core"
-version = "0.8.0-rc.1"
+version = "1.0.0-rc.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2199,7 +2199,7 @@ dependencies = [
 
 [[package]]
 name = "linklake-server"
-version = "0.8.0-rc.1"
+version = "1.0.0-rc.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2250,7 +2250,7 @@ dependencies = [
 
 [[package]]
 name = "linklake-update"
-version = "0.8.0-rc.1"
+version = "1.0.0-rc.1"
 dependencies = [
  "anyhow",
  "base64",

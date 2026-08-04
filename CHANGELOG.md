@@ -2,6 +2,26 @@
 
 本项目采用语义化版本号。候选版本用于完整验收，不代表已对外发布。
 
+## 1.0.0-rc.1 - 2026-08-04
+
+### 网络核心与现代 Web 协议
+
+- 完成 TCP、UDP、连续端口组、TLS SNI、Secret/P2P、SOCKS5 TCP/UDP 和 HTTP Forward Proxy/CONNECT 的统一生产数据面，并支持加权目标、访问控制、速率/并发/配额限制和跨节点策略下发。
+- HTTP/HTTPS 入口支持 HTTP/1.1、HTTP/2 与 ALPN；原生 gRPC 使用持久化 h2c 后端池，覆盖双向流、trailers、取消、连接复用、GOAWAY 排空与恢复。WebSocket/WSS 保持 HTTP/1.1 Upgrade 语义。
+- 公网 UDP 同端口提供 IPv4/IPv6 双栈监听，QUIC 数据面加入地址验证、短期一次性票据、准入限制和完整会话生命周期；Iroh 升级到 1.0.3 并保留直连竞速与显式中继回退。
+
+### 管理平面、多云与可观测性
+
+- Fleet Bundle v2 覆盖八类策略的签名身份、来源绑定、原子预览/应用、稳定 ownership、健康探测和 Cloudflare DNS 故障切换。
+- WebUI 与 Flutter Manager 完成多用户 RBAC、会话/TOTP/API Token、安全策略编辑、SLO 告警、诊断、更新、跨平台桌面生命周期和五套独立材质主题。
+- 增加启动/就绪/存活探针、优雅排空、持久通知投递、Prometheus/Grafana SLO 规则、生产 Helm Chart，以及加密全量备份、恢复 journal 和崩溃恢复。
+
+### 供应链与发布门禁
+
+- Rust 基线升级到 1.91.0，Iroh、Axum Server、Hickory、LRU 与 PEM 解析链迁移到安全版本；安全例外收敛为一项有期限的上游停止维护告警，工作区 path wildcard 和 Trivy 漏洞忽略归零。
+- Windows Authenticode、macOS Developer ID/公证、Linux OpenPGP、GHCR SBOM/provenance、Cosign 摘要签名与发布汇总复验全部失败关闭，并保持 LinkLake Ed25519 更新清单独立信任根。
+- Windows、Linux 与 macOS 的核心、Manager、原生安装包、容器和 Helm 发行身份统一为 `1.0.0-rc.1`；正式发布仍要求仓库登记生产公钥并配置对应私钥、平台签名和公证 Secret。
+
 ## 0.8.0-rc.1 - 2026-08-03
 
 ### Cloudflare DNS-01 与通配符证书

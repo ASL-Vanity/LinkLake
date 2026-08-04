@@ -6,6 +6,8 @@ LinkLake is a cross-platform secure tunnel platform implemented from scratch in 
 
 LinkLake's code implementation, automated tests, and project documentation were produced by OpenAI GPT-5.6; the project owner is responsible for requirements, infrastructure authorization, and final acceptance.
 
+The current candidate is `1.0.0-rc.1`. It exists to complete cross-platform, end-to-end, security, and production-signing acceptance on one commit and is not a formal release until every gate passes.
+
 The current release completes production TCP and UDP, multi-port/range forwarding, secret tunnels, byte-preserving TLS SNI pass-through, multi-node P2P direct paths with explicit server-relay fallback, SOCKS5 TCP/UDP, HTTP forward proxy/CONNECT, HTTP host routing, and the first stage of native HTTPS with ACME certificate automation.
 
 ## Advanced networking and security
