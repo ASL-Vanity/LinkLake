@@ -44,8 +44,36 @@ sudo linklake-server update rollback --yes
 
 正式 Release 必须包含 Ed25519 清单和签名。没有生产 CI signing secret 时禁止发布；开发验证可以使用 RFC 测试夹具和 `--development-signature`，但不得把这种状态部署为生产更新。
 
+## 加密托管状态备份与恢复
+
+`backup-full` 可在服务运行时生成 SQLite 一致性快照，并把数据库、ACME 账户状态和托管证书写入分块认证加密归档；日志不会进入归档。SQLite 是单点快照，ACME 和证书随后逐项采集，因此在线备份不是三个组件完全同一时刻的全局快照；需要严格一致性时应先停止服务。存在已提交证书 generation 时只备份有效提交且证书/私钥匹配的 generation，并排除顶层兼容 PEM；旧安装没有 generation 时必须通过证书/私钥匹配。归档路径必须位于数据目录外部，密码只通过非交互标准输入或受 ACL 保护的文件提供：
+
+```bash
+sudo linklake-server backup-full \
+  --data-dir /var/lib/linklake \
+  --output /srv/linklake-backups/linklake-full.llb \
+  --password-file /run/secrets/linklake_backup_password
+```
+
+恢复必须先停止服务。数据目录必须提前由安装器或管理员安全创建，不能是符号链接或重解析点；Linux 应归服务账户所有并设为 `0700`，Windows 仅授权 SYSTEM、Administrators、LocalService 和目录所有者。`restore-full` 不会替管理员临时创建或推断这个权限边界。命令会取得与服务端相同的数据库进程锁，验证加密终止记录、TAR 白名单、文件数量/大小、SHA-256 清单、SQLite 完整性、架构版本和迁移账本，并在暂存区迁移受支持的旧数据库后才替换数据；更高产品版本或数据库架构版本会失败关闭。旧状态保存在数据目录内的 `.pre-restore-*`，任一替换失败会回滚。持久 restore journal 同时覆盖进程崩溃和断电窗口：服务下次持锁启动时会根据已同步的提交标记幂等回滚旧状态或完成新状态。明文暂存只位于数据目录安全边界内，异常残留由活动锁协调后清理。
+
+归档只覆盖 LinkLake 数据目录中的托管状态，不包含服务环境变量、Enrollment Token、数据目录外 TLS 私钥、服务定义、防火墙、反向代理、DNS、容器编排或生产签名密钥。必须为这些外部配置和 Secret 建立独立备份，不能把 `.llb` 当作整机镜像。
+
+```bash
+sudo systemctl stop linklake-server
+sudo linklake-server restore-full \
+  --data-dir /var/lib/linklake \
+  --input /srv/linklake-backups/linklake-full.llb \
+  --password-file /run/secrets/linklake_backup_password
+sudo systemctl start linklake-server
+```
+
+应定期在隔离主机上演练恢复，并验证管理登录、客户端重连、ACME 续期和业务协议，而不能只检查备份命令退出码。
+
 ---
 
 The same rules apply in English: enable trusted TLS for management and control listeners, inject secrets at runtime, preserve Host for ACME HTTP-01, use layer-4 pass-through when LinkLake terminates business TLS, and use DNS-only records for arbitrary TCP/UDP unless an appropriate Cloudflare proxy product is configured.
 
 For upgrades, verify `--version-json`, then use `update download/apply/status/rollback` with service-control privileges. The updater replaces only the selected executable and leaves `/etc/linklake`, `/var/lib/linklake`, ProgramData configuration/databases/certificates, and logs unchanged. A previously running service must become stably active or the old executable is restored automatically. Formal releases require the Ed25519 manifest and signature; the development signature path must never be treated as production.
+
+For encrypted managed-state recovery, `backup-full` captures a point-in-time SQLite snapshot followed by atomically committed ACME and certificate state while excluding logs. A committed certificate generation supersedes top-level compatibility PEM files; legacy pairs are accepted only after certificate/private-key matching. The data directory must already be securely created, service-owned, and must not be a symlink or reparse point. It is not a globally simultaneous host snapshot. Supply a password of at least 16 bytes only with non-interactive `--password-stdin` or `--password-file`, keep the archive outside the data directory, stop the service before `restore-full`, separately protect external service/network configuration and secrets, and periodically prove restoration on an isolated host.
