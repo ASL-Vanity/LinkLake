@@ -3991,7 +3991,7 @@ mod tests {
     fn managed_file_copy_stops_before_exceeding_the_remaining_budget() {
         let root = test_root("copy-budget");
         let source = root.path.join("source.bin");
-        let destination = root.path.join("destination.bin");
+        let destination = root.path.join("payload/destination.bin");
         fs::write(&source, vec![0x5a; 128]).unwrap();
 
         let error = copy_file_and_hash(&source, &destination, 64).unwrap_err();
