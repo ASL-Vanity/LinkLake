@@ -155,7 +155,7 @@ jobs:
       - name: Run updater replacement and rollback end-to-end tests
         shell: pwsh
         run: |
-          ./tests/version-contract.ps1 -SkipBuild
+          ./tests/version-contract.ps1
           ./tests/update-e2e.ps1 -Product client
           ./tests/update-e2e.ps1 -Product server
           ./tests/manager-update-e2e.ps1 -SkipBuild

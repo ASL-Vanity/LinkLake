@@ -386,6 +386,8 @@ try {
 
   await openRoute('#/overview');
   await page.locator('#traffic-chart').waitFor({ state: 'visible' });
+  await page.locator('#overview-alert-panel:not(.hidden)').waitFor({ state: 'visible', timeout: 15_000 });
+  await page.locator('#overview-alert-more').waitFor({ state: 'visible', timeout: 15_000 });
   assert(await page.locator('#overview-kpis .kpi-card').count() === 5, '总览不是五个核心 KPI');
   assert(await page.locator('[data-trend-range]').evaluateAll(nodes => nodes.map(node => node.dataset.trendRange).join(',')) === '1h,12h,1d,7d,30d', '流量范围不是 1h/12h/1d/7d/30d');
   assert(await page.locator('[data-trend-range="1h"]').evaluate(node => node.classList.contains('active')), '流量范围默认值不是 1h');

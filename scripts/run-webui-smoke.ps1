@@ -130,6 +130,20 @@ try {
 
     $enrollmentHeaders = @{ Authorization = "Bearer $enrollmentToken" }
     $managementHeaders = @{ Authorization = "Bearer $managementToken" }
+    $alertRule = Invoke-LinkLakeJson -Method Post -Path '/api/v1/alerts/rules' -Headers $managementHeaders -Body @{
+        name = 'WebUI smoke active connections'
+        metric = 'active_connections'
+        comparator = 'greater_or_equal'
+        threshold = 0
+        target = 'global'
+        evaluation_window_seconds = 5
+        cooldown_seconds = 30
+        severity = 'info'
+        notify_webhook = $false
+        notify_email = $false
+        enabled = $true
+    }
+    $alertRuleId = [string]$alertRule.id
     $portPolicy = Invoke-RestMethod -Uri "$baseUrl/api/v1/public-port-policy" -Headers $managementHeaders
     if ($portPolicy.tcp_allowed -ne '18080-18081,32900-32999' -or $portPolicy.udp_allowed -ne '18080-18081,32900-32999') {
         throw "Public port policy did not match server configuration: $($portPolicy | ConvertTo-Json -Compress)"
@@ -153,6 +167,21 @@ try {
     )
     foreach ($policy in $policies) {
         Invoke-LinkLakeJson -Method Post -Path $policy.Path -Headers $managementHeaders -Body $policy.Body | Out-Null
+    }
+
+    $alertReady = $false
+    $observedAlertRuleIds = @()
+    for ($attempt = 0; $attempt -lt 400; $attempt++) {
+        $events = Invoke-RestMethod -Uri "$baseUrl/api/v1/alerts/events?active=true&limit=100" -Headers $managementHeaders
+        $observedAlertRuleIds = @($events.rule_id | ForEach-Object { [string]$_ })
+        if ($observedAlertRuleIds -contains $alertRuleId) {
+            $alertReady = $true
+            break
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    if (-not $alertReady) {
+        throw "Timed out waiting for deterministic WebUI smoke alert event for rule $alertRuleId; observed rule IDs: $($observedAlertRuleIds -join ', ')."
     }
 
     $env:LINKLAKE_SMOKE_BASE_URL = $baseUrl
