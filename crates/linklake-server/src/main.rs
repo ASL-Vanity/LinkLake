@@ -9,6 +9,7 @@ mod cloudflare_dns;
 mod database;
 mod database_migrations;
 mod database_tools;
+mod disaster_recovery;
 mod dual_stack_udp;
 mod fleet;
 mod fleet_health;
@@ -59,7 +60,7 @@ use certificate_catalog::{
     RouteTlsMode, RouteTlsPolicy, UpdateAcmeConfig, UpdateRouteTlsPolicy,
 };
 use certificate_manager::CertificateManager;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use client_registry::{Authentication, ClientRegistry, UpdateClient};
 use database::Database;
 use dual_stack_udp::{DualStackUdpSocket, PublicUdpBindMode};
@@ -102,7 +103,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt::Write as _,
     fs::File,
-    io::BufReader,
+    io::{BufReader, IsTerminal, Read},
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
     sync::{
@@ -153,6 +154,56 @@ const LOGIN_FAILURE_MAX_DELAY_SECONDS: u64 = 30;
 const LOGIN_THROTTLE_MAX_IDENTITIES: usize = 1_024;
 const DEFAULT_DRAIN_TIMEOUT_SECONDS: u64 = 30;
 const MAX_DRAIN_TIMEOUT_SECONDS: u64 = 60 * 60;
+
+pub(crate) fn migrate_application_schema(database: &Database) -> anyhow::Result<()> {
+    let connection = database.connect()?;
+    let administrator_table_exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'administrators')",
+        [],
+        |row| row.get(0),
+    )?;
+    let had_administrator = administrator_table_exists
+        && connection.query_row("SELECT COUNT(*) > 0 FROM administrators", [], |row| {
+            row.get::<_, bool>(0)
+        })?;
+    drop(connection);
+
+    let migration_username = format!("schema-migration-{}", Uuid::new_v4());
+    let bootstrap = (!had_administrator)
+        .then(|| BootstrapCredentials::schema_migration_placeholder(migration_username.clone()));
+    drop(AdminAuth::open_with_database(database, bootstrap)?);
+    if !had_administrator {
+        database.with_connection(|connection| {
+            connection.execute(
+                "DELETE FROM administrators WHERE username = ?1",
+                [&migration_username],
+            )?;
+            Ok(())
+        })?;
+    }
+
+    drop(ApiTokenCatalog::open_with_database(database)?);
+    drop(AuditLog::open_with_database(database)?);
+    drop(AlertCatalog::open_with_database(database)?);
+    drop(FleetCatalog::open_with_database(database)?);
+    drop(TrafficControlCatalog::open_with_database(database)?);
+    drop(ClientRegistry::open_with_database(database)?);
+    drop(TunnelCatalog::open_with_database(
+        database,
+        PublicPortPolicy::schema_migration(),
+    )?);
+    drop(HttpRouteCatalog::open_with_database(database)?);
+    drop(SniRouteCatalog::open_with_database(database)?);
+    drop(P2pNodeCatalog::open_with_database(database)?);
+    drop(SecretTunnelCatalog::open_with_database(database)?);
+    drop(CertificateCatalog::open_with_database(database)?);
+    drop(MetricsHistory::open_with_database(
+        database,
+        METRICS_HISTORY_CAPACITY,
+        METRICS_HISTORY_ARCHIVE_CAPACITY,
+    )?);
+    Ok(())
+}
 
 pub(crate) fn managed_config_for_client(
     state: &AppState,
@@ -1734,17 +1785,24 @@ fn route_tls_view(
 }
 
 fn main() -> anyhow::Result<()> {
-    if print_version_if_requested("LinkLake Server")? {
+    let cli = ServerCli::parse();
+    if cli.version_json {
+        println!(
+            "{}",
+            serde_json::to_string(&BuildInfo::current("LinkLake Server"))?
+        );
         return Ok(());
     }
-    if run_update_utility()? {
+    if cli.version {
+        println!("{}", BuildInfo::current("LinkLake Server").display_line());
         return Ok(());
     }
-    if run_database_utility()? {
+    if let Some(command) = cli.command {
+        run_maintenance_command(command)?;
         return Ok(());
     }
     let _log_guard = init_logging()?;
-    if std::env::args_os().any(|argument| argument == "--windows-service") {
+    if cli.windows_service {
         #[cfg(windows)]
         {
             return windows_service_host::run().map_err(Into::into);
@@ -1755,24 +1813,17 @@ fn main() -> anyhow::Result<()> {
     tokio::runtime::Runtime::new()?.block_on(run_server(None))
 }
 
-fn print_version_if_requested(product: &'static str) -> anyhow::Result<bool> {
-    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
-    if arguments.iter().any(|value| value == "--version-json") {
-        println!("{}", serde_json::to_string(&BuildInfo::current(product))?);
-        return Ok(true);
-    }
-    if arguments.iter().any(|value| value == "--version") {
-        println!("{}", BuildInfo::current(product).display_line());
-        return Ok(true);
-    }
-    Ok(false)
-}
-
 #[derive(Parser)]
 #[command(name = "linklake-server", disable_version_flag = true)]
-struct ServerMaintenanceCli {
+struct ServerCli {
+    #[arg(long, exclusive = true)]
+    version: bool,
+    #[arg(long, exclusive = true)]
+    version_json: bool,
+    #[arg(long, exclusive = true, hide = true)]
+    windows_service: bool,
     #[command(subcommand)]
-    command: ServerMaintenanceCommand,
+    command: Option<ServerMaintenanceCommand>,
 }
 
 #[derive(Subcommand)]
@@ -1789,6 +1840,34 @@ enum ServerMaintenanceCommand {
         #[command(subcommand)]
         action: ServerUpdateAction,
     },
+    Backup {
+        #[command(flatten)]
+        data: DataDirectoryArgs,
+        #[arg(long, value_name = "PATH")]
+        output: PathBuf,
+    },
+    Restore {
+        #[command(flatten)]
+        data: DataDirectoryArgs,
+        #[arg(long, value_name = "PATH")]
+        input: PathBuf,
+    },
+    BackupFull {
+        #[command(flatten)]
+        data: DataDirectoryArgs,
+        #[arg(long, value_name = "PATH")]
+        output: PathBuf,
+        #[command(flatten)]
+        password: FullBackupPasswordArgs,
+    },
+    RestoreFull {
+        #[command(flatten)]
+        data: DataDirectoryArgs,
+        #[arg(long, value_name = "PATH")]
+        input: PathBuf,
+        #[command(flatten)]
+        password: FullBackupPasswordArgs,
+    },
     #[command(name = "__update-helper", hide = true)]
     UpdateHelper {
         #[arg(long)]
@@ -1796,6 +1875,160 @@ enum ServerMaintenanceCommand {
         #[arg(long)]
         plan_sha256: String,
     },
+}
+
+#[derive(Args)]
+struct DataDirectoryArgs {
+    #[arg(long, value_name = "PATH")]
+    data_dir: Option<PathBuf>,
+}
+
+impl DataDirectoryArgs {
+    fn resolve(self) -> anyhow::Result<PathBuf> {
+        self.data_dir
+            .or_else(|| std::env::var_os("LINKLAKE_DATA_DIR").map(PathBuf::from))
+            .ok_or_else(|| anyhow::anyhow!("--data-dir or LINKLAKE_DATA_DIR is required"))
+    }
+}
+
+#[derive(Args)]
+#[group(required = true, multiple = false)]
+struct FullBackupPasswordArgs {
+    #[arg(long)]
+    password_stdin: bool,
+    #[arg(long, value_name = "PATH")]
+    password_file: Option<PathBuf>,
+}
+
+#[cfg(test)]
+mod maintenance_cli_tests {
+    use super::ServerCli;
+    use clap::Parser;
+
+    #[test]
+    fn database_commands_reject_duplicate_and_unknown_arguments() {
+        assert!(ServerCli::try_parse_from([
+            "linklake-server",
+            "backup",
+            "--data-dir",
+            "data",
+            "--output",
+            "first.sqlite3",
+            "--output",
+            "second.sqlite3",
+        ])
+        .is_err());
+        assert!(ServerCli::try_parse_from([
+            "linklake-server",
+            "restore",
+            "--data-dir",
+            "data",
+            "--input",
+            "backup.sqlite3",
+            "--unexpected",
+        ])
+        .is_err());
+        assert!(ServerCli::try_parse_from([
+            "linklake-server",
+            "backup",
+            "--output",
+            "--data-dir",
+            "data",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn full_backup_commands_require_one_non_command_line_password_source() {
+        assert!(ServerCli::try_parse_from([
+            "linklake-server",
+            "backup-full",
+            "--data-dir",
+            "data",
+            "--output",
+            "backup.llbk",
+        ])
+        .is_err());
+        assert!(ServerCli::try_parse_from([
+            "linklake-server",
+            "backup-full",
+            "--data-dir",
+            "data",
+            "--output",
+            "backup.llbk",
+            "--password-stdin",
+            "--password-file",
+            "password.txt",
+        ])
+        .is_err());
+        assert!(ServerCli::try_parse_from([
+            "linklake-server",
+            "restore-full",
+            "--data-dir",
+            "data",
+            "--input",
+            "backup.llbk",
+            "--password",
+            "plaintext",
+        ])
+        .is_err());
+        assert!(ServerCli::try_parse_from([
+            "linklake-server",
+            "backup-full",
+            "--data-dir",
+            "data",
+            "--output",
+            "backup.llbk",
+            "--password-stdin",
+            "--password-stdin",
+        ])
+        .is_err());
+        assert!(ServerCli::try_parse_from([
+            "linklake-server",
+            "backup-full",
+            "--data-dir",
+            "data",
+            "--output",
+            "backup.llbk",
+            "--password-file",
+            "first.txt",
+            "--password-file",
+            "second.txt",
+        ])
+        .is_err());
+        ServerCli::try_parse_from([
+            "linklake-server",
+            "restore-full",
+            "--data-dir",
+            "data",
+            "--input",
+            "backup.llbk",
+            "--password-file",
+            "password.txt",
+        ])
+        .expect("one password file must be accepted");
+    }
+
+    #[test]
+    fn root_cli_rejects_unknown_commands_and_version_bypasses() {
+        assert!(ServerCli::try_parse_from(["linklake-server", "backup-fll"]).is_err());
+        assert!(
+            ServerCli::try_parse_from(["linklake-server", "backup-full", "--version",]).is_err()
+        );
+        assert!(
+            ServerCli::try_parse_from(["linklake-server", "--version", "backup-full",]).is_err()
+        );
+        ServerCli::try_parse_from(["linklake-server"])
+            .expect("no arguments must continue to start the server");
+        ServerCli::try_parse_from(["linklake-server", "--version"])
+            .expect("the exact version command must remain supported");
+    }
+
+    #[test]
+    fn interactive_password_stdin_is_rejected_before_reading() {
+        assert!(super::ensure_noninteractive_password_stdin(true).is_err());
+        assert!(super::ensure_noninteractive_password_stdin(false).is_ok());
+    }
 }
 
 #[derive(Subcommand)]
@@ -1838,16 +2071,7 @@ enum ServerUpdateAction {
     },
 }
 
-fn run_update_utility() -> anyhow::Result<bool> {
-    let first = std::env::args_os().nth(1);
-    let recognized = matches!(
-        first.as_deref().and_then(|value| value.to_str()),
-        Some("check-update" | "update" | "__update-helper")
-    );
-    if !recognized {
-        return Ok(false);
-    }
-    let command = ServerMaintenanceCli::parse().command;
+fn run_maintenance_command(command: ServerMaintenanceCommand) -> anyhow::Result<()> {
     match command {
         ServerMaintenanceCommand::CheckUpdate {
             repository,
@@ -1935,8 +2159,61 @@ fn run_update_utility() -> anyhow::Result<bool> {
         ServerMaintenanceCommand::UpdateHelper { plan, plan_sha256 } => {
             linklake_update::run_helper(&plan, &plan_sha256)?;
         }
+        ServerMaintenanceCommand::Backup { data, output } => {
+            let data_directory = data.resolve()?;
+            let output = disaster_recovery::backup_database(&data_directory, &output)?;
+            println!("LinkLake backup created: {}", output.display());
+        }
+        ServerMaintenanceCommand::Restore { data, input } => {
+            let data_directory = data.resolve()?;
+            let previous = disaster_recovery::restore_database(&data_directory, &input)?;
+            println!("LinkLake database restored from: {}", input.display());
+            if let Some(previous) = previous {
+                println!("Previous database preserved at: {}", previous.display());
+            }
+        }
+        ServerMaintenanceCommand::BackupFull {
+            data,
+            output,
+            password,
+        } => {
+            let data_directory = data.resolve()?;
+            let password = read_full_backup_password(&password, &data_directory)?;
+            let report = disaster_recovery::backup_full(&data_directory, &output, &password)?;
+            println!(
+                "LinkLake encrypted full backup created: {}",
+                report.output.display()
+            );
+            println!(
+                "Protected {} files ({} plaintext bytes)",
+                report.file_count, report.plaintext_bytes
+            );
+        }
+        ServerMaintenanceCommand::RestoreFull {
+            data,
+            input,
+            password,
+        } => {
+            let data_directory = data.resolve()?;
+            let password = read_full_backup_password(&password, &data_directory)?;
+            let report = disaster_recovery::restore_full(&data_directory, &input, &password)?;
+            println!(
+                "LinkLake full backup restored from: {}",
+                report.input.display()
+            );
+            println!(
+                "Restored {} files ({} plaintext bytes) from LinkLake {}",
+                report.file_count, report.plaintext_bytes, report.source_version
+            );
+            for preserved in report.preserved_paths {
+                println!(
+                    "Previous managed state preserved at: {}",
+                    preserved.display()
+                );
+            }
+        }
     }
-    Ok(true)
+    Ok(())
 }
 
 fn signature_policy(development: bool) -> SignaturePolicy {
@@ -1947,44 +2224,55 @@ fn signature_policy(development: bool) -> SignaturePolicy {
     }
 }
 
-fn run_database_utility() -> anyhow::Result<bool> {
-    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
-    let Some(command) = arguments.first().and_then(|value| value.to_str()) else {
-        return Ok(false);
-    };
-    if command != "backup" && command != "restore" {
-        return Ok(false);
-    }
-    let data_directory = path_argument(&arguments, "--data-dir")
-        .or_else(|| std::env::var_os("LINKLAKE_DATA_DIR").map(PathBuf::from))
-        .ok_or_else(|| anyhow::anyhow!("--data-dir or LINKLAKE_DATA_DIR is required"))?;
-    let database = data_directory.join("linklake.sqlite3");
-    match command {
-        "backup" => {
-            let output = path_argument(&arguments, "--output")
-                .ok_or_else(|| anyhow::anyhow!("backup requires --output <path>"))?;
-            database_tools::backup(&database, &output)?;
-            println!("LinkLake backup created: {}", output.display());
+fn read_full_backup_password(
+    source: &FullBackupPasswordArgs,
+    data_directory: &FsPath,
+) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
+    let mut password = zeroize::Zeroizing::new(Vec::with_capacity(
+        disaster_recovery::MAX_PASSWORD_BYTES + 2,
+    ));
+    match (source.password_stdin, source.password_file.as_ref()) {
+        (true, None) => {
+            let stdin = std::io::stdin();
+            ensure_noninteractive_password_stdin(stdin.is_terminal())?;
+            stdin
+                .lock()
+                .take((disaster_recovery::MAX_PASSWORD_BYTES + 2) as u64)
+                .read_to_end(&mut password)?;
         }
-        "restore" => {
-            let input = path_argument(&arguments, "--input")
-                .ok_or_else(|| anyhow::anyhow!("restore requires --input <path>"))?;
-            let previous = database_tools::restore(&database, &input)?;
-            println!("LinkLake database restored from: {}", input.display());
-            if let Some(previous) = previous {
-                println!("Previous database preserved at: {}", previous.display());
-            }
+        (false, Some(requested_path)) => {
+            let path =
+                disaster_recovery::resolve_external_password_file(data_directory, requested_path)?;
+            File::open(&path)?
+                .take((disaster_recovery::MAX_PASSWORD_BYTES + 2) as u64)
+                .read_to_end(&mut password)?;
         }
-        _ => unreachable!(),
+        _ => anyhow::bail!("exactly one of --password-stdin or --password-file <path> is required"),
     }
-    Ok(true)
+    if password.last() == Some(&b'\n') {
+        password.pop();
+        if password.last() == Some(&b'\r') {
+            password.pop();
+        }
+    }
+    anyhow::ensure!(
+        password.len() >= disaster_recovery::MIN_PASSWORD_BYTES,
+        "backup password must contain at least {} bytes",
+        disaster_recovery::MIN_PASSWORD_BYTES
+    );
+    anyhow::ensure!(
+        password.len() <= disaster_recovery::MAX_PASSWORD_BYTES,
+        "backup password exceeds the maximum supported length"
+    );
+    Ok(password)
 }
 
-fn path_argument(arguments: &[std::ffi::OsString], name: &str) -> Option<PathBuf> {
-    arguments
-        .windows(2)
-        .find(|pair| pair[0] == name)
-        .map(|pair| PathBuf::from(&pair[1]))
+fn ensure_noninteractive_password_stdin(is_terminal: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !is_terminal,
+        "--password-stdin refuses an interactive terminal; pipe the password or use --password-file"
+    );
+    Ok(())
 }
 
 async fn run_server(

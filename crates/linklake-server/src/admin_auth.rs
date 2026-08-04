@@ -157,6 +157,14 @@ impl BootstrapCredentials {
             ),
         }
     }
+
+    pub(crate) fn schema_migration_placeholder(username: String) -> Self {
+        Self {
+            username,
+            password: format!("LinkLake-schema-migration-{}", Uuid::new_v4()),
+            force_password_change: true,
+        }
+    }
 }
 
 impl AdminAuth {

@@ -63,6 +63,9 @@ impl Database {
         process_lock.seek(SeekFrom::Start(0))?;
         writeln!(process_lock, "pid={}", std::process::id())?;
         process_lock.sync_data()?;
+        let maintenance = crate::disaster_recovery::acquire_restore_maintenance(&data_dir)?;
+        crate::disaster_recovery::recover_interrupted_restore(&data_dir, &maintenance)?;
+        drop(maintenance);
 
         let database = Self {
             inner: Arc::new(DatabaseInner {

@@ -377,9 +377,28 @@ Stop the service before restoring:
 linklake-server restore --data-dir C:\LinkLake\data --input D:\Backups\linklake.sqlite3
 ```
 
-Restore validates SQLite integrity and preserves the old database as `linklake.sqlite3.pre-restore-<timestamp>`.
+Restore first acquires the exclusive `linklake.sqlite3.lock` and validates SQLite integrity. It fails immediately while the service is still running and preserves the old database as `linklake.sqlite3.pre-restore-<timestamp>`.
 
-ACME account credentials and certificate private keys live under `LINKLAKE_DATA_DIR/acme` and `LINKLAKE_DATA_DIR/certificates`; they are not included in the SQLite-only `backup` output. Back up those directories separately with encryption for full disaster recovery, and treat every database and certificate backup as sensitive credentials.
+Encrypted `backup-full` / `restore-full` protects LinkLake-managed state: the online SQLite snapshot, `acme/`, and `certificates/`. Logs are deliberately excluded:
+
+```powershell
+linklake-server backup-full --data-dir C:\LinkLake\data --output D:\Backups\linklake-full.llb --password-file D:\Secrets\linklake-backup.pass
+
+# Stop the LinkLakeServer service before restore.
+linklake-server restore-full --data-dir C:\LinkLake\data --input D:\Backups\linklake-full.llb --password-file D:\Secrets\linklake-backup.pass
+```
+
+Passwords must contain at least 16 bytes and may be supplied only through `--password-stdin` or `--password-file`; they never belong in arguments, logs, or errors. `--password-stdin` refuses an interactive terminal and requires a pipe or redirection. The format uses fixed bounded Argon2id parameters and 64 KiB XChaCha20-Poly1305 chunks. The header, sequence, lengths, and explicit terminator are authenticated, so wrong passwords, tampering, truncation, unknown versions, and trailing bytes fail closed. Restore does not touch current state until decryption, TAR path/link/count/size validation, the SHA-256 manifest, SQLite `integrity_check`, schema compatibility, and the migration ledger all pass. Supported older databases are migrated inside staging; backups from a newer LinkLake build or newer database schema fail closed. Previous database, ACME, and certificate state is retained together under `.pre-restore-<timestamp>-<random>` and automatically rolled back if replacement fails.
+
+The `--data-dir` must already have been created securely by the installer or an administrator. It must not be a symbolic link, reparse point, or arbitrary directory created by the backup command. On Linux, make it service-owned with mode `0700`; on Windows, grant only SYSTEM, Administrators, LocalService, and the directory owner. Unix restore separately preserves the existing database-file, `acme/`, and `certificates/` uid/gid and applies each owner recursively to its restored tree; only a target that did not exist falls back to the data-directory owner. Backup and restore reject a missing or unsafe data directory rather than guessing its trust boundary.
+
+Every plaintext staging artifact remains inside the data-directory security boundary. Activity locks keep cleanup away from a live backup, while stale staging is removed on the next server startup or backup. A durable restore journal makes process or power failure deterministic: before its commit marker, startup idempotently restores the old database/ACME/certificate set; after the marker, startup validates and finalizes the complete new set instead of accepting a mixed generation.
+
+For an online backup, SQLite is a point-in-time snapshot and ACME/certificate files are collected afterward. ACME credentials use atomic file commits. When a committed certificate generation exists, backup retains only generations with a valid commit marker and matching certificate/private key, and excludes the top-level compatibility PEM files that may be between updates. A legacy installation without generations must first pass certificate/private-key matching. The archive is still not a globally simultaneous snapshot across all three components, so stop the service before backup when strict cross-component consistency is required.
+
+The archive does not contain logs, service environment variables or the enrollment token, management/control TLS private keys stored outside the data directory, systemd/Windows service/launchd definitions, firewall, reverse-proxy, DNS, container-orchestration configuration, or production signing keys. It cannot rebuild an entire host by itself; protect those external settings and secrets with a separate infrastructure recovery process.
+
+Backup inputs and outputs must be outside `LINKLAKE_DATA_DIR`. Protect both password files and `.llb` archives with backup-operator-only ACLs, and store the recovery secret separately from the archive.
 
 ## Production installation
 
