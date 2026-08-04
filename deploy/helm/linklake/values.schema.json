@@ -27,6 +27,28 @@
         }
       }
     },
+    "monitoring": {
+      "type": "object",
+      "properties": {
+        "serviceMonitor": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "interval": { "type": "string" },
+            "scrapeTimeout": { "type": "string" },
+            "insecureSkipVerify": { "type": "boolean" },
+            "additionalLabels": { "type": "object" }
+          }
+        },
+        "prometheusRule": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "additionalLabels": { "type": "object" }
+          }
+        }
+      }
+    },
     "services": {
       "type": "object",
       "properties": {

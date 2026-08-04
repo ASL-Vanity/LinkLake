@@ -1,0 +1,43 @@
+groups:
+  - name: linklake-slo-alerts
+    rules:
+      - alert: LinkLakeSloFastBurn
+        expr: linklake:slo_burn_rate:5m >= 14.4 and linklake:slo_burn_rate:1h >= 14.4
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: LinkLake is rapidly consuming its 30-day error budget
+          description: Both the 5-minute and 1-hour burn rates are at least 14.4x.
+      - alert: LinkLakeSloSlowBurn
+        expr: linklake:slo_burn_rate:6h >= 6 and linklake:slo_burn_rate:24h >= 6
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: LinkLake is persistently consuming its 30-day error budget
+          description: Both the 6-hour and 24-hour burn rates are at least 6x.
+      - alert: LinkLakeErrorBudgetExhausted
+        expr: linklake:slo_error_budget_remaining:ratio_30d <= 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: LinkLake 30-day error budget is exhausted
+          description: The rolling error budget has no remaining capacity.
+      - alert: LinkLakeNotificationDeadLetters
+        expr: linklake_notification_deliveries_dead_letter > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: LinkLake notification deliveries require manual retry
+          description: At least one alert notification is in the dead-letter queue.
+      - alert: LinkLakeHighRequestLatency
+        expr: linklake:http_request_latency:p99 > 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: LinkLake HTTP request p99 latency is elevated
+          description: Response-header latency p99 has exceeded two seconds for ten minutes.

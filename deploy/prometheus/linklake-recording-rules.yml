@@ -1,0 +1,24 @@
+groups:
+  - name: linklake-slo-recording
+    interval: 30s
+    rules:
+      - record: linklake:slo_availability:ratio_30d
+        expr: linklake_slo_availability_ratio
+      - record: linklake:slo_error_rate:ratio_30d
+        expr: linklake_slo_error_rate_ratio
+      - record: linklake:slo_error_budget_remaining:ratio_30d
+        expr: linklake_slo_error_budget_remaining_ratio
+      - record: linklake:slo_burn_rate:5m
+        expr: linklake_slo_burn_rate_5m
+      - record: linklake:slo_burn_rate:1h
+        expr: linklake_slo_burn_rate_1h
+      - record: linklake:slo_burn_rate:6h
+        expr: linklake_slo_burn_rate_6h
+      - record: linklake:slo_burn_rate:24h
+        expr: linklake_slo_burn_rate_24h
+      - record: linklake:http_request_latency:p50
+        expr: linklake_http_request_latency_p50_seconds
+      - record: linklake:http_request_latency:p95
+        expr: linklake_http_request_latency_p95_seconds
+      - record: linklake:http_request_latency:p99
+        expr: linklake_http_request_latency_p99_seconds
