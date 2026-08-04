@@ -4,8 +4,8 @@ param(
     [int]$ControlPort = 39211,
     [int]$UdpRelayPort = 39212,
     [ValidateSet('chromium', 'firefox', 'webkit')][string]$BrowserEngine = 'chromium',
-    [string]$BrowserPath = 'C:\Program Files\Google\Chrome\Application\chrome.exe',
-    [string]$BrowserLabel = 'Chrome',
+    [string]$BrowserPath = '',
+    [string]$BrowserLabel = 'Playwright Chromium',
     [ValidatePattern('^[A-Za-z0-9._-]+$')][string]$OutputName = 'webui-smoke',
     [switch]$KeepData,
     [switch]$KeepServer
@@ -14,10 +14,15 @@ param(
 $ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 if ([string]::IsNullOrWhiteSpace($ServerExe)) {
-    $ServerExe = Join-Path $projectRoot 'target\release\linklake-server.exe'
+    $ServerExe = Join-Path $projectRoot 'target\debug\linklake-server.exe'
+    if (-not (Test-Path -LiteralPath $ServerExe -PathType Leaf)) {
+        & cargo build --locked -p linklake-server
+        if ($LASTEXITCODE -ne 0) { throw 'Could not build the WebUI smoke-test server.' }
+    }
 }
 $ServerExe = (Resolve-Path -LiteralPath $ServerExe).Path
 $dataDir = Join-Path $projectRoot '.tmp-webui-smoke-data'
+$tlsDir = Join-Path $projectRoot '.tmp-webui-smoke-tls'
 $outputDir = Join-Path $projectRoot "target\$OutputName"
 $serverLog = Join-Path $outputDir 'server.log'
 $baseUrl = "http://127.0.0.1:$ManagementPort"
@@ -25,23 +30,27 @@ $adminUsername = 'admin'
 $adminPassword = 'LinkLake-Smoke-2026!'
 $enrollmentToken = 'linklake-smoke-enrollment'
 $managementToken = 'linklake-smoke-management'
-$controlCertificate = Join-Path $projectRoot '.tmp-tls-test\control-cert.pem'
-$controlPrivateKey = Join-Path $projectRoot '.tmp-tls-test\control-key.pem'
+$controlCertificate = Join-Path $tlsDir 'control-cert.pem'
+$controlPrivateKey = Join-Path $tlsDir 'control-key.pem'
 $serverProcess = $null
 
-if (-not (Test-Path -LiteralPath $controlCertificate) -or -not (Test-Path -LiteralPath $controlPrivateKey)) {
-    throw 'WebUI smoke test requires localhost control certificate and key files in .tmp-tls-test.'
+function Remove-SmokeDirectory {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$ExpectedName
+    )
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $resolved = (Resolve-Path -LiteralPath $Path).Path
+    $expectedParent = (Resolve-Path -LiteralPath $projectRoot).Path
+    if ((Split-Path -Parent $resolved) -ne $expectedParent -or (Split-Path -Leaf $resolved) -ne $ExpectedName) {
+        throw "Refusing to delete unexpected smoke-test path: $resolved"
+    }
+    Remove-Item -LiteralPath $resolved -Recurse -Force
 }
 
 function Remove-SmokeData {
     param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { return }
-    $resolved = (Resolve-Path -LiteralPath $Path).Path
-    $expectedParent = (Resolve-Path -LiteralPath $projectRoot).Path
-    if ((Split-Path -Parent $resolved) -ne $expectedParent -or (Split-Path -Leaf $resolved) -ne '.tmp-webui-smoke-data') {
-        throw "Refusing to delete unexpected smoke data path: $resolved"
-    }
-    Remove-Item -LiteralPath $resolved -Recurse -Force
+    Remove-SmokeDirectory -Path $Path -ExpectedName '.tmp-webui-smoke-data'
 }
 
 function Reset-SmokeOutput {
@@ -65,12 +74,20 @@ function Invoke-LinkLakeJson {
     Invoke-RestMethod -Method $Method -Uri "$baseUrl$Path" -Headers $Headers -ContentType 'application/json' -Body ($Body | ConvertTo-Json -Depth 8 -Compress)
 }
 
-Reset-SmokeOutput -Path $outputDir
-New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
-Remove-SmokeData -Path $dataDir
-New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
-
 try {
+    Reset-SmokeOutput -Path $outputDir
+    New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
+    Remove-SmokeData -Path $dataDir
+    New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+    Remove-SmokeDirectory -Path $tlsDir -ExpectedName '.tmp-webui-smoke-tls'
+    New-Item -ItemType Directory -Force -Path $tlsDir | Out-Null
+    & cargo run --quiet --locked -p linklake-server --example generate_localhost_certificate -- $tlsDir
+    if ($LASTEXITCODE -ne 0 -or
+        -not (Test-Path -LiteralPath $controlCertificate -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $controlPrivateKey -PathType Leaf)) {
+        throw 'Could not generate the WebUI smoke-test control certificate.'
+    }
+
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $ServerExe
     $startInfo.WorkingDirectory = $projectRoot
@@ -138,19 +155,19 @@ try {
         Invoke-LinkLakeJson -Method Post -Path $policy.Path -Headers $managementHeaders -Body $policy.Body | Out-Null
     }
 
-    $env:NODE_PATH = 'C:\Users\Laker\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\node_modules'
     $env:LINKLAKE_SMOKE_BASE_URL = $baseUrl
     $env:LINKLAKE_SMOKE_USERNAME = $adminUsername
     $env:LINKLAKE_SMOKE_PASSWORD = $adminPassword
     $env:LINKLAKE_SMOKE_BROWSER_ENGINE = $BrowserEngine
     $env:LINKLAKE_SMOKE_BROWSER_LABEL = $BrowserLabel
+    Remove-Item Env:NODE_PATH -ErrorAction SilentlyContinue
     if ([string]::IsNullOrWhiteSpace($BrowserPath)) {
         Remove-Item Env:LINKLAKE_SMOKE_CHROME -ErrorAction SilentlyContinue
     } else {
         $env:LINKLAKE_SMOKE_CHROME = (Resolve-Path -LiteralPath $BrowserPath).Path
     }
     $env:LINKLAKE_SMOKE_OUTPUT = $outputDir
-    $node = 'C:\Users\Laker\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe'
+    $node = (Get-Command node -ErrorAction Stop).Source
     & $node (Join-Path $PSScriptRoot 'webui-smoke.mjs')
     if ($LASTEXITCODE -ne 0) { throw "WebUI $BrowserLabel smoke test failed with exit code $LASTEXITCODE" }
 } finally {
@@ -165,6 +182,9 @@ try {
     if ($KeepServer -and $serverProcess) {
         Write-Host "LinkLake WebUI QA server PID: $($serverProcess.Id)"
         Write-Host "LinkLake WebUI QA URL: $baseUrl"
+    }
+    if (-not $KeepServer) {
+        Remove-SmokeDirectory -Path $tlsDir -ExpectedName '.tmp-webui-smoke-tls'
     }
     if (-not $KeepData -and -not $KeepServer) { Remove-SmokeData -Path $dataDir }
 }

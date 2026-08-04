@@ -1,9 +1,12 @@
 param(
-    [string]$OutputDirectory = (Join-Path $PSScriptRoot '..\dist')
+    [string]$OutputDirectory = (Join-Path $PSScriptRoot '..\dist'),
+    [string]$ExpectedSha256
 )
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+. (Join-Path $projectRoot 'packaging\windows\installer-common.ps1')
+$OutputDirectory = Resolve-LinkLakeSafePath ([IO.Path]::GetFullPath($OutputDirectory)) 'package output directory'
 $manifest = Get-Content -Raw -LiteralPath (Join-Path $projectRoot 'Cargo.toml')
 $match = [regex]::Match($manifest, '(?ms)\[workspace\.package\].*?version\s*=\s*"([^"]+)"')
 if (-not $match.Success) { throw 'Could not read the workspace version.' }
@@ -12,19 +15,24 @@ $archive = Join-Path $OutputDirectory "linklake-$version-windows-x86_64.zip"
 $checksum = "$archive.sha256"
 
 if (-not (Test-Path -LiteralPath $archive)) { throw "Missing archive: $archive" }
-if (-not (Test-Path -LiteralPath $checksum)) { throw "Missing checksum: $checksum" }
+if ((Get-Item -Force -LiteralPath $archive).Length -gt 1GB) { throw 'Windows release archive exceeds the size limit.' }
 
 $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
-$declaredHash = ((Get-Content -Raw -LiteralPath $checksum).Trim().Split(' ')[0]).ToLowerInvariant()
+$declaredHash = Read-LinkLakeSha256Sidecar $checksum ([IO.Path]::GetFileName($archive))
 if ($actualHash -ne $declaredHash) { throw "SHA-256 mismatch: $actualHash != $declaredHash" }
+if ($ExpectedSha256) {
+    if ($ExpectedSha256 -notmatch '^[0-9a-fA-F]{64}$') { throw 'ExpectedSha256 must contain exactly 64 hexadecimal characters.' }
+    if ($actualHash -ne $ExpectedSha256.ToLowerInvariant()) { throw 'Archive does not match the trusted expected SHA-256.' }
+}
 
-Add-Type -AssemblyName System.IO.Compression.FileSystem
-$zip = [System.IO.Compression.ZipFile]::OpenRead($archive)
+$verifyRoot = Join-Path $env:TEMP "linklake-package-verify-$([guid]::NewGuid().ToString('N'))"
 try {
-    $entries = @($zip.Entries | ForEach-Object { $_.FullName.Replace([char]92, [char]47) })
+    $inspection = Expand-LinkLakeZipArchiveSafely $archive $verifyRoot
+    $entries = @($inspection.Entries)
     $required = @(
         'bin/linklake-server.exe',
         'bin/linklake-client.exe',
+        'windows/installer-common.ps1',
         'windows/install-server.ps1',
         'windows/install-client.ps1',
         'windows/uninstall.ps1',
@@ -36,29 +44,18 @@ try {
         'THIRD_PARTY_NOTICES.md',
         'THIRD_PARTY_LICENSES.html',
         'TRADEMARKS.md',
-        'release.json'
+        'release.json',
+        'checksums.sha256'
     )
     foreach ($entry in $required) {
         if ($entries -notcontains $entry) { throw "Missing archive entry: $entry" }
     }
-}
-finally {
-    $zip.Dispose()
-}
-$verifyRoot = Join-Path $env:TEMP "linklake-package-verify-$([guid]::NewGuid().ToString('N'))"
-try {
-    Expand-Archive -LiteralPath $archive -DestinationPath $verifyRoot
-    $serverVersion = (& (Join-Path $verifyRoot 'bin\linklake-server.exe') --version).Trim()
-    $clientVersion = (& (Join-Path $verifyRoot 'bin\linklake-client.exe') --version).Trim()
-    foreach ($value in @($serverVersion, $clientVersion)) {
-        if ($value -notmatch [regex]::Escape($version) -or $value -notmatch 'target=windows-x86_64') {
-            throw "Invalid build information: $value"
-        }
-    }
-    $release = Get-Content -Raw -LiteralPath (Join-Path $verifyRoot 'release.json') | ConvertFrom-Json
-    if ($release.product -ne 'LinkLake' -or $release.version -ne $version -or -not $release.commit) {
-        throw 'release.json build identity is incomplete.'
-    }
+
+    $release = Read-LinkLakeReleaseIdentity $verifyRoot 'windows-x86_64'
+    if ($release.version -ne $version) { throw 'release.json version does not match the workspace package version.' }
+    Assert-LinkLakePackageChecksums $verifyRoot
+    $null = Assert-LinkLakePackageBinary (Join-Path $verifyRoot 'bin\linklake-server.exe') 'LinkLake Server' $release
+    $null = Assert-LinkLakePackageBinary (Join-Path $verifyRoot 'bin\linklake-client.exe') 'LinkLake Client' $release
 }
 finally {
     if (Test-Path -LiteralPath $verifyRoot) { Remove-Item -LiteralPath $verifyRoot -Recurse -Force }

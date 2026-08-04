@@ -70,6 +70,14 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Run unit tests
         run: cargo test --workspace --locked
+      - name: Verify root restore preserves each service-owned state root
+        run: |
+          set -eu
+          cargo test -p linklake-server --no-run --locked
+          test_bin="$(find target/debug/deps -maxdepth 1 -type f -name 'linklake_server-*' -perm -111 -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+          test -n "$test_bin"
+          sudo "$test_bin" disaster_recovery::tests::root_database_restore_preserves_database_owner_and_uses_data_owner_when_missing --exact
+          sudo "$test_bin" disaster_recovery::tests::root_full_restore_preserves_each_managed_owner_for_nested_files --exact
       - name: Verify development release-signing fixture
         run: |
           set -eu
@@ -137,6 +145,9 @@ jobs:
             }
           }
           if ($failed) { throw 'PowerShell syntax validation failed.' }
+      - name: Verify Windows installer lifecycle contract
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\windows-installer-contract.ps1
       - name: Run unit tests
         run: cargo test --workspace --locked
       - name: Run updater replacement and rollback end-to-end tests
@@ -146,6 +157,9 @@ jobs:
           ./tests/update-e2e.ps1 -Product client
           ./tests/update-e2e.ps1 -Product server
           ./tests/manager-update-e2e.ps1 -SkipBuild
+      - name: Run encrypted disaster-recovery end-to-end tests
+        shell: pwsh
+        run: ./tests/disaster-recovery-e2e.ps1 -SkipBuild
       - name: Run TCP end-to-end tests
         shell: powershell
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\tcp-e2e.ps1
@@ -170,6 +184,53 @@ jobs:
       - name: Run SOCKS5 TCP/UDP end-to-end tests
         shell: powershell
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\socks5-e2e.ps1 -SkipBuild
+
+  webui-smoke:
+    name: WebUI browser smoke
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.19.0'
+          cache: npm
+      - name: Install locked WebUI test dependencies
+        run: npm ci
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~\AppData\Local\ms-playwright
+          key: windows-playwright-${{ hashFiles('package-lock.json') }}
+      - name: Install pinned Chromium
+        run: node ./node_modules/playwright/cli.js install chromium
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Select pinned Rust toolchain
+        shell: pwsh
+        run: rustup default 1.88.0
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~\.cargo\registry
+            ~\.cargo\git
+            target
+          key: windows-webui-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: windows-webui-cargo-
+      - name: Build WebUI smoke-test server
+        run: cargo build --locked -p linklake-server
+      - name: Run WebUI browser smoke
+        shell: pwsh
+        run: ./scripts/run-webui-smoke.ps1 -ServerExe ./target/debug/linklake-server.exe
+      - name: Upload WebUI smoke evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: webui-smoke-${{ github.sha }}
+          path: target/webui-smoke
+          if-no-files-found: warn
+          retention-days: 14
 
   macos-test:
     name: macOS build and unit tests

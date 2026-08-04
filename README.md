@@ -383,17 +383,42 @@ linklake-server backup --data-dir C:\LinkLake\data --output D:\Backups\linklake.
 linklake-server restore --data-dir C:\LinkLake\data --input D:\Backups\linklake.sqlite3
 ```
 
-恢复会先执行 SQLite 完整性检查，并将原数据库保存为 `linklake.sqlite3.pre-restore-<时间戳>`。
+恢复会先取得 `linklake.sqlite3.lock` 独占锁并执行 SQLite 完整性检查；服务仍在运行时会直接失败。原数据库保存为 `linklake.sqlite3.pre-restore-<时间戳>`。
 
-ACME 账户凭据和证书私钥保存在 `LINKLAKE_DATA_DIR/acme` 与 `LINKLAKE_DATA_DIR/certificates`，不包含在仅针对 SQLite 的 `backup` 输出中。需要完整灾难恢复时应单独加密备份这两个目录，并把所有数据库和证书备份视为敏感凭据。
+加密托管状态备份与恢复使用 `backup-full` / `restore-full`，包含 SQLite 在线快照、`acme/` 和 `certificates/`，不包含日志：
+
+```powershell
+linklake-server backup-full --data-dir C:\LinkLake\data --output D:\Backups\linklake-full.llb --password-file D:\Secrets\linklake-backup.pass
+
+# 恢复前停止 LinkLakeServer 服务
+linklake-server restore-full --data-dir C:\LinkLake\data --input D:\Backups\linklake-full.llb --password-file D:\Secrets\linklake-backup.pass
+```
+
+密码至少 16 字节，只能通过 `--password-stdin` 或 `--password-file` 输入，不能出现在命令行参数、日志或错误信息中；`--password-stdin` 会拒绝可交互终端，必须使用管道或重定向。备份使用固定受限的 Argon2id 和 64 KiB 分块 XChaCha20-Poly1305，认证格式头、分块序号、长度和显式终止记录；错误密码、篡改、截断、未知版本及尾随数据都会失败关闭。恢复会在完整解密、TAR 路径/链接/数量/大小校验、SHA-256 清单、SQLite `integrity_check`、架构版本和迁移账本全部通过后，在暂存区迁移受支持的旧数据库，随后才替换当前状态。来自更高 LinkLake 版本或更高数据库架构版本的备份会失败关闭。原数据库、ACME 状态和证书会保存到同一 `.pre-restore-<时间戳>-<随机值>` 目录，替换失败自动回滚。
+
+`--data-dir` 必须由安装器或管理员提前安全创建，不能是符号链接、重解析点或由备份命令临时创建的任意目录。Linux 建议归服务账户所有并设为 `0700`；Windows 应只授权 SYSTEM、Administrators、LocalService 和该目录所有者。Unix 恢复会分别保留原数据库文件、`acme/` 和 `certificates/` 的 uid/gid，并把对应 owner 递归应用到恢复树；仅当某个目标原本不存在时才回退到 data-dir owner。备份与恢复会拒绝不存在或不安全的数据目录，而不会替管理员猜测权限边界。
+
+所有可能包含明文的暂存文件只创建在数据目录安全边界内，并通过活动文件锁避免清理仍在运行的备份；异常退出留下的暂存目录会在下次服务启动或备份前清理。恢复替换由持久 journal 保护：提交标记落盘前发生进程崩溃或断电，下一次服务启动会幂等恢复旧状态；提交标记已落盘则验证并保留新状态，避免数据库、ACME 和证书处于混合版本。
+
+在线备份的 SQLite 是单点一致快照；ACME 文件和证书在其后逐项采集。ACME 凭据使用原子文件提交；存在已提交 generation 时，备份只保留带有效提交标记且证书/私钥匹配的 generation，并排除可能处于半更新状态的顶层兼容 PEM。没有 generation 的旧安装必须先通过证书/私钥匹配验证。这仍不代表数据库、ACME 和证书处于同一时刻的全局快照；需要严格跨组件一致性时，应先停止服务再执行备份。
+
+归档不包含日志、服务环境变量与 Enrollment Token、数据目录外的管理/控制 TLS 私钥、systemd/Windows service/launchd 定义、防火墙、反向代理、DNS、容器编排配置或生产签名密钥。因此它不能单独重建整台主机；这些外部配置和 Secret 必须通过独立的基础设施备份恢复流程保护。
+
+备份输入和输出必须位于 `LINKLAKE_DATA_DIR` 外部。密码文件和 `.llb` 归档都应使用仅备份管理员可读的 ACL，并与恢复密钥分开保存。
 
 ## 生产安装
 
 Windows 发布包：
 
-- `windows/install-server.ps1`：安装并启动 `LinkLakeServer`
-- `windows/install-client.ps1`：安装并启动 `LinkLakeClient`
-- `windows/uninstall.ps1`：移除服务但保留程序和数据
+- `windows/install-server.ps1`：以 `LocalService` 安装或事务升级 `LinkLakeServer`；TLS 证书和私钥会复制到只读托管目录，启动或验证失败会恢复旧二进制、服务配置和运行状态
+- `windows/install-client.ps1`：以 `LocalService` 安装或事务升级 `LinkLakeClient`；默认保留现有配置，只有显式使用 `-ReplaceConfig` 才会替换
+- `windows/uninstall.ps1`：事务移除所选服务和程序二进制，默认保留配置、状态、日志和服务端数据；永久清理还必须同时使用 `-PurgeData -ConfirmPurge LINKLAKE-PURGE`
+
+Windows 安装器只接受本地绝对目标路径，拒绝重解析点、目录权限重叠、畸形服务环境和不匹配的包内 SHA-256 清单。同一时间只允许一个安装、升级或卸载事务。通过网络取得发布包时，应先按签名发布清单获得可信 SHA-256，再运行：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-windows-package.ps1 -ExpectedSha256 <签名清单中的64位SHA-256>
+```
 
 Linux 发布包：
 
@@ -430,6 +455,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\udp-e2e.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\http-e2e.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\sni-e2e.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\secret-e2e.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\windows-installer-contract.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\package-windows.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-windows-package.ps1
 $env:FLUTTER_BIN = 'F:\Tools\flutter\bin\flutter.bat'
@@ -456,7 +482,7 @@ macOS 使用 `scripts/package-macos.sh`、`scripts/verify-macos-package.sh`、`s
 
 打包脚本支持 `SOURCE_DATE_EPOCH`。设置相同时间戳并使用相同源码、工具链、目标平台和锁定依赖时，归档内的文件顺序、时间和发布清单保持稳定。Windows 生成 ZIP 和 SHA-256，Linux/macOS 生成 tar.gz 和 SHA-256；三个平台均同时生成 LinkLake 核心包和 LinkLake Manager 包。
 
-`.github/workflows/ci.yml` 会在推送和拉取请求中执行格式、Clippy、单元测试、脚本语法检查、Windows TCP/UDP/HTTP/TLS SNI/Secret-P2P/SOCKS5 E2E、Linux Pebble HTTP-01/Cloudflare DNS-01 E2E，以及 Flutter Manager 的 Windows/Linux/macOS 分析、测试和 Release 构建。`.github/workflows/soak.yml` 每周或手动运行长稳、弱网、崩溃、重启、并发与吞吐矩阵。`.github/workflows/release.yml` 会构建三个平台的核心包和管理客户端包；正式标签发布还会校验全部 SHA-256 旁车文件，生成 SPDX SBOM，并为同一组发布资产创建 GitHub build provenance 与 SBOM 证明，最后才生成 LinkLake Ed25519 清单并上传 Release。全部 GitHub Actions 都固定到完整提交 SHA，发布任务只恢复缓存且不写入缓存，checkout 不保留 Git 凭据。完整说明见 [`docs/release-supply-chain.zh-CN.md`](docs/release-supply-chain.zh-CN.md)。
+`.github/workflows/ci.yml` 会在推送和拉取请求中执行格式、Clippy、单元测试、脚本语法检查、使用锁定 Playwright/Chromium 的真实 WebUI 浏览器冒烟测试、Windows TCP/UDP/HTTP/TLS SNI/Secret-P2P/SOCKS5 E2E、Linux Pebble HTTP-01/Cloudflare DNS-01 E2E，以及 Flutter Manager 的 Windows/Linux/macOS 分析、测试和 Release 构建。WebUI 测试运行时生成一次性 localhost 证书，失败时保留截图和服务日志，不依赖开发者机器上的 Node 路径、浏览器模块或固定测试私钥。`.github/workflows/soak.yml` 每周或手动运行长稳、弱网、崩溃、重启、并发与吞吐矩阵。`.github/workflows/release.yml` 会构建三个平台的核心包和管理客户端包；正式标签发布还会校验全部 SHA-256 旁车文件，生成 SPDX SBOM，并为同一组发布资产创建 GitHub build provenance 与 SBOM 证明，最后才生成 LinkLake Ed25519 清单并上传 Release。全部 GitHub Actions 都固定到完整提交 SHA，发布任务只恢复缓存且不写入缓存，checkout 不保留 Git 凭据。完整说明见 [`docs/release-supply-chain.zh-CN.md`](docs/release-supply-chain.zh-CN.md)。
 
 ## 后续路线
 

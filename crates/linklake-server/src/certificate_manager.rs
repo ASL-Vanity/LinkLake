@@ -15,6 +15,7 @@ use rustls::{
     sign::CertifiedKey,
     ServerConfig,
 };
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     fmt, fs,
@@ -30,8 +31,8 @@ use x509_parser::{extensions::GeneralName, parse_x509_certificate};
 const CHALLENGE_TTL: Duration = Duration::from_secs(10 * 60);
 const ACME_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_PARALLEL_ORDERS: usize = 2;
-const CERTIFICATE_GENERATIONS_DIRECTORY: &str = "generations";
-const CERTIFICATE_COMMIT_MARKER: &[u8] = b"linklake-certificate-generation-v1\n";
+pub(crate) const CERTIFICATE_GENERATIONS_DIRECTORY: &str = "generations";
+pub(crate) const CERTIFICATE_COMMIT_MARKER: &[u8] = b"linklake-certificate-generation-v1\n";
 const RETAINED_CERTIFICATE_GENERATIONS: usize = 3;
 
 #[derive(Clone, Debug)]
@@ -70,6 +71,8 @@ impl CertificateManager {
     pub(crate) fn new(data_dir: PathBuf) -> anyhow::Result<Self> {
         fs::create_dir_all(data_dir.join("certificates"))?;
         fs::create_dir_all(data_dir.join("acme"))?;
+        crate::disaster_recovery::restrict_directory_permissions(&data_dir.join("certificates"))?;
+        crate::disaster_recovery::restrict_directory_permissions(&data_dir.join("acme"))?;
         let cloudflare_dns = CloudflareDnsClient::from_environment(&data_dir)?;
         Ok(Self {
             data_dir,
@@ -103,6 +106,9 @@ impl CertificateManager {
 
     pub(crate) fn account_registered(&self, directory_url: &str) -> bool {
         self.account_credentials_path(directory_url).is_file()
+            || self
+                .legacy_account_credentials_path(directory_url)
+                .is_file()
     }
 
     pub(crate) fn cloudflare_token_configured(&self) -> bool {
@@ -299,7 +305,7 @@ impl CertificateManager {
     async fn load_or_create_account(&self, config: &AcmeIssueConfig) -> anyhow::Result<Account> {
         let _guard = self.account_lock.lock().await;
         let credentials_path = self.account_credentials_path(&config.directory_url);
-        if let Ok(serialized) = fs::read(&credentials_path) {
+        if let Some(serialized) = self.read_account_credentials(&config.directory_url)? {
             let credentials: AccountCredentials = serde_json::from_slice(&serialized)?;
             return Ok(account_builder(config)?
                 .from_credentials(credentials)
@@ -375,11 +381,41 @@ impl CertificateManager {
     }
 
     fn account_credentials_path(&self, directory_url: &str) -> PathBuf {
+        let digest = Sha256::digest(directory_url.as_bytes());
+        let mut encoded = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            use fmt::Write as _;
+            write!(&mut encoded, "{byte:02x}").expect("writing to a string cannot fail");
+        }
+        self.data_dir
+            .join("acme")
+            .join(format!("account-sha256-{encoded}.json"))
+    }
+
+    fn legacy_account_credentials_path(&self, directory_url: &str) -> PathBuf {
         let mut hasher = DefaultHasher::new();
         directory_url.hash(&mut hasher);
         self.data_dir
             .join("acme")
             .join(format!("account-{:016x}.json", hasher.finish()))
+    }
+
+    fn read_account_credentials(&self, directory_url: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        let current = self.account_credentials_path(directory_url);
+        match fs::read(&current) {
+            Ok(serialized) => return Ok(Some(serialized)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let legacy = self.legacy_account_credentials_path(directory_url);
+        match fs::read(&legacy) {
+            Ok(serialized) => {
+                write_secret_file(&current, &serialized)?;
+                Ok(Some(serialized))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
@@ -553,11 +589,10 @@ fn validate_challenge_token(token: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_certificate(
-    hostname: &str,
+pub(crate) fn validate_certificate_key_pair(
     certificate_pem: &[u8],
     private_key_pem: &[u8],
-) -> anyhow::Result<(Arc<CertifiedKey>, CertificateMetadata)> {
+) -> anyhow::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
     let mut certificate_reader = BufReader::new(certificate_pem);
     let certificates = rustls_pemfile::certs(&mut certificate_reader)
         .collect::<Result<Vec<CertificateDer<'static>>, _>>()?;
@@ -568,6 +603,16 @@ fn validate_certificate(
     ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certificates.clone(), private_key.clone_key())?;
+    Ok((certificates, private_key))
+}
+
+fn validate_certificate(
+    hostname: &str,
+    certificate_pem: &[u8],
+    private_key_pem: &[u8],
+) -> anyhow::Result<(Arc<CertifiedKey>, CertificateMetadata)> {
+    let (certificates, private_key) =
+        validate_certificate_key_pair(certificate_pem, private_key_pem)?;
     let signing_key = any_supported_type(&private_key)?;
     let certified_key = Arc::new(CertifiedKey::new(certificates.clone(), signing_key));
     let (_, parsed) = parse_x509_certificate(certificates[0].as_ref())
@@ -700,6 +745,7 @@ pub(crate) fn write_secret_file(path: &Path, contents: &[u8]) -> anyhow::Result<
         options.mode(0o600);
     }
     let mut temporary_file = options.open(&temporary)?;
+    crate::disaster_recovery::restrict_file_permissions(&temporary)?;
     temporary_file.write_all(contents)?;
     temporary_file.sync_all()?;
     drop(temporary_file);
@@ -708,36 +754,78 @@ pub(crate) fn write_secret_file(path: &Path, contents: &[u8]) -> anyhow::Result<
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
     }
-    if path.exists() {
-        let backup = parent.join(format!(
-            ".{}.{}.backup",
-            path.file_name().unwrap().to_string_lossy(),
-            uuid::Uuid::new_v4()
-        ));
-        fs::rename(path, &backup)?;
-        if let Err(error) = fs::rename(&temporary, path) {
-            let _ = fs::rename(&backup, path);
-            let _ = fs::remove_file(&temporary);
-            return Err(error.into());
-        }
-        let _ = fs::remove_file(backup);
-    } else {
-        fs::rename(&temporary, path)?;
+    if let Err(error) = replace_file_atomically(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn replace_file_atomically(temporary: &Path, destination: &Path) -> anyhow::Result<()> {
+    fs::rename(temporary, destination)?;
+    sync_directory(
+        destination
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("secret file has no parent directory"))?,
+    )
+}
+
+#[cfg(windows)]
+fn replace_file_atomically(temporary: &Path, destination: &Path) -> anyhow::Result<()> {
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source = crate::disaster_recovery::encode_existing_windows_path(temporary)?;
+    let target = crate::disaster_recovery::encode_destination_windows_path(destination)?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut retry_delay = Duration::from_millis(1);
+    loop {
+        // SAFETY: UTF-16 路径缓冲区以 NUL 结尾，并在调用期间保持有效。
+        let succeeded = unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                target.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if succeeded != 0 {
+            return Ok(());
+        }
+
+        let error = std::io::Error::last_os_error();
+        let retryable = error.raw_os_error().is_some_and(|code| {
+            code == ERROR_ACCESS_DENIED as i32
+                || code == ERROR_SHARING_VIOLATION as i32
+                || code == ERROR_LOCK_VIOLATION as i32
+        });
+        if !retryable || Instant::now() >= deadline {
+            anyhow::bail!("atomic secret replacement failed: {error}");
+        }
+        std::thread::sleep(retry_delay);
+        retry_delay = retry_delay.saturating_mul(2).min(Duration::from_millis(25));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_certificate, validate_challenge_token, AcmeChallengeType, AcmeIssueConfig,
-        CertificateManager, DynamicCertResolver, Http01ChallengeStore, CERTIFICATE_COMMIT_MARKER,
-        CERTIFICATE_GENERATIONS_DIRECTORY, MAX_PARALLEL_ORDERS,
+        validate_certificate, validate_challenge_token, write_secret_file, AcmeChallengeType,
+        AcmeIssueConfig, CertificateManager, DynamicCertResolver, Http01ChallengeStore,
+        CERTIFICATE_COMMIT_MARKER, CERTIFICATE_GENERATIONS_DIRECTORY, MAX_PARALLEL_ORDERS,
     };
     use rcgen::{generate_simple_self_signed, CertifiedKey};
     use std::{
         fs,
-        sync::{Arc, Barrier},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Barrier,
+        },
         thread,
         time::Duration,
     };
@@ -748,6 +836,70 @@ mod tests {
         assert!(validate_challenge_token("").is_err());
         assert!(validate_challenge_token("bad/token").is_err());
         assert!(validate_challenge_token(&"a".repeat(257)).is_err());
+    }
+
+    #[test]
+    fn secret_replacement_never_exposes_a_missing_or_partial_file() {
+        let root = std::env::temp_dir().join(format!(
+            "linklake-secret-atomic-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = root.join("acme/account.json");
+        let first = vec![b'A'; 4096];
+        let second = vec![b'B'; 4096];
+        write_secret_file(&path, &first).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader_stop = stop.clone();
+        let reader_path = path.clone();
+        let reader_first = first.clone();
+        let reader_second = second.clone();
+        let reader = thread::spawn(move || {
+            while !reader_stop.load(Ordering::Acquire) {
+                let contents = fs::read(&reader_path)
+                    .expect("atomic replacement must never remove the authoritative path");
+                assert!(contents == reader_first || contents == reader_second);
+            }
+        });
+
+        for index in 0..32 {
+            let contents = if index % 2 == 0 { &second } else { &first };
+            write_secret_file(&path, contents).unwrap();
+        }
+        stop.store(true, Ordering::Release);
+        reader.join().unwrap();
+
+        assert!(!fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().starts_with('.')));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn acme_account_path_is_stable_and_legacy_credentials_are_migrated() {
+        let root = std::env::temp_dir().join(format!(
+            "linklake-acme-account-path-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let manager = CertificateManager::new(root.clone()).unwrap();
+        let directory_url = "https://acme-v02.api.letsencrypt.org/directory";
+        let current = manager.account_credentials_path(directory_url);
+        assert_eq!(
+            current.file_name().unwrap().to_string_lossy(),
+            "account-sha256-5e76d31517ecd6640e53c916ed3788eb8924f8e1c02ff12843ce031d749bf43e.json"
+        );
+
+        let legacy = manager.legacy_account_credentials_path(directory_url);
+        fs::write(&legacy, b"legacy-account-credentials").unwrap();
+        let migrated = manager
+            .read_account_credentials(directory_url)
+            .unwrap()
+            .expect("legacy credentials should be found");
+        assert_eq!(migrated, b"legacy-account-credentials");
+        assert_eq!(fs::read(&current).unwrap(), b"legacy-account-credentials");
+        assert!(manager.account_registered(directory_url));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

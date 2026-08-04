@@ -65,6 +65,9 @@ for (const name of workflowFiles) {
 const release = fs.readFileSync(path.join(workflowDirectory, 'release.yml'), 'utf8');
 const ci = fs.readFileSync(path.join(workflowDirectory, 'ci.yml'), 'utf8');
 const security = fs.readFileSync(path.join(workflowDirectory, 'security.yml'), 'utf8');
+const webuiSmoke = fs.readFileSync(path.join(root, 'scripts', 'run-webui-smoke.ps1'), 'utf8');
+const packageJson = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+const packageLock = JSON.parse(fs.readFileSync(path.join(root, 'package-lock.json'), 'utf8'));
 if (!/^\s*workflow_call:\s*$/m.test(ci) || !/^\s*workflow_call:\s*$/m.test(security)) {
   fail('CI and security workflows must remain reusable by the release workflow');
 }
@@ -78,6 +81,31 @@ for (const gate of ['ci-gate', 'security-gate']) {
   if (!new RegExp(`^      - ${gate}\\s*$`, 'm').test(publishJob)) {
     fail(`release publication does not depend on ${gate}`);
   }
+}
+for (const marker of [
+  'webui-smoke:',
+  'Install locked WebUI test dependencies',
+  'npm ci',
+  'node ./node_modules/playwright/cli.js install chromium',
+  'run-webui-smoke.ps1',
+  'Upload WebUI smoke evidence',
+]) {
+  if (!ci.includes(marker)) fail(`CI WebUI smoke contract is missing ${marker}`);
+}
+const playwrightVersion = packageJson.devDependencies?.playwright;
+if (!/^\d+\.\d+\.\d+$/.test(playwrightVersion ?? '')) {
+  fail('Playwright must use an exact semantic version in package.json');
+}
+const lockedPlaywright = packageLock.packages?.['node_modules/playwright'];
+if (
+  packageLock.lockfileVersion !== 3 ||
+  lockedPlaywright?.version !== playwrightVersion ||
+  !/^sha512-[A-Za-z0-9+/=]+$/.test(lockedPlaywright?.integrity ?? '')
+) {
+  fail('package-lock.json does not pin the declared Playwright package and integrity');
+}
+if (/\$env:NODE_PATH\s*=|codex-runtimes|C:\\Users\\Laker/i.test(webuiSmoke)) {
+  fail('WebUI smoke test must not depend on a developer-specific Node runtime path');
 }
 if (/uses:\s*actions\/cache@[0-9a-f]{40}/.test(release)) {
   fail('release workflow must use actions/cache/restore and never save a privileged cache');

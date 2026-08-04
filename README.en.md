@@ -377,17 +377,42 @@ Stop the service before restoring:
 linklake-server restore --data-dir C:\LinkLake\data --input D:\Backups\linklake.sqlite3
 ```
 
-Restore validates SQLite integrity and preserves the old database as `linklake.sqlite3.pre-restore-<timestamp>`.
+Restore first acquires the exclusive `linklake.sqlite3.lock` and validates SQLite integrity. It fails immediately while the service is still running and preserves the old database as `linklake.sqlite3.pre-restore-<timestamp>`.
 
-ACME account credentials and certificate private keys live under `LINKLAKE_DATA_DIR/acme` and `LINKLAKE_DATA_DIR/certificates`; they are not included in the SQLite-only `backup` output. Back up those directories separately with encryption for full disaster recovery, and treat every database and certificate backup as sensitive credentials.
+Encrypted `backup-full` / `restore-full` protects LinkLake-managed state: the online SQLite snapshot, `acme/`, and `certificates/`. Logs are deliberately excluded:
+
+```powershell
+linklake-server backup-full --data-dir C:\LinkLake\data --output D:\Backups\linklake-full.llb --password-file D:\Secrets\linklake-backup.pass
+
+# Stop the LinkLakeServer service before restore.
+linklake-server restore-full --data-dir C:\LinkLake\data --input D:\Backups\linklake-full.llb --password-file D:\Secrets\linklake-backup.pass
+```
+
+Passwords must contain at least 16 bytes and may be supplied only through `--password-stdin` or `--password-file`; they never belong in arguments, logs, or errors. `--password-stdin` refuses an interactive terminal and requires a pipe or redirection. The format uses fixed bounded Argon2id parameters and 64 KiB XChaCha20-Poly1305 chunks. The header, sequence, lengths, and explicit terminator are authenticated, so wrong passwords, tampering, truncation, unknown versions, and trailing bytes fail closed. Restore does not touch current state until decryption, TAR path/link/count/size validation, the SHA-256 manifest, SQLite `integrity_check`, schema compatibility, and the migration ledger all pass. Supported older databases are migrated inside staging; backups from a newer LinkLake build or newer database schema fail closed. Previous database, ACME, and certificate state is retained together under `.pre-restore-<timestamp>-<random>` and automatically rolled back if replacement fails.
+
+The `--data-dir` must already have been created securely by the installer or an administrator. It must not be a symbolic link, reparse point, or arbitrary directory created by the backup command. On Linux, make it service-owned with mode `0700`; on Windows, grant only SYSTEM, Administrators, LocalService, and the directory owner. Unix restore separately preserves the existing database-file, `acme/`, and `certificates/` uid/gid and applies each owner recursively to its restored tree; only a target that did not exist falls back to the data-directory owner. Backup and restore reject a missing or unsafe data directory rather than guessing its trust boundary.
+
+Every plaintext staging artifact remains inside the data-directory security boundary. Activity locks keep cleanup away from a live backup, while stale staging is removed on the next server startup or backup. A durable restore journal makes process or power failure deterministic: before its commit marker, startup idempotently restores the old database/ACME/certificate set; after the marker, startup validates and finalizes the complete new set instead of accepting a mixed generation.
+
+For an online backup, SQLite is a point-in-time snapshot and ACME/certificate files are collected afterward. ACME credentials use atomic file commits. When a committed certificate generation exists, backup retains only generations with a valid commit marker and matching certificate/private key, and excludes the top-level compatibility PEM files that may be between updates. A legacy installation without generations must first pass certificate/private-key matching. The archive is still not a globally simultaneous snapshot across all three components, so stop the service before backup when strict cross-component consistency is required.
+
+The archive does not contain logs, service environment variables or the enrollment token, management/control TLS private keys stored outside the data directory, systemd/Windows service/launchd definitions, firewall, reverse-proxy, DNS, container-orchestration configuration, or production signing keys. It cannot rebuild an entire host by itself; protect those external settings and secrets with a separate infrastructure recovery process.
+
+Backup inputs and outputs must be outside `LINKLAKE_DATA_DIR`. Protect both password files and `.llb` archives with backup-operator-only ACLs, and store the recovery secret separately from the archive.
 
 ## Production installation
 
 Windows release package:
 
-- `windows/install-server.ps1` installs and starts `LinkLakeServer`
-- `windows/install-client.ps1` installs and starts `LinkLakeClient`
-- `windows/uninstall.ps1` removes services while preserving programs and data
+- `windows/install-server.ps1` installs or transactionally upgrades `LinkLakeServer` as `LocalService`; TLS certificates and keys are copied into a read-only managed directory, and startup or validation failure restores the previous binary, service configuration, and runtime state
+- `windows/install-client.ps1` installs or transactionally upgrades `LinkLakeClient` as `LocalService`; the existing configuration is preserved unless `-ReplaceConfig` is explicit
+- `windows/uninstall.ps1` transactionally removes the selected services and program binaries while preserving configuration, state, logs, and server data by default; permanent cleanup additionally requires `-PurgeData -ConfirmPurge LINKLAKE-PURGE`
+
+Windows installers accept only local absolute destination paths and reject reparse points, overlapping privilege boundaries, malformed service environments, and package contents that do not match the internal SHA-256 inventory. Only one install, upgrade, or uninstall transaction can run at a time. For a package obtained over the network, first obtain its trusted SHA-256 from the signed release manifest, then run:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-windows-package.ps1 -ExpectedSha256 <64-hex-SHA-256-from-signed-manifest>
+```
 
 Linux release package:
 
@@ -422,6 +447,7 @@ cargo test --workspace --locked
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\tcp-e2e.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\udp-e2e.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\http-e2e.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\windows-installer-contract.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\package-windows.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-windows-package.ps1
 $env:FLUTTER_BIN = 'F:\Tools\flutter\bin\flutter.bat'
@@ -448,7 +474,7 @@ On macOS, use `scripts/package-macos.sh`, `scripts/verify-macos-package.sh`, `sc
 
 Packaging scripts honor `SOURCE_DATE_EPOCH`. With the same timestamp, source, toolchain, target platform, and locked dependencies, archive ordering, timestamps, and release metadata remain stable. Windows produces ZIP archives plus SHA-256; Linux and macOS produce tar.gz archives plus SHA-256. Every platform publishes both a LinkLake core package and a LinkLake Manager package.
 
-`.github/workflows/ci.yml` runs formatting, Clippy, unit tests, script syntax checks, Windows TCP/UDP/HTTP/TLS-SNI/secret-P2P/SOCKS5 E2E, Linux Pebble HTTP-01/Cloudflare DNS-01 E2E, and Flutter Manager analysis, tests, and release builds on Windows, Linux, and macOS. `.github/workflows/soak.yml` runs the long-running weak-network, crash, restart, concurrency, and throughput matrix weekly or on demand. For formal tags, `.github/workflows/release.yml` additionally verifies every SHA-256 sidecar, generates an SPDX SBOM, creates GitHub build-provenance and SBOM attestations for the same release subjects, then generates the LinkLake Ed25519 manifest before uploading the Release. Every GitHub Action is pinned to a full commit SHA, privileged release jobs restore but never save caches, and checkout credentials are not persisted. See [`docs/release-supply-chain.md`](docs/release-supply-chain.md).
+`.github/workflows/ci.yml` runs formatting, Clippy, unit tests, script syntax checks, a real browser smoke test with locked Playwright and Chromium, Windows TCP/UDP/HTTP/TLS-SNI/secret-P2P/SOCKS5 E2E, Linux Pebble HTTP-01/Cloudflare DNS-01 E2E, and Flutter Manager analysis, tests, and release builds on Windows, Linux, and macOS. The WebUI job generates an ephemeral localhost certificate at runtime, preserves screenshots and server logs on failure, and does not depend on a developer-specific Node path, browser module cache, or committed test private key. `.github/workflows/soak.yml` runs the long-running weak-network, crash, restart, concurrency, and throughput matrix weekly or on demand. For formal tags, `.github/workflows/release.yml` additionally verifies every SHA-256 sidecar, generates an SPDX SBOM, creates GitHub build-provenance and SBOM attestations for the same release subjects, then generates the LinkLake Ed25519 manifest before uploading the Release. Every GitHub Action is pinned to a full commit SHA, privileged release jobs restore but never save caches, and checkout credentials are not persisted. See [`docs/release-supply-chain.md`](docs/release-supply-chain.md).
 
 ## Roadmap
 

@@ -22,6 +22,15 @@ pub(crate) struct PublicPortPolicyView {
 }
 
 impl PublicPortPolicy {
+    pub(crate) fn schema_migration() -> Self {
+        Self {
+            tcp_allowed: PortRanges::parse("1-65535").expect("full TCP port range is valid"),
+            udp_allowed: PortRanges::parse("1-65535").expect("full UDP port range is valid"),
+            tcp_reserved: PortRanges::empty(),
+            udp_reserved: PortRanges::empty(),
+        }
+    }
+
     pub(crate) fn from_environment(
         tcp_listeners: impl IntoIterator<Item = SocketAddr>,
         udp_listeners: impl IntoIterator<Item = SocketAddr>,

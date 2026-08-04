@@ -1,0 +1,13 @@
+{
+  "name": "linklake-webui-ci",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test:webui": "pwsh -NoProfile -File ./scripts/run-webui-smoke.ps1"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}

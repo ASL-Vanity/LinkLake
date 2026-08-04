@@ -1,9 +1,9 @@
-//! SQLite 架构版本检查、迁移前备份与可校验迁移账本。
+﻿//! SQLite 架构版本检查、迁移前备份与可校验迁移账本。
 
 use crate::database::Database;
 use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::{fs, path::Path};
 
 pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 12;
 
@@ -252,7 +252,7 @@ pub(crate) fn prepare(database: &Database) -> anyhow::Result<MigrationPlan> {
                 crate::unix_seconds()
             ));
         }
-        crate::database_tools::backup(&database_path, &backup)?;
+        crate::database_tools::backup_managed(&database_path, &backup)?;
         Some(backup)
     } else {
         None
@@ -263,6 +263,55 @@ pub(crate) fn prepare(database: &Database) -> anyhow::Result<MigrationPlan> {
         from_version,
         backup_path,
     })
+}
+
+pub(crate) fn validate_restore_database(path: &Path) -> anyhow::Result<u32> {
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let version = connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?;
+    anyhow::ensure!(
+        version <= CURRENT_SCHEMA_VERSION,
+        "database schema version {version} is newer than this LinkLake build ({CURRENT_SCHEMA_VERSION})"
+    );
+    verify_migration_ledger(&connection, version)?;
+    Ok(version)
+}
+
+/// Validate and migrate a restore candidate in its isolated staging directory.
+pub(crate) fn migrate_restore_candidate(data_dir: &Path) -> anyhow::Result<()> {
+    validate_restore_database(&data_dir.join("linklake.sqlite3"))?;
+    let database = Database::persistent(data_dir)?;
+    let plan = prepare(&database)?;
+    let migration_backup = plan.backup_path().map(Path::to_path_buf);
+    plan.finish()?;
+    crate::migrate_application_schema(&database)?;
+
+    let database_path = database
+        .path()
+        .ok_or_else(|| anyhow::anyhow!("restore candidate must use a persistent database"))?
+        .to_path_buf();
+    database.with_connection(|connection| {
+        let version = connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?;
+        anyhow::ensure!(
+            version == CURRENT_SCHEMA_VERSION,
+            "restored database schema version {version} was not migrated to {CURRENT_SCHEMA_VERSION}"
+        );
+        verify_migration_ledger(connection, version)
+    })?;
+    crate::database_tools::checkpoint_database(&database_path)?;
+    drop(database);
+
+    crate::database_tools::remove_sidecars(&database_path)?;
+    if let Some(backup) = migration_backup {
+        fs::remove_file(backup)?;
+    }
+    let lock_path = data_dir.join("linklake.sqlite3.lock");
+    match fs::remove_file(&lock_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    crate::database_tools::validate_database(&database_path)
 }
 
 fn verify_migration_ledger(
@@ -468,6 +517,105 @@ mod tests {
         plan.finish().unwrap();
         prepare(&database).expect("current migration ledger should verify");
         drop(database);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn current_restore_database_accepts_additive_notification_tables() {
+        let root = temporary_directory("linklake-additive-notification-restore");
+        fs::create_dir_all(&root).unwrap();
+        let database_path = root.join("linklake.sqlite3");
+        let database = Database::persistent(&root).unwrap();
+        let plan = prepare(&database).unwrap();
+        plan.finish().unwrap();
+        database
+            .with_connection(|connection| {
+                connection.execute_batch(
+                    "CREATE TABLE notification_delivery_log (
+                        notification_id TEXT PRIMARY KEY NOT NULL,
+                        delivered_unix_seconds INTEGER NOT NULL
+                    );
+                    INSERT INTO notification_delivery_log VALUES ('notification-1', 42);",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(database);
+
+        assert_eq!(
+            validate_restore_database(&database_path).unwrap(),
+            CURRENT_SCHEMA_VERSION
+        );
+        migrate_restore_candidate(&root).unwrap();
+        let restored: (String, u64) = Connection::open(&database_path)
+            .unwrap()
+            .query_row(
+                "SELECT notification_id, delivered_unix_seconds FROM notification_delivery_log",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(restored, ("notification-1".into(), 42));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_candidate_is_migrated_and_auxiliary_files_are_removed() {
+        let root = temporary_directory("linklake-restore-candidate");
+        fs::create_dir_all(&root).unwrap();
+        let database_path = root.join("linklake.sqlite3");
+        Connection::open(&database_path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE legacy(value TEXT NOT NULL);
+                 INSERT INTO legacy VALUES ('preserved');
+                 PRAGMA user_version = 9;",
+            )
+            .unwrap();
+
+        migrate_restore_candidate(&root).expect("restore candidate should migrate");
+
+        let connection = Connection::open(&database_path).unwrap();
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        let value: String = connection
+            .query_row("SELECT value FROM legacy", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(value, "preserved");
+        verify_migration_ledger(&connection, version).unwrap();
+        drop(connection);
+        assert!(!root.join("linklake.sqlite3.lock").exists());
+        assert!(!root.join("linklake.sqlite3-wal").exists());
+        assert!(!root.join("linklake.sqlite3-shm").exists());
+        assert!(!fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .contains("pre-migration")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_candidate_rejects_newer_schema_without_replacing_it() {
+        let root = temporary_directory("linklake-newer-restore-candidate");
+        fs::create_dir_all(&root).unwrap();
+        let database_path = root.join("linklake.sqlite3");
+        Connection::open(&database_path)
+            .unwrap()
+            .execute_batch("CREATE TABLE future(value TEXT); PRAGMA user_version = 999;")
+            .unwrap();
+
+        let error = migrate_restore_candidate(&root).unwrap_err();
+        assert!(error.to_string().contains("newer than this LinkLake build"));
+        let version: u32 = Connection::open(&database_path)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 999);
         fs::remove_dir_all(root).unwrap();
     }
 
