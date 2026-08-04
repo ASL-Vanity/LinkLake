@@ -398,7 +398,8 @@ function Start-CertificateIssue {
         $conflict = $response.Content | ConvertFrom-Json
         if ($conflict.code -in @(
             'certificate_operation_in_progress',
-            'certificate_operation_cooldown'
+            'certificate_operation_cooldown',
+            'certificate_already_valid'
         )) {
             return
         }
