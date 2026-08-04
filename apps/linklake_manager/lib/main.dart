@@ -1299,6 +1299,7 @@ class _DashboardPageState extends State<DashboardPage> {
             ),
             if (_capabilities.canManageAlerts)
               FilledButton.icon(
+                key: const Key('new-alert-rule'),
                 onPressed: () => _showAlertRule(),
                 icon: const Icon(Icons.add),
                 label: Text(t('新建规则', 'New rule')),
@@ -1343,10 +1344,12 @@ class _DashboardPageState extends State<DashboardPage> {
                       spacing: 4,
                       children: [
                         IconButton(
+                          key: Key('edit-alert-${raw['id']}'),
                           onPressed: () => _showAlertRule(raw),
                           icon: const Icon(Icons.edit_outlined),
                         ),
                         IconButton(
+                          key: Key('delete-alert-${raw['id']}'),
                           onPressed: () => _deleteAlertRule(raw),
                           icon: const Icon(Icons.delete_outline),
                         ),
@@ -1397,11 +1400,13 @@ class _DashboardPageState extends State<DashboardPage> {
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   TextField(
+                    key: const Key('alert-rule-name'),
                     controller: name,
                     decoration: InputDecoration(labelText: t('名称', 'Name')),
                   ),
                   const SizedBox(height: 10),
                   DropdownButtonFormField<String>(
+                    key: const Key('alert-rule-metric'),
                     initialValue: metric,
                     items: const [
                       DropdownMenuItem(
@@ -1427,6 +1432,14 @@ class _DashboardPageState extends State<DashboardPage> {
                       DropdownMenuItem(
                         value: 'certificate_days_remaining',
                         child: Text('certificate_days_remaining'),
+                      ),
+                      DropdownMenuItem(
+                        value: 'slo_fast_burn_rate',
+                        child: Text('slo_fast_burn_rate'),
+                      ),
+                      DropdownMenuItem(
+                        value: 'slo_slow_burn_rate',
+                        child: Text('slo_slow_burn_rate'),
                       ),
                     ],
                     onChanged: (value) =>
@@ -1460,6 +1473,7 @@ class _DashboardPageState extends State<DashboardPage> {
                       const SizedBox(width: 10),
                       Expanded(
                         child: TextField(
+                          key: const Key('alert-rule-threshold'),
                           controller: threshold,
                           keyboardType: TextInputType.number,
                           decoration: InputDecoration(
@@ -1471,6 +1485,7 @@ class _DashboardPageState extends State<DashboardPage> {
                   ),
                   const SizedBox(height: 10),
                   TextField(
+                    key: const Key('alert-rule-target'),
                     controller: target,
                     decoration: InputDecoration(
                       labelText: t('目标（可选）', 'Target (optional)'),
@@ -1553,6 +1568,7 @@ class _DashboardPageState extends State<DashboardPage> {
               child: Text(t('取消', 'Cancel')),
             ),
             FilledButton(
+              key: const Key('save-alert-rule'),
               onPressed: () async {
                 try {
                   final body = <String, dynamic>{
@@ -1590,6 +1606,9 @@ class _DashboardPageState extends State<DashboardPage> {
         ),
       ),
     );
+    // The dialog route can still build during its dismissal animation after
+    // showDialog completes. Delay disposal until that route is fully detached.
+    await Future<void>.delayed(const Duration(milliseconds: 350));
     for (final controller in [name, threshold, target, window, cooldown]) {
       controller.dispose();
     }
