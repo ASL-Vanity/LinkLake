@@ -3,7 +3,7 @@
 use crate::database::Database;
 use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::{fs, path::Path};
 
 pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 10;
 
@@ -108,7 +108,7 @@ pub(crate) fn prepare(database: &Database) -> anyhow::Result<MigrationPlan> {
                 crate::unix_seconds()
             ));
         }
-        crate::database_tools::backup(&database_path, &backup)?;
+        crate::database_tools::backup_managed(&database_path, &backup)?;
         Some(backup)
     } else {
         None
@@ -119,6 +119,55 @@ pub(crate) fn prepare(database: &Database) -> anyhow::Result<MigrationPlan> {
         from_version,
         backup_path,
     })
+}
+
+pub(crate) fn validate_restore_database(path: &Path) -> anyhow::Result<u32> {
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let version = connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?;
+    anyhow::ensure!(
+        version <= CURRENT_SCHEMA_VERSION,
+        "database schema version {version} is newer than this LinkLake build ({CURRENT_SCHEMA_VERSION})"
+    );
+    verify_migration_ledger(&connection, version)?;
+    Ok(version)
+}
+
+/// 在独立暂存目录内验证并迁移待恢复数据库，绝不直接修改当前在线数据。
+pub(crate) fn migrate_restore_candidate(data_dir: &Path) -> anyhow::Result<()> {
+    validate_restore_database(&data_dir.join("linklake.sqlite3"))?;
+    let database = Database::persistent(data_dir)?;
+    let plan = prepare(&database)?;
+    let migration_backup = plan.backup_path().map(Path::to_path_buf);
+    crate::migrate_application_schema(&database)?;
+    plan.finish()?;
+
+    let database_path = database
+        .path()
+        .ok_or_else(|| anyhow::anyhow!("restore candidate must use a persistent database"))?
+        .to_path_buf();
+    database.with_connection(|connection| {
+        let version = connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?;
+        anyhow::ensure!(
+            version == CURRENT_SCHEMA_VERSION,
+            "restored database schema version {version} was not migrated to {CURRENT_SCHEMA_VERSION}"
+        );
+        verify_migration_ledger(connection, version)
+    })?;
+    crate::database_tools::checkpoint_database(&database_path)?;
+    drop(database);
+
+    crate::database_tools::remove_sidecars(&database_path)?;
+    if let Some(backup) = migration_backup {
+        fs::remove_file(backup)?;
+    }
+    let lock_path = data_dir.join("linklake.sqlite3.lock");
+    match fs::remove_file(&lock_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    crate::database_tools::validate_database(&database_path)
 }
 
 fn verify_migration_ledger(
@@ -148,20 +197,26 @@ fn verify_migration_ledger(
         "database schema version {user_version} is missing its migration ledger"
     );
     let expected_checksum = migration_checksum(MIGRATION_V10_SQL);
-    let record = connection
-        .query_row(
-            "SELECT name, checksum_sha256 FROM schema_migrations WHERE version = ?1",
-            [CURRENT_SCHEMA_VERSION],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()?;
-    let Some((name, checksum)) = record else {
-        anyhow::bail!(
-            "database migration ledger is missing schema version {CURRENT_SCHEMA_VERSION}"
-        );
-    };
+    let mut statement = connection
+        .prepare("SELECT version, name, checksum_sha256 FROM schema_migrations ORDER BY version")?;
+    let records = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, u32>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     anyhow::ensure!(
-        name == MIGRATION_V10_NAME && checksum == expected_checksum,
+        records.len() == 1,
+        "database migration ledger contains unknown, missing, or extra entries"
+    );
+    let (version, name, checksum) = &records[0];
+    anyhow::ensure!(
+        *version == CURRENT_SCHEMA_VERSION
+            && name == MIGRATION_V10_NAME
+            && checksum == &expected_checksum,
         "database migration checksum mismatch for schema version {CURRENT_SCHEMA_VERSION}"
     );
     Ok(())
@@ -258,6 +313,41 @@ mod tests {
     }
 
     #[test]
+    fn current_database_with_extra_ledger_rows_is_rejected() {
+        for extra_version in [1_u32, 999_u32] {
+            let root = temporary_directory("linklake-migration-extra-ledger");
+            fs::create_dir_all(&root).unwrap();
+            let database_path = root.join("linklake.sqlite3");
+            let connection = Connection::open(&database_path).unwrap();
+            connection.execute_batch(MIGRATION_V10_SQL).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO schema_migrations VALUES (?1, ?2, ?3, 1)",
+                    params![
+                        CURRENT_SCHEMA_VERSION,
+                        MIGRATION_V10_NAME,
+                        migration_checksum(MIGRATION_V10_SQL)
+                    ],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO schema_migrations VALUES (?1, 'unexpected', 'unexpected', 1)",
+                    [extra_version],
+                )
+                .unwrap();
+            connection
+                .execute_batch(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION};"))
+                .unwrap();
+            drop(connection);
+
+            let error = validate_restore_database(&database_path).unwrap_err();
+            assert!(error.to_string().contains("extra entries"));
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn newer_database_is_rejected_without_modification() {
         let root = temporary_directory("linklake-newer-schema");
         fs::create_dir_all(&root).expect("temporary directory should exist");
@@ -281,6 +371,172 @@ mod tests {
         plan.finish().unwrap();
         prepare(&database).expect("current migration ledger should verify");
         drop(database);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_candidate_is_migrated_and_auxiliary_files_are_removed() {
+        let root = temporary_directory("linklake-restore-candidate");
+        fs::create_dir_all(&root).unwrap();
+        let database_path = root.join("linklake.sqlite3");
+        Connection::open(&database_path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE legacy(value TEXT NOT NULL);
+                 INSERT INTO legacy VALUES ('preserved');
+                 PRAGMA user_version = 9;",
+            )
+            .unwrap();
+
+        migrate_restore_candidate(&root).expect("restore candidate should migrate");
+
+        let connection = Connection::open(&database_path).unwrap();
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        let value: String = connection
+            .query_row("SELECT value FROM legacy", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(value, "preserved");
+        verify_migration_ledger(&connection, version).unwrap();
+        drop(connection);
+        assert!(!root.join("linklake.sqlite3.lock").exists());
+        assert!(!root.join("linklake.sqlite3-wal").exists());
+        assert!(!root.join("linklake.sqlite3-shm").exists());
+        assert!(!fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .contains("pre-migration")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_candidate_runs_real_legacy_catalog_migrations_before_commit() {
+        let root = temporary_directory("linklake-real-legacy-restore-candidate");
+        fs::create_dir_all(&root).unwrap();
+        let database_path = root.join("linklake.sqlite3");
+        let administrator = "legacy-admin";
+        let client_id = uuid::Uuid::new_v4();
+        let tunnel_id = uuid::Uuid::new_v4();
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE administrators (
+                    username TEXT PRIMARY KEY NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    created_unix_seconds INTEGER NOT NULL
+                 );
+                 CREATE TABLE admin_sessions (
+                    session_id TEXT PRIMARY KEY NOT NULL,
+                    session_secret_hash TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    expires_unix_seconds INTEGER NOT NULL
+                 );
+                 CREATE TABLE clients (
+                    client_id TEXT PRIMARY KEY NOT NULL,
+                    name TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    access_token_hash TEXT NOT NULL,
+                    last_seen_unix_seconds INTEGER NOT NULL
+                 );
+                 CREATE TABLE tcp_tunnel_policies (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    client_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    public_port INTEGER NOT NULL UNIQUE,
+                    target_addr TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1
+                 );
+                 PRAGMA user_version = 9;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO administrators VALUES (?1, 'legacy-hash', 1)",
+                [administrator],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO clients VALUES (?1, 'legacy-client', 'windows', 'legacy-token-hash', 2)",
+                [client_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO tcp_tunnel_policies VALUES (?1, ?2, 'legacy-web', 80, '127.0.0.1:8080', 1)",
+                params![tunnel_id.to_string(), client_id.to_string()],
+            )
+            .unwrap();
+        drop(connection);
+
+        migrate_restore_candidate(&root).expect("all legacy catalog migrations should succeed");
+
+        let connection = Connection::open(&database_path).unwrap();
+        for (table, column) in [
+            ("administrators", "totp_enabled"),
+            ("admin_sessions", "created_unix_seconds"),
+            ("clients", "config_sync_status"),
+            ("tcp_tunnel_policies", "max_connections"),
+            ("tcp_tunnel_policies", "bandwidth_limit_bps"),
+        ] {
+            let present: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+                    params![table, column],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(present, "{table}.{column} should be migrated");
+        }
+        let restored_admin: String = connection
+            .query_row("SELECT username FROM administrators", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(restored_admin, administrator);
+        let placeholder_count: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM administrators WHERE username LIKE 'schema-migration-%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(placeholder_count, 0);
+        let (name, port, target, max_connections): (String, u16, String, u32) = connection
+            .query_row(
+                "SELECT name, public_port, target_addr, max_connections FROM tcp_tunnel_policies WHERE id = ?1",
+                [tunnel_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (name.as_str(), port, target.as_str(), max_connections),
+            ("legacy-web", 80, "127.0.0.1:8080", 64)
+        );
+        drop(connection);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_candidate_rejects_newer_schema_without_replacing_it() {
+        let root = temporary_directory("linklake-newer-restore-candidate");
+        fs::create_dir_all(&root).unwrap();
+        let database_path = root.join("linklake.sqlite3");
+        Connection::open(&database_path)
+            .unwrap()
+            .execute_batch("CREATE TABLE future(value TEXT); PRAGMA user_version = 999;")
+            .unwrap();
+
+        let error = migrate_restore_candidate(&root).unwrap_err();
+        assert!(error.to_string().contains("newer than this LinkLake build"));
+        let version: u32 = Connection::open(&database_path)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 999);
         fs::remove_dir_all(root).unwrap();
     }
 }
