@@ -86,7 +86,7 @@ function Start-ChildProcess {
     $startInfo.WorkingDirectory = $projectRoot
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
-    # 不继承操作者机器上可能存在的真实 Cloudflare 凭据。
+    # 不继承操作者机器上可能存在的真实 Cloudflare 凭据.
     foreach ($name in @('LINKLAKE_CLOUDFLARE_API_TOKEN', 'LINKLAKE_CLOUDFLARE_API_TOKEN_FILE')) {
         $null = $startInfo.Environment.Remove($name)
     }
@@ -496,7 +496,7 @@ try {
     $tokenPath = Join-Path $runRoot 'cloudflare-token'
     [System.IO.File]::WriteAllText($tokenPath, $testToken, [Text.UTF8Encoding]::new($false))
 
-    # 在启动完整系统前验证凭据来源边界。
+    # 在启动完整系统前验证凭据来源边界.
     & chmod 0600 $tokenPath
     if ($LASTEXITCODE -ne 0) { throw 'Could not restrict the test token file permissions.' }
     $failurePorts = [System.Collections.Generic.HashSet[int]]::new()
@@ -731,7 +731,7 @@ try {
         throw 'DNS-01 ACME configuration response is incomplete or leaked the token.'
     }
 
-    # ACME 尚未启用时先配置全部 TLS 策略，避免策略写入自动触发订单并干扰故障注入顺序。
+    # ACME 尚未启用时先配置全部 TLS 策略，避免策略写入自动触发订单并干扰故障注入顺序.
     $wildcardIdentifier = '*.deep.sub.example.test'
     $wildcardPolicy = Set-RouteTlsPolicy -BaseUrl $baseUrl -Session $webSession `
         -RouteId $routes['dns01-wildcard'].id -CertificateIdentifier $wildcardIdentifier
@@ -764,7 +764,7 @@ try {
     }
     $baselineMetrics = Invoke-RestMethod -Uri "$baseUrl/api/v1/metrics" -WebSession $webSession
 
-    # 通配符成功路径同时验证最长后缀 Zone 发现和 TXT 生命周期。
+    # 通配符成功路径同时验证最长后缀 Zone 发现和 TXT 生命周期.
     $stateBeforeSuccess = Get-MockState -MockBaseUrl $mockBaseUrl
     $successOffset = @($stateBeforeSuccess.events).Count
     Set-TestHttpRouteEnabled -BaseUrl $baseUrl -Session $webSession `
@@ -800,7 +800,7 @@ try {
     $null = Invoke-CurlRequest -Port $httpsPort `
         -ServerName 'nested.alternate.deep.sub.example.test' -ExpectFailure
 
-    # 错误的权威 TXT 会令 Pebble 拒绝授权，但 LinkLake 仍必须删除自己创建的记录。
+    # 错误的权威 TXT 会令 Pebble 拒绝授权，但 LinkLake 仍必须删除自己创建的记录.
     $null = Set-MockConfig -MockBaseUrl $mockBaseUrl -Config @{ publish_mode = 'wrong' }
     $stateBeforeInvalid = Get-MockState -MockBaseUrl $mockBaseUrl
     $invalidOffset = @($stateBeforeInvalid.events).Count
@@ -821,7 +821,7 @@ try {
         throw 'The failed ACME authorization left its TXT record behind.'
     }
 
-    # Cloudflare success=false envelope 必须被视为失败，不能继续创建记录。
+    # Cloudflare success=false envelope 必须被视为失败，不能继续创建记录.
     $null = Set-MockConfig -MockBaseUrl $mockBaseUrl -Config @{
         publish_mode = 'correct'
         zone_error_count = 1
@@ -858,7 +858,7 @@ try {
         throw 'A rejected Cloudflare TXT create mutated Mock DNS state.'
     }
 
-    # 删除 envelope 失败时保留私密 journal；下一次订单必须先恢复并清除孤儿记录。
+    # 删除 envelope 失败时保留私密 journal；下一次订单必须先恢复并清除孤儿记录.
     $null = Set-MockConfig -MockBaseUrl $mockBaseUrl -Config @{ delete_error_count = 1 }
     Set-TestHttpRouteEnabled -BaseUrl $baseUrl -Session $webSession `
         -RouteId $routes['dns01-delete-retry'].id -Enabled $true
