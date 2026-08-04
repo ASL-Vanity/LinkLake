@@ -130,7 +130,7 @@ jobs:
         run: sh scripts/verify-native-linux-packages.sh
       - name: Verify container image builds
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('validation-{0}', github.sha) }}
         run: docker build -t "linklake:$RELEASE_TAG" .
       - name: Build Flutter manager Linux package
         run: sh scripts/package-manager-linux.sh

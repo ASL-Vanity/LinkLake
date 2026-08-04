@@ -296,9 +296,7 @@ jobs:
         run: flutter test
       - name: Build Flutter manager
         working-directory: apps/linklake_manager
-        env:
-          FLUTTER_TARGET: ${{ matrix.target }}
-        run: flutter build "$FLUTTER_TARGET" --release
+        run: flutter build ${{ matrix.target }} --release
 
   linux-https-acme-e2e:
     name: Linux HTTPS/ACME HTTP-01 and DNS-01 E2E

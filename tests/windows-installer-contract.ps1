@@ -44,14 +44,21 @@ function Assert-RegistrySnapshotEqual {
 
 function Write-TestChecksumManifest {
     param([string]$Root)
-    $lines = Get-ChildItem -LiteralPath $Root -Recurse -File |
+    $manifestRoot = [IO.Path]::GetFullPath($Root).TrimEnd([char]92, [char]47)
+    $rootPrefix = $manifestRoot + [IO.Path]::DirectorySeparatorChar
+    $files = @(Get-ChildItem -LiteralPath $manifestRoot -Recurse -File |
         Where-Object { $_.Name -ne 'checksums.sha256' } |
-        Sort-Object FullName |
-        ForEach-Object {
-            $relative = $_.FullName.Substring($Root.Length).TrimStart([char]92, [char]47).Replace([char]92, [char]47)
-            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
-            "$hash  $relative"
+        Sort-Object FullName)
+    $lines = [Collections.Generic.List[string]]::new()
+    foreach ($file in $files) {
+        $fullPath = [IO.Path]::GetFullPath($file.FullName)
+        if (-not $fullPath.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Checksum fixture path escapes its package root: $fullPath"
         }
+        $relative = $fullPath.Substring($rootPrefix.Length).Replace([char]92, [char]47)
+        $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $fullPath).Hash.ToLowerInvariant()
+        $lines.Add("$hash  $relative")
+    }
     [IO.File]::WriteAllLines((Join-Path $Root 'checksums.sha256'), [string[]]$lines, [Text.Encoding]::ASCII)
 }
 

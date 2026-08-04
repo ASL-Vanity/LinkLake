@@ -155,7 +155,7 @@ jobs:
           persona: regular
           advanced-security: false
           annotations: true
-          token: ""
+          token: ${{ github.token }}
 
   filesystem-vulnerabilities:
     name: Filesystem vulnerability and misconfiguration scan
@@ -182,4 +182,4 @@ jobs:
           format: table
           hide-progress: true
           cache: false
-          token-setup-trivy: ""
+          token-setup-trivy: ${{ github.token }}

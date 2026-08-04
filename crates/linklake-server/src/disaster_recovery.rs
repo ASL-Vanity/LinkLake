@@ -2510,6 +2510,10 @@ fn copy_file_and_hash(
         restrict_directory_permissions(parent)?;
     }
     let input = File::open(source)?;
+    anyhow::ensure!(
+        input.metadata()?.len() <= maximum_bytes,
+        "managed file exceeds the remaining backup budget"
+    );
     let output = create_managed_new_file(destination)?;
     let mut reader = BufReader::new(input);
     let mut writer = BufWriter::new(output);
@@ -3956,13 +3960,27 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn backup_rejects_case_fold_collisions_before_creating_an_archive() {
+        use std::os::unix::fs::MetadataExt;
+
         let root = test_root("case-fold-collision");
         let data_dir = root.path.join("data");
         fs::create_dir_all(data_dir.join("acme")).unwrap();
         create_database(&data_dir.join("linklake.sqlite3"), "portable");
-        fs::write(data_dir.join("acme/Foo"), b"first").unwrap();
-        fs::write(data_dir.join("acme/foo"), b"second").unwrap();
+        let upper = data_dir.join("acme/Foo");
+        let lower = data_dir.join("acme/foo");
+        fs::write(&upper, b"first").unwrap();
+        fs::write(&lower, b"second").unwrap();
         let archive = root.path.join("collision.llb");
+
+        // 默认 APFS 不区分大小写，无法构造两个独立目录项，此时跳过该场景。
+        let upper_metadata = fs::metadata(&upper).unwrap();
+        let lower_metadata = fs::metadata(&lower).unwrap();
+        if upper_metadata.dev() == lower_metadata.dev()
+            && upper_metadata.ino() == lower_metadata.ino()
+        {
+            assert!(!archive.exists());
+            return;
+        }
 
         let error = backup_full(&data_dir, &archive, PASSWORD).unwrap_err();
         assert!(error.to_string().contains("case-insensitive platform"));
@@ -3978,7 +3996,7 @@ mod tests {
 
         let error = copy_file_and_hash(&source, &destination, 64).unwrap_err();
         assert!(error.to_string().contains("remaining backup budget"));
-        assert_eq!(fs::metadata(destination).unwrap().len(), 0);
+        assert!(!destination.exists());
     }
 
     #[test]

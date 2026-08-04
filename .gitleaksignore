@@ -10,3 +10,5 @@ ab95ad9ed570cfaaeb78999e693ea7697dd4abeb:Cargo.lock:generic-api-key:776
 ab95ad9ed570cfaaeb78999e693ea7697dd4abeb:README.en.md:generic-api-key:337
 # reason: Parallel UDP documentation mentions one-time passwords and secret authentication without embedding a credential; expires: 2026-09-03
 d384cb70554685ab8a50a0b2708336ac73e42032:README.en.md:generic-api-key:433
+# reason: End-to-end coverage documentation mentions one-time passwords and authentication without embedding a credential; expires: 2026-09-03
+e1dcb4b0f75e5b4b5a94390ffd804fa45f9eaa10:README.en.md:generic-api-key:438
