@@ -126,6 +126,17 @@ networkPolicy:
   enabled: false
   managementFrom: []
 
+monitoring:
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+    insecureSkipVerify: false
+    additionalLabels: {}
+  prometheusRule:
+    enabled: false
+    additionalLabels: {}
+
 nodeSelector: {}
 tolerations: []
 affinity: {}

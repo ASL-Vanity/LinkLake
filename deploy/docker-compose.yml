@@ -35,9 +35,19 @@ services:
     command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=30d"]
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/linklake-recording-rules.yml:/etc/prometheus/rules/linklake-recording-rules.yml:ro
+      - ./prometheus/linklake-alert-rules.yml:/etc/prometheus/rules/linklake-alert-rules.yml:ro
       - prometheus-data:/prometheus
     secrets: [linklake_metrics_token]
     depends_on: [linklake]
+
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    restart: unless-stopped
+    command: ["--config.file=/etc/alertmanager/alertmanager.yml"]
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
 
   grafana:
     image: grafana/grafana:12.1.0
@@ -56,6 +66,7 @@ volumes:
   linklake-data:
   linklake-logs:
   prometheus-data:
+  alertmanager-data:
   grafana-data:
 
 secrets:

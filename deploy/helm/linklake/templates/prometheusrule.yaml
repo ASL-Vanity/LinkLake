@@ -1,0 +1,66 @@
+{{- if .Values.monitoring.prometheusRule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "linklake.fullname" . }}
+  labels:
+    {{- include "linklake.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.prometheusRule.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: linklake-slo-recording
+      interval: 30s
+      rules:
+        - record: linklake:slo_availability:ratio_30d
+          expr: linklake_slo_availability_ratio
+        - record: linklake:slo_error_rate:ratio_30d
+          expr: linklake_slo_error_rate_ratio
+        - record: linklake:slo_error_budget_remaining:ratio_30d
+          expr: linklake_slo_error_budget_remaining_ratio
+        - record: linklake:slo_burn_rate:5m
+          expr: linklake_slo_burn_rate_5m
+        - record: linklake:slo_burn_rate:1h
+          expr: linklake_slo_burn_rate_1h
+        - record: linklake:slo_burn_rate:6h
+          expr: linklake_slo_burn_rate_6h
+        - record: linklake:slo_burn_rate:24h
+          expr: linklake_slo_burn_rate_24h
+        - record: linklake:http_request_latency:p50
+          expr: linklake_http_request_latency_p50_seconds
+        - record: linklake:http_request_latency:p95
+          expr: linklake_http_request_latency_p95_seconds
+        - record: linklake:http_request_latency:p99
+          expr: linklake_http_request_latency_p99_seconds
+    - name: linklake-slo-alerts
+      rules:
+        - alert: LinkLakeSloFastBurn
+          expr: linklake:slo_burn_rate:5m >= 14.4 and linklake:slo_burn_rate:1h >= 14.4
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: LinkLake is rapidly consuming its 30-day error budget
+        - alert: LinkLakeSloSlowBurn
+          expr: linklake:slo_burn_rate:6h >= 6 and linklake:slo_burn_rate:24h >= 6
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: LinkLake is persistently consuming its 30-day error budget
+        - alert: LinkLakeErrorBudgetExhausted
+          expr: linklake:slo_error_budget_remaining:ratio_30d <= 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: LinkLake 30-day error budget is exhausted
+        - alert: LinkLakeNotificationDeadLetters
+          expr: linklake_notification_deliveries_dead_letter > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: LinkLake notification deliveries require manual retry
+{{- end }}

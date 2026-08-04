@@ -1,0 +1,14 @@
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: linklake-default
+  group_by: [alertname, instance]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+receivers:
+  # Safe default: alerts remain visible in Alertmanager until an operator adds
+  # a secret-backed receiver. Never commit SMTP passwords or webhook URLs here.
+  - name: linklake-default

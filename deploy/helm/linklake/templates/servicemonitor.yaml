@@ -1,0 +1,27 @@
+{{- if .Values.monitoring.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "linklake.fullname" . }}
+  labels:
+    {{- include "linklake.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.serviceMonitor.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "linklake.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: management
+      scheme: https
+      path: /api/v1/metrics/prometheus
+      interval: {{ .Values.monitoring.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.monitoring.serviceMonitor.scrapeTimeout }}
+      authorization:
+        credentials:
+          name: {{ required "auth.existingSecret is required" .Values.auth.existingSecret }}
+          key: {{ .Values.auth.managementTokenKey }}
+      tlsConfig:
+        insecureSkipVerify: {{ .Values.monitoring.serviceMonitor.insecureSkipVerify }}
+{{- end }}

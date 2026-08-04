@@ -33,6 +33,7 @@ pub(crate) struct TunnelRegistration {
 #[derive(Default)]
 pub(crate) struct TunnelStatistics {
     pub(crate) active_connections: AtomicUsize,
+    pub(crate) connections_total: AtomicU64,
     pub(crate) rejected_connections: AtomicU64,
     pub(crate) rejected_policy_limit: AtomicU64,
     pub(crate) rejected_global_limit: AtomicU64,
@@ -721,6 +722,7 @@ async fn accept_public_connections(
             _ = stop.changed() => break,
             accepted = listener.accept() => match accepted {
                 Ok((external, source)) => {
+                    context.statistics.connections_total.fetch_add(1, Ordering::Relaxed);
                     if !context.state.lifecycle.accepts_new_work() {
                         context.statistics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                         drop(external);
