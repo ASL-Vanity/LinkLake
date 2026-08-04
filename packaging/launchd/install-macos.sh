@@ -2,7 +2,7 @@
 set -eu
 
 mode="${1:-}"
-package_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+package_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "Run this installer as root." >&2

@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 out="${1:-$root/dist}"
 version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' "$root/Cargo.toml" | head -n 1)"
 rpm_version="${version%%-*}"

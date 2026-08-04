@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-project_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+project_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 output_directory="${1:-$project_root/dist}"
 version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' "$project_root/Cargo.toml" | head -n 1)"
 archive="$output_directory/linklake-manager-$version-linux-x86_64.tar.gz"

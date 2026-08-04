@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+environment_file="${1:-/etc/linklake/server.env}"
 set -a
-. "${1:-/etc/linklake/server.env}"
+# shellcheck source=/dev/null
+. "$environment_file"
 set +a
 
 base="https://127.0.0.1:32100/api/v1"
