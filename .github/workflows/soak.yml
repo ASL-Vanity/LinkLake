@@ -30,10 +30,10 @@ jobs:
           persist-credentials: false
       - name: Install pinned Rust toolchain
         shell: pwsh
-        run: rustup toolchain install 1.88.0 --profile minimal
+        run: rustup toolchain install 1.91.0 --profile minimal
       - name: Select pinned Rust toolchain
         shell: pwsh
-        run: rustup default 1.88.0
+        run: rustup default 1.91.0
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |

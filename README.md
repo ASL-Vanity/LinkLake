@@ -135,7 +135,7 @@ access_key = "lls_replace-with-the-one-time-access-key"
 path_policy = "prefer_direct"
 ```
 
-自托管会合服务使用固定的 `iroh-relay 0.92.0`。生产配置、systemd 单元、Nginx WebSocket 反向代理片段和安装脚本位于 `packaging/iroh-relay/`；需为会合域名提供受信 TLS 证书，并开放公网 `443/tcp` 与 `7842/udp`。默认配置让 Relay 监听回环高位端口，避免与 Web UI 的 Nginx 监听冲突。该服务协助发现和打洞，不替代 LinkLake 的受控业务中继。
+自托管会合服务使用固定的 `iroh-relay 1.0.3`。生产配置、systemd 单元、Nginx WebSocket 反向代理片段和安装脚本位于 `packaging/iroh-relay/`；需为会合域名提供受信 TLS 证书，并开放公网 `443/tcp` 与 `7842/udp`。默认配置让 Relay 监听回环高位端口，避免与 Web UI 的 Nginx 监听冲突。该服务协助发现和打洞，不替代 LinkLake 的受控业务中继。
 
 ## SOCKS5 TCP/UDP 代理
 
@@ -444,7 +444,7 @@ relay QUIC TLS 复用 `LINKLAKE_CONTROL_CERT_PATH` 和 `LINKLAKE_CONTROL_KEY_PAT
 
 ## 构建与验证
 
-仓库通过 `rust-toolchain.toml` 固定 Rust `1.88.0`，并通过 `Cargo.lock` 固定依赖。建议使用 rustup 安装工具链；CI 会在 Windows 和 Linux 上使用相同版本。
+仓库通过 `rust-toolchain.toml` 固定 Rust `1.91.0`，并通过 `Cargo.lock` 固定依赖。建议使用 rustup 安装工具链；CI 会在 Windows、Linux 和 macOS 上使用相同版本。
 
 ```powershell
 cargo fmt --all -- --check

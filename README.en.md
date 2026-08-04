@@ -135,7 +135,7 @@ access_key = "lls_replace-with-the-one-time-access-key"
 path_policy = "prefer_direct"
 ```
 
-Self-hosted rendezvous uses pinned `iroh-relay 0.92.0`. Production configuration, a systemd unit, an Nginx WebSocket reverse-proxy snippet, and an installer are under `packaging/iroh-relay/`. Supply a publicly trusted certificate for the relay hostname and expose public `443/tcp` and `7842/udp`. The default configuration binds the Relay to high loopback ports so it can coexist with the Web UI's Nginx listener. This service assists discovery and hole punching; it does not replace LinkLake's policy-controlled business relay.
+Self-hosted rendezvous uses pinned `iroh-relay 1.0.3`. Production configuration, a systemd unit, an Nginx WebSocket reverse-proxy snippet, and an installer are under `packaging/iroh-relay/`. Supply a publicly trusted certificate for the relay hostname and expose public `443/tcp` and `7842/udp`. The default configuration binds the Relay to high loopback ports so it can coexist with the Web UI's Nginx listener. This service assists discovery and hole punching; it does not replace LinkLake's policy-controlled business relay.
 
 ## SOCKS5 TCP/UDP proxy
 
@@ -438,7 +438,7 @@ Relay QUIC TLS reuses `LINKLAKE_CONTROL_CERT_PATH` and `LINKLAKE_CONTROL_KEY_PAT
 
 ## Build and verify
 
-The repository pins Rust `1.88.0` through `rust-toolchain.toml` and dependencies through `Cargo.lock`. Install the toolchain with rustup; CI uses the same version on Windows and Linux.
+The repository pins Rust `1.91.0` through `rust-toolchain.toml` and dependencies through `Cargo.lock`. Install the toolchain with rustup; CI uses the same version on Windows, Linux, and macOS.
 
 ```powershell
 cargo fmt --all -- --check

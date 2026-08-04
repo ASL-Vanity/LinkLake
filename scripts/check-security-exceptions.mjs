@@ -41,6 +41,18 @@ function isoTodayUtc() {
   return new Date().toISOString().slice(0, 10);
 }
 
+function compareVersions(left, right) {
+  const parts = (value) => value.split('-', 1)[0].split('.').map((part) => Number(part));
+  const leftParts = parts(left);
+  const rightParts = parts(right);
+  const length = Math.max(leftParts.length, rightParts.length);
+  for (let index = 0; index < length; index += 1) {
+    const difference = (leftParts[index] ?? 0) - (rightParts[index] ?? 0);
+    if (difference !== 0) return Math.sign(difference);
+  }
+  return 0;
+}
+
 const canonicalText = read('security/exceptions.toml');
 if (!/^schema_version\s*=\s*1\s*$/m.test(canonicalText)) {
   fail('security/exceptions.toml 的 schema_version 必须为 1');
@@ -74,6 +86,53 @@ for (const item of exceptions) {
   }
   if (today >= item.expires) {
     fail(`${item.id} 已于 ${item.expires} 到期`);
+  }
+}
+
+const lockPackages = extractBlocks(read('Cargo.lock'), 'package').map((block) => ({
+  name: quoted(block, 'name'),
+  version: quoted(block, 'version'),
+}));
+const retiredAdvisories = [
+  {
+    ids: ['RUSTSEC-2026-0118', 'RUSTSEC-2026-0119'],
+    package: 'hickory-proto',
+    affected: (version) => compareVersions(version, '0.26.1') < 0,
+  },
+  {
+    ids: ['RUSTSEC-2026-0002'],
+    package: 'lru',
+    affected: (version) =>
+      compareVersions(version, '0.9.0') >= 0 && compareVersions(version, '0.16.3') < 0,
+  },
+  {
+    ids: ['RUSTSEC-2025-0134'],
+    package: 'rustls-pemfile',
+    affected: () => true,
+  },
+  {
+    ids: ['RUSTSEC-2023-0089'],
+    package: 'atomic-polyfill',
+    affected: () => true,
+  },
+  {
+    ids: ['RUSTSEC-2024-0384'],
+    package: 'instant',
+    affected: () => true,
+  },
+];
+for (const retired of retiredAdvisories) {
+  const staleException = retired.ids.find((id) => seen.has(id));
+  if (staleException) {
+    fail(`${staleException} 已完成依赖迁移，不得继续保留例外`);
+  }
+  const affectedVersions = lockPackages
+    .filter((pkg) => pkg.name === retired.package && pkg.version && retired.affected(pkg.version))
+    .map((pkg) => pkg.version);
+  if (affectedVersions.length > 0) {
+    fail(
+      `${retired.ids.join('/')} 的旧依赖 ${retired.package} ${affectedVersions.join(', ')} 重新进入 Cargo.lock`,
+    );
   }
 }
 
@@ -245,6 +304,9 @@ if (fs.existsSync(trivyPath)) {
     fail(`.trivyignore.yaml 漏洞例外已于 ${expires} 到期`);
   }
   trivyCount = 1;
+}
+if (!fs.existsSync(trivyPath) && /^\s*trivyignores:/m.test(read('.github/workflows/security.yml'))) {
+  fail('security workflow 仍引用已删除的 .trivyignore.yaml');
 }
 
 console.log(

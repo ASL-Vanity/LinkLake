@@ -95,7 +95,7 @@ where
             let mut state = transport.lock().await;
             let written = state.write_message(&input[..read], &mut output)?;
             messages = messages.saturating_add(1);
-            if messages % REKEY_MESSAGE_INTERVAL == 0 {
+            if messages.is_multiple_of(REKEY_MESSAGE_INTERVAL) {
                 state.rekey_outgoing();
             }
             written
@@ -131,7 +131,7 @@ where
             let mut state = transport.lock().await;
             let read = state.read_message(&frame, &mut output)?;
             messages = messages.saturating_add(1);
-            if messages % REKEY_MESSAGE_INTERVAL == 0 {
+            if messages.is_multiple_of(REKEY_MESSAGE_INTERVAL) {
                 state.rekey_incoming();
             }
             read

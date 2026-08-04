@@ -14,8 +14,8 @@ ed25519-dalek.workspace = true
 flate2.workspace = true
 getrandom.workspace = true
 iroh.workspace = true
-linklake-core = { path = "../linklake-core" }
-linklake-update = { path = "../linklake-update" }
+linklake-core = { path = "../linklake-core", version = "=0.8.0-rc.1" }
+linklake-update = { path = "../linklake-update", version = "=0.8.0-rc.1" }
 quinn.workspace = true
 reqwest.workspace = true
 semver.workspace = true
@@ -31,7 +31,7 @@ uuid.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
-rustls-pemfile.workspace = true
+rustls-pki-types.workspace = true
 zip.workspace = true
 
 [target.'cfg(windows)'.dependencies]

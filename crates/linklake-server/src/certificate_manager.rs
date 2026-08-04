@@ -15,6 +15,7 @@ use rustls::{
     sign::CertifiedKey,
     ServerConfig,
 };
+use rustls_pki_types::pem::PemObject;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
@@ -593,12 +594,14 @@ pub(crate) fn validate_certificate_key_pair(
     certificate_pem: &[u8],
     private_key_pem: &[u8],
 ) -> anyhow::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
-    let mut certificate_reader = BufReader::new(certificate_pem);
-    let certificates = rustls_pemfile::certs(&mut certificate_reader)
+    let certificate_reader = BufReader::new(certificate_pem);
+    let certificates = CertificateDer::pem_reader_iter(certificate_reader)
         .collect::<Result<Vec<CertificateDer<'static>>, _>>()?;
     anyhow::ensure!(!certificates.is_empty(), "certificate chain is empty");
-    let mut key_reader = BufReader::new(private_key_pem);
-    let private_key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)?
+    let key_reader = BufReader::new(private_key_pem);
+    let private_key: PrivateKeyDer<'static> = PrivateKeyDer::pem_reader_iter(key_reader)
+        .next()
+        .transpose()?
         .ok_or_else(|| anyhow::anyhow!("certificate private key is missing"))?;
     ServerConfig::builder()
         .with_no_client_auth()

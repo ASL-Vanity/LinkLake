@@ -92,6 +92,7 @@ use policy_service::{
 };
 use public_port_policy::{PublicPortPolicy, PublicPortPolicyView};
 use rusqlite::{params, Connection};
+use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use secret_tunnel_catalog::{
     CreateSecretTunnelPolicy, CreatedSecretTunnelPolicy, SecretPolicyError, SecretTunnelCatalog,
     SecretTunnelPolicy, UpdateSecretTunnelPolicy,
@@ -2989,7 +2990,7 @@ async fn run_server(
             wait_for_shutdown(management_shutdown).await;
             shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
         });
-        axum_server::from_tcp_rustls(listener, config)
+        axum_server::from_tcp_rustls(listener, config)?
             .handle(handle)
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await?;
@@ -12534,14 +12535,16 @@ fn unix_seconds() -> u64 {
 }
 
 fn load_control_tls(cert_path: &str, key_path: &str) -> anyhow::Result<TlsAcceptor> {
-    let mut cert_file = BufReader::new(File::open(cert_path)?);
-    let certificates = rustls_pemfile::certs(&mut cert_file).collect::<Result<Vec<_>, _>>()?;
+    let cert_file = BufReader::new(File::open(cert_path)?);
+    let certificates = CertificateDer::pem_reader_iter(cert_file).collect::<Result<Vec<_>, _>>()?;
     anyhow::ensure!(
         !certificates.is_empty(),
         "control certificate file contains no certificates"
     );
-    let mut key_file = BufReader::new(File::open(key_path)?);
-    let private_key = rustls_pemfile::private_key(&mut key_file)?
+    let key_file = BufReader::new(File::open(key_path)?);
+    let private_key = PrivateKeyDer::pem_reader_iter(key_file)
+        .next()
+        .transpose()?
         .ok_or_else(|| anyhow::anyhow!("control key file contains no private key"))?;
     let config = ServerConfig::builder()
         .with_no_client_auth()

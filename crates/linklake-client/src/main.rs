@@ -10,6 +10,7 @@ use linklake_core::{
     ManagedConfigStatus, ManagedHttpProxy, ManagedHttpRoute, ManagedSecretTunnel,
     ManagedSocks5Proxy, ManagedTcpTunnel, ManagedTlsRoute, ManagedUdpTunnel, PRODUCT_NAME,
 };
+use rustls_pki_types::{pem::PemObject, CertificateDer};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -3557,8 +3558,9 @@ impl ControlTransport {
             });
         };
 
-        let mut cert_file = BufReader::new(File::open(ca_cert)?);
-        let certificates = rustls_pemfile::certs(&mut cert_file).collect::<Result<Vec<_>, _>>()?;
+        let cert_file = BufReader::new(File::open(ca_cert)?);
+        let certificates =
+            CertificateDer::pem_reader_iter(cert_file).collect::<Result<Vec<_>, _>>()?;
         anyhow::ensure!(
             !certificates.is_empty(),
             "control CA certificate file contains no certificates"
@@ -4581,11 +4583,10 @@ async fn run_p2p_provider(
             }, if iroh.is_some() => {
                 match incoming {
                     Some(incoming) => {
-                        let endpoint_handle = iroh.as_ref().expect("Iroh endpoint should exist").clone();
                         let transport = transport.clone();
                         let token = token.clone();
                         tokio::spawn(async move {
-                            if let Err(error) = handle_p2p_iroh(incoming, endpoint_handle, transport, client_id, token).await {
+                            if let Err(error) = handle_p2p_iroh(incoming, transport, client_id, token).await {
                                 tracing::warn!("Iroh P2P direct connection rejected: {error}");
                             }
                         });
@@ -4721,13 +4722,12 @@ async fn handle_p2p_direct(
 
 async fn handle_p2p_iroh(
     incoming: iroh::endpoint::Incoming,
-    endpoint: iroh::Endpoint,
     transport: ControlTransport,
     client_id: Uuid,
     token: String,
 ) -> anyhow::Result<()> {
     let connection = incoming.accept()?.await?;
-    p2p_iroh::wait_for_direct(&endpoint, connection.remote_node_id()?).await?;
+    p2p_iroh::wait_for_direct(&connection).await?;
     let (mut send, mut receive) = connection.accept_bi().await?;
     let ticket = timeout(Duration::from_secs(5), read_p2p_ticket(&mut receive)).await??;
     let (session_id, visitor_client_id, target, _) =

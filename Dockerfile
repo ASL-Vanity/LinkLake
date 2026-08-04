@@ -1,9 +1,9 @@
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.91-bookworm AS builder
 WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo +1.88.0 build --release --locked -p linklake-server -p linklake-client && \
+    cargo +1.91.0 build --release --locked -p linklake-server -p linklake-client && \
     install -D target/release/linklake-server /out/linklake-server && \
     install -D target/release/linklake-client /out/linklake-client
 

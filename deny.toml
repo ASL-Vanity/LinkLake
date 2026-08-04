@@ -10,13 +10,7 @@ targets = [
 [advisories]
 # 原因和到期日的唯一来源是 security/exceptions.toml，CI 会校验这里没有遗漏或扩大。
 ignore = [
-    { id = "RUSTSEC-2026-0118", reason = "Transitive through iroh 0.92.0 -> hickory-resolver 0.25.2; no compatible stable patched release is available, so the iroh/hickory upgrade must be tracked upstream." },
-    { id = "RUSTSEC-2026-0119", reason = "Transitive through iroh 0.92.0 -> hickory-resolver 0.25.2; the fix requires hickory-proto >=0.26.1 and an upstream iroh dependency update outside this baseline branch." },
-    { id = "RUSTSEC-2023-0089", reason = "Unmaintained transitive dependency through iroh metrics/relay -> postcard -> heapless; remove it by upgrading the iroh dependency chain." },
-    { id = "RUSTSEC-2024-0384", reason = "Unmaintained transitive dependency from iroh 0.92.0; remove it by upgrading iroh after compatibility validation." },
-    { id = "RUSTSEC-2024-0436", reason = "Unmaintained transitive dependency through iroh 0.92.0 -> stun-rs; remove it by upgrading the upstream networking stack." },
-    { id = "RUSTSEC-2025-0134", reason = "Unmaintained direct and axum-server dependency; migrate PEM parsing and upgrade axum-server in a dedicated dependency change." },
-    { id = "RUSTSEC-2026-0002", reason = "Unsound IterMut implementation in lru 0.13.0 via iroh-relay/pkarr; the fix in >=0.16.3 requires an upstream iroh update." },
+    { id = "RUSTSEC-2024-0436", reason = "Transitive through iroh 1.0.3 -> netwatch 0.19.1 -> netlink-packet-core 0.8.1, whose current release still uses the unmaintained paste 1.0.15 proc macro." },
 ]
 
 [licenses]
@@ -49,8 +43,8 @@ ignore = false
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
-# 工作区内部 path 依赖由同一提交锁定；仍拒绝注册表依赖使用 `*` 版本。
-allow-wildcard-paths = true
+# 工作区内部 path 依赖也必须声明精确兼容版本。
+allow-wildcard-paths = false
 highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"

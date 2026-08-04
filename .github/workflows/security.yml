@@ -40,9 +40,9 @@ jobs:
         with:
           persist-credentials: false
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.88.0 --profile minimal
+        run: rustup toolchain install 1.91.0 --profile minimal
       - name: Select pinned Rust toolchain
-        run: rustup default 1.88.0
+        run: rustup default 1.91.0
       - name: Validate exact and unexpired security exceptions
         run: node scripts/check-security-exceptions.mjs
       - name: Install pinned Rust security tools
@@ -53,8 +53,7 @@ jobs:
       - name: Audit Rust advisories
         run: cargo audit --deny warnings
       - name: Enforce Rust dependency policy
-        # 四个既有工作区 path 依赖由上一步逐项校验并设置到期日；其他 bans 仍保持 deny。
-        run: cargo deny check advisories bans licenses sources --warn wildcard
+        run: cargo deny check advisories bans licenses sources
 
   dependency-vulnerabilities:
     name: OSV dependency scan
@@ -184,4 +183,3 @@ jobs:
           hide-progress: true
           cache: false
           token-setup-trivy: ""
-          trivyignores: .trivyignore.yaml

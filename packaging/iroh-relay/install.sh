@@ -11,18 +11,18 @@ if command -v cargo >/dev/null 2>&1; then
 elif [[ -x /root/.cargo/bin/cargo ]]; then
   cargo_bin=/root/.cargo/bin/cargo
 else
-  echo "未找到 Cargo。请先安装 Rust 1.88 或更新版本。" >&2
+  echo "未找到 Cargo。请先安装 Rust 1.91 或更新版本。" >&2
   exit 1
 fi
 
-cargo_target_directory="${CARGO_TARGET_DIR:-/var/cache/linklake/cargo-target/iroh-relay-0.92.0}"
+cargo_target_directory="${CARGO_TARGET_DIR:-/var/cache/linklake/cargo-target/iroh-relay-1.0.3}"
 if [[ -x /usr/local/bin/iroh-relay ]] \
-  && [[ "$(/usr/local/bin/iroh-relay --version)" == "iroh-relay 0.92.0" ]]; then
-  echo "iroh-relay 0.92.0 已安装，跳过重复编译。"
+  && [[ "$(/usr/local/bin/iroh-relay --version)" == "iroh-relay 1.0.3" ]]; then
+  echo "iroh-relay 1.0.3 已安装，跳过重复编译。"
 else
   install -d -m 0755 "$cargo_target_directory"
   CARGO_TARGET_DIR="$cargo_target_directory" \
-    "$cargo_bin" install iroh-relay --version 0.92.0 --features server --locked --root /usr/local
+    "$cargo_bin" install iroh-relay --version 1.0.3 --features server --locked --root /usr/local
 fi
 
 install -d -m 0750 -o root -g linklake /etc/linklake

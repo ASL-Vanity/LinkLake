@@ -1,7 +1,8 @@
 //! 基于 Iroh QUIC 的 UDP 地址发现、打洞和直连数据通道。
 
 use iroh::{
-    endpoint::ConnectionType, Endpoint, NodeAddr, NodeId, RelayMode, RelayUrl, SecretKey, Watcher,
+    endpoint::{presets, Connection},
+    Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr, Watcher,
 };
 use linklake_core::p2p_protocol::{
     P2pCandidate, P2pIrohAddress, P2pMappingBehavior, P2pNetworkProfile, P2pTransport,
@@ -31,19 +32,18 @@ pub(crate) async fn build_endpoint(
     material.update(b"LinkLake-Iroh-Endpoint-v1\0");
     material.update(client_token.as_bytes());
     let secret: [u8; 32] = material.finalize().into();
-    let mut builder = Endpoint::builder()
+    let mut builder = Endpoint::builder(presets::N0)
+        .clear_address_lookup()
         .relay_mode(relay_mode)
-        .secret_key(SecretKey::from_bytes(&secret));
+        .secret_key(SecretKey::from_bytes(&secret))
+        .clear_ip_transports()
+        .bind_addr(bind)?;
     if accept_incoming {
         builder = builder.alpns(vec![ALPN.to_vec()]);
     }
-    builder = match bind {
-        SocketAddr::V4(address) => builder.bind_addr_v4(address),
-        SocketAddr::V6(address) => builder.bind_addr_v6(address),
-    };
     let endpoint = builder.bind().await?;
     if relay_url.is_some() {
-        timeout(Duration::from_secs(10), endpoint.home_relay().initialized())
+        timeout(Duration::from_secs(10), endpoint.online())
             .await
             .map_err(|_| anyhow::anyhow!("Iroh rendezvous relay did not become ready"))?;
     }
@@ -51,10 +51,10 @@ pub(crate) async fn build_endpoint(
 }
 
 pub(crate) async fn candidate(endpoint: &Endpoint, priority: u16) -> anyhow::Result<P2pCandidate> {
-    let addresses = endpoint.direct_addresses().initialized().await;
-    let direct_addresses = addresses
-        .iter()
-        .map(|address| address.addr.to_string())
+    let address = endpoint.watch_addr().get();
+    let direct_addresses = address
+        .ip_addrs()
+        .map(ToString::to_string)
         .collect::<Vec<_>>();
     let report = endpoint.net_report().get();
     let network = report.map(|report| P2pNetworkProfile {
@@ -71,14 +71,13 @@ pub(crate) async fn candidate(endpoint: &Endpoint, priority: u16) -> anyhow::Res
         },
         global_v4: report.global_v4.map(|address| address.to_string()),
         global_v6: report.global_v6.map(|address| address.to_string()),
-        port_mapping: addresses
-            .iter()
-            .any(|address| address.typ.to_string() == "portmap"),
+        // Iroh 1.0 的稳定 EndpointAddr 不再暴露地址来源；不能把普通公网地址误报成端口映射。
+        port_mapping: false,
     });
     let value = P2pIrohAddress {
-        endpoint_id: endpoint.node_id().to_string(),
+        endpoint_id: endpoint.id().to_string(),
         direct_addresses,
-        relay_url: endpoint.home_relay().get().first().map(ToString::to_string),
+        relay_url: address.relay_urls().next().map(ToString::to_string),
         network,
     };
     anyhow::ensure!(
@@ -95,13 +94,13 @@ pub(crate) async fn candidate(endpoint: &Endpoint, priority: u16) -> anyhow::Res
 pub(crate) async fn connect(
     candidate: &P2pCandidate,
     client_token: &str,
-) -> anyhow::Result<(Endpoint, iroh::endpoint::Connection)> {
+) -> anyhow::Result<(Endpoint, Connection)> {
     anyhow::ensure!(
         candidate.transport == P2pTransport::IrohQuic,
         "not an Iroh candidate"
     );
     let address: P2pIrohAddress = serde_json::from_str(&candidate.endpoint)?;
-    let endpoint_id = NodeId::from_str(&address.endpoint_id)?;
+    let endpoint_id = EndpointId::from_str(&address.endpoint_id)?;
     let direct_addresses = address
         .direct_addresses
         .iter()
@@ -112,7 +111,13 @@ pub(crate) async fn connect(
         .as_deref()
         .map(RelayUrl::from_str)
         .transpose()?;
-    let remote = NodeAddr::from_parts(endpoint_id, relay, direct_addresses);
+    let remote = EndpointAddr::from_parts(
+        endpoint_id,
+        relay
+            .into_iter()
+            .map(TransportAddr::Relay)
+            .chain(direct_addresses.into_iter().map(TransportAddr::Ip)),
+    );
     let bind = match address
         .direct_addresses
         .first()
@@ -122,24 +127,19 @@ pub(crate) async fn connect(
         _ => "0.0.0.0:0".parse()?,
     };
     let endpoint = build_endpoint(bind, address.relay_url.as_deref(), client_token, false).await?;
-    // Iroh 0.92 在地址监测器完成初始化前立即 connect，Windows 上可能尚未开始接收 UDP。
-    endpoint.direct_addresses().initialized().await;
+    // 地址监测器完成初始化前立即 connect，Windows 上可能尚未开始接收 UDP。
+    let _ = endpoint.watch_addr().get();
     let connection = timeout(DIRECT_PATH_TIMEOUT, endpoint.connect(remote, ALPN))
         .await
         .map_err(|_| anyhow::anyhow!("Iroh connection timed out"))??;
-    wait_for_direct(&endpoint, endpoint_id).await?;
+    wait_for_direct(&connection).await?;
     Ok((endpoint, connection))
 }
 
-pub(crate) async fn wait_for_direct(endpoint: &Endpoint, remote: NodeId) -> anyhow::Result<()> {
+pub(crate) async fn wait_for_direct(connection: &Connection) -> anyhow::Result<()> {
     let deadline = Instant::now() + DIRECT_PATH_TIMEOUT;
     loop {
-        if endpoint.conn_type(remote).is_some_and(|mut connection| {
-            matches!(
-                connection.get(),
-                ConnectionType::Direct(_) | ConnectionType::Mixed(_, _)
-            )
-        }) {
+        if connection.paths().iter().any(|path| path.is_ip()) {
             return Ok(());
         }
         anyhow::ensure!(Instant::now() < deadline, "Iroh path remained relay-only");
@@ -189,14 +189,9 @@ mod tests {
                     .expect("incoming should be accepted")
                     .await
                     .expect("incoming should connect");
-                wait_for_direct(
-                    &provider,
-                    connection
-                        .remote_node_id()
-                        .expect("remote node id should exist"),
-                )
-                .await
-                .expect("provider path should become direct");
+                wait_for_direct(&connection)
+                    .await
+                    .expect("provider path should become direct");
                 let (mut send, mut recv) =
                     connection.accept_bi().await.expect("stream should arrive");
                 let value = recv.read_to_end(32).await.expect("payload should read");

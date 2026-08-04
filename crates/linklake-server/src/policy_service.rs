@@ -1329,17 +1329,24 @@ fn validate_plan(
                 let allowed = value
                     .allowed_agent_instance_id
                     .map(|agent| clients.get(&agent).copied());
-                if provider.is_none() || allowed.is_some_and(|client| client.is_none()) {
-                    Err("referenced secret-tunnel client is not enrolled locally".to_owned())
-                } else if !desired_names.insert((
-                    planned.kind,
-                    provider.expect("provider checked"),
-                    value.name.clone(),
-                )) {
-                    Err("duplicate Fleet secret-tunnel name".to_owned())
-                } else {
-                    Ok(())
-                }
+                provider
+                    .ok_or_else(|| {
+                        "referenced secret-tunnel client is not enrolled locally".to_owned()
+                    })
+                    .and_then(|provider| {
+                        if allowed.is_some_and(|client| client.is_none()) {
+                            Err("referenced secret-tunnel client is not enrolled locally"
+                                .to_owned())
+                        } else if !desired_names.insert((
+                            planned.kind,
+                            provider,
+                            value.name.clone(),
+                        )) {
+                            Err("duplicate Fleet secret-tunnel name".to_owned())
+                        } else {
+                            Ok(())
+                        }
+                    })
             }
             FleetResourceSpec::Socks5Proxy(value) => clients
                 .get(&value.agent_instance_id)

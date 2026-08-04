@@ -5,6 +5,7 @@ use linklake_core::{
     UdpDataPlaneControlFrame, UDP_DATA_PLANE_ALPN, UDP_DATA_PLANE_PROTOCOL_VERSION,
 };
 use quinn::crypto::rustls::QuicServerConfig;
+use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use std::{
     collections::HashMap,
     fs::File,
@@ -18,7 +19,7 @@ use tokio::{
     sync::{oneshot, OwnedSemaphorePermit, Semaphore},
     time::Instant,
 };
-use tokio_rustls::rustls::{self, pki_types::PrivateKeyDer};
+use tokio_rustls::rustls;
 use uuid::Uuid;
 
 /// 控制面发出的 ticket 有效期；这不是单次 QUIC attach 操作的执行时限。
@@ -184,18 +185,21 @@ impl UdpDataPlane {
         );
 
         let certificates = {
-            let mut reader = BufReader::new(File::open(config.certificate_path)?);
-            rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?
+            let reader = BufReader::new(File::open(config.certificate_path)?);
+            CertificateDer::pem_reader_iter(reader).collect::<Result<Vec<_>, _>>()?
         };
         anyhow::ensure!(
             !certificates.is_empty(),
             "UDP data-plane certificate file contains no certificates"
         );
         let private_key = {
-            let mut reader = BufReader::new(File::open(config.private_key_path)?);
-            rustls_pemfile::private_key(&mut reader)?.ok_or_else(|| {
-                anyhow::anyhow!("UDP data-plane private key file contains no private key")
-            })?
+            let reader = BufReader::new(File::open(config.private_key_path)?);
+            PrivateKeyDer::pem_reader_iter(reader)
+                .next()
+                .transpose()?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("UDP data-plane private key file contains no private key")
+                })?
         };
         let server_config = build_server_config(certificates, private_key)?;
         let endpoint = quinn::Endpoint::server(server_config, config.bind_address)?;

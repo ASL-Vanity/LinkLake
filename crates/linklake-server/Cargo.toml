@@ -24,8 +24,8 @@ hyper.workspace = true
 hyper-util.workspace = true
 hmac.workspace = true
 instant-acme.workspace = true
-linklake-core = { path = "../linklake-core" }
-linklake-update = { path = "../linklake-update" }
+linklake-core = { path = "../linklake-core", version = "=0.8.0-rc.1" }
+linklake-update = { path = "../linklake-update", version = "=0.8.0-rc.1" }
 quinn.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -39,7 +39,7 @@ tower-http.workspace = true
 uuid.workspace = true
 x509-parser.workspace = true
 zeroize.workspace = true
-rustls-pemfile.workspace = true
+rustls-pki-types.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
 rusqlite.workspace = true
