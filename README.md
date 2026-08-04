@@ -391,9 +391,15 @@ ACME 账户凭据和证书私钥保存在 `LINKLAKE_DATA_DIR/acme` 与 `LINKLAKE
 
 Windows 发布包：
 
-- `windows/install-server.ps1`：安装并启动 `LinkLakeServer`
-- `windows/install-client.ps1`：安装并启动 `LinkLakeClient`
-- `windows/uninstall.ps1`：移除服务但保留程序和数据
+- `windows/install-server.ps1`：以 `LocalService` 安装或事务升级 `LinkLakeServer`；TLS 证书和私钥会复制到只读托管目录，启动或验证失败会恢复旧二进制、服务配置和运行状态
+- `windows/install-client.ps1`：以 `LocalService` 安装或事务升级 `LinkLakeClient`；默认保留现有配置，只有显式使用 `-ReplaceConfig` 才会替换
+- `windows/uninstall.ps1`：事务移除所选服务和程序二进制，默认保留配置、状态、日志和服务端数据；永久清理还必须同时使用 `-PurgeData -ConfirmPurge LINKLAKE-PURGE`
+
+Windows 安装器只接受本地绝对目标路径，拒绝重解析点、目录权限重叠、畸形服务环境和不匹配的包内 SHA-256 清单。同一时间只允许一个安装、升级或卸载事务。通过网络取得发布包时，应先按签名发布清单获得可信 SHA-256，再运行：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-windows-package.ps1 -ExpectedSha256 <签名清单中的64位SHA-256>
+```
 
 Linux 发布包：
 
@@ -430,6 +436,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\udp-e2e.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\http-e2e.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\sni-e2e.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\secret-e2e.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\windows-installer-contract.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\package-windows.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-windows-package.ps1
 $env:FLUTTER_BIN = 'F:\Tools\flutter\bin\flutter.bat'
