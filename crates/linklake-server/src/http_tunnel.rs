@@ -52,6 +52,9 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HTTP_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_PUBLIC_HTTP_CONNECTIONS: usize = 2048;
 const MAX_PUBLIC_HTTP2_STREAMS: u32 = 256;
+pub(crate) const HTTP_REQUEST_LATENCY_BUCKETS_MILLIS: [u64; 12] = [
+    5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000,
+];
 
 static PUBLIC_HTTP_CONNECTION_PERMITS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(MAX_PUBLIC_HTTP_CONNECTIONS)));
@@ -107,7 +110,6 @@ pub(crate) struct HttpRouteRegistration {
     context: Arc<HttpRouteContext>,
 }
 
-#[derive(Default)]
 pub(crate) struct HttpRouteStatistics {
     pub(crate) active_connections: AtomicUsize,
     pub(crate) requests_total: AtomicU64,
@@ -123,6 +125,135 @@ pub(crate) struct HttpRouteStatistics {
     pub(crate) grpc_failures_total: AtomicU64,
     pub(crate) grpc_cancellations_total: AtomicU64,
     pub(crate) http2_backend: Arc<Http2BackendCounters>,
+    request_latency: HttpRequestLatencyHistogram,
+}
+
+impl Default for HttpRouteStatistics {
+    fn default() -> Self {
+        Self {
+            active_connections: AtomicUsize::new(0),
+            requests_total: AtomicU64::new(0),
+            failed_requests: AtomicU64::new(0),
+            bytes_from_public: AtomicU64::new(0),
+            bytes_to_public: AtomicU64::new(0),
+            pairing_timeouts: AtomicU64::new(0),
+            http2_active_streams: AtomicUsize::new(0),
+            http2_requests_total: AtomicU64::new(0),
+            grpc_active_streams: AtomicUsize::new(0),
+            grpc_requests_total: AtomicU64::new(0),
+            grpc_trailers_total: AtomicU64::new(0),
+            grpc_failures_total: AtomicU64::new(0),
+            grpc_cancellations_total: AtomicU64::new(0),
+            http2_backend: Arc::new(Http2BackendCounters::default()),
+            request_latency: HttpRequestLatencyHistogram::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HttpRequestLatencySnapshot {
+    pub(crate) cumulative_buckets: [u64; HTTP_REQUEST_LATENCY_BUCKETS_MILLIS.len()],
+    pub(crate) count: u64,
+    pub(crate) sum_micros: u64,
+}
+
+impl HttpRequestLatencySnapshot {
+    pub(crate) fn add_assign(&mut self, other: &Self) {
+        for (total, value) in self
+            .cumulative_buckets
+            .iter_mut()
+            .zip(other.cumulative_buckets)
+        {
+            *total = total.saturating_add(value);
+        }
+        self.count = self.count.saturating_add(other.count);
+        self.sum_micros = self.sum_micros.saturating_add(other.sum_micros);
+    }
+
+    pub(crate) fn quantile_seconds(&self, quantile: f64) -> f64 {
+        if self.count == 0 {
+            return 0.0;
+        }
+        let rank = ((self.count as f64 * quantile).ceil() as u64).max(1);
+        for (index, count) in self.cumulative_buckets.iter().enumerate() {
+            if *count >= rank {
+                return HTTP_REQUEST_LATENCY_BUCKETS_MILLIS[index] as f64 / 1_000.0;
+            }
+        }
+        HTTP_REQUEST_LATENCY_BUCKETS_MILLIS
+            .last()
+            .copied()
+            .unwrap_or_default() as f64
+            / 1_000.0
+    }
+}
+
+struct HttpRequestLatencyHistogram {
+    cumulative_buckets: [AtomicU64; HTTP_REQUEST_LATENCY_BUCKETS_MILLIS.len()],
+    count: AtomicU64,
+    sum_micros: AtomicU64,
+}
+
+impl Default for HttpRequestLatencyHistogram {
+    fn default() -> Self {
+        Self {
+            cumulative_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            count: AtomicU64::new(0),
+            sum_micros: AtomicU64::new(0),
+        }
+    }
+}
+
+impl HttpRequestLatencyHistogram {
+    fn observe(&self, elapsed: Duration) {
+        let micros = elapsed.as_micros().min(u64::MAX as u128) as u64;
+        let millis = elapsed.as_millis().min(u64::MAX as u128) as u64;
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.sum_micros.fetch_add(micros, Ordering::Relaxed);
+        for (index, boundary) in HTTP_REQUEST_LATENCY_BUCKETS_MILLIS.iter().enumerate() {
+            if millis <= *boundary {
+                self.cumulative_buckets[index].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> HttpRequestLatencySnapshot {
+        HttpRequestLatencySnapshot {
+            cumulative_buckets: std::array::from_fn(|index| {
+                self.cumulative_buckets[index].load(Ordering::Relaxed)
+            }),
+            count: self.count.load(Ordering::Relaxed),
+            sum_micros: self.sum_micros.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl HttpRouteStatistics {
+    pub(crate) fn request_latency_snapshot(&self) -> HttpRequestLatencySnapshot {
+        self.request_latency.snapshot()
+    }
+}
+
+struct RequestLatencyObservation {
+    statistics: Arc<HttpRouteStatistics>,
+    started: Instant,
+}
+
+impl RequestLatencyObservation {
+    fn begin(statistics: Arc<HttpRouteStatistics>) -> Self {
+        Self {
+            statistics,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for RequestLatencyObservation {
+    fn drop(&mut self) {
+        self.statistics
+            .request_latency
+            .observe(self.started.elapsed());
+    }
 }
 
 struct HttpRouteContext {
@@ -799,6 +930,7 @@ async fn proxy_request(
         .statistics
         .requests_total
         .fetch_add(1, Ordering::Relaxed);
+    let _latency_observation = RequestLatencyObservation::begin(context.statistics.clone());
     if public_http2 {
         context
             .statistics

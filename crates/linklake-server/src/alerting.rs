@@ -12,7 +12,6 @@ const NOTIFICATION_DELIVERY_LEASE_SECONDS: u64 = 60;
 const NOTIFICATION_DELIVERY_MAX_ATTEMPTS: u32 = 10;
 const NOTIFICATION_DELIVERY_BACKOFF_BASE_SECONDS: u64 = 5;
 const NOTIFICATION_DELIVERY_BACKOFF_MAX_SECONDS: u64 = 3_600;
-const NOTIFICATION_DELIVERY_ERROR_MAX_CHARS: usize = 512;
 const NOTIFICATION_DELIVERY_PAYLOAD_MAX_BYTES: usize = 64 * 1024;
 const NOTIFICATION_DELIVERY_RETENTION_SECONDS: u64 = 30 * 24 * 60 * 60;
 
@@ -25,6 +24,8 @@ pub(crate) enum AlertMetric {
     TrafficBytesPerSecond,
     ActiveConnections,
     CertificateDaysRemaining,
+    SloFastBurnRate,
+    SloSlowBurnRate,
 }
 
 impl fmt::Display for AlertMetric {
@@ -36,6 +37,8 @@ impl fmt::Display for AlertMetric {
             Self::TrafficBytesPerSecond => "traffic_bytes_per_second",
             Self::ActiveConnections => "active_connections",
             Self::CertificateDaysRemaining => "certificate_days_remaining",
+            Self::SloFastBurnRate => "slo_fast_burn_rate",
+            Self::SloSlowBurnRate => "slo_slow_burn_rate",
         })
     }
 }
@@ -51,6 +54,8 @@ impl FromStr for AlertMetric {
             "traffic_bytes_per_second" => Ok(Self::TrafficBytesPerSecond),
             "active_connections" => Ok(Self::ActiveConnections),
             "certificate_days_remaining" => Ok(Self::CertificateDaysRemaining),
+            "slo_fast_burn_rate" => Ok(Self::SloFastBurnRate),
+            "slo_slow_burn_rate" => Ok(Self::SloSlowBurnRate),
             _ => anyhow::bail!("unknown alert metric"),
         }
     }
@@ -318,6 +323,12 @@ pub(crate) struct NotificationDeliveryMetrics {
     pub(crate) notification_delivery_failures_total: u64,
     pub(crate) notification_delivery_dead_letters_total: u64,
     pub(crate) notification_oldest_pending_age_seconds: u64,
+    pub(crate) notification_webhook_pending: u64,
+    pub(crate) notification_webhook_in_flight: u64,
+    pub(crate) notification_webhook_dead_letter: u64,
+    pub(crate) notification_email_pending: u64,
+    pub(crate) notification_email_in_flight: u64,
+    pub(crate) notification_email_dead_letter: u64,
 }
 
 pub(crate) struct AlertCatalog {
@@ -634,7 +645,7 @@ impl AlertCatalog {
              SET state = 'pending', lease_expires_unix_seconds = NULL,
                  lease_token = NULL,
                  updated_unix_seconds = ?1,
-                 last_error = COALESCE(last_error, 'delivery lease expired before acknowledgement')
+                 last_error = COALESCE(last_error, 'notification_lease_expired')
              WHERE state = 'delivering'
                AND lease_expires_unix_seconds IS NOT NULL
                AND lease_expires_unix_seconds <= ?1",
@@ -755,7 +766,7 @@ impl AlertCatalog {
                 delivery.id,
                 state.to_string(),
                 next_attempt as i64,
-                sanitize_delivery_error(error),
+                normalize_delivery_error_code(error),
                 now as i64,
                 delivery.lease_token,
             ],
@@ -878,6 +889,34 @@ impl AlertCatalog {
                     ))
                 },
             )?;
+        let (
+            webhook_pending,
+            webhook_in_flight,
+            webhook_dead_letter,
+            email_pending,
+            email_in_flight,
+            email_dead_letter,
+        ): (u64, u64, u64, u64, u64, u64) = self.database.query_row(
+            "SELECT
+                 COALESCE(SUM(CASE WHEN channel = 'webhook' AND state = 'pending' THEN 1 ELSE 0 END), 0),
+                 COALESCE(SUM(CASE WHEN channel = 'webhook' AND state = 'delivering' THEN 1 ELSE 0 END), 0),
+                 COALESCE(SUM(CASE WHEN channel = 'webhook' AND state = 'dead_letter' THEN 1 ELSE 0 END), 0),
+                 COALESCE(SUM(CASE WHEN channel = 'email' AND state = 'pending' THEN 1 ELSE 0 END), 0),
+                 COALESCE(SUM(CASE WHEN channel = 'email' AND state = 'delivering' THEN 1 ELSE 0 END), 0),
+                 COALESCE(SUM(CASE WHEN channel = 'email' AND state = 'dead_letter' THEN 1 ELSE 0 END), 0)
+             FROM alert_notification_deliveries",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?.max(0) as u64,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                    row.get::<_, i64>(2)?.max(0) as u64,
+                    row.get::<_, i64>(3)?.max(0) as u64,
+                    row.get::<_, i64>(4)?.max(0) as u64,
+                    row.get::<_, i64>(5)?.max(0) as u64,
+                ))
+            },
+        )?;
         Ok(NotificationDeliveryMetrics {
             notification_deliveries_pending: pending,
             notification_deliveries_retrying: retrying,
@@ -888,6 +927,12 @@ impl AlertCatalog {
             notification_delivery_dead_letters_total: dead_letters_total,
             notification_oldest_pending_age_seconds: oldest_pending
                 .map_or(0, |created| now.saturating_sub(created)),
+            notification_webhook_pending: webhook_pending,
+            notification_webhook_in_flight: webhook_in_flight,
+            notification_webhook_dead_letter: webhook_dead_letter,
+            notification_email_pending: email_pending,
+            notification_email_in_flight: email_in_flight,
+            notification_email_dead_letter: email_dead_letter,
         })
     }
 
@@ -895,65 +940,101 @@ impl AlertCatalog {
         let count: u64 =
             self.database
                 .query_row("SELECT COUNT(*) FROM alert_rules", [], |row| row.get(0))?;
-        if count > 0 {
-            return Ok(());
-        }
         let now = crate::unix_seconds();
+        if count == 0 {
+            for request in [
+                CreateAlertRule {
+                    name: "Client offline".to_owned(),
+                    metric: AlertMetric::ClientOffline,
+                    comparator: AlertComparator::GreaterOrEqual,
+                    threshold: 1.0,
+                    target: None,
+                    evaluation_window_seconds: 120,
+                    cooldown_seconds: 900,
+                    severity: AlertSeverity::Warning,
+                    notify_webhook: true,
+                    notify_email: false,
+                    enabled: true,
+                },
+                CreateAlertRule {
+                    name: "Policy unavailable".to_owned(),
+                    metric: AlertMetric::PolicyUnavailable,
+                    comparator: AlertComparator::GreaterOrEqual,
+                    threshold: 1.0,
+                    target: None,
+                    evaluation_window_seconds: 60,
+                    cooldown_seconds: 900,
+                    severity: AlertSeverity::Critical,
+                    notify_webhook: true,
+                    notify_email: true,
+                    enabled: true,
+                },
+                CreateAlertRule {
+                    name: "Authentication failures".to_owned(),
+                    metric: AlertMetric::AuthenticationFailures,
+                    comparator: AlertComparator::GreaterOrEqual,
+                    threshold: 10.0,
+                    target: None,
+                    evaluation_window_seconds: 300,
+                    cooldown_seconds: 900,
+                    severity: AlertSeverity::Warning,
+                    notify_webhook: true,
+                    notify_email: false,
+                    enabled: true,
+                },
+                CreateAlertRule {
+                    name: "Certificate expiry".to_owned(),
+                    metric: AlertMetric::CertificateDaysRemaining,
+                    comparator: AlertComparator::LessOrEqual,
+                    threshold: 30.0,
+                    target: None,
+                    evaluation_window_seconds: 300,
+                    cooldown_seconds: 86_400,
+                    severity: AlertSeverity::Warning,
+                    notify_webhook: true,
+                    notify_email: true,
+                    enabled: true,
+                },
+            ] {
+                self.create_rule(request, now)?;
+            }
+        }
         for request in [
             CreateAlertRule {
-                name: "Client offline".to_owned(),
-                metric: AlertMetric::ClientOffline,
+                name: "SLO fast burn (5m and 1h)".to_owned(),
+                metric: AlertMetric::SloFastBurnRate,
                 comparator: AlertComparator::GreaterOrEqual,
-                threshold: 1.0,
-                target: None,
-                evaluation_window_seconds: 120,
-                cooldown_seconds: 900,
-                severity: AlertSeverity::Warning,
-                notify_webhook: true,
-                notify_email: false,
-                enabled: true,
-            },
-            CreateAlertRule {
-                name: "Policy unavailable".to_owned(),
-                metric: AlertMetric::PolicyUnavailable,
-                comparator: AlertComparator::GreaterOrEqual,
-                threshold: 1.0,
-                target: None,
-                evaluation_window_seconds: 60,
-                cooldown_seconds: 900,
+                threshold: 14.4,
+                target: Some("global".to_owned()),
+                evaluation_window_seconds: 300,
+                cooldown_seconds: 3_600,
                 severity: AlertSeverity::Critical,
                 notify_webhook: true,
                 notify_email: true,
                 enabled: true,
             },
             CreateAlertRule {
-                name: "Authentication failures".to_owned(),
-                metric: AlertMetric::AuthenticationFailures,
+                name: "SLO slow burn (6h and 24h)".to_owned(),
+                metric: AlertMetric::SloSlowBurnRate,
                 comparator: AlertComparator::GreaterOrEqual,
-                threshold: 10.0,
-                target: None,
-                evaluation_window_seconds: 300,
-                cooldown_seconds: 900,
-                severity: AlertSeverity::Warning,
-                notify_webhook: true,
-                notify_email: false,
-                enabled: true,
-            },
-            CreateAlertRule {
-                name: "Certificate expiry".to_owned(),
-                metric: AlertMetric::CertificateDaysRemaining,
-                comparator: AlertComparator::LessOrEqual,
-                threshold: 30.0,
-                target: None,
-                evaluation_window_seconds: 300,
-                cooldown_seconds: 86_400,
+                threshold: 6.0,
+                target: Some("global".to_owned()),
+                evaluation_window_seconds: 21_600,
+                cooldown_seconds: 21_600,
                 severity: AlertSeverity::Warning,
                 notify_webhook: true,
                 notify_email: true,
                 enabled: true,
             },
         ] {
-            self.create_rule(request, now)?;
+            let exists: bool = self.database.query_row(
+                "SELECT EXISTS(SELECT 1 FROM alert_rules WHERE metric = ?1)",
+                [request.metric.to_string()],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                self.create_rule(request, now)?;
+            }
         }
         Ok(())
     }
@@ -1110,20 +1191,59 @@ fn notification_retry_delay_seconds(attempts: u32) -> u64 {
         .min(NOTIFICATION_DELIVERY_BACKOFF_MAX_SECONDS)
 }
 
-fn sanitize_delivery_error(error: &str) -> String {
+fn normalize_delivery_error_code(error: &str) -> String {
+    match error {
+        "webhook_invalid_configuration"
+        | "webhook_timeout"
+        | "webhook_transport"
+        | "smtp_invalid_configuration"
+        | "smtp_timeout"
+        | "smtp_connect"
+        | "smtp_tls"
+        | "notification_lease_expired" => error.to_owned(),
+        _ if valid_webhook_status_code(error) || valid_smtp_stage_code(error) => error.to_owned(),
+        _ => "notification_delivery_failed".to_owned(),
+    }
+}
+
+fn valid_webhook_status_code(error: &str) -> bool {
     error
-        .chars()
-        .map(|value| {
-            if matches!(value, '\r' | '\n' | '\t') {
-                ' '
-            } else {
-                value
-            }
-        })
-        .take(NOTIFICATION_DELIVERY_ERROR_MAX_CHARS)
-        .collect::<String>()
-        .trim()
-        .to_owned()
+        .strip_prefix("webhook_http_status_")
+        .is_some_and(valid_status_code)
+}
+
+fn valid_smtp_stage_code(error: &str) -> bool {
+    let valid_stage = |stage: &str| {
+        matches!(
+            stage,
+            "greeting"
+                | "ehlo"
+                | "starttls"
+                | "auth"
+                | "mail_from"
+                | "recipient"
+                | "data"
+                | "message"
+                | "quit"
+        )
+    };
+    if let Some(stage) = error
+        .strip_prefix("smtp_io_")
+        .or_else(|| error.strip_prefix("smtp_protocol_"))
+    {
+        return valid_stage(stage);
+    }
+    let Some(rest) = error.strip_prefix("smtp_status_") else {
+        return false;
+    };
+    let Some((stage, status)) = rest.rsplit_once('_') else {
+        return false;
+    };
+    valid_stage(stage) && valid_status_code(status)
+}
+
+fn valid_status_code(value: &str) -> bool {
+    value.len() == 3 && value.bytes().all(|value| value.is_ascii_digit())
 }
 
 fn parse_notification_delivery(row: &rusqlite::Row<'_>) -> rusqlite::Result<NotificationDelivery> {
@@ -1290,6 +1410,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn notification_failure_codes_are_allowlisted_and_secret_safe() {
+        assert_eq!(
+            normalize_delivery_error_code("webhook_http_status_503"),
+            "webhook_http_status_503"
+        );
+        assert_eq!(
+            normalize_delivery_error_code("smtp_status_auth_535"),
+            "smtp_status_auth_535"
+        );
+        assert_eq!(
+            normalize_delivery_error_code("smtp_status_auth_535 supersecret raw response"),
+            "notification_delivery_failed"
+        );
+        assert_eq!(
+            normalize_delivery_error_code("https://user:supersecret@example.test/hook?token=1"),
+            "notification_delivery_failed"
+        );
+    }
+
+    fn create_notification_rule(
+        catalog: &mut AlertCatalog,
+        webhook: bool,
+        email: bool,
+        now: u64,
+    ) -> Uuid {
+        catalog
+            .create_rule(
+                CreateAlertRule {
+                    name: "Notification delivery test".to_owned(),
+                    metric: AlertMetric::ActiveConnections,
+                    comparator: AlertComparator::GreaterOrEqual,
+                    threshold: 1.0,
+                    target: Some("delivery-test".to_owned()),
+                    evaluation_window_seconds: 5,
+                    cooldown_seconds: 30,
+                    severity: AlertSeverity::Critical,
+                    notify_webhook: webhook,
+                    notify_email: email,
+                    enabled: true,
+                },
+                now,
+            )
+            .expect("notification rule should be created")
+            .id
+    }
+
+    fn enqueue_test_notification(catalog: &mut AlertCatalog, webhook: bool, email: bool, now: u64) {
+        let rule_id = create_notification_rule(catalog, webhook, email, now);
+        let notifications = catalog
+            .evaluate(
+                &[AlertSignal {
+                    metric: AlertMetric::ActiveConnections,
+                    subject: "delivery-test".to_owned(),
+                    value: 2.0,
+                    message: "test notification".to_owned(),
+                    window_seconds: None,
+                }],
+                now + 1,
+            )
+            .expect("notification should enqueue");
+        assert!(notifications
+            .iter()
+            .any(|notification| notification.event.rule_id == rule_id));
+    }
+
+    #[test]
     fn alert_lifecycle_is_persistent_and_resolves() {
         let root = std::env::temp_dir().join(format!("linklake-alerts-{}", Uuid::new_v4()));
         let rule_id;
@@ -1348,5 +1534,185 @@ mod tests {
                 .any(|event| event.rule_id == rule_id));
         }
         std::fs::remove_dir_all(root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn notification_delivery_is_persistent_and_acknowledged_once() {
+        let root = std::env::temp_dir().join(format!("linklake-outbox-{}", Uuid::new_v4()));
+        let (delivery_id, idempotency_key);
+        {
+            let mut catalog = AlertCatalog::open(Some(&root)).expect("catalog should open");
+            enqueue_test_notification(&mut catalog, true, false, 100);
+            let metrics = catalog
+                .notification_delivery_metrics(102)
+                .expect("metrics should read");
+            assert_eq!(metrics.notification_deliveries_pending, 1);
+            assert_eq!(metrics.notification_webhook_pending, 1);
+            assert_eq!(metrics.notification_email_pending, 0);
+            let deliveries = catalog
+                .claim_notification_deliveries(102, 1)
+                .expect("delivery should be claimed");
+            assert_eq!(deliveries.len(), 1);
+            delivery_id = deliveries[0].id;
+            idempotency_key = deliveries[0].idempotency_key.clone();
+        }
+        {
+            let mut catalog = AlertCatalog::open(Some(&root)).expect("catalog should reopen");
+            assert!(catalog
+                .claim_notification_deliveries(161, 1)
+                .expect("unexpired lease should not be reclaimed")
+                .is_empty());
+            let delivery = catalog
+                .claim_notification_deliveries(162, 1)
+                .expect("expired lease should be reclaimed")
+                .pop()
+                .expect("one expired delivery should be reclaimed");
+            assert_eq!(delivery.id, delivery_id);
+            assert_eq!(delivery.idempotency_key, idempotency_key);
+            assert_eq!(delivery.attempts, 2);
+            assert!(catalog
+                .acknowledge_notification_delivery(&delivery, 163)
+                .expect("delivery should acknowledge"));
+            assert!(!catalog
+                .acknowledge_notification_delivery(&delivery, 164)
+                .expect("duplicate acknowledgement should be ignored"));
+            let metrics = catalog
+                .notification_delivery_metrics(164)
+                .expect("metrics should read");
+            assert_eq!(metrics.notification_deliveries_delivered_total, 1);
+            assert_eq!(metrics.notification_deliveries_pending, 0);
+            assert_eq!(metrics.notification_webhook_pending, 0);
+            assert_eq!(metrics.notification_webhook_in_flight, 0);
+        }
+        std::fs::remove_dir_all(root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn stale_notification_lease_cannot_complete_a_reclaimed_delivery() {
+        let mut catalog = AlertCatalog::open(None).expect("catalog should open");
+        enqueue_test_notification(&mut catalog, true, false, 100);
+        let first = catalog
+            .claim_notification_deliveries(102, 1)
+            .expect("delivery should claim")
+            .pop()
+            .expect("one delivery should exist");
+        let second = catalog
+            .claim_notification_deliveries(162, 1)
+            .expect("expired delivery should reclaim")
+            .pop()
+            .expect("one delivery should be reclaimed");
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.idempotency_key, second.idempotency_key);
+        assert_ne!(first.lease_token, second.lease_token);
+        assert!(!catalog
+            .acknowledge_notification_delivery(&first, 163)
+            .expect("stale acknowledgement should be ignored"));
+        assert_eq!(
+            catalog
+                .fail_notification_delivery(&first, 163, "stale failure")
+                .expect("stale failure should be ignored"),
+            None
+        );
+        assert!(catalog
+            .acknowledge_notification_delivery(&second, 164)
+            .expect("current lease should acknowledge"));
+    }
+
+    #[test]
+    fn notification_failures_back_off_then_dead_letter_and_retry_manually() {
+        let mut catalog = AlertCatalog::open(None).expect("catalog should open");
+        enqueue_test_notification(&mut catalog, true, false, 1_000);
+        let mut now = 1_002;
+        let mut idempotency_key = String::new();
+        for attempt in 1..=NOTIFICATION_DELIVERY_MAX_ATTEMPTS {
+            let delivery = catalog
+                .claim_notification_deliveries(now, 1)
+                .expect("delivery should claim")
+                .pop()
+                .expect("one delivery should be due");
+            if idempotency_key.is_empty() {
+                idempotency_key.clone_from(&delivery.idempotency_key);
+            } else {
+                assert_eq!(delivery.idempotency_key, idempotency_key);
+            }
+            assert_eq!(delivery.attempts, attempt);
+            let state = catalog
+                .fail_notification_delivery(
+                    &delivery,
+                    now,
+                    "smtp_status_auth_535 supersecret\r\nraw response",
+                )
+                .expect("failure should persist")
+                .expect("lease should be current");
+            let view = catalog
+                .list_notification_deliveries(1, None, None)
+                .expect("delivery should list")
+                .pop()
+                .expect("one delivery should list");
+            let last_error = view
+                .last_error
+                .as_deref()
+                .expect("failure should be recorded");
+            assert_eq!(last_error, "notification_delivery_failed");
+            assert!(!last_error.contains("supersecret"));
+            if attempt == NOTIFICATION_DELIVERY_MAX_ATTEMPTS {
+                assert_eq!(state, NotificationDeliveryState::DeadLetter);
+                let outcome = catalog
+                    .retry_notification_delivery(delivery.id, now + 1)
+                    .expect("dead-letter retry should succeed");
+                let NotificationDeliveryRetryOutcome::Retried(retried) = outcome else {
+                    panic!("dead-letter delivery should be retried")
+                };
+                assert_eq!(retried.state, NotificationDeliveryState::Pending);
+                assert_eq!(retried.attempts, 0);
+                assert_eq!(retried.idempotency_key, idempotency_key);
+                let reclaimed = catalog
+                    .claim_notification_deliveries(now + 1, 1)
+                    .expect("manual retry should be immediately due")
+                    .pop()
+                    .expect("manual retry should claim");
+                assert_eq!(reclaimed.attempts, 1);
+                assert_eq!(reclaimed.idempotency_key, idempotency_key);
+            } else {
+                assert_eq!(state, NotificationDeliveryState::Pending);
+                let delay = notification_retry_delay_seconds(attempt);
+                assert!(catalog
+                    .claim_notification_deliveries(now + delay - 1, 1)
+                    .expect("early retry should not claim")
+                    .is_empty());
+                now = now.saturating_add(delay);
+            }
+        }
+        let metrics = catalog
+            .notification_delivery_metrics(now + 1)
+            .expect("metrics should read");
+        assert_eq!(
+            metrics.notification_delivery_failures_total,
+            NOTIFICATION_DELIVERY_MAX_ATTEMPTS as u64
+        );
+        assert_eq!(metrics.notification_delivery_dead_letters_total, 1);
+    }
+
+    #[test]
+    fn retry_reports_missing_and_non_dead_letter_states() {
+        let mut catalog = AlertCatalog::open(None).expect("catalog should open");
+        assert_eq!(
+            catalog
+                .retry_notification_delivery(9_999, 1)
+                .expect("missing retry should be classified"),
+            NotificationDeliveryRetryOutcome::NotFound
+        );
+        enqueue_test_notification(&mut catalog, true, false, 10);
+        let pending = catalog
+            .list_notification_deliveries(1, None, None)
+            .expect("delivery should list")
+            .pop()
+            .expect("one delivery should list");
+        assert_eq!(
+            catalog
+                .retry_notification_delivery(pending.id, 12)
+                .expect("pending retry should be classified"),
+            NotificationDeliveryRetryOutcome::NotDeadLetter(NotificationDeliveryState::Pending)
+        );
     }
 }

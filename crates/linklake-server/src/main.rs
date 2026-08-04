@@ -151,6 +151,10 @@ const METRICS_HISTORY_ARCHIVE_CAPACITY: usize =
     (METRICS_HISTORY_RETENTION_SECONDS / METRICS_HISTORY_ARCHIVE_SAMPLE_INTERVAL_SECONDS) as usize
         + 2;
 const METRICS_HISTORY_DEFAULT_MAX_POINTS: u64 = 300;
+const SLO_PERIOD_SECONDS: u64 = 30 * 24 * 60 * 60;
+const SLO_DEFAULT_AVAILABILITY_TARGET: f64 = 0.999;
+const SLO_FAST_BURN_THRESHOLD: f64 = 14.4;
+const SLO_SLOW_BURN_THRESHOLD: f64 = 6.0;
 const ALERT_EVALUATION_INTERVAL_SECONDS: u64 = 30;
 const LOGIN_HASH_CONCURRENCY: usize = 1;
 const LOGIN_FAILURE_BASE_DELAY_MILLIS: u64 = 250;
@@ -831,6 +835,7 @@ struct MetricsResponse {
     uptime_seconds: u64,
     tcp_active_connections: usize,
     tcp_pending_connections: usize,
+    tcp_connections_total: u64,
     tcp_bytes_from_public: u64,
     tcp_bytes_to_public: u64,
     tcp_failed_connections: u64,
@@ -939,9 +944,43 @@ struct MetricsResponse {
     acme_http01_challenges_total: u64,
     acme_dns01_challenges_total: u64,
     #[serde(flatten)]
+    slo: SloMetrics,
+    http_request_latency_p50_seconds: f64,
+    http_request_latency_p95_seconds: f64,
+    http_request_latency_p99_seconds: f64,
+    http_request_latency_histogram: HttpRequestLatencyHistogramResponse,
+    #[serde(flatten)]
     notification_deliveries: NotificationDeliveryMetrics,
     #[serde(flatten)]
     fleet_health: FleetHealthMetrics,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+struct SloMetrics {
+    slo_availability_target: f64,
+    slo_period_seconds: u64,
+    slo_observed_seconds: u64,
+    slo_requests_total: u64,
+    slo_errors_total: u64,
+    slo_availability_ratio: f64,
+    slo_error_rate_ratio: f64,
+    slo_error_budget_total_ratio: f64,
+    slo_error_budget_consumed_ratio: f64,
+    slo_error_budget_remaining_ratio: f64,
+    slo_burn_rate_5m: f64,
+    slo_burn_rate_1h: f64,
+    slo_burn_rate_6h: f64,
+    slo_burn_rate_24h: f64,
+    slo_fast_burn_alert: u64,
+    slo_slow_burn_alert: u64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+struct HttpRequestLatencyHistogramResponse {
+    boundaries_seconds: Vec<f64>,
+    cumulative_buckets: Vec<u64>,
+    count: u64,
+    sum_seconds: f64,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -2306,6 +2345,7 @@ async fn run_server(
         .route("/api/v1/public-port-policy", get(get_public_port_policy))
         .route("/api/v1/metrics", get(metrics))
         .route("/api/v1/metrics/prometheus", get(prometheus_metrics))
+        .route("/api/v1/slo", get(slo_status))
         .route("/api/v1/metrics/history", get(metrics_history))
         .route(
             "/api/v1/metrics/history/export",
@@ -3107,6 +3147,14 @@ async fn metrics(
     headers: HeaderMap,
 ) -> Result<Json<MetricsResponse>, ApiError> {
     authorize_management(&state, &headers)?;
+    let slo = collect_slo_metrics(
+        &state
+            .metrics_history
+            .lock()
+            .expect("metrics history lock poisoned"),
+        unix_seconds(),
+        configured_slo_availability_target(),
+    );
     let notification_deliveries = state
         .alerts
         .lock()
@@ -3159,6 +3207,19 @@ async fn metrics(
             .values()
             .map(|statistics| load(statistics))
             .sum()
+    };
+    let mut http_request_latency = http_tunnel::HttpRequestLatencySnapshot::default();
+    for statistics in http_statistics.values() {
+        http_request_latency.add_assign(&statistics.request_latency_snapshot());
+    }
+    let http_request_latency_histogram = HttpRequestLatencyHistogramResponse {
+        boundaries_seconds: http_tunnel::HTTP_REQUEST_LATENCY_BUCKETS_MILLIS
+            .iter()
+            .map(|value| *value as f64 / 1_000.0)
+            .collect(),
+        cumulative_buckets: http_request_latency.cumulative_buckets.to_vec(),
+        count: http_request_latency.count,
+        sum_seconds: http_request_latency.sum_micros as f64 / 1_000_000.0,
     };
     let socks5_statistics = state
         .socks5_proxy_statistics
@@ -3226,6 +3287,9 @@ async fn metrics(
             - state.global_connection_permits.available_permits(),
         tcp_pending_connections: PENDING_CONNECTION_LIMIT
             - state.pending_connection_permits.available_permits(),
+        tcp_connections_total: sum_u64(|statistics| {
+            statistics.connections_total.load(Ordering::Relaxed)
+        }),
         tcp_bytes_from_public: sum_u64(|statistics| {
             statistics.bytes_from_public.load(Ordering::Relaxed)
         }),
@@ -3585,6 +3649,11 @@ async fn metrics(
             .metrics
             .acme_dns01_challenges_total
             .load(Ordering::Relaxed),
+        slo,
+        http_request_latency_p50_seconds: http_request_latency.quantile_seconds(0.50),
+        http_request_latency_p95_seconds: http_request_latency.quantile_seconds(0.95),
+        http_request_latency_p99_seconds: http_request_latency.quantile_seconds(0.99),
+        http_request_latency_histogram,
         notification_deliveries,
         fleet_health,
     }))
@@ -3612,10 +3681,144 @@ async fn prometheus_metrics(
         .into_response())
 }
 
+async fn slo_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<SloMetrics>, ApiError> {
+    authorize_management(&state, &headers)?;
+    Ok(Json(collect_slo_metrics(
+        &state
+            .metrics_history
+            .lock()
+            .expect("metrics history lock poisoned"),
+        unix_seconds(),
+        configured_slo_availability_target(),
+    )))
+}
+
+fn configured_slo_availability_target() -> f64 {
+    std::env::var("LINKLAKE_SLO_AVAILABILITY_TARGET")
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0 && *value < 1.0)
+        .unwrap_or(SLO_DEFAULT_AVAILABILITY_TARGET)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SloWindowDelta {
+    observed_seconds: u64,
+    requests: u64,
+    errors: u64,
+}
+
+impl SloWindowDelta {
+    fn error_rate(self) -> f64 {
+        if self.requests == 0 {
+            0.0
+        } else {
+            (self.errors as f64 / self.requests as f64).clamp(0.0, 1.0)
+        }
+    }
+
+    fn burn_rate(self, availability_target: f64) -> f64 {
+        let allowed_error_rate = 1.0 - availability_target;
+        if allowed_error_rate <= 0.0 {
+            0.0
+        } else {
+            self.error_rate() / allowed_error_rate
+        }
+    }
+}
+
+fn slo_window_delta(history: &MetricsHistory, now: u64, window_seconds: u64) -> SloWindowDelta {
+    let (samples, _) = history.tier(window_seconds);
+    let Some(end) = samples
+        .iter()
+        .rev()
+        .find(|sample| sample.timestamp_unix_seconds <= now)
+    else {
+        return SloWindowDelta::default();
+    };
+    let cutoff = now.saturating_sub(window_seconds);
+    let start = samples
+        .iter()
+        .rev()
+        .find(|sample| sample.timestamp_unix_seconds <= cutoff)
+        .or_else(|| samples.front())
+        .unwrap_or(end);
+    let start = start.counters(MetricsHistoryProtocol::Total);
+    let end_counters = end.counters(MetricsHistoryProtocol::Total);
+    let counter_delta = |end: u64, start: u64| {
+        if end >= start {
+            end - start
+        } else {
+            end
+        }
+    };
+    SloWindowDelta {
+        observed_seconds: end.timestamp_unix_seconds.saturating_sub(
+            samples
+                .iter()
+                .rev()
+                .find(|sample| sample.timestamp_unix_seconds <= cutoff)
+                .or_else(|| samples.front())
+                .unwrap_or(end)
+                .timestamp_unix_seconds,
+        ),
+        requests: counter_delta(end_counters.requests_total, start.requests_total),
+        errors: counter_delta(end_counters.errors_total, start.errors_total),
+    }
+}
+
+fn collect_slo_metrics(history: &MetricsHistory, now: u64, availability_target: f64) -> SloMetrics {
+    let period = slo_window_delta(history, now, SLO_PERIOD_SECONDS);
+    let five_minutes = slo_window_delta(history, now, 5 * 60);
+    let one_hour = slo_window_delta(history, now, 60 * 60);
+    let six_hours = slo_window_delta(history, now, 6 * 60 * 60);
+    let twenty_four_hours = slo_window_delta(history, now, 24 * 60 * 60);
+    let error_rate = period.error_rate();
+    let error_budget_total = 1.0 - availability_target;
+    let error_budget_consumed = if period.requests == 0 || error_budget_total <= 0.0 {
+        0.0
+    } else {
+        error_rate / error_budget_total
+    };
+    let burn_rate_5m = five_minutes.burn_rate(availability_target);
+    let burn_rate_1h = one_hour.burn_rate(availability_target);
+    let burn_rate_6h = six_hours.burn_rate(availability_target);
+    let burn_rate_24h = twenty_four_hours.burn_rate(availability_target);
+    SloMetrics {
+        slo_availability_target: availability_target,
+        slo_period_seconds: SLO_PERIOD_SECONDS,
+        slo_observed_seconds: period.observed_seconds,
+        slo_requests_total: period.requests,
+        slo_errors_total: period.errors,
+        slo_availability_ratio: 1.0 - error_rate,
+        slo_error_rate_ratio: error_rate,
+        slo_error_budget_total_ratio: error_budget_total,
+        slo_error_budget_consumed_ratio: error_budget_consumed,
+        slo_error_budget_remaining_ratio: (1.0 - error_budget_consumed).clamp(0.0, 1.0),
+        slo_burn_rate_5m: burn_rate_5m,
+        slo_burn_rate_1h: burn_rate_1h,
+        slo_burn_rate_6h: burn_rate_6h,
+        slo_burn_rate_24h: burn_rate_24h,
+        slo_fast_burn_alert: u64::from(
+            burn_rate_5m >= SLO_FAST_BURN_THRESHOLD && burn_rate_1h >= SLO_FAST_BURN_THRESHOLD,
+        ),
+        slo_slow_burn_alert: u64::from(
+            burn_rate_6h >= SLO_SLOW_BURN_THRESHOLD && burn_rate_24h >= SLO_SLOW_BURN_THRESHOLD,
+        ),
+    }
+}
+
 fn render_prometheus_metrics(value: &serde_json::Value) -> String {
     let mut output = String::new();
     if let Some(fields) = value.as_object() {
         for (name, value) in fields {
+            if name == "http_request_latency_histogram" {
+                render_http_latency_histogram(&mut output, value);
+                continue;
+            }
             if !value.is_number() {
                 continue;
             }
@@ -3626,6 +3829,46 @@ fn render_prometheus_metrics(value: &serde_json::Value) -> String {
         }
     }
     output
+}
+
+fn render_http_latency_histogram(output: &mut String, value: &serde_json::Value) {
+    let Some(histogram) = value.as_object() else {
+        return;
+    };
+    let Some(boundaries) = histogram
+        .get("boundaries_seconds")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+    let Some(buckets) = histogram
+        .get("cumulative_buckets")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+    let Some(count) = histogram.get("count").and_then(serde_json::Value::as_u64) else {
+        return;
+    };
+    let Some(sum) = histogram
+        .get("sum_seconds")
+        .and_then(serde_json::Value::as_f64)
+    else {
+        return;
+    };
+    if boundaries.len() != buckets.len() {
+        return;
+    }
+    let metric = "linklake_http_request_duration_seconds";
+    let _ = writeln!(output, "# TYPE {metric} histogram");
+    for (boundary, bucket) in boundaries.iter().zip(buckets) {
+        if let (Some(boundary), Some(bucket)) = (boundary.as_f64(), bucket.as_u64()) {
+            let _ = writeln!(output, "{metric}_bucket{{le=\"{boundary}\"}} {bucket}");
+        }
+    }
+    let _ = writeln!(output, "{metric}_bucket{{le=\"+Inf\"}} {count}");
+    let _ = writeln!(output, "{metric}_sum {sum}");
+    let _ = writeln!(output, "{metric}_count {count}");
 }
 
 async fn metrics_history(
@@ -4052,7 +4295,7 @@ async fn deliver_due_alert_notifications(state: &Arc<AppState>) {
 fn complete_alert_notification_delivery(
     state: &AppState,
     delivery: &NotificationDelivery,
-    result: anyhow::Result<()>,
+    result: Result<(), notifications::NotificationDeliveryError>,
 ) {
     let now = unix_seconds();
     match result {
@@ -4074,11 +4317,12 @@ fn complete_alert_notification_delivery(
             ),
         },
         Err(error) => {
+            let safe_error = error.safe_code();
             let failed = state
                 .alerts
                 .lock()
                 .expect("alert catalog lock poisoned")
-                .fail_notification_delivery(delivery, now, &error.to_string());
+                .fail_notification_delivery(delivery, now, &safe_error);
             match failed {
                 Ok(Some(NotificationDeliveryState::DeadLetter)) => {
                     tracing::error!(
@@ -4282,6 +4526,27 @@ fn collect_alert_signals(state: &AppState, rules: &[AlertRule]) -> Vec<AlertSign
             }
         }
     }
+    let slo = collect_slo_metrics(&history, now, configured_slo_availability_target());
+    signals.push(AlertSignal {
+        metric: AlertMetric::SloFastBurnRate,
+        subject: "global".to_owned(),
+        value: slo.slo_burn_rate_5m.min(slo.slo_burn_rate_1h),
+        message: format!(
+            "SLO fast burn: 5m={:.2}x, 1h={:.2}x",
+            slo.slo_burn_rate_5m, slo.slo_burn_rate_1h
+        ),
+        window_seconds: Some(5 * 60),
+    });
+    signals.push(AlertSignal {
+        metric: AlertMetric::SloSlowBurnRate,
+        subject: "global".to_owned(),
+        value: slo.slo_burn_rate_6h.min(slo.slo_burn_rate_24h),
+        message: format!(
+            "SLO slow burn: 6h={:.2}x, 24h={:.2}x",
+            slo.slo_burn_rate_6h, slo.slo_burn_rate_24h
+        ),
+        window_seconds: Some(6 * 60 * 60),
+    });
     drop(history);
 
     let route_names = state
@@ -4520,6 +4785,10 @@ fn collect_metrics_history_sample(
             active_connections: statistics
                 .values()
                 .map(|value| value.active_connections.load(Ordering::Relaxed) as u64)
+                .sum(),
+            requests_total: statistics
+                .values()
+                .map(|value| value.connections_total.load(Ordering::Relaxed))
                 .sum(),
             errors_total: statistics
                 .values()
@@ -12085,9 +12354,9 @@ mod tests {
     use super::{
         apply_cache_control, auth_me_response, build_metrics_history_response,
         certificate_target_matches, coded_http_route_creation_error, coded_tcp_policy_error,
-        fleet_mutation_target, login_throttle_identity, management_session_cookie,
-        normalize_metrics_history_step, parse_metrics_history_range, release_certificate_job_slot,
-        render_prometheus_metrics, reserve_certificate_job_slot,
+        collect_slo_metrics, fleet_mutation_target, login_throttle_identity,
+        management_session_cookie, normalize_metrics_history_step, parse_metrics_history_range,
+        release_certificate_job_slot, render_prometheus_metrics, reserve_certificate_job_slot,
         resolve_certificate_identifier_update, select_certificate_maintenance_operation,
         session_cookie_header, tcp_history_error_total, udp_history_error_total,
         udp_metrics_response, validate_fleet_source_binding, verify_agent_enrollment_identity,
@@ -12097,7 +12366,8 @@ mod tests {
         MANAGEMENT_UI, METRICS_HISTORY_ARCHIVE_CAPACITY,
         METRICS_HISTORY_ARCHIVE_SAMPLE_INTERVAL_SECONDS, METRICS_HISTORY_CAPACITY,
         METRICS_HISTORY_RECENT_RETENTION_SECONDS, METRICS_HISTORY_RETENTION_SECONDS,
-        METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS,
+        METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS, SLO_DEFAULT_AVAILABILITY_TARGET,
+        SLO_FAST_BURN_THRESHOLD, SLO_SLOW_BURN_THRESHOLD,
     };
     use crate::{
         admin_auth::SessionIdentity,
@@ -12331,14 +12601,98 @@ mod tests {
         let output = render_prometheus_metrics(&serde_json::json!({
             "large-counter": u64::MAX,
             "active_connections": 3,
+            "http_request_latency_histogram": {
+                "boundaries_seconds": [0.005, 0.01],
+                "cumulative_buckets": [2, 3],
+                "count": 4,
+                "sum_seconds": 0.025
+            },
             "optional": null,
             "label": "ignored"
         }));
         assert!(output.contains("# TYPE linklake_large_counter gauge\n"));
         assert!(output.contains("linklake_large_counter 18446744073709551615\n"));
         assert!(output.contains("linklake_active_connections 3\n"));
+        assert!(output.contains("# TYPE linklake_http_request_duration_seconds histogram\n"));
+        assert!(output.contains("linklake_http_request_duration_seconds_bucket{le=\"0.005\"} 2\n"));
+        assert!(output.contains("linklake_http_request_duration_seconds_bucket{le=\"+Inf\"} 4\n"));
+        assert!(output.contains("linklake_http_request_duration_seconds_count 4\n"));
         assert!(!output.contains("optional"));
         assert!(!output.contains("label"));
+    }
+
+    #[test]
+    fn slo_metrics_calculate_budget_and_multi_window_burn_rates() {
+        let now = 30 * 24 * 60 * 60;
+        let mut history = MetricsHistory::new(16, 16);
+        for (timestamp, requests, errors) in [
+            (0, 0, 0),
+            (now - 24 * 60 * 60, 1_000, 0),
+            (now - 6 * 60 * 60, 2_000, 20),
+            (now - 60 * 60, 3_000, 40),
+            (now - 5 * 60, 4_000, 60),
+            (now, 5_000, 80),
+        ] {
+            history.push(history_sample(
+                timestamp,
+                HistoryCounters {
+                    requests_total: requests,
+                    errors_total: errors,
+                    ..HistoryCounters::default()
+                },
+                HistoryCounters::default(),
+            ));
+        }
+        let slo = collect_slo_metrics(&history, now, SLO_DEFAULT_AVAILABILITY_TARGET);
+        assert_eq!(slo.slo_period_seconds, now);
+        assert_eq!(slo.slo_observed_seconds, now);
+        assert_eq!(slo.slo_requests_total, 5_000);
+        assert_eq!(slo.slo_errors_total, 80);
+        assert!((slo.slo_availability_ratio - 0.984).abs() < f64::EPSILON);
+        assert!((slo.slo_error_budget_consumed_ratio - 16.0).abs() < 1e-9);
+        assert_eq!(slo.slo_error_budget_remaining_ratio, 0.0);
+        assert!(slo.slo_burn_rate_5m >= SLO_FAST_BURN_THRESHOLD);
+        assert!(slo.slo_burn_rate_1h >= SLO_FAST_BURN_THRESHOLD);
+        assert!(slo.slo_burn_rate_6h >= SLO_SLOW_BURN_THRESHOLD);
+        assert!(slo.slo_burn_rate_24h >= SLO_SLOW_BURN_THRESHOLD);
+        assert_eq!(slo.slo_fast_burn_alert, 1);
+        assert_eq!(slo.slo_slow_burn_alert, 1);
+    }
+
+    #[test]
+    fn slo_metrics_handle_idle_and_counter_reset_without_nan() {
+        let mut idle = MetricsHistory::new(4, 4);
+        idle.push(history_sample(
+            100,
+            HistoryCounters::default(),
+            HistoryCounters::default(),
+        ));
+        let idle_slo = collect_slo_metrics(&idle, 100, SLO_DEFAULT_AVAILABILITY_TARGET);
+        assert_eq!(idle_slo.slo_availability_ratio, 1.0);
+        assert_eq!(idle_slo.slo_error_rate_ratio, 0.0);
+        assert_eq!(idle_slo.slo_error_budget_remaining_ratio, 1.0);
+
+        idle.push(history_sample(
+            200,
+            HistoryCounters {
+                requests_total: 10,
+                errors_total: 1,
+                ..HistoryCounters::default()
+            },
+            HistoryCounters::default(),
+        ));
+        idle.push(history_sample(
+            300,
+            HistoryCounters {
+                requests_total: 2,
+                errors_total: 1,
+                ..HistoryCounters::default()
+            },
+            HistoryCounters::default(),
+        ));
+        let reset = collect_slo_metrics(&idle, 300, SLO_DEFAULT_AVAILABILITY_TARGET);
+        assert!(reset.slo_availability_ratio.is_finite());
+        assert!(reset.slo_error_budget_consumed_ratio.is_finite());
     }
 
     #[test]
