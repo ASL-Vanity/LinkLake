@@ -152,6 +152,17 @@ for (const required of [
 ]) {
   if (!release.includes(required)) fail(`release workflow is missing ${required}`);
 }
+const stableNativeSigningGate =
+  "startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')";
+if ((release.match(new RegExp(stableNativeSigningGate.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) ?? []).length < 3) {
+  fail('stable releases must require Windows and macOS native signing while prereleases remain testable');
+}
+if (!release.includes("LINKLAKE_LINUX_SIGNING_REQUIRED: ${{ startsWith(github.ref, 'refs/tags/v')")) {
+  fail('every tagged release, including release candidates, must require Linux OpenPGP signing');
+}
+if (!release.includes('Create and verify production Ed25519 release manifest')) {
+  fail('every tagged release must retain the production updater signing gate');
+}
 if ((release.match(/uses:\s*actions\/attest@[0-9a-f]{40}/g) ?? []).length !== 2) {
   fail('release workflow must create exactly one provenance and one SBOM attestation');
 }

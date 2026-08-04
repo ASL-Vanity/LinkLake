@@ -7,6 +7,13 @@
       "purpose": "development",
       "not_before_version": "0.8.0-rc.1",
       "not_after_version": "1.0.99"
+    },
+    {
+      "key_id": "linklake-production-2026-08-a",
+      "public_key_base64": "I/+EFpI4pN68Ot0Zj2/7HWCzlCmwzlRq9YcqH2GEGjE=",
+      "purpose": "production",
+      "not_before_version": "1.0.0-rc.1",
+      "not_after_version": "1.99.99"
     }
   ]
 }

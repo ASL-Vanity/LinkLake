@@ -17,7 +17,7 @@ test('macOS signing keeps certificate passwords out of command arguments', () =>
   assert.doesNotMatch(setup, /--password/);
 });
 
-test('macOS release packages require hardened signing, notarization, and stapling', () => {
+test('macOS stable release packages require hardened signing, notarization, and stapling', () => {
   const core = read('scripts/package-macos.sh');
   const manager = read('scripts/package-manager-macos.sh');
   const notarize = read('scripts/notarize-macos-artifact.sh');
@@ -31,4 +31,13 @@ test('macOS release packages require hardened signing, notarization, and staplin
   assert.match(notarize, /stapler staple/);
   assert.match(verifyManager, /stapler validate/);
   assert.match(verifyManager, /spctl --assess/);
+});
+
+test('release candidates stay testable without weakening stable native-signing gates', () => {
+  const workflow = read('.github/workflows/release.yml');
+  const stableGate = "startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')";
+  assert.match(workflow, new RegExp(stableGate.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(workflow, /LINKLAKE_LINUX_SIGNING_REQUIRED:.*startsWith\(github\.ref, 'refs\/tags\/v'\)/);
+  assert.match(workflow, /Create and verify production Ed25519 release manifest/);
+  assert.match(workflow, /Windows Authenticode and Apple Developer ID\/notarization remain mandatory for v1\.0\.0/);
 });

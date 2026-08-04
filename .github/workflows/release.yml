@@ -36,7 +36,7 @@ jobs:
     name: Windows release packages
     runs-on: windows-latest
     env:
-      LINKLAKE_WINDOWS_SIGNING_REQUIRED: ${{ startsWith(github.ref, 'refs/tags/v') && 'true' || 'false' }}
+      LINKLAKE_WINDOWS_SIGNING_REQUIRED: ${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') && 'true' || 'false' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -167,7 +167,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 120
     env:
-      LINKLAKE_MACOS_SIGNING_REQUIRED: ${{ startsWith(github.ref, 'refs/tags/v') && 'true' || 'false' }}
+      LINKLAKE_MACOS_SIGNING_REQUIRED: ${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') && 'true' || 'false' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -190,7 +190,7 @@ jobs:
           flutter-version: '3.44.8'
           cache: true
       - name: Prepare temporary Developer ID and notarization credentials
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
         env:
           LINKLAKE_MACOS_SIGNING_CERT_P12_B64: ${{ secrets.LINKLAKE_MACOS_SIGNING_CERT_P12_B64 }}
           LINKLAKE_MACOS_SIGNING_CERT_PASSWORD: ${{ secrets.LINKLAKE_MACOS_SIGNING_CERT_PASSWORD }}
@@ -398,7 +398,12 @@ jobs:
         run: |
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             if [[ "$TAG" == *-rc.* ]]; then
-              gh release create "$TAG" --title "LinkLake $TAG" --verify-tag --generate-notes --prerelease
+              gh release create "$TAG" \
+                --title "LinkLake $TAG" \
+                --verify-tag \
+                --generate-notes \
+                --notes $'> [!WARNING]\n> This release candidate is protected by SHA-256, Linux OpenPGP, GitHub attestations, GHCR Cosign, and the production Ed25519 updater manifest. Windows Authenticode and Apple Developer ID/notarization remain mandatory for v1.0.0 but are not yet attached to this RC.\n\n> 此候选版已使用 SHA-256、Linux OpenPGP、GitHub Attestation、GHCR Cosign 与生产 Ed25519 更新清单保护。Windows Authenticode 与 Apple Developer ID/公证仍是 v1.0.0 的强制门禁，但本 RC 暂未附带。' \
+                --prerelease
             else
               gh release create "$TAG" --title "LinkLake $TAG" --verify-tag --generate-notes --latest
             fi

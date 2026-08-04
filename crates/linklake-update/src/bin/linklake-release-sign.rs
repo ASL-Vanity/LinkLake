@@ -22,6 +22,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// 仅输出指定 Ed25519 种子的公钥信息，绝不输出私钥。
+    PublicKey {
+        #[arg(long)]
+        key_id: String,
+        #[arg(long, default_value = "LINKLAKE_RELEASE_SIGNING_KEY_B64")]
+        signing_key_env: String,
+    },
     Generate {
         #[arg(long)]
         dist: PathBuf,
@@ -46,6 +53,10 @@ enum Command {
 
 fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
+        Command::PublicKey {
+            key_id,
+            signing_key_env,
+        } => print_public_key(&key_id, &signing_key_env),
         Command::Generate {
             dist,
             version,
@@ -68,6 +79,33 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+fn signing_key_from_env(signing_key_env: &str) -> anyhow::Result<SigningKey> {
+    let key_value = std::env::var(signing_key_env)
+        .map_err(|_| anyhow::anyhow!("required signing secret {signing_key_env} is not set"))?;
+    signing_key_from_base64(&key_value)
+}
+
+fn signing_key_from_base64(key_value: &str) -> anyhow::Result<SigningKey> {
+    let seed: [u8; 32] = BASE64.decode(key_value.trim())?.try_into().map_err(|_| {
+        anyhow::anyhow!("Ed25519 signing secret must be a base64-encoded 32-byte seed")
+    })?;
+    Ok(SigningKey::from_bytes(&seed))
+}
+
+fn print_public_key(key_id: &str, signing_key_env: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(!key_id.trim().is_empty(), "key ID must not be empty");
+    let signing_key = signing_key_from_env(signing_key_env)?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "key_id": key_id,
+            "algorithm": "Ed25519",
+            "public_key_base64": BASE64.encode(signing_key.verifying_key().to_bytes()),
+        })
+    );
+    Ok(())
+}
+
 fn generate(
     dist: &Path,
     version: &Version,
@@ -76,12 +114,7 @@ fn generate(
     signing_key_env: &str,
     allow_development_key: bool,
 ) -> anyhow::Result<()> {
-    let key_value = std::env::var(signing_key_env)
-        .map_err(|_| anyhow::anyhow!("required signing secret {signing_key_env} is not set"))?;
-    let seed: [u8; 32] = BASE64.decode(key_value.trim())?.try_into().map_err(|_| {
-        anyhow::anyhow!("Ed25519 signing secret must be a base64-encoded 32-byte seed")
-    })?;
-    let signing_key = SigningKey::from_bytes(&seed);
+    let signing_key = signing_key_from_env(signing_key_env)?;
     validate_signing_key(key_id, &signing_key, version, allow_development_key)?;
 
     let assets = collect_assets(dist, version)?;
@@ -244,6 +277,15 @@ fn archive_target(value: &str) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn derives_public_key_without_exposing_seed() {
+        let key = signing_key_from_base64("nWGxne/9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A=").unwrap();
+        assert_eq!(
+            BASE64.encode(key.verifying_key().to_bytes()),
+            "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
+        );
+    }
 
     #[test]
     fn platform_signatures_and_supply_chain_evidence_are_not_update_assets() {

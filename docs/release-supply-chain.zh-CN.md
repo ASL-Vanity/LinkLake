@@ -2,6 +2,8 @@
 
 LinkLake 正式发布使用相互独立的证据链：SHA-256 旁车文件、Windows Authenticode、macOS Developer ID 与 Apple 公证、Linux OpenPGP 分离签名、GHCR 镜像的 OCI SBOM/provenance 与 Cosign keyless 签名、GitHub 文件证明，以及更新器自己的 Ed25519 发布清单。任一必需证据失败都会关闭发布。
 
+候选版仍强制使用生产 Ed25519 更新信任根、Linux OpenPGP 签名、GitHub Attestation 与 GHCR Cosign 证据。在外部 Windows 和 Apple 身份完成申请前，RC 可以暂不附带 Authenticode 与 Developer ID/公证，并会在预发布页面明确标注。`v1.0.0` 等稳定标签仍会在任一原生签名材料缺失或无效时关闭失败。
+
 ## 发布顺序
 
 1. 同一标签提交上的完整 CI、安全扫描以及 Windows、Linux、macOS 打包任务并行执行；任一门禁失败都会阻止后续发布。
@@ -14,7 +16,7 @@ LinkLake 正式发布使用相互独立的证据链：SHA-256 旁车文件、Win
 
 ## 正式发布 Secret
 
-正式 `v*` 标签需要以下 GitHub Actions Secrets；缺失、格式错误、证书或密钥与固定指纹不一致都会关闭失败：
+所有 `v*` 标签都需要下表中的 Linux OpenPGP 与更新器 Secrets。稳定标签还必须具备全部 Windows 与 macOS Secrets；缺失、格式错误、证书或密钥与固定指纹不一致都会关闭失败：
 
 | 平台 | Secret | 用途 |
 | --- | --- | --- |
@@ -34,7 +36,9 @@ LinkLake 正式发布使用相互独立的证据链：SHA-256 旁车文件、Win
 | 更新器 | `LINKLAKE_RELEASE_SIGNING_KEY_B64` | 生产 Ed25519 种子 |
 | 更新器 | `LINKLAKE_RELEASE_SIGNING_KEY_ID` | 已登记生产公钥的 key ID |
 
-仓库不生成或提交任何生产私钥。当前仍只有 development Ed25519 公钥；在离线生成生产密钥、提交对应公钥并配置上述 Secrets 前，正式标签按设计不能发布。
+仓库自身不生成或提交任何生产私钥。发布前必须离线生成生产更新签名密钥、提交对应公钥，并按发布类型配置所需 Secrets。
+
+可选工具 `scripts/generate-linux-release-key.sh` 只能在运维人员控制的离线容器或工作站中使用。它拒绝覆盖已有文件，通过标准输入向 GnuPG 提供口令，使用全新的纯公钥密钥环验证测试签名，并且只写入显式指定的备份目录。`scripts/verify-linux-release-key-backup.sh` 会独立核对加密私钥、口令、公钥和固定指纹。私钥输出必须保存在仓库外，并在配置对应 GitHub Secrets 前完成备份。
 
 ## 工作流边界
 

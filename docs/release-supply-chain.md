@@ -2,6 +2,8 @@
 
 Formal LinkLake releases combine independent evidence chains: SHA-256 sidecars; Windows Authenticode; macOS Developer ID plus Apple notarization; Linux detached OpenPGP signatures; OCI SBOM/provenance and keyless Cosign signing for GHCR; GitHub file attestations; and the updater's own Ed25519 release manifest. Any required failure closes the release.
 
+Release candidates deliberately keep the production Ed25519 updater trust root, Linux OpenPGP signatures, GitHub attestations, and GHCR Cosign evidence active. Until the external Windows and Apple identities are enrolled, RC packages may omit Authenticode and Developer ID/notarization and are marked accordingly on the prerelease page. Stable tags such as `v1.0.0` still fail closed unless every native-signing credential is present and valid.
+
 ## Release order
 
 1. Full CI, security scanning, and the three platform package jobs run concurrently for the tagged commit.
@@ -14,7 +16,7 @@ Formal LinkLake releases combine independent evidence chains: SHA-256 sidecars; 
 
 ## Formal release secrets
 
-Tagged releases require the following GitHub Actions Secrets and fail closed on missing values or fingerprint mismatches:
+Every tagged release requires the Linux OpenPGP and updater secrets below. Stable tags additionally require all Windows and macOS secrets and fail closed on missing values or fingerprint mismatches:
 
 | Platform | Secret | Purpose |
 | --- | --- | --- |
@@ -34,7 +36,9 @@ Tagged releases require the following GitHub Actions Secrets and fail closed on 
 | Updater | `LINKLAKE_RELEASE_SIGNING_KEY_B64` | Production Ed25519 seed |
 | Updater | `LINKLAKE_RELEASE_SIGNING_KEY_ID` | Registered production key ID |
 
-No production private key is generated or committed. The repository still contains only the development Ed25519 public key; formal publication remains intentionally blocked until an offline production key is created, its public key is committed, and all required Secrets are configured.
+No production private key is generated or committed by the repository. Publication remains intentionally blocked until an offline production updater key is created, its public key is committed, and the required Secrets for the selected release class are configured.
+
+The optional `scripts/generate-linux-release-key.sh` helper is intended only for an operator-controlled offline container or workstation. It refuses overwrites, receives the passphrase through standard input to GnuPG, verifies a test signature with a fresh public-only keyring, and writes only the explicitly selected backup directory. `scripts/verify-linux-release-key-backup.sh` independently checks the encrypted private export, passphrase, public key, and pinned fingerprint. Private-key output must remain outside the repository and be backed up before the matching GitHub Secrets are configured.
 
 ## Workflow boundaries
 
