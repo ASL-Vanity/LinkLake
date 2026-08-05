@@ -39,6 +39,20 @@ if command -v dpkg-deb >/dev/null 2>&1; then
       exit 1
     }
   done
+  if printf '%s\n' "$deb_entries" | grep -Fx '/etc/linklake/server.env' >/dev/null || \
+    printf '%s\n' "$deb_entries" | grep -Fx '/etc/linklake/client.toml' >/dev/null; then
+    echo 'DEB must create mutable runtime configuration in postinst rather than package it as a replaceable payload.' >&2
+    exit 1
+  fi
+  control_root="$(mktemp -d)"
+  dpkg-deb -e "$deb" "$control_root"
+  grep -Fx '/etc/linklake/server.env.example' "$control_root/conffiles" >/dev/null
+  grep -Fx '/etc/linklake/client.toml.example' "$control_root/conffiles" >/dev/null
+  grep -F 'if [ ! -e /etc/linklake/server.env ] && [ ! -L /etc/linklake/server.env ]; then' "$control_root/postinst" >/dev/null
+  grep -F 'install -o root -g root -m 0600 /etc/linklake/server.env.example /etc/linklake/server.env' "$control_root/postinst" >/dev/null
+  grep -F 'if [ ! -e /etc/linklake/client.toml ] && [ ! -L /etc/linklake/client.toml ]; then' "$control_root/postinst" >/dev/null
+  grep -F 'install -o linklake -g linklake -m 0600 /etc/linklake/client.toml.example /etc/linklake/client.toml' "$control_root/postinst" >/dev/null
+  rm -rf -- "$control_root"
   verified=$((verified + 1))
 fi
 
@@ -66,6 +80,17 @@ if command -v rpm >/dev/null 2>&1; then
       exit 1
     }
   done
+  if printf '%s\n' "$rpm_entries" | grep -Fx '/etc/linklake/server.env' >/dev/null || \
+    printf '%s\n' "$rpm_entries" | grep -Fx '/etc/linklake/client.toml' >/dev/null; then
+    echo 'RPM must create mutable runtime configuration in %post rather than package it as a replaceable payload.' >&2
+    exit 1
+  fi
+  rpm -qpc "$rpm_package" | grep -Fx '/etc/linklake/server.env.example' >/dev/null
+  rpm -qpc "$rpm_package" | grep -Fx '/etc/linklake/client.toml.example' >/dev/null
+  rpm -qp --scripts "$rpm_package" | grep -F 'if [ ! -e /etc/linklake/server.env ] && [ ! -L /etc/linklake/server.env ]; then' >/dev/null
+  rpm -qp --scripts "$rpm_package" | grep -F 'install -o root -g root -m 0600 /etc/linklake/server.env.example /etc/linklake/server.env' >/dev/null
+  rpm -qp --scripts "$rpm_package" | grep -F 'if [ ! -e /etc/linklake/client.toml ] && [ ! -L /etc/linklake/client.toml ]; then' >/dev/null
+  rpm -qp --scripts "$rpm_package" | grep -F 'install -o linklake -g linklake -m 0600 /etc/linklake/client.toml.example /etc/linklake/client.toml' >/dev/null
   verified=$((verified + 1))
 fi
 

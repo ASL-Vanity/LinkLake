@@ -1,5 +1,7 @@
 param(
-    [string]$OutputDirectory = (Join-Path $PSScriptRoot '..\dist')
+    [string]$OutputDirectory = (Join-Path $PSScriptRoot '..\dist'),
+    [ValidateSet('none', 'pfx', 'cloud')]
+    [string]$WindowsSigningMode = 'none'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -53,9 +55,8 @@ Copy-Item -LiteralPath (Join-Path $projectRoot 'README.md'), (Join-Path $project
     (Join-Path $projectRoot 'THIRD_PARTY_LICENSES.html'), (Join-Path $projectRoot 'TRADEMARKS.md') `
     -Destination $stage
 
-$windowsSigningRequired = $env:LINKLAKE_WINDOWS_SIGNING_REQUIRED -match '^(?i:1|true|yes)$'
 & (Join-Path $projectRoot 'scripts\sign-windows-artifacts.ps1') `
-    -Required:$windowsSigningRequired `
+    -Mode $WindowsSigningMode `
     -Path @(
         (Join-Path $stage 'bin\linklake-server.exe'),
         (Join-Path $stage 'bin\linklake-client.exe')

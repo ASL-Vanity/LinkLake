@@ -17,7 +17,7 @@ test('macOS signing keeps certificate passwords out of command arguments', () =>
   assert.doesNotMatch(setup, /--password/);
 });
 
-test('macOS stable release packages require hardened signing, notarization, and stapling', () => {
+test('macOS source packaging retains its local signing hardening', () => {
   const core = read('scripts/package-macos.sh');
   const manager = read('scripts/package-manager-macos.sh');
   const notarize = read('scripts/notarize-macos-artifact.sh');
@@ -33,11 +33,48 @@ test('macOS stable release packages require hardened signing, notarization, and 
   assert.match(verifyManager, /spctl --assess/);
 });
 
-test('release candidates stay testable without weakening stable native-signing gates', () => {
+test('official releases keep Windows unsigned while preserving Linux and supply-chain gates', () => {
   const workflow = read('.github/workflows/release.yml');
-  const stableGate = "startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')";
-  assert.match(workflow, new RegExp(stableGate.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  const ci = read('.github/workflows/ci.yml');
+  const releaseAssets = read('scripts/prepare-release-attestations.mjs');
+  const packageSboms = read('scripts/generate-package-sboms.mjs');
+  const windowsSigner = read('scripts/sign-windows-artifacts.ps1');
+
+  assert.match(workflow, /release tag must start with v/);
+  assert.match(workflow, /semver_pattern=/);
+  assert.match(workflow, /version_without_build="\$\{version%%\+\*\}"/);
+  assert.match(workflow, /if \[\[ "\$version_without_build" == \*-\* \]\]/);
+  assert.match(workflow, /RELEASE_PRERELEASE/);
+  assert.match(workflow, /if \[\[ "\$RELEASE_PRERELEASE" == true \]\]/);
+  assert.match(workflow, /gh api --method PATCH/);
+  assert.match(workflow, /-f prerelease=true/);
+  assert.match(workflow, /-f prerelease=false/);
+  assert.match(workflow, /gh release edit "\$TAG" --notes/);
+  assert.match(workflow, /existing_notes="\$\(gh release view "\$TAG" --json body --jq \.body\)"/);
+  assert.doesNotMatch(workflow, /\[\[ "\$TAG" == \*-rc\.\* \]\]/);
+  assert.match(workflow, /Windows unsigned release packages/);
+  assert.equal((workflow.match(/-WindowsSigningMode none/g) ?? []).length, 2);
+  assert.match(
+    workflow,
+    /Windows packages are intentionally unsigned under the personal open-source release policy for LinkLake/,
+  );
+  assert.doesNotMatch(workflow, /LINKLAKE_WINDOWS_SIGNING_(?:REQUIRED|PFX|CERT)/);
+  assert.doesNotMatch(workflow, /RequireAuthenticode/);
   assert.match(workflow, /LINKLAKE_LINUX_SIGNING_REQUIRED:.*startsWith\(github\.ref, 'refs\/tags\/v'\)/);
   assert.match(workflow, /Create and verify production Ed25519 release manifest/);
-  assert.match(workflow, /Windows Authenticode and Apple Developer ID\/notarization remain mandatory for v1\.0\.0/);
+  assert.match(workflow, /actions\/attest@/);
+  assert.match(workflow, /cosign sign --yes/);
+  assert.match(windowsSigner, /\[ValidateSet\('none', 'pfx', 'cloud'\)\]/);
+  assert.match(windowsSigner, /Windows packages are intentionally unsigned by release policy/);
+  assert.match(windowsSigner, /Cloud Windows signing is reserved but not implemented/);
+  assert.match(windowsSigner, /Select -Mode pfx explicitly in a future approved signing workflow/);
+  assert.doesNotMatch(workflow, /^\s*macos-package:/m);
+  assert.doesNotMatch(workflow, /LINKLAKE_MACOS_/);
+  assert.doesNotMatch(workflow, /setup-macos-signing\.sh/);
+  assert.match(ci, /^\s*macos-test:/m);
+  assert.match(ci, /runs-on: macos-latest/);
+  assert.match(releaseAssets, /windows-x86_64/);
+  assert.match(releaseAssets, /linux-x86_64/);
+  assert.doesNotMatch(releaseAssets, /macos-/);
+  assert.doesNotMatch(packageSboms, /macos-/);
 });

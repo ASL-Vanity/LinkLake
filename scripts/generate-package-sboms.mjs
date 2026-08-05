@@ -36,7 +36,7 @@ const escapedRpmVersion = rpmVersion.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const escapedRpmRelease = rpmRelease.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const patterns = [
   new RegExp(
-    `^linklake(-manager)?-${escapedVersion}-(windows-x86_64\\.zip|linux-x86_64\\.tar\\.gz|macos-(?:x86_64|arm64|aarch64)\\.tar\\.gz)$`,
+    `^linklake(-manager)?-${escapedVersion}-(windows-x86_64\\.zip|linux-x86_64\\.tar\\.gz)$`,
   ),
   new RegExp(`^linklake_${escapedVersion}_(?:amd64|arm64)\\.deb$`),
   new RegExp(

@@ -2,6 +2,13 @@
 
 本项目采用语义化版本号。候选版本用于完整验收，不代表已对外发布。
 
+## 1.0.0 - 2026-08-05
+
+### 正式发布
+
+- 完成服务端更新的认证状态、候选服务业务就绪、数据库迁移恢复、Windows 安装器交接以及 Linux 原生包首装/升级配置保护门禁。
+- Windows 官方包按个人开源策略有意未做 Authenticode 签名；SHA-256、GitHub Attestation、Linux OpenPGP、GHCR SBOM/provenance、Cosign 与 LinkLake Ed25519 更新清单继续失败关闭。
+
 ## 1.0.0-rc.1 - 2026-08-04
 
 ### 网络核心与现代 Web 协议
@@ -19,8 +26,8 @@
 ### 供应链与发布门禁
 
 - Rust 基线升级到 1.91.0，Iroh、Axum Server、Hickory、LRU 与 PEM 解析链迁移到安全版本；安全例外收敛为一项有期限的上游停止维护告警，工作区 path wildcard 和 Trivy 漏洞忽略归零。
-- Windows Authenticode、macOS Developer ID/公证、Linux OpenPGP、GHCR SBOM/provenance、Cosign 摘要签名与发布汇总复验全部失败关闭，并保持 LinkLake Ed25519 更新清单独立信任根。
-- Windows、Linux 与 macOS 的核心、Manager、原生安装包、容器和 Helm 发行身份统一为 `1.0.0-rc.1`；正式发布仍要求仓库登记生产公钥并配置对应私钥、平台签名和公证 Secret。
+- 按 `v1.0.0` 的个人开源发布策略，Windows 官方资产有意未签名，并在发布说明中提示“未知发布者”或 SmartScreen 风险；SHA-256、GitHub Attestation、Linux OpenPGP、GHCR SBOM/provenance、Cosign 摘要签名和 LinkLake Ed25519 更新清单仍全部失败关闭。Windows PFX 后端仅保留给未来经审批的显式流程，云签名尚未实现且会关闭失败。
+- Windows 与 Linux 的核心、Manager、原生安装包、容器和 Helm 发行身份统一为 `1.0.0-rc.1`；macOS 仅保留源码/CI 兼容性。正式发布仍要求仓库登记生产更新公钥，并配置 Linux OpenPGP 与更新器 Ed25519 私钥 Secret。
 
 ## 0.8.0-rc.1 - 2026-08-03
 

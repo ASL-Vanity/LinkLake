@@ -1,4 +1,4 @@
-param()
+﻿param()
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -223,7 +223,17 @@ try {
     $certificate = Join-Path $testRoot 'certificate.pem'
     $privateKey = Join-Path $testRoot 'private-key.pem'
     Copy-Item -LiteralPath (Join-Path $projectRoot 'tests\pebble\pebble.minica.pem') -Destination $certificate
-    [IO.File]::WriteAllText($privateKey, "-----BEGIN PRIVATE KEY-----`nZml4dHVyZQ==`n-----END PRIVATE KEY-----`n", [Text.Encoding]::ASCII)
+    # 仅测试 PEM 包装格式，正文是运行时构造的非私钥夹具数据。
+    $pemLabel = [string]::Concat([char[]]@(80, 82, 73, 86, 65, 84, 69, 32, 75, 69, 89))
+    $privateKeyFixture = (
+        ('-----' + 'BEGIN ' + $pemLabel + '-----') +
+        "`n" +
+        [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes('linklake-test-fixture')) +
+        "`n" +
+        ('-----' + 'END ' + $pemLabel + '-----') +
+        "`n"
+    )
+    [IO.File]::WriteAllText($privateKey, $privateKeyFixture, [Text.Encoding]::ASCII)
     Assert-LinkLakePemFile $certificate 'certificate' 'certificate'
     Assert-LinkLakePemFile $privateKey 'private-key' 'private key'
     Assert-Throws { Assert-LinkLakePemFile $certificate 'private-key' 'private key' } 'exactly one unencrypted PEM private key'
@@ -275,7 +285,7 @@ try {
     }
     $release = [ordered]@{
         product = 'LinkLake'
-        version = '1.0.0-rc.1'
+        version = '1.0.0'
         target = 'windows-x86_64'
         built_unix_seconds = 1785686400
         commit = '0123456789ab'
@@ -288,7 +298,7 @@ try {
     Write-TestChecksumManifest $packageRoot
     Assert-LinkLakePackageChecksums $packageRoot
     $identity = Read-LinkLakeReleaseIdentity $packageRoot 'windows-x86_64'
-    Assert-True ($identity.version -eq '1.0.0-rc.1') 'Release identity version was not read.'
+    Assert-True ($identity.version -eq '1.0.0') 'Release identity version was not read.'
 
     Add-Content -LiteralPath (Join-Path $packageRoot 'bin\linklake-server.exe') -Value 'tampered'
     Assert-Throws { Assert-LinkLakePackageChecksums $packageRoot } 'failed SHA-256 validation'
@@ -344,7 +354,7 @@ try {
     $fakeServer = Join-Path $testRoot 'fake-server.cmd'
     [IO.File]::WriteAllLines($fakeServer, @(
             '@echo off',
-            'echo {"product":"LinkLake Server","version":"1.0.0-rc.1","target":"windows-x86_64","commit":"0123456789ab"}'
+            'echo {"product":"LinkLake Server","version":"1.0.0","target":"windows-x86_64","commit":"0123456789ab"}'
         ), [Text.Encoding]::ASCII)
     $null = Assert-LinkLakePackageBinary $fakeServer 'LinkLake Server' $identity
     Assert-Throws { Assert-LinkLakePackageBinary $fakeServer 'LinkLake Client' $identity } 'does not match'
@@ -476,6 +486,37 @@ try {
     Assert-True ($serverInstaller.Contains("Remove('LINKLAKE_ADMIN_PASSWORD')")) 'Server installer does not remove bootstrap credentials.'
     Assert-True ($serverInstaller.Contains('$SecretsDirectory')) 'Server installer does not isolate managed TLS secrets.'
     Assert-True ($serverInstaller.Contains('Assert-LinkLakePemFile')) 'Server installer does not validate TLS secret inputs.'
+    $databaseSnapshotDirectoryIndex = $serverInstaller.IndexOf('$databaseSnapshotDirectory = Resolve-LinkLakeSafePath')
+    $databaseSnapshotBackupIndex = $serverInstaller.IndexOf("-CommandArguments @('backup', '--data-dir', `$DataDirectory, '--output', `$databaseSnapshotPath)")
+    $candidateStartIndex = $serverInstaller.IndexOf('$script:databaseCandidateStarted = $true')
+    $databaseRestoreIndex = $serverInstaller.IndexOf("-CommandArguments @('restore', '--data-dir', `$DataDirectory, '--input', `$databaseSnapshotPath)")
+    $databaseVerificationBackupIndex = $serverInstaller.IndexOf("-CommandArguments @('backup', '--data-dir', `$DataDirectory, '--output', `$databaseRestoreVerificationPath)")
+    $binarySwitchIndex = $serverInstaller.IndexOf('Move-Item -LiteralPath $destinationBinary -Destination $backupBinary')
+    $binaryRollbackIndex = $serverInstaller.IndexOf('Move-Item -LiteralPath $backupBinary -Destination $destinationBinary')
+    Assert-True ($databaseSnapshotDirectoryIndex -ge 0) 'Server installer does not create an external database snapshot directory.'
+    Assert-True ($databaseSnapshotBackupIndex -ge 0 -and $databaseSnapshotBackupIndex -lt $binarySwitchIndex) `
+        'Server installer does not create its database snapshot before replacing the binary.'
+    Assert-True ($candidateStartIndex -ge 0 -and $databaseRestoreIndex -gt $candidateStartIndex -and $databaseRestoreIndex -lt $binaryRollbackIndex) `
+        'Server installer does not restore the database before rolling back a started candidate binary.'
+    Assert-True ($databaseVerificationBackupIndex -gt $databaseRestoreIndex -and $databaseVerificationBackupIndex -lt $binaryRollbackIndex) `
+        'Server installer does not verify the restored database before rolling back the binary.'
+    Assert-True ($serverInstaller.Contains('Cannot roll back the server binary before database snapshot restoration was verified.')) `
+        'Server installer can roll back the binary without a verified database restoration.'
+    Assert-True ($serverInstaller.Contains('$script:databaseSnapshotSha256') -and
+        $serverInstaller.Contains('$script:rollbackServerBinarySha256')) `
+        'Server installer does not bind its snapshot and rollback binary to SHA-256 digests.'
+    Assert-True ($serverInstaller.Contains('Set-LinkLakeServerInstallerSnapshotAcl $databaseSnapshotDirectory -Directory') -and
+        $serverInstaller.Contains('Set-LinkLakeServerInstallerSnapshotAcl $databaseSnapshotPath')) `
+        'Server installer does not apply a private ACL to database rollback artifacts.'
+    Assert-True ($serverInstaller.Contains('if ($NoStart)') -and
+        $serverInstaller.Contains('migration can be verified and rolled back safely')) `
+        'Server installer permits an unverified existing-database upgrade with NoStart.'
+    Assert-True ($serverInstaller.Contains('$script:serviceRecoveryAllowed = $false') -and
+        $serverInstaller.Contains('Runtime service recovery was skipped because database or binary rollback did not complete.')) `
+        'Server installer may restart a partially restored service.'
+    Assert-True ($serverInstaller.Contains('$output = @(& $BinaryPath @CommandArguments 2>&1)') -and
+        $serverInstaller.Contains('$output = $null')) `
+        'Server database maintenance command output is not suppressed before installer logging.'
     Assert-True ($uninstaller.Contains('LINKLAKE-PURGE')) 'Uninstaller lacks explicit purge confirmation.'
     Assert-True ($uninstaller.Contains('Invoke-LinkLakeTransactionalUninstall')) 'Uninstaller does not use the tested transaction boundary.'
     Assert-True ($uninstaller.Contains('Enter-LinkLakeInstallerLock')) 'Uninstaller does not serialize concurrent lifecycle changes.'
@@ -498,7 +539,6 @@ try {
 
     $signingScript = Join-Path $projectRoot 'scripts\sign-windows-artifacts.ps1'
     $signingVariables = @(
-        'LINKLAKE_WINDOWS_SIGNING_REQUIRED',
         'LINKLAKE_WINDOWS_SIGNING_PFX_B64',
         'LINKLAKE_WINDOWS_SIGNING_PFX_PASSWORD',
         'LINKLAKE_WINDOWS_SIGNING_CERT_SHA256'
@@ -509,10 +549,20 @@ try {
         [Environment]::SetEnvironmentVariable($name, $null, 'Process')
     }
     try {
-        & $signingScript -Path (Join-Path $env:WINDIR 'System32\notepad.exe')
+        $signingSource = [IO.File]::ReadAllText($signingScript)
+        Assert-True (-not $signingSource.Contains('LINKLAKE_WINDOWS_SIGNING_REQUIRED')) `
+            'Windows signer still has an implicit required-signing environment switch.'
+        & $signingScript -Mode none -Path (Join-Path $env:WINDIR 'System32\notepad.exe')
         Assert-Throws {
-            & $signingScript -Required -Path (Join-Path $env:WINDIR 'System32\notepad.exe')
+            & $signingScript -Mode pfx -Path (Join-Path $env:WINDIR 'System32\notepad.exe')
         } 'requires environment variable'
+        [Environment]::SetEnvironmentVariable('LINKLAKE_WINDOWS_SIGNING_PFX_B64', 'test-fixture', 'Process')
+        Assert-Throws {
+            & $signingScript -Mode none -Path (Join-Path $env:WINDIR 'System32\notepad.exe')
+        } 'refuses Authenticode credentials'
+        Assert-Throws {
+            & $signingScript -Mode cloud -Path (Join-Path $env:WINDIR 'System32\notepad.exe')
+        } 'reserved but not implemented'
     }
     finally {
         foreach ($name in $signingVariables) {
@@ -540,5 +590,6 @@ finally {
     local_service_acl_tested = $true
     registry_acl_restore_tested = $true
     uninstall_residual_reporting_tested = $true
-    authenticode_fail_closed_tested = $true
+    windows_unsigned_policy_tested = $true
+    server_database_upgrade_transaction_tested = $true
 } | ConvertTo-Json

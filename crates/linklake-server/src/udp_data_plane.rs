@@ -9,10 +9,15 @@ use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use std::{
     collections::HashMap,
     fs::File,
+    future::Future,
     io::BufReader,
     net::{IpAddr, SocketAddr},
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    task::Poll,
     time::Duration,
 };
 use tokio::{
@@ -158,6 +163,7 @@ struct UdpDataPlaneInner {
     server_name: String,
     tickets: Mutex<HashMap<String, PendingTicket>>,
     attachment_limits: AttachmentLimits,
+    accept_loop_started: AtomicBool,
 }
 
 /// 全局 QUIC UDP 数据平面。所有 UDP 策略共用同一个监听端口。
@@ -210,10 +216,36 @@ impl UdpDataPlane {
                 server_name: config.server_name,
                 tickets: Mutex::new(HashMap::new()),
                 attachment_limits: AttachmentLimits::new(),
+                accept_loop_started: AtomicBool::new(false),
             }),
         };
-        tokio::spawn(run_accept_loop(data_plane.clone()));
         Ok(data_plane)
+    }
+
+    /// 启动 QUIC 接收循环，并返回只报告一次的启动屏障。只有循环首次实际 poll
+    /// `Endpoint::accept()` 后，服务端才可把该数据平面算作可用；仅完成 UDP bind
+    /// 或创建 task 都不足以证明它已经能够处理传入连接。
+    pub(crate) fn start_accept_loop(
+        &self,
+    ) -> anyhow::Result<oneshot::Receiver<anyhow::Result<()>>> {
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+            anyhow::anyhow!("UDP data-plane accept loop requires an active Tokio runtime")
+        })?;
+        anyhow::ensure!(
+            !self.inner.accept_loop_started.swap(true, Ordering::AcqRel),
+            "UDP data-plane accept loop is already started"
+        );
+        let (startup_sender, receiver) = oneshot::channel();
+        runtime.spawn(run_accept_loop(self.clone(), startup_sender));
+        Ok(receiver)
+    }
+
+    /// 使 QUIC endpoint 立即停止接收新连接。服务端启动失败或正常停止时都必须调用，
+    /// 否则 accept task 所持有的 clone 会让已绑定的 UDP 端口继续存活。
+    pub(crate) fn stop(&self) {
+        self.inner
+            .endpoint
+            .close(quinn::VarInt::from_u32(0), b"LinkLake server is stopping");
     }
 
     /// 为一次隧道注册创建 15 秒有效、原子消费的一次性 ticket。
@@ -308,8 +340,47 @@ fn build_server_config(
     Ok(server)
 }
 
-async fn run_accept_loop(data_plane: UdpDataPlane) {
-    while let Some(incoming) = data_plane.inner.endpoint.accept().await {
+async fn await_udp_accept_with_startup<F, T>(
+    accept: F,
+    startup_sender: &mut Option<oneshot::Sender<anyhow::Result<()>>>,
+) -> Option<T>
+where
+    F: Future<Output = Option<T>>,
+{
+    let mut accept = Box::pin(accept);
+    std::future::poll_fn(|context| {
+        let result = accept.as_mut().poll(context);
+        match &result {
+            // Pending 表示 endpoint 已经注册等待下一个传入 QUIC 连接；Ready(Some)
+            // 则更强，说明它已实际取得一个连接。两种情况都可以解除启动屏障。
+            Poll::Pending | Poll::Ready(Some(_)) => {
+                if let Some(sender) = startup_sender.take() {
+                    let _ = sender.send(Ok(()));
+                }
+            }
+            // endpoint 在第一次 accept 之前就关闭，绝不能把已 bind 的 UDP socket
+            // 误判为可工作的数据平面。
+            Poll::Ready(None) => {
+                if let Some(sender) = startup_sender.take() {
+                    let _ = sender.send(Err(anyhow::anyhow!(
+                        "UDP QUIC accept loop ended before accepting or waiting for a connection"
+                    )));
+                }
+            }
+        }
+        result
+    })
+    .await
+}
+
+async fn run_accept_loop(
+    data_plane: UdpDataPlane,
+    startup_sender: oneshot::Sender<anyhow::Result<()>>,
+) {
+    let mut startup_sender = Some(startup_sender);
+    while let Some(incoming) =
+        await_udp_accept_with_startup(data_plane.inner.endpoint.accept(), &mut startup_sender).await
+    {
         // 对未验证的初始包只发 Retry，先完成地址验证后再分配任何用户态资源。
         if !incoming.remote_address_validated() {
             let _ = incoming.retry();
@@ -473,9 +544,15 @@ fn generate_ticket() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{consume_ticket, generate_ticket, AttachmentLimits, PendingTicket};
+    use super::{
+        await_udp_accept_with_startup, consume_ticket, generate_ticket, AttachmentLimits,
+        PendingTicket,
+    };
     use std::{collections::HashMap, net::IpAddr, sync::Mutex, time::Duration};
-    use tokio::{sync::oneshot, time::Instant};
+    use tokio::{
+        sync::oneshot,
+        time::{timeout, Instant},
+    };
     use uuid::Uuid;
 
     #[test]
@@ -599,5 +676,61 @@ mod tests {
         assert!(limits.has_active_capacity());
         assert!(limits.try_acquire_active().is_some());
         drop(second);
+    }
+
+    #[tokio::test]
+    async fn udp_accept_startup_reports_ready_after_first_accept_poll() {
+        let (sender, mut receiver) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut sender = Some(sender);
+            let _ =
+                await_udp_accept_with_startup(std::future::pending::<Option<()>>(), &mut sender)
+                    .await;
+        });
+
+        let reported = timeout(Duration::from_secs(1), &mut receiver)
+            .await
+            .expect("the pending accept future should report startup")
+            .expect("the accept task should not drop its startup sender");
+        assert!(reported.is_ok());
+
+        task.abort();
+        let error = task
+            .await
+            .expect_err("the aborted accept task should not finish normally");
+        assert!(error.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn udp_accept_startup_reports_ready_when_a_connection_is_already_available() {
+        let (sender, receiver) = oneshot::channel();
+        let mut sender = Some(sender);
+
+        let incoming =
+            await_udp_accept_with_startup(std::future::ready(Some(7_u8)), &mut sender).await;
+
+        assert_eq!(incoming, Some(7));
+        assert!(receiver
+            .await
+            .expect("the accept task should report startup")
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn udp_accept_startup_fails_closed_when_endpoint_closes_before_first_accept() {
+        let (sender, receiver) = oneshot::channel();
+        let mut sender = Some(sender);
+
+        let incoming =
+            await_udp_accept_with_startup(std::future::ready(None::<u8>), &mut sender).await;
+
+        assert_eq!(incoming, None);
+        let error = receiver
+            .await
+            .expect("the accept task should report its early exit")
+            .expect_err("a closed endpoint must not pass the startup barrier");
+        assert!(error
+            .to_string()
+            .contains("ended before accepting or waiting for a connection"));
     }
 }

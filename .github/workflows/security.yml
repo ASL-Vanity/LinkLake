@@ -127,7 +127,7 @@ jobs:
       - name: Validate immutable workflow and release-evidence contracts
         run: |
           node scripts/check-workflow-hardening.mjs
-          node --test tests/release-attestations.test.mjs tests/macos-signing-contract.test.mjs
+          node --test tests/release-attestations.test.mjs tests/macos-signing-contract.test.mjs tests/native-linux-package-contract.test.mjs
       - name: Install checksum-verified actionlint
         shell: bash
         run: |

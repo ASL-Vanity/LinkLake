@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const script = path.join(root, 'scripts', 'prepare-release-attestations.mjs');
-const version = '1.0.0-rc.1';
+const version = '1.0.0';
 
 function digest(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
@@ -40,12 +40,10 @@ function fixture() {
   const assets = [
     `linklake-${version}-windows-x86_64.zip`,
     `linklake-${version}-linux-x86_64.tar.gz`,
-    `linklake-${version}-macos-arm64.tar.gz`,
     `linklake-manager-${version}-windows-x86_64.zip`,
     `linklake-manager-${version}-linux-x86_64.tar.gz`,
-    `linklake-manager-${version}-macos-arm64.tar.gz`,
     `linklake_${version}_amd64.deb`,
-    'linklake-1.0.0-0.rc.1.x86_64.rpm',
+    'linklake-1.0.0-1.x86_64.rpm',
   ];
   for (const name of assets) {
     writeAsset(directory, name);
@@ -58,22 +56,22 @@ function run(directory) {
   return execFileSync(process.execPath, [script, directory, version], { encoding: 'utf8' });
 }
 
-test('prepares deterministic release subjects and an SBOM checksum', () => {
+test('prepares deterministic Windows and Linux release subjects and an SBOM checksum', () => {
   const directory = fixture();
   try {
     const output = run(directory);
-    assert.match(output, /prepared 8 release subjects/);
+    assert.match(output, /prepared 6 release subjects/);
     const subjects = fs
       .readFileSync(path.join(directory, `linklake-${version}-release-subjects.sha256`), 'ascii')
       .trim()
       .split('\n');
-    assert.equal(subjects.length, 8);
+    assert.equal(subjects.length, 6);
     const collection = JSON.parse(
       fs.readFileSync(path.join(directory, `linklake-${version}-release.spdx.json`), 'utf8'),
     );
-    assert.equal(collection.packages.length, 8);
-    assert.equal(collection.externalDocumentRefs.length, 8);
-    assert.equal(collection.relationships.length, 16);
+    assert.equal(collection.packages.length, 6);
+    assert.equal(collection.externalDocumentRefs.length, 6);
+    assert.equal(collection.relationships.length, 12);
     assert.ok(fs.existsSync(path.join(directory, `linklake-${version}-release.spdx.json.sha256`)));
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
@@ -90,12 +88,34 @@ test('rejects a tampered package checksum', () => {
   }
 });
 
-test('rejects an incomplete cross-platform package set', () => {
+test('rejects an incomplete official Windows and Linux package set', () => {
   const directory = fixture();
   try {
-    fs.rmSync(path.join(directory, `linklake-manager-${version}-macos-arm64.tar.gz`));
-    fs.rmSync(path.join(directory, `linklake-manager-${version}-macos-arm64.tar.gz.sha256`));
-    assert.throws(() => run(directory), /exactly one macOS core package and one macOS manager package/);
+    const name = `linklake-manager-${version}-linux-x86_64.tar.gz`;
+    for (const suffix of ['', '.sha256', '.spdx.json', '.spdx.json.sha256']) {
+      fs.rmSync(path.join(directory, `${name}${suffix}`));
+    }
+    assert.throws(() => run(directory), /required release package is missing/);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('rejects macOS archives and stray macOS evidence from the official release evidence set', () => {
+  const directory = fixture();
+  try {
+    const name = `linklake-${version}-macos-arm64.tar.gz`;
+    writeAsset(directory, name);
+    writeDetailedSbom(directory, name);
+    assert.throws(() => run(directory), /macOS release evidence is not permitted/);
+
+    fs.rmSync(path.join(directory, name));
+    fs.rmSync(path.join(directory, `${name}.sha256`));
+    fs.rmSync(path.join(directory, `${name}.spdx.json`));
+    fs.rmSync(path.join(directory, `${name}.spdx.json.sha256`));
+    const straySbom = `${name}.spdx.json`;
+    writeAsset(directory, straySbom);
+    assert.throws(() => run(directory), /macOS release evidence is not permitted/);
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }

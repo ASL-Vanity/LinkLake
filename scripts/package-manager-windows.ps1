@@ -1,6 +1,8 @@
 param(
     [string]$OutputDirectory = (Join-Path $PSScriptRoot '..\dist'),
-    [string]$FlutterExecutable = $(if ($env:FLUTTER_BIN) { $env:FLUTTER_BIN } else { 'flutter' })
+    [string]$FlutterExecutable = $(if ($env:FLUTTER_BIN) { $env:FLUTTER_BIN } else { 'flutter' }),
+    [ValidateSet('none', 'pfx', 'cloud')]
+    [string]$WindowsSigningMode = 'none'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -63,12 +65,11 @@ Copy-Item -LiteralPath (Join-Path $projectRoot 'README.md'), `
 Copy-Item -LiteralPath (Join-Path $managerRoot 'README.md') `
     -Destination (Join-Path $stage 'MANAGER_README.md')
 
-$windowsSigningRequired = $env:LINKLAKE_WINDOWS_SIGNING_REQUIRED -match '^(?i:1|true|yes)$'
 $peArtifacts = @(Get-ChildItem -LiteralPath $stage -Recurse -File | Where-Object {
         $_.Extension.ToLowerInvariant() -in @('.exe', '.dll')
     } | ForEach-Object FullName)
 & (Join-Path $projectRoot 'scripts\sign-windows-artifacts.ps1') `
-    -Required:$windowsSigningRequired `
+    -Mode $WindowsSigningMode `
     -Path $peArtifacts
 
 $releaseManifest = [ordered]@{

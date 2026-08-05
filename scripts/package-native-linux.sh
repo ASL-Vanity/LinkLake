@@ -48,11 +48,21 @@ Maintainer: LinkLake Contributors
 Depends: ca-certificates
 Description: Cross-platform secure tunnel server and client
 EOF
+  cat >"$stage/DEBIAN/conffiles" <<'EOF'
+/etc/linklake/server.env.example
+/etc/linklake/client.toml.example
+EOF
   cat >"$stage/DEBIAN/postinst" <<'EOF'
 #!/bin/sh
 set -e
 getent group linklake >/dev/null || addgroup --system linklake
 getent passwd linklake >/dev/null || adduser --system --ingroup linklake --home /var/lib/linklake --no-create-home linklake
+if [ ! -e /etc/linklake/server.env ] && [ ! -L /etc/linklake/server.env ]; then
+  install -o root -g root -m 0600 /etc/linklake/server.env.example /etc/linklake/server.env
+fi
+if [ ! -e /etc/linklake/client.toml ] && [ ! -L /etc/linklake/client.toml ]; then
+  install -o linklake -g linklake -m 0600 /etc/linklake/client.toml.example /etc/linklake/client.toml
+fi
 chown -R linklake:linklake /var/lib/linklake /var/log/linklake /var/lib/linklake-client /var/log/linklake-client
 chown root:root /var/lib/linklake-updater /var/lib/linklake-updater/server
 chmod 0700 /var/lib/linklake-updater /var/lib/linklake-updater/server
@@ -85,6 +95,12 @@ tar -xzf %{SOURCE0} -C %{buildroot}
 %post
 getent group linklake >/dev/null || groupadd --system linklake
 getent passwd linklake >/dev/null || useradd --system --gid linklake --home-dir /var/lib/linklake --shell /sbin/nologin linklake
+if [ ! -e /etc/linklake/server.env ] && [ ! -L /etc/linklake/server.env ]; then
+  install -o root -g root -m 0600 /etc/linklake/server.env.example /etc/linklake/server.env
+fi
+if [ ! -e /etc/linklake/client.toml ] && [ ! -L /etc/linklake/client.toml ]; then
+  install -o linklake -g linklake -m 0600 /etc/linklake/client.toml.example /etc/linklake/client.toml
+fi
 chown -R linklake:linklake /var/lib/linklake /var/log/linklake /var/lib/linklake-client /var/log/linklake-client
 chown root:root /var/lib/linklake-updater /var/lib/linklake-updater/server
 chmod 0700 /var/lib/linklake-updater /var/lib/linklake-updater/server

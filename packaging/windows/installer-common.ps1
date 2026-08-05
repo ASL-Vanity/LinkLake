@@ -1,4 +1,4 @@
-Set-StrictMode -Version Latest
+﻿Set-StrictMode -Version Latest
 
 function Assert-LinkLakeAdministrator {
     $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
@@ -1549,6 +1549,137 @@ function Restore-LinkLakeServiceSnapshot {
     }
 }
 
+function Get-LinkLakeCandidateHandoffRecoveryDecision {
+    param(
+        [bool]$CandidateHandoffStarted,
+        [bool]$RestoreAfterCandidateHandoff,
+        [bool]$ConfirmDataLoss
+    )
+    if (-not $CandidateHandoffStarted) { return 'automatic_rollback' }
+    if ($RestoreAfterCandidateHandoff -and $ConfirmDataLoss) { return 'restore_snapshot' }
+    return 'preserve_for_manual_recovery'
+}
+
+function Test-LinkLakeLowercaseSha256 {
+    param([AllowEmptyString()][string]$Value)
+    return -not [string]::IsNullOrWhiteSpace($Value) -and $Value -cmatch '^[0-9a-f]{64}$'
+}
+
+function Read-LinkLakeServerCandidateHandoffRecord {
+    param(
+        [Parameter(Mandatory)][string]$HandoffDirectory,
+        [Parameter(Mandatory)][string]$ExpectedDataDirectory,
+        [Parameter(Mandatory)][string]$ExpectedInstallDirectory,
+        [Parameter(Mandatory)][string]$ExpectedServiceName
+    )
+    $HandoffDirectory = Resolve-LinkLakeSafePath $HandoffDirectory 'candidate handoff directory' -RequireLocalDrive
+    $ExpectedDataDirectory = Resolve-LinkLakeSafePath $ExpectedDataDirectory 'data directory' -RequireLocalDrive
+    $ExpectedInstallDirectory = Resolve-LinkLakeSafePath $ExpectedInstallDirectory 'install directory' -RequireLocalDrive
+    if (-not (Test-Path -LiteralPath $HandoffDirectory -PathType Container)) {
+        throw 'Candidate handoff directory was not found.'
+    }
+    $handoffParent = Split-Path -Parent $ExpectedDataDirectory
+    if ([string]::IsNullOrWhiteSpace($handoffParent)) {
+        throw 'Could not derive the candidate handoff parent directory.'
+    }
+    $handoffParent = Resolve-LinkLakeSafePath $handoffParent 'candidate handoff parent directory' -RequireLocalDrive
+    $handoffLeaf = Split-Path -Leaf $HandoffDirectory
+    if ((Split-Path -Parent $HandoffDirectory) -ine $handoffParent -or
+        $handoffLeaf -cnotmatch '^\.linklake-server-upgrade-[0-9a-f]{32}$') {
+        throw 'Candidate handoff directory is outside the permitted local transaction parent.'
+    }
+
+    $recordPath = Resolve-LinkLakeSafePath (
+        Join-Path $HandoffDirectory 'candidate-handoff.json'
+    ) 'candidate handoff record' -RequireLocalDrive
+    if (-not (Test-Path -LiteralPath $recordPath -PathType Leaf)) {
+        throw 'Candidate handoff record was not found.'
+    }
+    $recordItem = Get-Item -Force -LiteralPath $recordPath
+    if (($recordItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'Candidate handoff record must not be a reparse point.'
+    }
+    if ($recordItem.Length -le 0 -or $recordItem.Length -gt 16KB) {
+        throw 'Candidate handoff record has an invalid size.'
+    }
+    try { $record = [IO.File]::ReadAllText($recordPath, [Text.Encoding]::UTF8) | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw 'Candidate handoff record is not valid JSON.' }
+    if ($null -eq $record -or $record -is [Array] -or $record -is [string] -or $record -is [ValueType]) {
+        throw 'Candidate handoff record must be a JSON object.'
+    }
+    $expectedFields = @(
+        'schema_version', 'kind', 'operation_id', 'service_name', 'data_directory', 'install_directory',
+        'snapshot_directory', 'snapshot_path', 'snapshot_sha256', 'rollback_binary_paths',
+        'rollback_binary_sha256', 'created_unix_seconds'
+    )
+    $actualFields = @($record.PSObject.Properties.Name)
+    if (@(Compare-Object $expectedFields $actualFields).Count -ne 0) {
+        throw 'Candidate handoff record has missing or unknown fields.'
+    }
+    if ($record.schema_version -is [string] -or [int]$record.schema_version -ne 1 -or
+        $record.kind -cne 'linklake-server-candidate-handoff' -or
+        $record.service_name -cne $ExpectedServiceName -or
+        $record.operation_id -isnot [string] -or $record.operation_id -cnotmatch '^[0-9a-f]{32}$') {
+        throw 'Candidate handoff record has an invalid identity binding.'
+    }
+    if ($record.data_directory -isnot [string] -or $record.install_directory -isnot [string] -or
+        $record.snapshot_directory -isnot [string] -or $record.snapshot_path -isnot [string]) {
+        throw 'Candidate handoff record contains invalid paths.'
+    }
+    $recordDataDirectory = Resolve-LinkLakeSafePath $record.data_directory 'candidate handoff data directory' -RequireLocalDrive
+    $recordInstallDirectory = Resolve-LinkLakeSafePath $record.install_directory 'candidate handoff install directory' -RequireLocalDrive
+    $snapshotDirectory = Resolve-LinkLakeSafePath $record.snapshot_directory 'candidate handoff snapshot directory' -RequireLocalDrive
+    $snapshotPath = Resolve-LinkLakeSafePath $record.snapshot_path 'candidate handoff snapshot path' -RequireLocalDrive
+    if ($recordDataDirectory -ine $ExpectedDataDirectory -or $recordInstallDirectory -ine $ExpectedInstallDirectory -or
+        $snapshotDirectory -ine $HandoffDirectory -or
+        (Split-Path -Parent $snapshotPath) -ine $HandoffDirectory -or
+        (Split-Path -Leaf $snapshotPath) -cnotmatch '^\.server-before-upgrade-[0-9a-f]{32}\.sqlite3$') {
+        throw 'Candidate handoff record path binding is invalid.'
+    }
+    if (-not (Test-LinkLakeLowercaseSha256 ([string]$record.snapshot_sha256)) -or
+        -not (Test-LinkLakeLowercaseSha256 ([string]$record.rollback_binary_sha256))) {
+        throw 'Candidate handoff record contains an invalid SHA-256 digest.'
+    }
+    if ($record.rollback_binary_paths -is [string]) {
+        throw 'Candidate handoff record rollback binaries must be an array.'
+    }
+    $rollbackBinaryPaths = @($record.rollback_binary_paths)
+    if ($rollbackBinaryPaths.Count -lt 1 -or $rollbackBinaryPaths.Count -gt 2) {
+        throw 'Candidate handoff record has an invalid rollback binary count.'
+    }
+    $resolvedRollbackBinaries = [Collections.Generic.List[string]]::new()
+    foreach ($path in $rollbackBinaryPaths) {
+        if ($path -isnot [string]) { throw 'Candidate handoff record contains an invalid rollback binary path.' }
+        $resolved = Resolve-LinkLakeSafePath $path 'candidate handoff rollback binary' -RequireLocalDrive
+        if ((Split-Path -Parent $resolved) -ine $ExpectedInstallDirectory -or
+            (Split-Path -Leaf $resolved) -cnotmatch '^(linklake-server|\.linklake-server\.backup-[0-9a-f]{32})\.exe$') {
+            throw 'Candidate handoff rollback binary is outside the permitted install directory.'
+        }
+        if (-not $resolvedRollbackBinaries.Contains($resolved)) { $resolvedRollbackBinaries.Add($resolved) }
+    }
+    if ($resolvedRollbackBinaries.Count -ne $rollbackBinaryPaths.Count) {
+        throw 'Candidate handoff record repeats a rollback binary path.'
+    }
+    if ($record.created_unix_seconds -is [string]) { throw 'Candidate handoff record has an invalid creation time.' }
+    try { $createdUnixSeconds = [Int64]$record.created_unix_seconds }
+    catch { throw 'Candidate handoff record has an invalid creation time.' }
+    if ($createdUnixSeconds -le 0 -or $createdUnixSeconds -gt ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 86400)) {
+        throw 'Candidate handoff record has an invalid creation time.'
+    }
+    return [pscustomobject]@{
+        RecordPath = $recordPath
+        HandoffDirectory = $HandoffDirectory
+        OperationId = [string]$record.operation_id
+        ServiceName = [string]$record.service_name
+        DataDirectory = $recordDataDirectory
+        InstallDirectory = $recordInstallDirectory
+        SnapshotPath = $snapshotPath
+        SnapshotSha256 = [string]$record.snapshot_sha256
+        RollbackBinaryPaths = @($resolvedRollbackBinaries)
+        RollbackBinarySha256 = [string]$record.rollback_binary_sha256
+    }
+}
+
 function Invoke-LinkLakeTransactionalChange {
     param(
         [Parameter(Mandatory)][scriptblock]$Stop,
@@ -1557,9 +1688,16 @@ function Invoke-LinkLakeTransactionalChange {
         [Parameter(Mandatory)][scriptblock]$Start,
         [Parameter(Mandatory)][scriptblock]$Rollback,
         [Parameter(Mandatory)][scriptblock]$Recover,
+        [scriptblock]$CandidateHandoffStarted = { $false },
+        [scriptblock]$Handoff = { },
         [bool]$WasRunning,
         [bool]$ShouldStart
     )
+    $candidateHandoffConfigured = $PSBoundParameters.ContainsKey('CandidateHandoffStarted')
+    $handoffConfigured = $PSBoundParameters.ContainsKey('Handoff')
+    if ($candidateHandoffConfigured -xor $handoffConfigured) {
+        throw 'Candidate handoff detection and preservation callbacks must be configured together.'
+    }
     $stopStarted = $false
     $applyStarted = $false
     try {
@@ -1575,11 +1713,33 @@ function Invoke-LinkLakeTransactionalChange {
     catch {
         $primary = $_.Exception.Message
         $recoveryErrors = [Collections.Generic.List[string]]::new()
-        if ($applyStarted) {
-            try { & $Rollback } catch { $recoveryErrors.Add("rollback: $($_.Exception.Message)") }
+        $handoffStarted = $false
+        try {
+            # 一旦无法确定候选服务是否开始交接，按可能已接受写入处理，绝不退回
+            # 到会覆盖数据库快照的普通自动回滚路径。未配置候选交接时，默认回调返回 false。
+            $handoffStarted = [bool](& $CandidateHandoffStarted)
         }
-        if ($WasRunning -and $stopStarted) {
+        catch {
+            $handoffStarted = $true
+            $recoveryErrors.Add("candidate handoff state: $($_.Exception.Message)")
+        }
+        if ($applyStarted) {
+            if ($handoffStarted) {
+                try { & $Handoff } catch { $recoveryErrors.Add("candidate handoff: $($_.Exception.Message)") }
+            }
+            else {
+                try { & $Rollback } catch { $recoveryErrors.Add("rollback: $($_.Exception.Message)") }
+            }
+        }
+        if ($WasRunning -and $stopStarted -and -not $handoffStarted) {
             try { & $Recover } catch { $recoveryErrors.Add("service recovery: $($_.Exception.Message)") }
+        }
+        if ($handoffStarted) {
+            $handoffMessage = "$primary Candidate service handoff may have accepted writes; automatic rollback is intentionally disabled and manual recovery requires explicit data-loss confirmation."
+            if ($recoveryErrors.Count -gt 0) {
+                throw "$handoffMessage Handoff preservation also failed: $($recoveryErrors -join '; ')"
+            }
+            throw $handoffMessage
         }
         if ($recoveryErrors.Count -gt 0) {
             throw "$primary Recovery also failed: $($recoveryErrors -join '; ')"

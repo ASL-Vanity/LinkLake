@@ -45,6 +45,7 @@ use alerting::{
     NotificationDeliveryRetryOutcome, NotificationDeliveryState, NotificationDeliveryView,
     UpdateAlertRule,
 };
+use anyhow::Context;
 use api_tokens::{ApiTokenCatalog, ApiTokenScope, CreateApiToken, CreatedApiToken};
 use audit_log::{AuditEvent, AuditLog};
 use axum::{
@@ -98,25 +99,31 @@ use secret_tunnel_catalog::{
     SecretTunnelPolicy, UpdateSecretTunnelPolicy,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sni_route_catalog::{
     CreateSniRoutePolicy, SniRouteCatalog, SniRoutePolicy, SniRoutePolicyError,
     UpdateSniRoutePolicy,
 };
+#[cfg(target_os = "linux")]
+use std::process::Command;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt::Write as _,
-    fs::File,
+    fs::{self, File},
+    future::Future,
     io::{BufReader, IsTerminal, Read},
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
+    task::Poll,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::net::TcpListener;
-use tokio::sync::{watch, Mutex as AsyncMutex, Semaphore};
+use tokio::sync::{oneshot, watch, Mutex as AsyncMutex, Semaphore};
 use tokio_rustls::{
     rustls::{self, ServerConfig},
     TlsAcceptor,
@@ -164,6 +171,9 @@ const LOGIN_FAILURE_MAX_DELAY_SECONDS: u64 = 30;
 const LOGIN_THROTTLE_MAX_IDENTITIES: usize = 1_024;
 const DEFAULT_DRAIN_TIMEOUT_SECONDS: u64 = 30;
 const MAX_DRAIN_TIMEOUT_SECONDS: u64 = 60 * 60;
+const SERVER_UPDATE_SERVICE_NAME: &str = "LinkLakeServer";
+const MAX_SERVICE_ENVIRONMENT_BYTES: usize = 64 * 1024;
+const LISTENER_STARTUP_TIMEOUT_SECONDS: u64 = 10;
 
 pub(crate) fn migrate_application_schema(database: &Database) -> anyhow::Result<()> {
     let connection = database.connect()?;
@@ -1937,6 +1947,56 @@ enum ServerMaintenanceCommand {
         #[arg(long)]
         plan_sha256: String,
     },
+    #[command(name = "__update-db-inspect", hide = true)]
+    UpdateDbInspect {
+        #[arg(long, value_name = "PATH")]
+        data_dir: PathBuf,
+    },
+    #[command(name = "__update-db-preflight", hide = true)]
+    UpdateDbPreflight {
+        #[arg(long, value_name = "PATH")]
+        snapshot: PathBuf,
+        #[arg(long, value_name = "SHA256")]
+        snapshot_sha256: String,
+        #[arg(long, value_name = "PATH")]
+        scratch_dir: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct UpdateDatabaseInspectReport {
+    schema_version: u32,
+    product: String,
+    version: String,
+    executable_sha256: String,
+    canonical_data_dir: PathBuf,
+    canonical_database_path: PathBuf,
+    observed_schema: u32,
+    ledger_sha256: String,
+    min_readable_schema: u32,
+    max_readable_schema: u32,
+    target_schema: u32,
+    migration_contract_sha256: String,
+    can_migrate: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct UpdateDatabasePreflightReport {
+    schema_version: u32,
+    product: String,
+    version: String,
+    executable_sha256: String,
+    snapshot_path: PathBuf,
+    snapshot_sha256: String,
+    source_schema: u32,
+    source_ledger_sha256: String,
+    target_schema: u32,
+    target_ledger_sha256: String,
+    migration_contract_sha256: String,
+    integrity_ok: bool,
+    catalogs_ok: bool,
 }
 
 #[derive(Args)]
@@ -1953,6 +2013,403 @@ impl DataDirectoryArgs {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // 平台专属配置解析在另一平台构建时不会实例化全部枚举值。
+enum ServiceEnvironmentPlatform {
+    Windows,
+    Linux,
+}
+
+/// 服务端升级不能只相信发起维护命令的进程环境。实际运行的服务可能持有另一套
+/// `LINKLAKE_DATA_DIR`，此时若对错误目录做快照，候选服务启动后会迁移未受保护的数据库。
+///
+/// 已注册服务必须从其自身配置读取数据目录；未注册服务仅用于开发/便携式场景，因此没有
+/// 可比较的服务配置。无论哪种情况，都先把选择的目录解析为规范化的真实目录。
+fn resolve_server_update_data_directory(data: DataDirectoryArgs) -> anyhow::Result<PathBuf> {
+    let requested = data.resolve()?;
+    verify_server_update_data_directory(&requested, configured_server_service_data_directories()?)
+}
+
+fn verify_server_update_data_directory(
+    requested: &FsPath,
+    configured_directories: Option<Vec<PathBuf>>,
+) -> anyhow::Result<PathBuf> {
+    let requested = canonical_update_directory(requested, "--data-dir")?;
+    let Some(configured_directories) = configured_directories else {
+        return Ok(requested);
+    };
+
+    let mut configured = None;
+    for directory in configured_directories {
+        let directory =
+            canonical_update_directory(&directory, "configured service data directory")?;
+        if let Some(existing) = &configured {
+            anyhow::ensure!(
+                *existing == directory,
+                "configured LinkLakeServer LINKLAKE_DATA_DIR values conflict; refusing update"
+            );
+        } else {
+            configured = Some(directory);
+        }
+    }
+    let configured = configured.ok_or_else(|| {
+        anyhow::anyhow!("configured LinkLakeServer service has no LINKLAKE_DATA_DIR")
+    })?;
+    anyhow::ensure!(
+        requested == configured,
+        "configured LinkLakeServer LINKLAKE_DATA_DIR does not match --data-dir; refusing update before database snapshot or binary replacement"
+    );
+    Ok(requested)
+}
+
+fn configured_server_service_data_directories() -> anyhow::Result<Option<Vec<PathBuf>>> {
+    #[cfg(windows)]
+    {
+        configured_windows_server_service_data_directories()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        configured_linux_server_service_data_directories()
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        // macOS 当前不发布官方服务端自动更新资产，因此没有对应的服务配置读取器。
+        Ok(None)
+    }
+}
+
+fn parse_service_data_directories(
+    entries: impl IntoIterator<Item = String>,
+    platform: ServiceEnvironmentPlatform,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let mut directories = Vec::new();
+    for entry in entries {
+        let entry = entry.trim();
+        if entry.is_empty() || entry.starts_with('#') {
+            continue;
+        }
+        let Some((name, value)) = entry.split_once('=') else {
+            continue;
+        };
+        let is_data_directory = match platform {
+            ServiceEnvironmentPlatform::Windows => name.eq_ignore_ascii_case("LINKLAKE_DATA_DIR"),
+            ServiceEnvironmentPlatform::Linux => name == "LINKLAKE_DATA_DIR",
+        };
+        if !is_data_directory {
+            continue;
+        }
+        let value = parse_service_environment_value(value)?;
+        anyhow::ensure!(
+            !value.is_empty(),
+            "configured LinkLakeServer LINKLAKE_DATA_DIR must not be empty"
+        );
+        anyhow::ensure!(
+            !value.contains('\0'),
+            "configured LinkLakeServer LINKLAKE_DATA_DIR contains an embedded NUL"
+        );
+        directories.push(PathBuf::from(value));
+    }
+    anyhow::ensure!(
+        !directories.is_empty(),
+        "configured LinkLakeServer service has no LINKLAKE_DATA_DIR"
+    );
+    Ok(directories)
+}
+
+fn parse_service_environment_value(value: &str) -> anyhow::Result<String> {
+    let value = value.trim();
+    if let Some(quote) = value
+        .chars()
+        .next()
+        .filter(|value| matches!(value, '\'' | '\"'))
+    {
+        anyhow::ensure!(
+            value.len() >= 2 && value.ends_with(quote),
+            "configured LinkLakeServer environment value has an unterminated quote"
+        );
+        return Ok(value[quote.len_utf8()..value.len() - quote.len_utf8()].to_owned());
+    }
+    Ok(value.to_owned())
+}
+
+#[cfg(windows)]
+fn configured_windows_server_service_data_directories() -> anyhow::Result<Option<Vec<PathBuf>>> {
+    let Some(entries) = read_windows_service_environment(SERVER_UPDATE_SERVICE_NAME)? else {
+        return Ok(None);
+    };
+    Ok(Some(parse_service_data_directories(
+        entries,
+        ServiceEnvironmentPlatform::Windows,
+    )?))
+}
+
+#[cfg(windows)]
+fn read_windows_service_environment(service_name: &str) -> anyhow::Result<Option<Vec<String>>> {
+    type RawHkey = isize;
+    const HKEY_LOCAL_MACHINE: RawHkey = 0x8000_0002u32 as RawHkey;
+    const KEY_QUERY_VALUE: u32 = 0x0001;
+    const REG_MULTI_SZ: u32 = 7;
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+    const ERROR_PATH_NOT_FOUND: i32 = 3;
+    const ERROR_SUCCESS: i32 = 0;
+    const MAX_SERVICE_ENVIRONMENT_BYTES_U32: u32 = MAX_SERVICE_ENVIRONMENT_BYTES as u32;
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn RegOpenKeyExW(
+            key: RawHkey,
+            sub_key: *const u16,
+            options: u32,
+            desired_access: u32,
+            result: *mut RawHkey,
+        ) -> i32;
+        fn RegQueryValueExW(
+            key: RawHkey,
+            value_name: *const u16,
+            reserved: *mut u32,
+            value_type: *mut u32,
+            data: *mut u8,
+            byte_count: *mut u32,
+        ) -> i32;
+        fn RegCloseKey(key: RawHkey) -> i32;
+    }
+
+    fn utf16z(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    let sub_key = utf16z(&format!(
+        "SYSTEM\\CurrentControlSet\\Services\\{service_name}"
+    ));
+    let value_name = utf16z("Environment");
+    let mut key = 0;
+    let status = unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            sub_key.as_ptr(),
+            0,
+            KEY_QUERY_VALUE,
+            &mut key,
+        )
+    };
+    if matches!(status, ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        status == ERROR_SUCCESS,
+        "cannot read LinkLakeServer service configuration: {}",
+        std::io::Error::from_raw_os_error(status)
+    );
+
+    let result = (|| -> anyhow::Result<Vec<String>> {
+        let mut value_type = 0;
+        let mut byte_count = 0;
+        let status = unsafe {
+            RegQueryValueExW(
+                key,
+                value_name.as_ptr(),
+                std::ptr::null_mut(),
+                &mut value_type,
+                std::ptr::null_mut(),
+                &mut byte_count,
+            )
+        };
+        anyhow::ensure!(
+            status == ERROR_SUCCESS,
+            "registered LinkLakeServer service has no readable Environment value: {}",
+            std::io::Error::from_raw_os_error(status)
+        );
+        anyhow::ensure!(
+            value_type == REG_MULTI_SZ,
+            "registered LinkLakeServer Environment must use REG_MULTI_SZ"
+        );
+        anyhow::ensure!(
+            (4..=MAX_SERVICE_ENVIRONMENT_BYTES_U32).contains(&byte_count) && byte_count % 2 == 0,
+            "registered LinkLakeServer Environment has an invalid size"
+        );
+
+        let mut data = vec![0u16; usize::try_from(byte_count / 2)?];
+        let status = unsafe {
+            RegQueryValueExW(
+                key,
+                value_name.as_ptr(),
+                std::ptr::null_mut(),
+                &mut value_type,
+                data.as_mut_ptr().cast(),
+                &mut byte_count,
+            )
+        };
+        anyhow::ensure!(
+            status == ERROR_SUCCESS,
+            "cannot read LinkLakeServer service Environment: {}",
+            std::io::Error::from_raw_os_error(status)
+        );
+        anyhow::ensure!(
+            value_type == REG_MULTI_SZ
+                && (4..=MAX_SERVICE_ENVIRONMENT_BYTES_U32).contains(&byte_count)
+                && byte_count % 2 == 0,
+            "registered LinkLakeServer Environment changed while being read"
+        );
+        data.truncate(usize::try_from(byte_count / 2)?);
+        anyhow::ensure!(
+            data.ends_with(&[0, 0]),
+            "registered LinkLakeServer Environment is not a terminated REG_MULTI_SZ"
+        );
+        data.split(|unit| *unit == 0)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| {
+                String::from_utf16(entry)
+                    .context("registered LinkLakeServer Environment is not valid UTF-16")
+            })
+            .collect()
+    })();
+    unsafe {
+        let _ = RegCloseKey(key);
+    }
+    result.map(Some)
+}
+
+#[cfg(target_os = "linux")]
+fn configured_linux_server_service_data_directories() -> anyhow::Result<Option<Vec<PathBuf>>> {
+    let load_state = systemctl_show_server_property("LoadState")?;
+    if load_state == "not-found" {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        load_state == "loaded",
+        "LinkLakeServer systemd unit is not loaded"
+    );
+
+    let mut entries =
+        split_systemd_environment_words(&systemctl_show_server_property("Environment")?)?;
+    for path in
+        systemd_environment_file_paths(&systemctl_show_server_property("EnvironmentFiles")?)?
+    {
+        let content = read_systemd_environment_file(&path)?;
+        entries.extend(
+            content
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .map(str::to_owned),
+        );
+    }
+    Ok(Some(parse_service_data_directories(
+        entries,
+        ServiceEnvironmentPlatform::Linux,
+    )?))
+}
+
+#[cfg(target_os = "linux")]
+fn read_systemd_environment_file(path: &FsPath) -> anyhow::Result<String> {
+    let metadata = fs::metadata(path).with_context(|| {
+        format!(
+            "cannot inspect configured LinkLakeServer EnvironmentFile {}",
+            path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        metadata.len() <= MAX_SERVICE_ENVIRONMENT_BYTES as u64,
+        "configured LinkLakeServer EnvironmentFile exceeds the size limit"
+    );
+    let mut file = File::open(path).with_context(|| {
+        format!(
+            "cannot read configured LinkLakeServer EnvironmentFile {}",
+            path.display()
+        )
+    })?;
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len())?);
+    file.take(MAX_SERVICE_ENVIRONMENT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_SERVICE_ENVIRONMENT_BYTES,
+        "configured LinkLakeServer EnvironmentFile exceeds the size limit"
+    );
+    String::from_utf8(bytes).context("configured LinkLakeServer EnvironmentFile is not valid UTF-8")
+}
+
+#[cfg(target_os = "linux")]
+fn systemctl_show_server_property(property: &str) -> anyhow::Result<String> {
+    let output = Command::new("systemctl")
+        .arg("show")
+        .arg("linklake-server.service")
+        .arg(format!("--property={property}"))
+        .output()
+        .context("cannot query LinkLakeServer systemd configuration")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "cannot query LinkLakeServer systemd configuration"
+    );
+    anyhow::ensure!(
+        output.stdout.len() <= MAX_SERVICE_ENVIRONMENT_BYTES,
+        "LinkLakeServer systemd configuration output exceeds the size limit"
+    );
+    let output = String::from_utf8(output.stdout)
+        .context("LinkLakeServer systemd configuration is not valid UTF-8")?;
+    let prefix = format!("{property}=");
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("LinkLakeServer systemd configuration omitted {property}"))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn split_systemd_environment_words(value: &str) -> anyhow::Result<Vec<String>> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for character in value.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(expected) = quote {
+            if character == expected {
+                quote = None;
+            } else {
+                current.push(character);
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '\"') {
+            quote = Some(character);
+        } else if character.is_whitespace() {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(character);
+        }
+    }
+    anyhow::ensure!(
+        !escaped && quote.is_none(),
+        "LinkLakeServer systemd environment contains an unterminated escape or quote"
+    );
+    if !current.is_empty() {
+        words.push(current);
+    }
+    Ok(words)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn systemd_environment_file_paths(value: &str) -> anyhow::Result<Vec<PathBuf>> {
+    let paths = split_systemd_environment_words(value)?
+        .into_iter()
+        .filter_map(|entry| {
+            let entry = entry.strip_prefix('-').unwrap_or(&entry);
+            entry.starts_with('/').then(|| PathBuf::from(entry))
+        })
+        .collect::<Vec<_>>();
+    Ok(paths)
+}
+
 #[derive(Args)]
 #[group(required = true, multiple = false)]
 struct FullBackupPasswordArgs {
@@ -1964,8 +2421,60 @@ struct FullBackupPasswordArgs {
 
 #[cfg(test)]
 mod maintenance_cli_tests {
-    use super::ServerCli;
+    use super::{
+        canonical_update_directory, inspect_update_database, parse_service_data_directories,
+        preflight_update_database, sha256_file, split_systemd_environment_words,
+        systemd_environment_file_paths, verify_server_update_data_directory, ServerCli,
+        ServerMaintenanceCommand, ServerUpdateAction, ServiceEnvironmentPlatform,
+        UpdateDatabaseInspectReport,
+    };
+    use crate::{database::Database, database_migrations, database_tools};
     use clap::Parser;
+    use rusqlite::Connection;
+    use std::{fs, path::PathBuf};
+    use uuid::Uuid;
+
+    fn temporary_directory(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()))
+    }
+
+    fn snapshot_at_schema(root: &std::path::Path, schema: u32) -> PathBuf {
+        let data_dir = root.join(format!("source-v{schema}"));
+        fs::create_dir_all(&data_dir).unwrap();
+        let database_path = data_dir.join("linklake.sqlite3");
+        Connection::open(&database_path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE legacy(value TEXT NOT NULL);
+                 INSERT INTO legacy VALUES ('preserved');
+                 PRAGMA user_version = 9;",
+            )
+            .unwrap();
+        if schema >= 10 {
+            let database = Database::persistent(&data_dir).unwrap();
+            database_migrations::prepare(&database)
+                .unwrap()
+                .finish()
+                .unwrap();
+            drop(database);
+            if schema == 12 {
+                Connection::open(&database_path)
+                    .unwrap()
+                    .execute_batch(
+                        "DELETE FROM schema_migrations WHERE version = 13;
+                         PRAGMA user_version = 12;",
+                    )
+                    .unwrap();
+            } else {
+                assert_eq!(schema, database_migrations::CURRENT_SCHEMA_VERSION);
+            }
+        } else {
+            assert_eq!(schema, 9);
+        }
+        database_tools::checkpoint_database(&database_path).unwrap();
+        database_tools::remove_sidecars(&database_path).unwrap();
+        database_path
+    }
 
     #[test]
     fn database_commands_reject_duplicate_and_unknown_arguments() {
@@ -2087,6 +2596,343 @@ mod maintenance_cli_tests {
     }
 
     #[test]
+    fn hidden_database_compatibility_commands_parse_strictly() {
+        ServerCli::try_parse_from([
+            "linklake-server",
+            "__update-db-inspect",
+            "--data-dir",
+            "data",
+        ])
+        .expect("database inspection command must parse");
+        ServerCli::try_parse_from([
+            "linklake-server",
+            "__update-db-preflight",
+            "--snapshot",
+            "snapshot.sqlite3",
+            "--snapshot-sha256",
+            &"a".repeat(64),
+            "--scratch-dir",
+            "scratch",
+        ])
+        .expect("database preflight command must parse");
+        assert!(ServerCli::try_parse_from([
+            "linklake-server",
+            "__update-db-preflight",
+            "--snapshot",
+            "snapshot.sqlite3",
+            "--snapshot-sha256",
+            &"a".repeat(64),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn server_update_database_commands_require_an_explicit_data_directory() {
+        ServerCli::try_parse_from([
+            "linklake-server",
+            "update",
+            "apply",
+            "--yes",
+            "--data-dir",
+            "data",
+        ])
+        .expect("server update apply must accept an explicit data directory");
+        ServerCli::try_parse_from([
+            "linklake-server",
+            "update",
+            "rollback",
+            "--yes",
+            "--data-dir",
+            "data",
+            "--restore-database-snapshot",
+            "--confirm-data-loss",
+        ])
+        .expect("server rollback must expose the explicit data-loss confirmation flags");
+        let recovery = ServerCli::try_parse_from([
+            "linklake-server",
+            "update",
+            "recover",
+            "--yes",
+            "--state-dir",
+            "state",
+            "--data-dir",
+            "data",
+            "--restore-after-candidate-handoff",
+            "--confirm-data-loss",
+        ])
+        .expect("server update recovery command must parse");
+        let ServerCli {
+            command:
+                Some(ServerMaintenanceCommand::Update {
+                    action:
+                        ServerUpdateAction::Recover {
+                            restore_after_candidate_handoff,
+                            confirm_data_loss,
+                            ..
+                        },
+                }),
+            ..
+        } = recovery
+        else {
+            panic!("server update recovery flags must remain scoped to update recover");
+        };
+        assert!(restore_after_candidate_handoff);
+        assert!(confirm_data_loss);
+
+        let recovery_without_handoff_consent = ServerCli::try_parse_from([
+            "linklake-server",
+            "update",
+            "recover",
+            "--yes",
+            "--data-dir",
+            "data",
+        ])
+        .expect("server update recovery may parse before the update state requires consent");
+        let ServerCli {
+            command:
+                Some(ServerMaintenanceCommand::Update {
+                    action:
+                        ServerUpdateAction::Recover {
+                            restore_after_candidate_handoff,
+                            confirm_data_loss,
+                            ..
+                        },
+                }),
+            ..
+        } = recovery_without_handoff_consent
+        else {
+            panic!("server update recovery flags must remain scoped to update recover");
+        };
+        assert!(!restore_after_candidate_handoff);
+        assert!(!confirm_data_loss);
+    }
+
+    #[test]
+    fn service_environment_parser_preserves_windows_and_linux_name_rules() {
+        let windows = parse_service_data_directories(
+            vec![
+                "LINKLAKE_LOG_DIR=C:\\LinkLake\\logs".to_owned(),
+                "linklake_data_dir=C:\\LinkLake\\data".to_owned(),
+            ],
+            ServiceEnvironmentPlatform::Windows,
+        )
+        .expect("Windows service environment names are case-insensitive");
+        assert_eq!(windows, vec![PathBuf::from(r"C:\LinkLake\data")]);
+
+        let linux = parse_service_data_directories(
+            vec!["linklake_data_dir=/var/lib/linklake".to_owned()],
+            ServiceEnvironmentPlatform::Linux,
+        );
+        assert!(
+            linux.is_err(),
+            "Linux environment variable names are case-sensitive"
+        );
+
+        let linux = parse_service_data_directories(
+            vec!["LINKLAKE_DATA_DIR='/var/lib/linklake data'".to_owned()],
+            ServiceEnvironmentPlatform::Linux,
+        )
+        .expect("quoted systemd EnvironmentFile values must remain usable");
+        assert_eq!(linux, vec![PathBuf::from("/var/lib/linklake data")]);
+    }
+
+    #[test]
+    fn systemd_environment_display_and_environment_files_preserve_data_directory_values() {
+        let entries = split_systemd_environment_words(
+            "LINKLAKE_BIND=127.0.0.1:32100 'LINKLAKE_DATA_DIR=/var/lib/linklake data'",
+        )
+        .expect("systemd Environment display must parse quoted values");
+        let directories =
+            parse_service_data_directories(entries, ServiceEnvironmentPlatform::Linux)
+                .expect("the parsed systemd Environment value must remain usable");
+        assert_eq!(directories, vec![PathBuf::from("/var/lib/linklake data")]);
+
+        let paths = systemd_environment_file_paths(
+            "/etc/linklake/server.env (ignore_errors=no) -/etc/linklake/optional.env (ignore_errors=yes)",
+        )
+        .expect("systemd EnvironmentFiles display must parse configured paths");
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/etc/linklake/server.env"),
+                PathBuf::from("/etc/linklake/optional.env"),
+            ]
+        );
+    }
+
+    #[test]
+    fn server_update_data_directory_must_match_the_service_configuration() {
+        let root = temporary_directory("linklake-server-update-data-binding");
+        let configured = root.join("configured");
+        let different = root.join("different");
+        fs::create_dir_all(&configured).unwrap();
+        fs::create_dir_all(&different).unwrap();
+
+        // 规范化比较应接受同一目录的等价写法，而不是简单比较原始字符串。
+        let selected = verify_server_update_data_directory(
+            &configured.join("."),
+            Some(vec![configured.clone()]),
+        )
+        .expect("the canonical service data directory must match");
+        assert_eq!(
+            selected,
+            canonical_update_directory(&configured, "test data directory").unwrap()
+        );
+
+        let mismatch =
+            verify_server_update_data_directory(&different, Some(vec![configured.clone()]))
+                .expect_err(
+                    "an update must not snapshot a directory different from the running service",
+                );
+        assert!(mismatch.to_string().contains("does not match --data-dir"));
+
+        let conflict = verify_server_update_data_directory(
+            &configured,
+            Some(vec![configured.clone(), different.clone()]),
+        )
+        .expect_err("conflicting service environment entries must fail closed");
+        assert!(conflict.to_string().contains("values conflict"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn database_inspection_is_read_only_and_uses_the_strict_json_contract() {
+        let root = temporary_directory("linklake-update-db-inspect");
+        fs::create_dir_all(&root).unwrap();
+        let database_path = snapshot_at_schema(&root, 9);
+        let data_dir = database_path.parent().unwrap();
+        let before = sha256_file(&database_path).unwrap();
+
+        let report = inspect_update_database(data_dir).unwrap();
+        assert_eq!(report.schema_version, 1);
+        assert_eq!(report.product, "server");
+        assert_eq!(report.observed_schema, 9);
+        assert_eq!(
+            report.target_schema,
+            database_migrations::CURRENT_SCHEMA_VERSION
+        );
+        assert!(report.can_migrate);
+        assert_eq!(sha256_file(&database_path).unwrap(), before);
+        assert!(!data_dir.join("linklake.sqlite3.lock").exists());
+        #[cfg(windows)]
+        {
+            assert!(
+                !report
+                    .canonical_data_dir
+                    .to_string_lossy()
+                    .starts_with(r"\\?\"),
+                "maintenance JSON must not leak an internal Windows verbatim path"
+            );
+            let verbatim = PathBuf::from(format!(r"\\?\{}", data_dir.display()));
+            assert!(
+                canonical_update_directory(&verbatim, "data directory").is_err(),
+                "maintenance inputs must reject an external Windows verbatim namespace"
+            );
+        }
+
+        let mut encoded = serde_json::to_value(&report).unwrap();
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".to_owned(), serde_json::json!(true));
+        assert!(serde_json::from_value::<UpdateDatabaseInspectReport>(encoded).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn database_preflight_is_isolated_and_deterministic_for_supported_schemas() {
+        let root = temporary_directory("linklake-update-db-preflight");
+        fs::create_dir_all(&root).unwrap();
+        for schema in [9, 12, database_migrations::CURRENT_SCHEMA_VERSION] {
+            let snapshot = snapshot_at_schema(&root, schema);
+            let snapshot_sha256 = sha256_file(&snapshot).unwrap();
+            let source_value: String = Connection::open(&snapshot)
+                .unwrap()
+                .query_row("SELECT value FROM legacy", [], |row| row.get(0))
+                .unwrap();
+            let first_scratch = root.join(format!("scratch-v{schema}-first"));
+            let second_scratch = root.join(format!("scratch-v{schema}-second"));
+            fs::create_dir(&first_scratch).unwrap();
+            fs::create_dir(&second_scratch).unwrap();
+
+            let first =
+                preflight_update_database(&snapshot, &snapshot_sha256, &first_scratch).unwrap();
+            let second =
+                preflight_update_database(&snapshot, &snapshot_sha256, &second_scratch).unwrap();
+            assert_eq!(first, second);
+            assert_eq!(first.source_schema, schema);
+            assert_eq!(
+                first.target_schema,
+                database_migrations::CURRENT_SCHEMA_VERSION
+            );
+            assert_eq!(
+                first.target_ledger_sha256,
+                database_migrations::migration_contract_sha256()
+            );
+            assert!(first.integrity_ok && first.catalogs_ok);
+            assert_eq!(sha256_file(&snapshot).unwrap(), snapshot_sha256);
+            assert_eq!(
+                Connection::open(&snapshot)
+                    .unwrap()
+                    .query_row("SELECT value FROM legacy", [], |row| row
+                        .get::<_, String>(0))
+                    .unwrap(),
+                source_value
+            );
+            for scratch in [&first_scratch, &second_scratch] {
+                let migrated = scratch.join("linklake.sqlite3");
+                assert!(migrated.is_file());
+                assert_eq!(
+                    database_migrations::inspect_database(&migrated)
+                        .unwrap()
+                        .ledger_sha256,
+                    database_migrations::migration_contract_sha256()
+                );
+                assert!(Connection::open(&migrated)
+                    .unwrap()
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'administrators')",
+                        [],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap());
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn database_preflight_rejects_tampering_without_touching_the_snapshot() {
+        let root = temporary_directory("linklake-update-db-tamper");
+        fs::create_dir_all(&root).unwrap();
+        let snapshot = snapshot_at_schema(&root, 12);
+        Connection::open(&snapshot)
+            .unwrap()
+            .execute(
+                "UPDATE schema_migrations SET checksum_sha256 = 'tampered' WHERE version = 12",
+                [],
+            )
+            .unwrap();
+        database_tools::checkpoint_database(&snapshot).unwrap();
+        database_tools::remove_sidecars(&snapshot).unwrap();
+        let snapshot_sha256 = sha256_file(&snapshot).unwrap();
+        let scratch = root.join("scratch-tampered");
+        fs::create_dir(&scratch).unwrap();
+
+        let wrong_digest = preflight_update_database(&snapshot, &"0".repeat(64), &scratch)
+            .expect_err("snapshot digest mismatch must fail closed");
+        assert!(wrong_digest.to_string().contains("SHA-256 does not match"));
+        assert!(fs::read_dir(&scratch).unwrap().next().is_none());
+        let error = preflight_update_database(&snapshot, &snapshot_sha256, &scratch)
+            .expect_err("tampered migration ledger must fail closed");
+        assert!(error.to_string().contains("migration ledger"));
+        assert!(scratch.join("linklake.sqlite3").is_file());
+        assert_eq!(sha256_file(&snapshot).unwrap(), snapshot_sha256);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn interactive_password_stdin_is_rejected_before_reading() {
         assert!(super::ensure_noninteractive_password_stdin(true).is_err());
         assert!(super::ensure_noninteractive_password_stdin(false).is_ok());
@@ -2114,6 +2960,8 @@ enum ServerUpdateAction {
         channel: UpdateChannel,
         #[arg(long)]
         state_dir: Option<PathBuf>,
+        #[command(flatten)]
+        data: DataDirectoryArgs,
         #[arg(long)]
         allow_downgrade: bool,
         #[arg(long)]
@@ -2128,6 +2976,24 @@ enum ServerUpdateAction {
     Rollback {
         #[arg(long)]
         state_dir: Option<PathBuf>,
+        #[command(flatten)]
+        data: DataDirectoryArgs,
+        #[arg(long)]
+        restore_database_snapshot: bool,
+        #[arg(long)]
+        confirm_data_loss: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+    Recover {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[command(flatten)]
+        data: DataDirectoryArgs,
+        #[arg(long)]
+        restore_after_candidate_handoff: bool,
+        #[arg(long)]
+        confirm_data_loss: bool,
         #[arg(long)]
         yes: bool,
     },
@@ -2174,6 +3040,7 @@ fn run_maintenance_command(command: ServerMaintenanceCommand) -> anyhow::Result<
                 repository,
                 channel,
                 state_dir,
+                data,
                 allow_downgrade,
                 development_signature,
                 yes,
@@ -2181,15 +3048,17 @@ fn run_maintenance_command(command: ServerMaintenanceCommand) -> anyhow::Result<
                 let state = state_dir.unwrap_or_else(|| {
                     linklake_update::default_state_directory(UpdateProduct::Server)
                 });
-                let result = tokio::runtime::Runtime::new()?.block_on(linklake_update::apply(
-                    UpdateProduct::Server,
-                    &repository,
-                    channel,
-                    &state,
-                    allow_downgrade,
-                    yes,
-                    signature_policy(development_signature),
-                ))?;
+                let data = resolve_server_update_data_directory(data)?;
+                let result =
+                    tokio::runtime::Runtime::new()?.block_on(linklake_update::server_apply(
+                        &repository,
+                        channel,
+                        &state,
+                        &data,
+                        allow_downgrade,
+                        yes,
+                        signature_policy(development_signature),
+                    ))?;
                 println!("{}", serde_json::to_string_pretty(&result)?);
             }
             ServerUpdateAction::Status { state_dir } => {
@@ -2204,22 +3073,69 @@ fn run_maintenance_command(command: ServerMaintenanceCommand) -> anyhow::Result<
                     )?)?
                 );
             }
-            ServerUpdateAction::Rollback { state_dir, yes } => {
+            ServerUpdateAction::Rollback {
+                state_dir,
+                data,
+                restore_database_snapshot,
+                confirm_data_loss,
+                yes,
+            } => {
                 let state = state_dir.unwrap_or_else(|| {
                     linklake_update::default_state_directory(UpdateProduct::Server)
                 });
+                let data = resolve_server_update_data_directory(data)?;
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&linklake_update::rollback(
-                        UpdateProduct::Server,
+                    serde_json::to_string_pretty(&linklake_update::server_rollback(
                         &state,
+                        &data,
                         yes,
+                        linklake_update::ManualDatabaseRollbackConsent {
+                            restore_database_snapshot,
+                            confirm_data_loss,
+                        },
+                    )?)?
+                );
+            }
+            ServerUpdateAction::Recover {
+                state_dir,
+                data,
+                restore_after_candidate_handoff,
+                confirm_data_loss,
+                yes,
+            } => {
+                let state = state_dir.unwrap_or_else(|| {
+                    linklake_update::default_state_directory(UpdateProduct::Server)
+                });
+                let data = resolve_server_update_data_directory(data)?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&linklake_update::server_recover(
+                        &state,
+                        &data,
+                        yes,
+                        linklake_update::ServerRecoveryConsent {
+                            restore_after_candidate_handoff,
+                            confirm_data_loss,
+                        },
                     )?)?
                 );
             }
         },
         ServerMaintenanceCommand::UpdateHelper { plan, plan_sha256 } => {
             linklake_update::run_helper(&plan, &plan_sha256)?;
+        }
+        ServerMaintenanceCommand::UpdateDbInspect { data_dir } => {
+            let report = inspect_update_database(&data_dir)?;
+            println!("{}", serde_json::to_string(&report)?);
+        }
+        ServerMaintenanceCommand::UpdateDbPreflight {
+            snapshot,
+            snapshot_sha256,
+            scratch_dir,
+        } => {
+            let report = preflight_update_database(&snapshot, &snapshot_sha256, &scratch_dir)?;
+            println!("{}", serde_json::to_string(&report)?);
         }
         ServerMaintenanceCommand::Backup { data, output } => {
             let data_directory = data.resolve()?;
@@ -2276,6 +3192,282 @@ fn run_maintenance_command(command: ServerMaintenanceCommand) -> anyhow::Result<
         }
     }
     Ok(())
+}
+
+fn inspect_update_database(data_dir: &FsPath) -> anyhow::Result<UpdateDatabaseInspectReport> {
+    let canonical_data_dir = canonical_update_directory(data_dir, "data directory")?;
+    let database_path = canonical_data_dir.join("linklake.sqlite3");
+    let canonical_database_path = canonical_update_file(&database_path, "database")?;
+    anyhow::ensure!(
+        canonical_database_path.parent() == Some(canonical_data_dir.as_path()),
+        "database must resolve directly inside the requested data directory"
+    );
+    let inspection = database_migrations::inspect_database(&canonical_database_path)?;
+    Ok(UpdateDatabaseInspectReport {
+        schema_version: 1,
+        product: "server".to_owned(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        executable_sha256: current_executable_sha256()?,
+        canonical_data_dir,
+        canonical_database_path,
+        observed_schema: inspection.observed_schema,
+        ledger_sha256: inspection.ledger_sha256,
+        min_readable_schema: database_migrations::MIN_READABLE_SCHEMA_VERSION,
+        max_readable_schema: database_migrations::MAX_READABLE_SCHEMA_VERSION,
+        target_schema: database_migrations::CURRENT_SCHEMA_VERSION,
+        migration_contract_sha256: database_migrations::migration_contract_sha256(),
+        can_migrate: inspection.can_migrate,
+    })
+}
+
+fn preflight_update_database(
+    snapshot: &FsPath,
+    expected_snapshot_sha256: &str,
+    scratch_dir: &FsPath,
+) -> anyhow::Result<UpdateDatabasePreflightReport> {
+    let expected_snapshot_sha256 = normalize_update_sha256(expected_snapshot_sha256)?;
+    let snapshot_path = canonical_update_file(snapshot, "database snapshot")?;
+    ensure_update_snapshot_has_no_sidecars(&snapshot_path)?;
+    anyhow::ensure!(
+        fs::metadata(&snapshot_path)?.len() <= database_tools::MAX_DATABASE_BYTES,
+        "database snapshot exceeds the maximum supported size"
+    );
+    let scratch_dir = canonical_update_directory(scratch_dir, "preflight scratch directory")?;
+    anyhow::ensure!(
+        !snapshot_path.starts_with(&scratch_dir),
+        "database snapshot must be outside the preflight scratch directory"
+    );
+    anyhow::ensure!(
+        fs::read_dir(&scratch_dir)?.next().is_none(),
+        "preflight scratch directory must be empty"
+    );
+
+    let snapshot_sha256 = sha256_file(&snapshot_path)?;
+    anyhow::ensure!(
+        snapshot_sha256 == expected_snapshot_sha256,
+        "database snapshot SHA-256 does not match"
+    );
+    let scratch_database_path = scratch_dir.join("linklake.sqlite3");
+    clone_update_snapshot(&snapshot_path, &scratch_database_path)?;
+    anyhow::ensure!(
+        sha256_file(&snapshot_path)? == expected_snapshot_sha256,
+        "database snapshot changed during preflight"
+    );
+    ensure_update_snapshot_has_no_sidecars(&snapshot_path)?;
+    anyhow::ensure!(
+        sha256_file(&scratch_database_path)? == expected_snapshot_sha256,
+        "preflight database clone does not match the authenticated snapshot"
+    );
+    database_tools::validate_database(&scratch_database_path)?;
+    let source = database_migrations::inspect_database(&scratch_database_path)?;
+    anyhow::ensure!(
+        source.can_migrate,
+        "database snapshot schema or migration ledger is not supported"
+    );
+
+    // 该入口只对 scratch clone 执行既有恢复迁移。该流程内部会运行全部 Catalog
+    // 的幂等 DDL，并在返回前完成 integrity、foreign-key 和账本验证。
+    database_migrations::migrate_restore_candidate(&scratch_dir)?;
+    database_tools::validate_database(&scratch_database_path)?;
+    database_migrations::validate_restore_database(&scratch_database_path)?;
+    let target = database_migrations::inspect_database(&scratch_database_path)?;
+    let migration_contract_sha256 = database_migrations::migration_contract_sha256();
+    anyhow::ensure!(
+        target.observed_schema == database_migrations::CURRENT_SCHEMA_VERSION
+            && target.can_migrate
+            && target.ledger_sha256 == migration_contract_sha256,
+        "preflight database did not reach the current verified migration contract"
+    );
+
+    Ok(UpdateDatabasePreflightReport {
+        schema_version: 1,
+        product: "server".to_owned(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        executable_sha256: current_executable_sha256()?,
+        snapshot_path,
+        snapshot_sha256,
+        source_schema: source.observed_schema,
+        source_ledger_sha256: source.ledger_sha256,
+        target_schema: target.observed_schema,
+        target_ledger_sha256: target.ledger_sha256,
+        migration_contract_sha256,
+        integrity_ok: true,
+        catalogs_ok: true,
+    })
+}
+
+fn canonical_update_directory(path: &FsPath, label: &str) -> anyhow::Result<PathBuf> {
+    reject_update_windows_namespace(path, label)?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| anyhow::anyhow!("cannot inspect {label} {}: {error}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_dir(),
+        "{label} is not a directory: {}",
+        path.display()
+    );
+    ensure_update_path_is_not_redirected(path, &metadata, label)?;
+    let canonical = fs::canonicalize(path)
+        .map_err(|error| anyhow::anyhow!("cannot resolve {label} {}: {error}", path.display()))?;
+    let canonical_metadata = fs::symlink_metadata(&canonical)?;
+    ensure_update_path_is_not_redirected(&canonical, &canonical_metadata, label)?;
+    normalize_update_canonical_path(canonical)
+}
+
+fn canonical_update_file(path: &FsPath, label: &str) -> anyhow::Result<PathBuf> {
+    reject_update_windows_namespace(path, label)?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| anyhow::anyhow!("cannot inspect {label} {}: {error}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "{label} is not a regular file: {}",
+        path.display()
+    );
+    ensure_update_path_is_not_redirected(path, &metadata, label)?;
+    let canonical = fs::canonicalize(path)
+        .map_err(|error| anyhow::anyhow!("cannot resolve {label} {}: {error}", path.display()))?;
+    let canonical_metadata = fs::symlink_metadata(&canonical)?;
+    anyhow::ensure!(
+        canonical_metadata.is_file(),
+        "resolved {label} is not a regular file: {}",
+        canonical.display()
+    );
+    ensure_update_path_is_not_redirected(&canonical, &canonical_metadata, label)?;
+    normalize_update_canonical_path(canonical)
+}
+
+/// 仅允许普通 Win32 绝对路径进入维护命令。`\\?\` 和 `\\.\` 会绕开常规
+/// 路径归一化；同时 Rust 的 `canonicalize` 在 Windows 上会生成可信的 `\\?\`
+/// 内部结果，因此在完成重解析点检查后将其转换回普通路径，作为稳定 JSON 合同
+/// 输出给更新器。
+#[cfg(windows)]
+fn reject_update_windows_namespace(path: &FsPath, label: &str) -> anyhow::Result<()> {
+    let value = path.as_os_str().to_string_lossy().replace('/', "\\");
+    anyhow::ensure!(
+        !value.starts_with(r"\\?\") && !value.starts_with(r"\\.\"),
+        "{label} must not use a Windows verbatim or device namespace"
+    );
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn reject_update_windows_namespace(_path: &FsPath, _label: &str) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn normalize_update_canonical_path(path: PathBuf) -> anyhow::Result<PathBuf> {
+    use std::{
+        ffi::OsString,
+        os::windows::ffi::{OsStrExt, OsStringExt},
+    };
+
+    let units = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    const VERBATIM_PREFIX: [u16; 4] = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    const UNC_PREFIX: [u16; 4] = [b'U' as u16, b'N' as u16, b'C' as u16, b'\\' as u16];
+    if !units.starts_with(&VERBATIM_PREFIX) {
+        return Ok(path);
+    }
+    let suffix = &units[VERBATIM_PREFIX.len()..];
+    let regular = if suffix.starts_with(&UNC_PREFIX) {
+        let mut value = vec![b'\\' as u16, b'\\' as u16];
+        value.extend_from_slice(&suffix[UNC_PREFIX.len()..]);
+        value
+    } else {
+        suffix.to_vec()
+    };
+    anyhow::ensure!(
+        !regular.is_empty(),
+        "canonical update path has an empty Windows verbatim suffix"
+    );
+    Ok(PathBuf::from(OsString::from_wide(&regular)))
+}
+
+#[cfg(not(windows))]
+fn normalize_update_canonical_path(path: PathBuf) -> anyhow::Result<PathBuf> {
+    Ok(path)
+}
+
+fn ensure_update_path_is_not_redirected(
+    path: &FsPath,
+    metadata: &fs::Metadata,
+    label: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink() && !update_metadata_is_reparse_point(metadata),
+        "{label} must not be a symbolic link or reparse point: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn ensure_update_snapshot_has_no_sidecars(snapshot: &FsPath) -> anyhow::Result<()> {
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = snapshot.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let sidecar = PathBuf::from(sidecar);
+        anyhow::ensure!(
+            !sidecar.exists(),
+            "database snapshot must be checkpointed and must not have a {suffix} sidecar"
+        );
+    }
+    Ok(())
+}
+
+fn clone_update_snapshot(source_path: &FsPath, destination_path: &FsPath) -> anyhow::Result<()> {
+    let result = (|| -> anyhow::Result<()> {
+        let mut source = File::open(source_path)?;
+        let mut destination = disaster_recovery::create_managed_new_file(destination_path)?;
+        let mut limited = (&mut source).take(database_tools::MAX_DATABASE_BYTES + 1);
+        let copied = std::io::copy(&mut limited, &mut destination)?;
+        anyhow::ensure!(
+            copied <= database_tools::MAX_DATABASE_BYTES,
+            "database snapshot exceeds the maximum supported size"
+        );
+        destination.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(destination_path);
+        let _ = database_tools::remove_sidecars(destination_path);
+    }
+    result
+}
+
+#[cfg(windows)]
+fn update_metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(windows))]
+fn update_metadata_is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+fn normalize_update_sha256(value: &str) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "SHA-256 digest must contain 64 hexadecimal characters"
+    );
+    Ok(value.to_ascii_lowercase())
+}
+
+fn current_executable_sha256() -> anyhow::Result<String> {
+    sha256_file(&fs::canonicalize(std::env::current_exe()?)?)
+}
+
+fn sha256_file(path: &FsPath) -> anyhow::Result<String> {
+    let mut file = File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn signature_policy(development: bool) -> SignaturePolicy {
@@ -2335,6 +3527,133 @@ fn ensure_noninteractive_password_stdin(is_terminal: bool) -> anyhow::Result<()>
         "--password-stdin refuses an interactive terminal; pipe the password or use --password-file"
     );
     Ok(())
+}
+
+/// 监听器任务在首次 poll 中进入 Pending，才表示它已完成同步初始化并已到达
+/// accept/serve 的可工作路径。仅完成 socket bind 仍可能因为任务尚未被调度而不能
+/// 证明候选服务可用，因此更新回执必须等待此屏障。
+struct ListenerStartupBarrier {
+    listener_name: &'static str,
+    future: Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>,
+    startup_sender: Option<oneshot::Sender<anyhow::Result<()>>>,
+}
+
+impl Future for ListenerStartupBarrier {
+    type Output = anyhow::Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let this = self.as_mut().get_mut();
+        match this.future.as_mut().poll(context) {
+            Poll::Pending => {
+                if let Some(sender) = this.startup_sender.take() {
+                    let _ = sender.send(Ok(()));
+                }
+                Poll::Pending
+            }
+            Poll::Ready(result) => {
+                if let Some(sender) = this.startup_sender.take() {
+                    let _ = sender.send(Err(anyhow::anyhow!(
+                        "{listener} listener task exited before entering its accept loop",
+                        listener = this.listener_name
+                    )));
+                }
+                Poll::Ready(result)
+            }
+        }
+    }
+}
+
+struct ListenerStartupProbe {
+    listener_name: &'static str,
+    receiver: oneshot::Receiver<anyhow::Result<()>>,
+}
+
+struct RunningListenerTask {
+    listener_name: &'static str,
+    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+}
+
+fn spawn_listener_task<F>(
+    listener_name: &'static str,
+    future: F,
+) -> (ListenerStartupProbe, RunningListenerTask)
+where
+    F: Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    let (startup_sender, receiver) = oneshot::channel();
+    let task = tokio::spawn(ListenerStartupBarrier {
+        listener_name,
+        future: Box::pin(future),
+        startup_sender: Some(startup_sender),
+    });
+    (
+        ListenerStartupProbe {
+            listener_name,
+            receiver,
+        },
+        RunningListenerTask {
+            listener_name,
+            task,
+        },
+    )
+}
+
+async fn wait_for_listener_startup(probes: &mut [ListenerStartupProbe]) -> anyhow::Result<()> {
+    wait_for_listener_startup_with_timeout(
+        probes,
+        Duration::from_secs(LISTENER_STARTUP_TIMEOUT_SECONDS),
+    )
+    .await
+}
+
+async fn wait_for_listener_startup_with_timeout(
+    probes: &mut [ListenerStartupProbe],
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    for probe in probes {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        anyhow::ensure!(
+            !remaining.is_zero(),
+            "timed out waiting for {} listener to enter its accept loop",
+            probe.listener_name
+        );
+        match tokio::time::timeout(remaining, &mut probe.receiver).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => {
+                return Err(error.context(format!(
+                    "{} listener failed during startup",
+                    probe.listener_name
+                )));
+            }
+            Ok(Err(_)) => {
+                anyhow::bail!(
+                    "{} listener task terminated before reporting startup readiness",
+                    probe.listener_name
+                );
+            }
+            Err(_) => {
+                anyhow::bail!(
+                    "timed out waiting for {} listener to enter its accept loop",
+                    probe.listener_name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn abort_listener_tasks(tasks: &[RunningListenerTask]) {
+    for task in tasks {
+        tracing::debug!(listener = task.listener_name, "aborting listener task");
+        task.task.abort();
+    }
+}
+
+fn stop_udp_data_plane(state: &AppState) {
+    if let Some(udp_data_plane) = state.udp_data_plane.as_ref() {
+        udp_data_plane.stop();
+    }
 }
 
 async fn run_server(
@@ -2495,6 +3814,9 @@ async fn run_server(
         tracing::warn!("No LINKLAKE_DATA_DIR configured; identities and administrator sessions are in-memory only.");
     }
     let bootstrap_admin = BootstrapCredentials::from_environment(insecure_default_requested)?;
+    if let Some(data_dir) = data_dir.as_deref() {
+        database_migrations::recover_interrupted_startup_migration(data_dir)?;
+    }
     let database = Database::open(data_dir.as_deref())?;
     let migration_plan = database
         .is_persistent()
@@ -2510,12 +3832,14 @@ async fn run_server(
             );
         }
     }
-    if let Some(plan) = migration_plan {
-        plan.finish()?;
-    }
     // 版本化账本升级后，先补齐各业务目录的幂等 DDL，再构造任何运行时服务。
-    // 这样旧数据库不会在目录首次查询新增列时才失败。
-    migrate_application_schema(&database)?;
+    // 这样旧数据库不会在目录首次查询新增列时才失败。该包装器还会在 Catalog
+    // DDL 失败时恢复版本化迁移前的数据库，而不是留下已提交的账本或部分结构。
+    let database = database_migrations::apply_startup_schema(
+        database,
+        migration_plan,
+        migrate_application_schema,
+    )?;
     let certificate_manager = data_dir
         .as_ref()
         .map(|data_dir| CertificateManager::new(data_dir.clone()))
@@ -2902,10 +4226,200 @@ async fn run_server(
         None
     };
 
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let shutdown_state = state.clone();
+    let shutdown_signal_tx = shutdown_tx.clone();
+    tokio::spawn(async move {
+        match service_shutdown {
+            Some(shutdown) => {
+                let _ = shutdown.await;
+            }
+            None => wait_for_os_shutdown().await,
+        }
+        shutdown_state.lifecycle.begin_stopping(unix_seconds());
+        tracing::info!(
+            "LinkLake received a shutdown signal; closing tunnels and draining requests."
+        );
+        stop_udp_data_plane(&shutdown_state);
+        tcp_tunnel::stop_all(&shutdown_state);
+        udp_tunnel::stop_all(&shutdown_state);
+        http_tunnel::stop_all(&shutdown_state);
+        sni_tunnel::stop_all(&shutdown_state);
+        secret_tunnel::stop_all(&shutdown_state);
+        socks5_tunnel::stop_all(&shutdown_state);
+        http_proxy_tunnel::stop_all(&shutdown_state);
+        let _ = shutdown_signal_tx.send(true);
+    });
+
+    let mut startup_probes = Vec::new();
+    let mut listener_tasks = Vec::new();
+    if let Some(udp_data_plane) = state.udp_data_plane.as_ref() {
+        let receiver = match udp_data_plane.start_accept_loop() {
+            Ok(receiver) => receiver,
+            Err(error) => {
+                state.lifecycle.begin_stopping(unix_seconds());
+                stop_udp_data_plane(&state);
+                let _ = shutdown_tx.send(true);
+                return Err(error.context(
+                    "failed to start UDP QUIC relay accept loop before server readiness",
+                ));
+            }
+        };
+        startup_probes.push(ListenerStartupProbe {
+            listener_name: "UDP QUIC relay",
+            receiver,
+        });
+    }
+    let (control_startup, control_task) = if let Some(acceptor) = control_tls {
+        tracing::info!("{PRODUCT_NAME} TLS TCP control listening on {control_address}");
+        let listener_state = state.clone();
+        let listener_shutdown = shutdown_rx.clone();
+        spawn_listener_task("TLS TCP control", async move {
+            tcp_tunnel::run_tls_control_listener(
+                listener_state,
+                control_listener,
+                acceptor,
+                listener_shutdown,
+            )
+            .await;
+            Ok(())
+        })
+    } else {
+        tracing::info!("{PRODUCT_NAME} development TCP control listening on {control_address}");
+        let listener_state = state.clone();
+        let listener_shutdown = shutdown_rx.clone();
+        spawn_listener_task("TCP control", async move {
+            tcp_tunnel::run_control_listener(listener_state, control_listener, listener_shutdown)
+                .await;
+            Ok(())
+        })
+    };
+    startup_probes.push(control_startup);
+    listener_tasks.push(control_task);
+    if let Some((http_address, http_listener)) = http_listener {
+        tracing::info!("{PRODUCT_NAME} HTTP route listener active on {http_address}");
+        let listener_state = state.clone();
+        let listener_shutdown = shutdown_rx.clone();
+        let (startup, task) = spawn_listener_task("HTTP routes", async move {
+            http_tunnel::run_http_listener(listener_state, http_listener, listener_shutdown).await;
+            Ok(())
+        });
+        startup_probes.push(startup);
+        listener_tasks.push(task);
+    }
+    if let Some((https_address, https_listener, acceptor)) = https_listener {
+        tracing::info!("{PRODUCT_NAME} HTTPS route listener active on {https_address}");
+        let listener_state = state.clone();
+        let listener_shutdown = shutdown_rx.clone();
+        let (startup, task) = spawn_listener_task("HTTPS routes", async move {
+            http_tunnel::run_https_listener(
+                listener_state,
+                https_listener,
+                acceptor,
+                listener_shutdown,
+            )
+            .await;
+            Ok(())
+        });
+        startup_probes.push(startup);
+        listener_tasks.push(task);
+    }
+    if let Some((sni_address, sni_listener)) = sni_listener {
+        tracing::info!("{PRODUCT_NAME} TLS SNI pass-through listener active on {sni_address}");
+        let listener_state = state.clone();
+        let listener_shutdown = shutdown_rx.clone();
+        let (startup, task) = spawn_listener_task("TLS SNI pass-through", async move {
+            sni_tunnel::run_listener(listener_state, sni_listener, listener_shutdown).await;
+            Ok(())
+        });
+        startup_probes.push(startup);
+        listener_tasks.push(task);
+    }
+    let (management_startup, management_task) = if let Some(config) = management_tls {
+        let listener = management_tls_listener.expect("TLS management listener must be bound");
+        tracing::info!("{PRODUCT_NAME} HTTPS management listening on https://{address}");
+        let handle = axum_server::Handle::new();
+        let shutdown_handle = handle.clone();
+        let management_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            wait_for_shutdown(management_shutdown).await;
+            shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
+        });
+        spawn_listener_task("HTTPS management", async move {
+            axum_server::from_tcp_rustls(listener, config)
+                .context("failed to configure HTTPS management listener")?
+                .handle(handle)
+                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+                .await
+                .context("HTTPS management listener stopped with an error")
+        })
+    } else {
+        let listener = management_http_listener.expect("HTTP management listener must be bound");
+        tracing::info!("{PRODUCT_NAME} development HTTP management listening on http://{address}");
+        let management_shutdown = shutdown_rx.clone();
+        spawn_listener_task("HTTP management", async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(wait_for_shutdown(management_shutdown))
+            .await
+            .context("HTTP management listener stopped with an error")
+        })
+    };
+    startup_probes.push(management_startup);
+
+    if let Err(error) = wait_for_listener_startup(&mut startup_probes).await {
+        state.lifecycle.begin_stopping(unix_seconds());
+        stop_udp_data_plane(&state);
+        let _ = shutdown_tx.send(true);
+        abort_listener_tasks(&listener_tasks);
+        management_task.task.abort();
+        return Err(error.context(
+            "configured server listeners did not enter their accept loops; refusing readiness",
+        ));
+    }
+    if *shutdown_rx.borrow() {
+        state.lifecycle.begin_stopping(unix_seconds());
+        stop_udp_data_plane(&state);
+        abort_listener_tasks(&listener_tasks);
+        management_task.task.abort();
+        anyhow::bail!("server received a shutdown request before listener startup completed");
+    }
+
     state.lifecycle.mark_ready(unix_seconds());
+    if let Some(data_dir) = data_dir.as_deref() {
+        // 更新 helper 只能接受候选服务在数据库、配置和所有静态监听器已实际进入
+        // accept/serve 路径后写出的回执。回执发布失败时立即结束启动，避免把未完成
+        // 初始化的候选二进制误判为可用版本。
+        let current_exe = fs::canonicalize(std::env::current_exe()?)
+            .context("failed to resolve server executable before publishing update readiness")?;
+        let published = linklake_update::publish_server_update_readiness(
+            data_dir,
+            &current_exe,
+            env!("CARGO_PKG_VERSION"),
+        )
+        .context("failed to publish authenticated server update readiness receipt");
+        match published {
+            Ok(true) => {
+                tracing::info!(
+                    data_dir = %data_dir.display(),
+                    "服务端已发布受认证的更新就绪回执"
+                );
+            }
+            Ok(false) => {}
+            Err(error) => {
+                state.lifecycle.begin_stopping(unix_seconds());
+                stop_udp_data_plane(&state);
+                let _ = shutdown_tx.send(true);
+                abort_listener_tasks(&listener_tasks);
+                management_task.task.abort();
+                return Err(error);
+            }
+        }
+    }
     tracing::info!("{PRODUCT_NAME} startup completed; lifecycle is ready");
 
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     record_metrics_history_sample(&state);
     tokio::spawn(run_metrics_history_sampler(
         state.clone(),
@@ -2921,92 +4435,27 @@ async fn run_server(
         shutdown_rx.clone(),
     ));
     tokio::spawn(run_fleet_health_monitor(state.clone(), shutdown_rx.clone()));
-    let shutdown_state = state.clone();
-    tokio::spawn(async move {
-        match service_shutdown {
-            Some(shutdown) => {
-                let _ = shutdown.await;
-            }
-            None => wait_for_os_shutdown().await,
-        }
-        shutdown_state.lifecycle.begin_stopping(unix_seconds());
-        tracing::info!(
-            "LinkLake received a shutdown signal; closing tunnels and draining requests."
-        );
-        tcp_tunnel::stop_all(&shutdown_state);
-        udp_tunnel::stop_all(&shutdown_state);
-        http_tunnel::stop_all(&shutdown_state);
-        sni_tunnel::stop_all(&shutdown_state);
-        secret_tunnel::stop_all(&shutdown_state);
-        socks5_tunnel::stop_all(&shutdown_state);
-        http_proxy_tunnel::stop_all(&shutdown_state);
+
+    let management_name = management_task.listener_name;
+    let management_result = management_task.task.await.map_err(|error| {
+        anyhow::anyhow!("{management_name} listener task terminated unexpectedly: {error}")
+    })?;
+    if let Err(error) = management_result {
+        state.lifecycle.begin_stopping(unix_seconds());
+        stop_udp_data_plane(&state);
         let _ = shutdown_tx.send(true);
-    });
-    if let Some(acceptor) = control_tls {
-        tracing::info!("{PRODUCT_NAME} TLS TCP control listening on {control_address}");
-        tokio::spawn(tcp_tunnel::run_tls_control_listener(
-            state.clone(),
-            control_listener,
-            acceptor,
-            shutdown_rx.clone(),
-        ));
-    } else {
-        tracing::info!("{PRODUCT_NAME} development TCP control listening on {control_address}");
-        tokio::spawn(tcp_tunnel::run_control_listener(
-            state.clone(),
-            control_listener,
-            shutdown_rx.clone(),
-        ));
+        abort_listener_tasks(&listener_tasks);
+        return Err(error.context("management listener stopped with an error"));
     }
-    if let Some((http_address, http_listener)) = http_listener {
-        tracing::info!("{PRODUCT_NAME} HTTP route listener active on {http_address}");
-        tokio::spawn(http_tunnel::run_http_listener(
-            state.clone(),
-            http_listener,
-            shutdown_rx.clone(),
-        ));
+    if !*shutdown_rx.borrow() {
+        state.lifecycle.begin_stopping(unix_seconds());
+        stop_udp_data_plane(&state);
+        let _ = shutdown_tx.send(true);
+        abort_listener_tasks(&listener_tasks);
+        anyhow::bail!("management listener stopped before the server shutdown signal");
     }
-    if let Some((https_address, https_listener, acceptor)) = https_listener {
-        tracing::info!("{PRODUCT_NAME} HTTPS route listener active on {https_address}");
-        tokio::spawn(http_tunnel::run_https_listener(
-            state.clone(),
-            https_listener,
-            acceptor,
-            shutdown_rx.clone(),
-        ));
-    }
-    if let Some((sni_address, sni_listener)) = sni_listener {
-        tracing::info!("{PRODUCT_NAME} TLS SNI pass-through listener active on {sni_address}");
-        tokio::spawn(sni_tunnel::run_listener(
-            state.clone(),
-            sni_listener,
-            shutdown_rx.clone(),
-        ));
-    }
-    if let Some(config) = management_tls {
-        let listener = management_tls_listener.expect("TLS management listener must be bound");
-        tracing::info!("{PRODUCT_NAME} HTTPS management listening on https://{address}");
-        let handle = axum_server::Handle::new();
-        let shutdown_handle = handle.clone();
-        let management_shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
-            wait_for_shutdown(management_shutdown).await;
-            shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
-        });
-        axum_server::from_tcp_rustls(listener, config)?
-            .handle(handle)
-            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-            .await?;
-    } else {
-        let listener = management_http_listener.expect("HTTP management listener must be bound");
-        tracing::info!("{PRODUCT_NAME} development HTTP management listening on http://{address}");
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
-        .await?;
-    }
+    stop_udp_data_plane(&state);
+    abort_listener_tasks(&listener_tasks);
     Ok(())
 }
 
@@ -12652,10 +14101,12 @@ mod tests {
         management_session_cookie, normalize_metrics_history_step, parse_metrics_history_range,
         release_certificate_job_slot, render_prometheus_metrics, reserve_certificate_job_slot,
         resolve_certificate_identifier_update, select_certificate_maintenance_operation,
-        session_cookie_header, tcp_history_error_total, udp_history_error_total,
-        udp_metrics_response, validate_fleet_source_binding, verify_agent_enrollment_identity,
-        CertificateOperation, FleetPolicyKind, HistoryCounters, HttpTransportCapabilitiesView,
-        LoginResponse, LoginThrottle, ManagementPrincipal, MetricsHistory, MetricsHistoryProtocol,
+        session_cookie_header, spawn_listener_task, tcp_history_error_total,
+        udp_history_error_total, udp_metrics_response, validate_fleet_source_binding,
+        verify_agent_enrollment_identity, wait_for_listener_startup,
+        wait_for_listener_startup_with_timeout, CertificateOperation, FleetPolicyKind,
+        HistoryCounters, HttpTransportCapabilitiesView, ListenerStartupProbe, LoginResponse,
+        LoginThrottle, ManagementPrincipal, MetricsHistory, MetricsHistoryProtocol,
         MetricsHistorySample, Socks5CapabilitiesView, UserRole, LOGIN_THROTTLE_MAX_IDENTITIES,
         MANAGEMENT_UI, METRICS_HISTORY_ARCHIVE_CAPACITY,
         METRICS_HISTORY_ARCHIVE_SAMPLE_INTERVAL_SECONDS, METRICS_HISTORY_CAPACITY,
@@ -13885,5 +15336,65 @@ mod tests {
             select_certificate_maintenance_operation(Some(&certificate), false, retry_time),
             Some(CertificateOperation::Issue)
         );
+    }
+
+    #[tokio::test]
+    async fn listener_startup_barrier_waits_until_the_task_reaches_an_accept_capable_pending_state()
+    {
+        let (mut probe, task) = spawn_listener_task("test listener", async {
+            std::future::pending::<()>().await;
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+
+        wait_for_listener_startup(std::slice::from_mut(&mut probe))
+            .await
+            .expect("a pending listener task should pass the startup barrier");
+
+        task.task.abort();
+        let error = task
+            .task
+            .await
+            .expect_err("the aborted test listener should not complete normally");
+        assert!(error.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn listener_startup_barrier_fails_closed_when_a_task_exits_before_accept() {
+        let (mut probe, task) = spawn_listener_task("failing listener", async {
+            anyhow::bail!("simulated listener initialization failure")
+        });
+
+        let error = wait_for_listener_startup(std::slice::from_mut(&mut probe))
+            .await
+            .expect_err("a listener that exits on its first poll must fail startup");
+        assert!(error
+            .to_string()
+            .contains("failing listener listener failed during startup"));
+
+        let task_error = task
+            .task
+            .await
+            .expect("the listener task itself should complete without panicking")
+            .expect_err("the simulated listener should return its initialization error");
+        assert!(task_error
+            .to_string()
+            .contains("simulated listener initialization failure"));
+    }
+
+    #[tokio::test]
+    async fn listener_startup_barrier_times_out_closed_when_no_listener_reports_ready() {
+        let (_sender, receiver) = tokio::sync::oneshot::channel();
+        let mut probes = [ListenerStartupProbe {
+            listener_name: "unreported listener",
+            receiver,
+        }];
+
+        let error = wait_for_listener_startup_with_timeout(&mut probes, Duration::from_millis(10))
+            .await
+            .expect_err("an unreported listener must not be treated as ready");
+        assert!(error
+            .to_string()
+            .contains("timed out waiting for unreported listener listener"));
     }
 }

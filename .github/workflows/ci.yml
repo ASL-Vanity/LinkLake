@@ -157,7 +157,7 @@ jobs:
         run: |
           ./tests/version-contract.ps1
           ./tests/update-e2e.ps1 -Product client
-          ./tests/update-e2e.ps1 -Product server
+          ./tests/server-update-e2e.ps1
           ./tests/manager-update-e2e.ps1 -SkipBuild
       - name: Run lifecycle and fleet-health end-to-end tests
         shell: pwsh

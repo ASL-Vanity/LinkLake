@@ -6,7 +6,7 @@ LinkLake 是一个使用 Rust 从零实现的跨平台安全隧道平台，采�
 
 LinkLake 的代码实现、自动化测试与项目文档由 OpenAI GPT-5.6 完成；项目所有者负责需求定义、基础设施授权与最终验收。
 
-当前候选版本为 `1.0.0-rc.1`，用于在同一提交上完成跨平台、端到端、安全和生产签名验收；候选版本通过全部门禁前不视为正式发布。
+当前正式版本为 `1.0.0`。Windows 官方资产按个人开源发布策略有意未做 Authenticode 签名；安装前请验证 SHA-256、GitHub Attestation 与 LinkLake Ed25519 更新清单。
 
 当前版本已完成 TCP 与 UDP 生产化、多端口/端口范围、Secret 私密隧道、TLS SNI 原样透传、多节点 P2P 直连与显式服务端中继回退、SOCKS5 TCP/UDP 代理、HTTP 正向代理/CONNECT、HTTP 域名路由以及第一阶段原生 HTTPS 与 ACME 证书自动化。
 
@@ -271,7 +271,7 @@ Linux systemd 服务默认把托管配置保存到 `/var/lib/linklake-client/man
 
 远程控制连接还必须指定 `control_ca_cert` 和 `control_server_name`。公网端口范围由各服务端独立决定，因此云 A 与云 B 可以使用不同公网端口；TCP 与 UDP 仍可使用相同的数值端口。
 
-客户端可以按语义版本检查 GitHub Release。候选版本默认继续跟踪候选版本，稳定版本默认只跟踪稳定版本，也可以显式选择通道：
+官方二进制与自动更新目标仅为 `windows-x86_64` 和 `linux-x86_64`。macOS 保留源码与 CI 兼容性，但不提供 GitHub Release 资产、Ed25519 更新清单条目或自动更新通道。Windows/Linux 客户端可以按语义版本检查 GitHub Release；候选版本默认继续跟踪候选版本，稳定版本默认只跟踪稳定版本，也可以显式选择通道：
 
 ```powershell
 linklake-client check-update --channel auto
@@ -307,9 +307,10 @@ linklake-client update rollback --yes
 ```powershell
 linklake-server check-update
 linklake-server update download
-linklake-server update apply --yes
+linklake-server update apply --yes --data-dir <服务端数据目录>
 linklake-server update status
-linklake-server update rollback --yes
+linklake-server update rollback --yes --data-dir <服务端数据目录>
+linklake-server update recover --yes --data-dir <服务端数据目录>
 ```
 
 - `download` 仅下载和验证，不修改正在使用的程序。
@@ -317,11 +318,11 @@ linklake-server update rollback --yes
 - `status` 返回最后一次操作的 `scheduled/installing/succeeded/rolled_back/failed` 状态。
 - `rollback` 使用最近一份与当前安装不同且摘要有效的本地备份。生产签名策略禁止网络降级；`--allow-downgrade` 仅与显式 `--development-signature` 测试路径同时有效。
 - 自动安装目标必须支持统一的 `--version`，因此不会自动安装 0.8.0-rc.1 之前不符合新契约的旧包；旧二进制仍可作为已验证本地备份恢复。
-- 默认状态目录位于当前用户的本地状态目录，也可以通过 `--state-dir` 显式指定。
+- 客户端与 Manager 默认使用当前用户的本地状态目录；服务端默认使用 Windows 的 `%ProgramData%\LinkLake\updates\server` 或 Linux 的 `/var/lib/linklake-updater/server`，所有产品均可通过 `--state-dir` 显式指定。
 
-安全验证链包括：HTTPS 与仓库路径约束、GitHub 资产 SHA-256、独立 `.sha256`、Ed25519 签名发布清单、下载大小、ZIP/TAR 路径与条目限制、`release.json` 产品/版本/平台、暂存二进制摘要、带摘要的帮助进程计划、安装前目标摘要、安装后 `--version` 以及 systemd/Windows service/launchd 恢复。客户端或服务端更新器只替换对应可执行文件，不覆盖配置、SQLite 数据库、托管状态、证书或日志。任一安装、版本或服务恢复检查失败时会自动恢复备份。
+上述自动更新验证链仅适用于 Windows/Linux 官方资产，包含 HTTPS 与仓库路径约束、GitHub 资产 SHA-256、独立 `.sha256`、Ed25519 签名发布清单、下载大小、ZIP/TAR 路径与条目限制、`release.json` 产品/版本/平台、暂存二进制摘要、带摘要的帮助进程计划、安装前目标摘要、安装后 `--version` 以及 systemd/Windows service 恢复。客户端更新只替换对应可执行文件；服务端替换前会以旧二进制创建与操作绑定的 SQLite 快照，在隔离目录真实预演候选迁移，候选失败时先恢复已认证的数据库快照，再恢复旧二进制。配置、证书、托管状态和日志不进入替换集合。
 
-独立信任根位于 `security/release-keys.json`。正式 Release 必须由 CI secret 提供与仓库生产公钥匹配的 Ed25519 私钥，否则流水线关闭失败；仓库只含公钥、格式和明确标记的 RFC 8032 测试夹具。开发测试必须显式使用 `--development-signature`，生产默认绝不接受测试密钥。密钥轮换通过并行登记新旧公钥及版本有效区间完成。完整威胁模型、清单格式和轮换步骤见 `docs/update-security.zh-CN.md`。
+独立信任根位于 `security/release-keys.json`。每个标签 Release（稳定版或语义版本预发布版）都必须由 CI secret 提供与仓库生产公钥匹配的 Ed25519 私钥，否则流水线关闭失败；仓库只含公钥、格式和明确标记的 RFC 8032 测试夹具。开发测试必须显式使用 `--development-signature`，生产默认绝不接受测试密钥。密钥轮换通过并行登记新旧公钥及版本有效区间完成。完整威胁模型、清单格式和轮换步骤见 `docs/update-security.zh-CN.md`。
 
 Manager UI 不直接替换自身文件。`linklake-client manager-update download/apply/status/rollback` 提供稳定 JSON 契约，`apply`/`rollback` 必须传入 `--manager-pid <pid>`。命令返回 schema v2 且 `requires_manager_exit=true` 后 Manager 才退出；独立帮助进程等待该 PID，复核完整暂存/安装目录树摘要，在同卷切换目录并自动回滚失败。机器可读契约位于 `docs/manager-update-json-schema.json`，Flutter 封装位于 `apps/linklake_manager/lib/update_protocol.dart`。
 
@@ -478,13 +479,13 @@ sh scripts/package-manager-linux.sh
 sh scripts/verify-manager-linux.sh
 ```
 
-TCP 端到端测试覆盖真实二进制回显、限速、连接限制、重连、策略生命周期、配对超时和指标。UDP 端到端测试覆盖同一业务端口的 IPv4/IPv6 双栈回显、`0` 到 `65507` 字节真实数据报回显、多会话、限速丢包、空闲回收、分片重组、策略生命周期、重连、TCP/UDP 同数值端口、TCP/UDP 连续端口组的全部映射及指标；生产验收还覆盖独立公网服务器、Linux 服务端和 Windows 客户端。TLS SNI E2E 使用真实自签名目标和 .NET `SslStream`，覆盖原始 ClientHello 透传、真实 TLS 握手/回显、未知 SNI 拒绝、启停恢复、删除和指标。Secret E2E 覆盖托管目标端、一次性密钥隔离、访问客户端白名单、错误密钥、连接限制、启停恢复、删除失效、统计、两个独立客户端之间的真实 P2P 直连、不可达候选下的显式中继回退，以及服务端无公网业务监听。SOCKS5 E2E 覆盖托管出口、一次性密码隔离、强制认证、错误密码、域名/IPv4 CONNECT、IPv4/IPv6 公网传输下的真实 UDP ASSOCIATE 回显、UDP 分片拒绝、TCP 控制连接生命周期、BIND 拒绝、连接限制、策略恢复和指标。HTTP E2E 同时覆盖 Host 路由以及正向代理的一次性密码、强制/错误认证、absolute-form 改写、凭据隔离、GET/POST 请求体、请求走私拒绝、真实 CONNECT 隧道、连接限制、客户端重连、策略生命周期和指标。HTTPS/ACME 测试在 Linux CI 中使用本地 Pebble 与 Cloudflare/DoH Mock，覆盖 HTTP-01、DNS-01、通配符 SNI、TXT 生命周期、证书签发与续期、HTTPS 转发、跳转、持久化、失败恢复和证书指标，不访问公网证书机构或真实 Cloudflare API。
+TCP 端到端测试覆盖真实二进制回显、限速、连接限制、重连、策略生命周期、配对超时和指标。UDP 端到端测试覆盖同一业务端口的 IPv4/IPv6 双栈回显、`0` 到 `65507` 字节真实数据报回显、多会话、限速丢包、空闲回收、分片重组、策略生命周期、重连、TCP/UDP 同数值端口、TCP/UDP 连续端口组的全部映射及指标；生产验收还覆盖独立公网服务器、Linux 服务端和 Windows 客户端。TLS SNI E2E 使用真实自签名目标和 .NET `SslStream`，覆盖原始 ClientHello 透传、真实 TLS 握手/回显、未知 SNI 拒绝、启停恢复、删除和指标。Secret E2E 覆盖托管目标端、单次访问密钥隔离、访问客户端白名单、错误密钥、连接限制、启停恢复、删除失效、统计、两个独立客户端之间的真实 P2P 直连、不可达候选下的显式中继回退，以及服务端无公网业务监听。SOCKS5 E2E 覆盖托管出口、单次凭据隔离、强制认证、错误凭据、域名/IPv4 CONNECT、IPv4/IPv6 公网传输下的真实 UDP ASSOCIATE 回显、UDP 分片拒绝、TCP 控制连接生命周期、BIND 拒绝、连接限制、策略恢复和指标。HTTP E2E 同时覆盖 Host 路由以及正向代理的单次凭据、强制/错误认证、absolute-form 改写、凭据隔离、GET/POST 请求体、请求走私拒绝、真实 CONNECT 隧道、连接限制、客户端重连、策略生命周期和指标。HTTPS/ACME 测试在 Linux CI 中使用本地 Pebble 与 Cloudflare/DoH Mock，覆盖 HTTP-01、DNS-01、通配符 SNI、TXT 生命周期、证书签发与续期、HTTPS 转发、跳转、持久化、失败恢复和证书指标，不访问公网证书机构或真实 Cloudflare API。
 
-macOS 使用 `scripts/package-macos.sh`、`scripts/verify-macos-package.sh`、`scripts/package-manager-macos.sh` 和 `scripts/verify-manager-macos.sh` 构建并校验核心服务与 Flutter 管理客户端。
+macOS 开发者可使用 `scripts/package-macos.sh`、`scripts/verify-macos-package.sh`、`scripts/package-manager-macos.sh` 和 `scripts/verify-manager-macos.sh` 从源码构建并校验核心服务与 Flutter 管理客户端。这些仅用于源码/CI 兼容性验证，不会成为 GitHub Release、Attestation、Ed25519 更新清单或自动更新资产。
 
-打包脚本支持 `SOURCE_DATE_EPOCH`。设置相同时间戳并使用相同源码、工具链、目标平台和锁定依赖时，归档内的文件顺序、时间和发布清单保持稳定。Windows 生成 ZIP 和 SHA-256，Linux/macOS 生成 tar.gz 和 SHA-256；三个平台均同时生成 LinkLake 核心包和 LinkLake Manager 包。
+打包脚本支持 `SOURCE_DATE_EPOCH`。设置相同时间戳并使用相同源码、工具链、目标平台和锁定依赖时，归档内的文件顺序、时间和发布元数据保持稳定。Windows 生成 ZIP 和 SHA-256，Linux 生成 tar.gz 和 SHA-256，并且两者均生成 LinkLake 核心包和 LinkLake Manager 包；macOS 归档仅可作为本地源码兼容性输出，不属于官方发行集合。
 
-`.github/workflows/ci.yml` 会在推送和拉取请求中执行格式、Clippy、单元测试、脚本语法检查、使用锁定 Playwright/Chromium 的真实 WebUI 浏览器冒烟测试、Windows TCP/UDP/HTTP/TLS SNI/Secret-P2P/SOCKS5 E2E、Linux Pebble HTTP-01/Cloudflare DNS-01 E2E，以及 Flutter Manager 的 Windows/Linux/macOS 分析、测试和 Release 构建。WebUI 测试运行时生成一次性 localhost 证书，失败时保留截图和服务日志，不依赖开发者机器上的 Node 路径、浏览器模块或固定测试私钥。`.github/workflows/soak.yml` 每周或手动运行长稳、弱网、崩溃、重启、并发与吞吐矩阵。正式标签还必须通过 Windows Authenticode、macOS Developer ID/Apple 公证、Linux OpenPGP、GHCR OCI SBOM/provenance 与 Cosign 摘要签名，再生成文件级 SPDX/GitHub 证明和 LinkLake Ed25519 更新清单。全部 GitHub Actions 都固定到完整提交 SHA，发布任务只恢复缓存且不写入缓存，checkout 不保留 Git 凭据。完整说明与必需 Secret 清单见 [`docs/release-supply-chain.zh-CN.md`](docs/release-supply-chain.zh-CN.md)。
+`.github/workflows/ci.yml` 会在推送和拉取请求中执行格式、Clippy、单元测试、脚本语法检查、使用锁定 Playwright/Chromium 的真实 WebUI 浏览器冒烟测试、Windows TCP/UDP/HTTP/TLS SNI/Secret-P2P/SOCKS5 E2E、Linux Pebble HTTP-01/Cloudflare DNS-01 E2E，以及 Flutter Manager 的 Windows/Linux/macOS 分析、测试和构建兼容性验证。WebUI 测试运行时生成一次性 localhost 证书，失败时保留截图和服务日志，不依赖开发者机器上的 Node 路径、浏览器模块或固定测试私钥。`.github/workflows/soak.yml` 每周或手动运行长稳、弱网、崩溃、重启、并发与吞吐矩阵。按 `v1.0.0` 的个人开源发布策略，官方 Windows 资产有意未签名，可能出现“未知发布者”或 SmartScreen 警告；只能从官方 Release 下载，并验证 SHA-256、GitHub Attestation 与生产 Ed25519 更新清单。所有语义版本标签（稳定版与预发布版）都继续强制 Linux OpenPGP、GHCR OCI SBOM/provenance、Cosign 摘要签名、GitHub 文件证明和 Ed25519 更新器签名；每个语义版本预发布标签都会作为 GitHub 预发布版发布。Windows PFX 不会注入正式发布任务，保留的 PFX 后端只供未来经审批的显式流程使用，云签名尚未实现且会关闭失败。macOS 不属于官方发行资产、自动更新或签名门禁。全部 GitHub Actions 都固定到完整提交 SHA，发布任务只恢复缓存且不写入缓存，checkout 不保留 Git 凭据。完整说明与必需 Secret 清单见 [`docs/release-supply-chain.zh-CN.md`](docs/release-supply-chain.zh-CN.md)。
 
 ## 后续路线
 

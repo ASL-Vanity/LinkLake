@@ -1,16 +1,12 @@
-param(
-    [switch]$Required,
+﻿param(
+    [ValidateSet('none', 'pfx', 'cloud')]
+    [string]$Mode = 'none',
     [Parameter(Mandatory = $true)]
     [string[]]$Path
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-
-function Test-LinkLakeEnabled {
-    param([string]$Value)
-    return $Value -match '^(?i:1|true|yes)$'
-}
 
 function Get-LinkLakeSignTool {
     $command = Get-Command signtool.exe -ErrorAction SilentlyContinue
@@ -49,17 +45,26 @@ function Get-LinkLakeCertificateSha256 {
     finally { $sha256.Dispose() }
 }
 
-$requiredByEnvironment = Test-LinkLakeEnabled $env:LINKLAKE_WINDOWS_SIGNING_REQUIRED
-$mustSign = $Required -or $requiredByEnvironment
 $secretNames = @(
     'LINKLAKE_WINDOWS_SIGNING_PFX_B64',
     'LINKLAKE_WINDOWS_SIGNING_PFX_PASSWORD',
     'LINKLAKE_WINDOWS_SIGNING_CERT_SHA256'
 )
 $configured = @($secretNames | Where-Object { -not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) })
-if (-not $mustSign -and $configured.Count -eq 0) {
-    Write-Host 'Windows Authenticode signing is not enabled for this development package.'
-    return
+switch ($Mode) {
+    'none' {
+        if ($configured.Count -ne 0) {
+            throw 'Unsigned Windows package mode refuses Authenticode credentials. Select -Mode pfx explicitly in a future approved signing workflow.'
+        }
+        Write-Host 'Windows packages are intentionally unsigned by release policy; SHA-256, GitHub attestations, and Ed25519 verification remain required.'
+        return
+    }
+    'cloud' {
+        throw 'Cloud Windows signing is reserved but not implemented; refusing to create a signed package.'
+    }
+    'pfx' {
+        # PFX 后端仅供未来经审核的可选签名工作流显式调用，正式发布工作流不会选择此模式。
+    }
 }
 foreach ($name in $secretNames) {
     if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {

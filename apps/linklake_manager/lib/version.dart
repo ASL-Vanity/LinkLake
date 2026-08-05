@@ -2,12 +2,12 @@
 // 发布构建可以用 --dart-define 覆盖；默认值必须与 pubspec.yaml 和 Cargo.toml 保持一致。
 const managerVersion = String.fromEnvironment(
   'LINKLAKE_MANAGER_VERSION',
-  defaultValue: '1.0.0-rc.1',
+  defaultValue: '1.0.0',
 );
 
 const managerReleaseVersion = String.fromEnvironment(
   'LINKLAKE_RELEASE_VERSION',
-  defaultValue: '1.0.0-rc.1',
+  defaultValue: '1.0.0',
 );
 
 bool isReleaseNewer(String latest, String current) {

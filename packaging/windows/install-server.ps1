@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$InstallDirectory = "$env:ProgramFiles\LinkLake",
     [string]$DataDirectory = "$env:ProgramData\LinkLake\data",
     [string]$LogDirectory = "$env:ProgramData\LinkLake\logs",
@@ -19,6 +19,9 @@ param(
     [string]$ManagementKey,
     [string]$ControlCertificate,
     [string]$ControlKey,
+    [string]$RecoverCandidateHandoffDirectory,
+    [switch]$RestoreAfterCandidateHandoff,
+    [switch]$ConfirmDataLoss,
     [switch]$NoStart
 )
 
@@ -26,6 +29,232 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $installerBoundParameters = @{} + $PSBoundParameters
 . (Join-Path $PSScriptRoot 'installer-common.ps1')
+
+function Get-LinkLakeServerInstallerSha256 {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Name)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "$Name was not found."
+    }
+    return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+}
+
+function Assert-LinkLakeServerInstallerSha256 {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Expected,
+        [Parameter(Mandatory)][string]$Name
+    )
+    if ((Get-LinkLakeServerInstallerSha256 $Path $Name) -cne $Expected) {
+        throw "$Name changed after it was verified."
+    }
+}
+
+function Invoke-LinkLakeServerMaintenanceChecked {
+    param(
+        [Parameter(Mandatory)][string]$BinaryPath,
+        [Parameter(Mandatory)][string[]]$CommandArguments,
+        [Parameter(Mandatory)][string]$Operation
+    )
+    # 维护命令的标准输出和错误输出可能包含部署路径；安装器不转发它们，以免未来
+    # 命令扩展时意外把环境或凭据细节写入安装日志。
+    $output = @(& $BinaryPath @CommandArguments 2>&1)
+    $exitCode = $LASTEXITCODE
+    $output = $null
+    if ($exitCode -ne 0) {
+        throw "$Operation failed with exit code $exitCode."
+    }
+}
+
+function Set-LinkLakeServerInstallerSnapshotAcl {
+    param([Parameter(Mandatory)][string]$Path, [switch]$Directory)
+    $administrators = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+    $system = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+    $allow = [Security.AccessControl.AccessControlType]::Allow
+    if ($Directory) {
+        $acl = [Security.AccessControl.DirectorySecurity]::new()
+        $inheritance = [Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'
+        $propagation = [Security.AccessControl.PropagationFlags]::None
+        $acl.SetOwner($administrators)
+        $acl.SetAccessRuleProtection($true, $false)
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($system, 'FullControl', $inheritance, $propagation, $allow))
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($administrators, 'FullControl', $inheritance, $propagation, $allow))
+    }
+    else {
+        $acl = [Security.AccessControl.FileSecurity]::new()
+        $acl.SetOwner($administrators)
+        $acl.SetAccessRuleProtection($true, $false)
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($system, 'FullControl', $allow))
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($administrators, 'FullControl', $allow))
+    }
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Get-LinkLakeServerCandidateHandoffPath {
+    param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)][string]$Name)
+    return Resolve-LinkLakeSafePath (Join-Path $Directory $Name) "candidate handoff $Name" -RequireLocalDrive
+}
+
+function Write-LinkLakeServerCandidateHandoffFile {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Record
+    )
+    if (Test-Path -LiteralPath $Path) {
+        throw "Candidate handoff artifact already exists: $Path"
+    }
+    $json = $Record | ConvertTo-Json -Compress -Depth 5
+    if ([Text.Encoding]::UTF8.GetByteCount($json) -le 0 -or [Text.Encoding]::UTF8.GetByteCount($json) -gt 16KB) {
+        throw 'Candidate handoff artifact has an invalid size.'
+    }
+    $temporary = "$Path.new-$([guid]::NewGuid().ToString('N'))"
+    try {
+        [IO.File]::WriteAllText($temporary, $json, [Text.UTF8Encoding]::new($false))
+        Set-LinkLakeServerInstallerSnapshotAcl $temporary
+        Move-Item -LiteralPath $temporary -Destination $Path -ErrorAction Stop
+        Set-LinkLakeServerInstallerSnapshotAcl $Path
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporary) {
+            Remove-LinkLakeArtifactBestEffort $temporary
+        }
+    }
+}
+
+function New-LinkLakeServerCandidateHandoffRecord {
+    param(
+        [Parameter(Mandatory)][string]$Directory,
+        [Parameter(Mandatory)][string]$OperationId,
+        [Parameter(Mandatory)][string]$ServiceName,
+        [Parameter(Mandatory)][string]$DataDirectory,
+        [Parameter(Mandatory)][string]$InstallDirectory,
+        [Parameter(Mandatory)][string]$SnapshotPath,
+        [Parameter(Mandatory)][string]$SnapshotSha256,
+        [Parameter(Mandatory)][string[]]$RollbackBinaryPaths,
+        [Parameter(Mandatory)][string]$RollbackBinarySha256
+    )
+    $recordPath = Get-LinkLakeServerCandidateHandoffPath $Directory 'candidate-handoff.json'
+    Write-LinkLakeServerCandidateHandoffFile $recordPath ([ordered]@{
+            schema_version = 1
+            kind = 'linklake-server-candidate-handoff'
+            operation_id = $OperationId
+            service_name = $ServiceName
+            data_directory = $DataDirectory
+            install_directory = $InstallDirectory
+            snapshot_directory = $Directory
+            snapshot_path = $SnapshotPath
+            snapshot_sha256 = $SnapshotSha256
+            rollback_binary_paths = @($RollbackBinaryPaths)
+            rollback_binary_sha256 = $RollbackBinarySha256
+            created_unix_seconds = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        })
+    return $recordPath
+}
+
+function New-LinkLakeServerCandidateHandoffStage {
+    param(
+        [Parameter(Mandatory)][string]$Directory,
+        [Parameter(Mandatory)][ValidateSet('candidate-starting', 'restore-started', 'restore-complete')][string]$Stage,
+        [Parameter(Mandatory)]$Record
+    )
+    $stageName = "candidate-handoff.$Stage.json"
+    $stagePath = Get-LinkLakeServerCandidateHandoffPath $Directory $stageName
+    Write-LinkLakeServerCandidateHandoffFile $stagePath ([ordered]@{
+            schema_version = 1
+            operation_id = $Record.OperationId
+            snapshot_sha256 = $Record.SnapshotSha256
+            stage = $Stage
+        })
+    return $stagePath
+}
+
+function Test-LinkLakeServerCandidateHandoffStage {
+    param(
+        [Parameter(Mandatory)][string]$Directory,
+        [Parameter(Mandatory)][ValidateSet('candidate-starting', 'restore-started', 'restore-complete')][string]$Stage,
+        [Parameter(Mandatory)]$Record
+    )
+    $stagePath = Get-LinkLakeServerCandidateHandoffPath $Directory "candidate-handoff.$Stage.json"
+    if (-not (Test-Path -LiteralPath $stagePath)) { return $false }
+    if (-not (Test-Path -LiteralPath $stagePath -PathType Leaf)) {
+        throw 'Candidate handoff stage is not a regular file.'
+    }
+    $item = Get-Item -Force -LiteralPath $stagePath
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $item.Length -le 0 -or $item.Length -gt 4KB) {
+        throw 'Candidate handoff stage is invalid.'
+    }
+    try { $value = [IO.File]::ReadAllText($stagePath, [Text.Encoding]::UTF8) | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw 'Candidate handoff stage is not valid JSON.' }
+    $expectedFields = @('schema_version', 'operation_id', 'snapshot_sha256', 'stage')
+    if ($null -eq $value -or @(Compare-Object $expectedFields @($value.PSObject.Properties.Name)).Count -ne 0 -or
+        $value.schema_version -is [string] -or [int]$value.schema_version -ne 1 -or
+        $value.operation_id -cne $Record.OperationId -or
+        $value.snapshot_sha256 -cne $Record.SnapshotSha256 -or $value.stage -cne $Stage) {
+        throw 'Candidate handoff stage does not match its record.'
+    }
+    return $true
+}
+
+function Select-LinkLakeServerCandidateHandoffRollbackBinary {
+    param([Parameter(Mandatory)]$Record)
+    foreach ($path in @($Record.RollbackBinaryPaths)) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+        if ((Get-LinkLakeServerInstallerSha256 $path 'candidate handoff rollback binary') -ceq $Record.RollbackBinarySha256) {
+            return $path
+        }
+    }
+    throw 'No verified pre-candidate server binary is available for candidate handoff recovery.'
+}
+
+function Invoke-LinkLakeServerCandidateHandoffRecovery {
+    param(
+        [Parameter(Mandatory)][string]$Directory,
+        [Parameter(Mandatory)][string]$DataDirectory,
+        [Parameter(Mandatory)][string]$InstallDirectory,
+        [Parameter(Mandatory)][string]$ServiceName,
+        [switch]$RestoreAfterCandidateHandoff,
+        [switch]$ConfirmDataLoss
+    )
+    $record = Read-LinkLakeServerCandidateHandoffRecord `
+        -HandoffDirectory $Directory -ExpectedDataDirectory $DataDirectory `
+        -ExpectedInstallDirectory $InstallDirectory -ExpectedServiceName $ServiceName
+    if (-not (Test-LinkLakeServerCandidateHandoffStage $record.HandoffDirectory 'candidate-starting' $record)) {
+        throw 'Candidate handoff recovery record was not marked before the candidate service start.'
+    }
+    if (Test-LinkLakeServerCandidateHandoffStage $record.HandoffDirectory 'restore-complete' $record) {
+        throw 'Candidate handoff database recovery was already completed; refusing to restore its old snapshot again.'
+    }
+    if (Test-LinkLakeServerCandidateHandoffStage $record.HandoffDirectory 'restore-started' $record) {
+        throw 'Candidate handoff database recovery was interrupted after confirmation; refusing to retry an uncertain restore automatically.'
+    }
+    if ((Get-LinkLakeCandidateHandoffRecoveryDecision $true $RestoreAfterCandidateHandoff $ConfirmDataLoss) -ne 'restore_snapshot') {
+        throw 'Candidate handoff recovery requires both -RestoreAfterCandidateHandoff and -ConfirmDataLoss because restoring the snapshot discards candidate writes.'
+    }
+    Assert-LinkLakeServerInstallerSha256 $record.SnapshotPath $record.SnapshotSha256 'candidate handoff database snapshot'
+    $rollbackBinary = Select-LinkLakeServerCandidateHandoffRollbackBinary $record
+    New-LinkLakeServerCandidateHandoffStage $record.HandoffDirectory 'restore-started' $record | Out-Null
+    Stop-LinkLakeServiceChecked $ServiceName 10
+    Assert-LinkLakeServerInstallerSha256 $record.SnapshotPath $record.SnapshotSha256 'candidate handoff database snapshot'
+    Assert-LinkLakeServerInstallerSha256 $rollbackBinary $record.RollbackBinarySha256 'candidate handoff rollback binary'
+    Invoke-LinkLakeServerMaintenanceChecked -BinaryPath $rollbackBinary `
+        -CommandArguments @('restore', '--data-dir', $record.DataDirectory, '--input', $record.SnapshotPath) `
+        -Operation 'candidate handoff server database restore'
+    Assert-LinkLakeServerInstallerSha256 $record.SnapshotPath $record.SnapshotSha256 'candidate handoff database snapshot'
+    Assert-LinkLakeServerInstallerSha256 $rollbackBinary $record.RollbackBinarySha256 'candidate handoff rollback binary'
+    $verificationPath = Get-LinkLakeServerCandidateHandoffPath $record.HandoffDirectory (
+        ".server-restored-$([guid]::NewGuid().ToString('N')).sqlite3"
+    )
+    Invoke-LinkLakeServerMaintenanceChecked -BinaryPath $rollbackBinary `
+        -CommandArguments @('backup', '--data-dir', $record.DataDirectory, '--output', $verificationPath) `
+        -Operation 'candidate handoff restored database verification backup'
+    Set-LinkLakeServerInstallerSnapshotAcl $verificationPath
+    $null = Get-LinkLakeServerInstallerSha256 $verificationPath 'candidate handoff restored database verification backup'
+    New-LinkLakeServerCandidateHandoffStage $record.HandoffDirectory 'restore-complete' $record | Out-Null
+    # 先保留完成标记，再移除可执行的 pending record；若清理被中断，后续运行只会
+    # 拒绝重复恢复，不会把已经产生的新写入再次覆盖。
+    Remove-LinkLakeArtifactBestEffort $record.RecordPath
+    Remove-LinkLakeArtifactBestEffort $record.HandoffDirectory
+    Write-Host 'Candidate handoff database snapshot was restored after explicit data-loss confirmation. The LinkLake service remains stopped; inspect it before starting the restored server.'
+}
 
 Assert-LinkLakeAdministrator
 $installerLock = $null
@@ -84,12 +313,37 @@ function Resolve-EnvironmentSetting {
 
 $DataDirectory = Resolve-LinkLakeSafePath (Resolve-EnvironmentSetting 'DataDirectory' 'LINKLAKE_DATA_DIR' $DataDirectory) 'data directory' -RequireLocalDrive
 $LogDirectory = Resolve-LinkLakeSafePath (Resolve-EnvironmentSetting 'LogDirectory' 'LINKLAKE_LOG_DIR' $LogDirectory) 'log directory' -RequireLocalDrive
+$databaseSnapshotParent = Split-Path -Parent $DataDirectory
+if ([string]::IsNullOrWhiteSpace($databaseSnapshotParent)) {
+    throw 'Could not derive a parent directory for the server database snapshot.'
+}
+$databaseSnapshotDirectory = Resolve-LinkLakeSafePath (
+    (Join-Path $databaseSnapshotParent ".linklake-server-upgrade-$([guid]::NewGuid().ToString('N'))")
+) 'server database snapshot directory' -RequireLocalDrive
 Assert-LinkLakePathsDoNotOverlap $InstallDirectory 'install directory' $DataDirectory 'data directory'
 Assert-LinkLakePathsDoNotOverlap $InstallDirectory 'install directory' $LogDirectory 'log directory'
 Assert-LinkLakePathsDoNotOverlap $InstallDirectory 'install directory' $SecretsDirectory 'secrets directory'
 Assert-LinkLakePathsDoNotOverlap $DataDirectory 'data directory' $LogDirectory 'log directory'
 Assert-LinkLakePathsDoNotOverlap $DataDirectory 'data directory' $SecretsDirectory 'secrets directory'
 Assert-LinkLakePathsDoNotOverlap $LogDirectory 'log directory' $SecretsDirectory 'secrets directory'
+Assert-LinkLakePathsDoNotOverlap $InstallDirectory 'install directory' $databaseSnapshotDirectory 'server database snapshot directory'
+Assert-LinkLakePathsDoNotOverlap $DataDirectory 'data directory' $databaseSnapshotDirectory 'server database snapshot directory'
+Assert-LinkLakePathsDoNotOverlap $LogDirectory 'log directory' $databaseSnapshotDirectory 'server database snapshot directory'
+Assert-LinkLakePathsDoNotOverlap $SecretsDirectory 'secrets directory' $databaseSnapshotDirectory 'server database snapshot directory'
+if ([string]::IsNullOrWhiteSpace($RecoverCandidateHandoffDirectory)) {
+    if ($RestoreAfterCandidateHandoff -or $ConfirmDataLoss) {
+        throw '-RestoreAfterCandidateHandoff and -ConfirmDataLoss are only valid together with -RecoverCandidateHandoffDirectory.'
+    }
+}
+else {
+    if ($NoStart) {
+        throw 'Candidate handoff recovery cannot be combined with -NoStart.'
+    }
+    Invoke-LinkLakeServerCandidateHandoffRecovery -Directory $RecoverCandidateHandoffDirectory `
+        -DataDirectory $DataDirectory -InstallDirectory $InstallDirectory -ServiceName $serviceName `
+        -RestoreAfterCandidateHandoff:$RestoreAfterCandidateHandoff -ConfirmDataLoss:$ConfirmDataLoss
+    return
+}
 $Bind = Resolve-EnvironmentSetting 'Bind' 'LINKLAKE_BIND' $Bind
 $ControlBind = Resolve-EnvironmentSetting 'ControlBind' 'LINKLAKE_CONTROL_BIND' $ControlBind
 
@@ -250,6 +504,15 @@ foreach ($specification in @(
 
     $databasePath = Join-Path $DataDirectory 'linklake.sqlite3'
     $needsBootstrap = -not (Test-Path -LiteralPath $databasePath -PathType Leaf)
+    $requiresDatabaseSnapshot = $snapshot.Exists -and -not $needsBootstrap
+    if ($requiresDatabaseSnapshot) {
+        if ($NoStart) {
+            throw 'An existing server database upgrade must start the candidate service so its migration can be verified and rolled back safely.'
+        }
+        if (-not (Test-Path -LiteralPath $destinationBinary -PathType Leaf)) {
+            throw 'An existing LinkLakeServer service has no installed server binary for a database-safe upgrade.'
+        }
+    }
     if ($needsBootstrap) {
         if ($NoStart) { throw 'A fresh server installation must start once so bootstrap credentials can be removed.' }
         if (-not $AdminPassword) { throw 'AdminPassword is required until the administrator database exists.' }
@@ -271,22 +534,82 @@ foreach ($specification in @(
         $environment.Remove('LINKLAKE_ADMIN_PASSWORD')
     }
 
+    $databaseSnapshotPath = $null
+    $databaseRestoreVerificationPath = $null
+    if ($requiresDatabaseSnapshot) {
+        $databaseSnapshotPath = Resolve-LinkLakeSafePath (
+            (Join-Path $databaseSnapshotDirectory ".server-before-upgrade-$([guid]::NewGuid().ToString('N')).sqlite3")
+        ) 'server database snapshot path' -RequireLocalDrive
+        $databaseRestoreVerificationPath = Resolve-LinkLakeSafePath (
+            (Join-Path $databaseSnapshotDirectory ".server-restored-$([guid]::NewGuid().ToString('N')).sqlite3")
+        ) 'server database restore verification path' -RequireLocalDrive
+        if ((Test-LinkLakePathAtOrBelow $databaseSnapshotPath $DataDirectory) -or
+            (Test-LinkLakePathAtOrBelow $databaseRestoreVerificationPath $DataDirectory)) {
+            throw 'Server database snapshots must remain outside the live data directory.'
+        }
+    }
+    $script:databaseSnapshotCreated = $false
+    $script:databaseSnapshotSha256 = $null
+    $script:databaseRestoreVerificationSha256 = $null
+    $databaseHandoffOperationId = [guid]::NewGuid().ToString('N')
+    $script:databaseHandoffRecordPath = $null
+    $script:databaseCandidateStarted = $false
+    $script:databaseRestoreVerified = $false
+    $script:rollbackServerBinarySha256 = $null
+    $script:serviceRecoveryAllowed = $true
+
     $directoryPlans = @(
         New-LinkLakeDirectoryTransactionPlan $InstallDirectory
         New-LinkLakeDirectoryTransactionPlan $DataDirectory -WritableByService
         New-LinkLakeDirectoryTransactionPlan $LogDirectory -WritableByService
         New-LinkLakeDirectoryTransactionPlan $SecretsDirectory
     )
+    if ($requiresDatabaseSnapshot) {
+        $directoryPlans += New-LinkLakeDirectoryTransactionPlan $databaseSnapshotDirectory
+    }
+    $directoryPlansWithoutSnapshot = @($directoryPlans | Where-Object {
+            $_.Path -ine $databaseSnapshotDirectory
+        })
     $temporaryBinary = Join-Path $InstallDirectory ".linklake-server.new-$([guid]::NewGuid().ToString('N')).exe"
     $backupBinary = Join-Path $InstallDirectory ".linklake-server.backup-$([guid]::NewGuid().ToString('N')).exe"
-    $binaryBackedUp = $false
-    $binaryReplaced = $false
+    $script:binaryBackedUp = $false
+    $script:binaryReplaced = $false
     $binaryPath = "`"$destinationBinary`" --windows-service"
-    $shouldStart = (-not $NoStart) -and ((-not $snapshot.Exists) -or $snapshot.WasActive -or $needsBootstrap)
+    $shouldStart = (-not $NoStart) -and (
+        (-not $snapshot.Exists) -or $snapshot.WasActive -or $needsBootstrap -or $requiresDatabaseSnapshot
+    )
 
     $stop = { Stop-LinkLakeServiceChecked $serviceName }
     $apply = {
         Install-LinkLakeDirectoryPlans $directoryPlans
+        if ($requiresDatabaseSnapshot) {
+            Set-LinkLakeServerInstallerSnapshotAcl $databaseSnapshotDirectory -Directory
+            $rollbackIdentity = Read-LinkLakeBinaryIdentity $destinationBinary
+            if ($rollbackIdentity.product -ne 'LinkLake Server' -or $rollbackIdentity.target -ne $release.target) {
+                throw 'The installed server binary is not a compatible LinkLake Server rollback binary.'
+            }
+            $script:rollbackServerBinarySha256 = Get-LinkLakeServerInstallerSha256 $destinationBinary 'installed server binary'
+            if (Test-Path -LiteralPath $databaseSnapshotPath) {
+                throw 'The transaction database snapshot path already exists.'
+            }
+            Invoke-LinkLakeServerMaintenanceChecked -BinaryPath $destinationBinary `
+                -CommandArguments @('backup', '--data-dir', $DataDirectory, '--output', $databaseSnapshotPath) `
+                -Operation 'installed server database snapshot'
+            $resolvedSnapshotPath = Resolve-LinkLakeSafePath $databaseSnapshotPath 'server database snapshot path' -RequireLocalDrive
+            if (-not $resolvedSnapshotPath.Equals($databaseSnapshotPath, [StringComparison]::OrdinalIgnoreCase)) {
+                throw 'The transaction database snapshot path changed while it was created.'
+            }
+            Set-LinkLakeServerInstallerSnapshotAcl $databaseSnapshotPath
+            $script:databaseSnapshotSha256 = Get-LinkLakeServerInstallerSha256 $databaseSnapshotPath 'server database snapshot'
+            Assert-LinkLakeServerInstallerSha256 $destinationBinary $script:rollbackServerBinarySha256 'installed server binary'
+            $script:databaseSnapshotCreated = $true
+            $script:databaseHandoffRecordPath = New-LinkLakeServerCandidateHandoffRecord `
+                -Directory $databaseSnapshotDirectory -OperationId $databaseHandoffOperationId `
+                -ServiceName $serviceName -DataDirectory $DataDirectory -InstallDirectory $InstallDirectory `
+                -SnapshotPath $databaseSnapshotPath -SnapshotSha256 $script:databaseSnapshotSha256 `
+                -RollbackBinaryPaths @($destinationBinary, $backupBinary) `
+                -RollbackBinarySha256 $script:rollbackServerBinarySha256
+        }
         Copy-Item -LiteralPath $sourceBinary -Destination $temporaryBinary -Force
         if ((Get-FileHash -Algorithm SHA256 -LiteralPath $temporaryBinary).Hash.ToLowerInvariant() -ne $sourceBinarySha256) {
             throw 'Staged server binary changed after package verification.'
@@ -333,11 +656,30 @@ foreach ($specification in @(
     }
     $validate = {
         $null = Assert-LinkLakePackageBinary $destinationBinary 'LinkLake Server' $release
+        if ($requiresDatabaseSnapshot) {
+            if (-not $script:databaseSnapshotCreated -or [string]::IsNullOrWhiteSpace($script:databaseSnapshotSha256)) {
+                throw 'The server database snapshot was not completed before binary replacement.'
+            }
+            Assert-LinkLakeServerInstallerSha256 $databaseSnapshotPath $script:databaseSnapshotSha256 'server database snapshot'
+        }
         foreach ($plan in $secretPlans) {
             Assert-LinkLakePemFile $plan.Destination $plan.Kind 'installed TLS secret'
         }
     }
     $start = {
+        if ($requiresDatabaseSnapshot) {
+            Assert-LinkLakeServerInstallerSha256 $databaseSnapshotPath $script:databaseSnapshotSha256 'server database snapshot'
+            if ([string]::IsNullOrWhiteSpace($script:databaseHandoffRecordPath)) {
+                throw 'The candidate handoff record was not completed before service start.'
+            }
+            # 先持久化“即将交接”标记，再允许候选进程启动；从这里起即使启动检查
+            # 失败，也必须按可能已接受写入处理，不能自动覆盖旧数据库快照。
+            $record = Read-LinkLakeServerCandidateHandoffRecord `
+                -HandoffDirectory $databaseSnapshotDirectory -ExpectedDataDirectory $DataDirectory `
+                -ExpectedInstallDirectory $InstallDirectory -ExpectedServiceName $serviceName
+            New-LinkLakeServerCandidateHandoffStage $record.HandoffDirectory 'candidate-starting' $record | Out-Null
+            $script:databaseCandidateStarted = $true
+        }
         Start-LinkLakeServiceChecked $serviceName
         if ($needsBootstrap) {
             $deadline = [DateTime]::UtcNow.AddSeconds(30)
@@ -358,58 +700,156 @@ foreach ($specification in @(
             Suspend-Service -Name $serviceName -ErrorAction Stop
             Wait-LinkLakeServiceStatus $serviceName ([ServiceProcess.ServiceControllerStatus]::Paused)
         }
-        elseif ($needsBootstrap -and $snapshot.Exists -and -not $snapshot.WasActive) {
+        elseif ($snapshot.Exists -and -not $snapshot.WasActive -and ($needsBootstrap -or $requiresDatabaseSnapshot)) {
             Stop-LinkLakeServiceChecked $serviceName
         }
     }
     $rollback = {
-        $rollbackErrors = [Collections.Generic.List[string]]::new()
-        try { Stop-LinkLakeServiceChecked $serviceName 10 }
-        catch { $rollbackErrors.Add("stop replacement service: $($_.Exception.Message)") }
-        try {
-            if ($script:binaryReplaced -and (Test-Path -LiteralPath $destinationBinary)) {
-                Remove-Item -LiteralPath $destinationBinary -Force
+        # 只有这一段完全成功后，事务框架才可恢复原服务运行状态。任一失败均保留
+        # 停止状态和受 ACL 保护的恢复证据，避免新旧 schema 与二进制混合运行。
+        if ($script:databaseCandidateStarted) {
+            throw 'Candidate service handoff has started; database rollback must use the explicit handoff recovery path.'
+        }
+        $script:serviceRecoveryAllowed = $false
+        Stop-LinkLakeServiceChecked $serviceName 10
+
+        if ($script:databaseSnapshotCreated) {
+            if ([string]::IsNullOrWhiteSpace($script:databaseSnapshotSha256) -or
+                [string]::IsNullOrWhiteSpace($script:rollbackServerBinarySha256)) {
+                throw 'Cannot roll back the server database because its verified snapshot or rollback binary is unavailable.'
             }
-            if ($script:binaryBackedUp -and (Test-Path -LiteralPath $backupBinary)) {
-                Move-Item -LiteralPath $backupBinary -Destination $destinationBinary
+            $rollbackMaintenanceBinary = if ($script:binaryBackedUp) { $backupBinary } else { $destinationBinary }
+            Assert-LinkLakeServerInstallerSha256 $rollbackMaintenanceBinary $script:rollbackServerBinarySha256 'rollback server binary'
+            Assert-LinkLakeServerInstallerSha256 $databaseSnapshotPath $script:databaseSnapshotSha256 'server database snapshot'
+            Invoke-LinkLakeServerMaintenanceChecked -BinaryPath $rollbackMaintenanceBinary `
+                -CommandArguments @('restore', '--data-dir', $DataDirectory, '--input', $databaseSnapshotPath) `
+                -Operation 'server database restore'
+            Assert-LinkLakeServerInstallerSha256 $rollbackMaintenanceBinary $script:rollbackServerBinarySha256 'rollback server binary'
+            Assert-LinkLakeServerInstallerSha256 $databaseSnapshotPath $script:databaseSnapshotSha256 'server database snapshot'
+            if (Test-Path -LiteralPath $databaseRestoreVerificationPath) {
+                throw 'The server database restore verification path already exists.'
+            }
+            Invoke-LinkLakeServerMaintenanceChecked -BinaryPath $rollbackMaintenanceBinary `
+                -CommandArguments @('backup', '--data-dir', $DataDirectory, '--output', $databaseRestoreVerificationPath) `
+                -Operation 'restored server database verification backup'
+            $resolvedVerificationPath = Resolve-LinkLakeSafePath $databaseRestoreVerificationPath 'server database restore verification path' -RequireLocalDrive
+            if (-not $resolvedVerificationPath.Equals($databaseRestoreVerificationPath, [StringComparison]::OrdinalIgnoreCase)) {
+                throw 'The server database restore verification path changed while it was created.'
+            }
+            Set-LinkLakeServerInstallerSnapshotAcl $databaseRestoreVerificationPath
+            $script:databaseRestoreVerificationSha256 = Get-LinkLakeServerInstallerSha256 $databaseRestoreVerificationPath 'restored server database verification backup'
+            if ([string]::IsNullOrWhiteSpace($script:databaseRestoreVerificationSha256)) {
+                throw 'The restored server database verification backup has no SHA-256 digest.'
+            }
+            $script:databaseRestoreVerified = $true
+        }
+        elseif ($requiresDatabaseSnapshot -and
+            ($script:databaseCandidateStarted -or $script:binaryBackedUp -or $script:binaryReplaced)) {
+            throw 'Cannot roll back the server binary because its required verified database snapshot is unavailable.'
+        }
+        if ($script:databaseSnapshotCreated -and -not $script:databaseRestoreVerified) {
+            throw 'Cannot roll back the server binary before database snapshot restoration was verified.'
+        }
+
+        if ($script:binaryReplaced -and (Test-Path -LiteralPath $destinationBinary)) {
+            Remove-Item -LiteralPath $destinationBinary -Force
+        }
+        if ($script:binaryBackedUp -and (Test-Path -LiteralPath $backupBinary)) {
+            Move-Item -LiteralPath $backupBinary -Destination $destinationBinary
+            if ($requiresDatabaseSnapshot) {
+                Assert-LinkLakeServerInstallerSha256 $destinationBinary $script:rollbackServerBinarySha256 'restored server binary'
             }
         }
-        catch { $rollbackErrors.Add("restore binary: $($_.Exception.Message)") }
         for ($index = $secretPlans.Count - 1; $index -ge 0; $index--) {
             $plan = $secretPlans[$index]
-            try {
-                if ($plan.Replaced -and (Test-Path -LiteralPath $plan.Destination)) {
-                    Remove-Item -LiteralPath $plan.Destination -Force
-                }
-                if ($plan.BackedUp -and (Test-Path -LiteralPath $plan.Backup)) {
-                    Move-Item -LiteralPath $plan.Backup -Destination $plan.Destination
-                }
-                elseif ($plan.SamePath -and $plan.OriginalAclSddl -and (Test-Path -LiteralPath $plan.Destination)) {
-                    $acl = Get-Acl -LiteralPath $plan.Destination
-                    $acl.SetSecurityDescriptorSddlForm($plan.OriginalAclSddl)
-                    Set-Acl -LiteralPath $plan.Destination -AclObject $acl
-                }
-                if (Test-Path -LiteralPath $plan.Temporary) { Remove-Item -LiteralPath $plan.Temporary -Force }
+            if ($plan.Replaced -and (Test-Path -LiteralPath $plan.Destination)) {
+                Remove-Item -LiteralPath $plan.Destination -Force
             }
-            catch { $rollbackErrors.Add("restore TLS secret $($plan.Destination): $($_.Exception.Message)") }
+            if ($plan.BackedUp -and (Test-Path -LiteralPath $plan.Backup)) {
+                Move-Item -LiteralPath $plan.Backup -Destination $plan.Destination
+            }
+            elseif ($plan.SamePath -and $plan.OriginalAclSddl -and (Test-Path -LiteralPath $plan.Destination)) {
+                $acl = Get-Acl -LiteralPath $plan.Destination
+                $acl.SetSecurityDescriptorSddlForm($plan.OriginalAclSddl)
+                Set-Acl -LiteralPath $plan.Destination -AclObject $acl
+            }
+            if (Test-Path -LiteralPath $plan.Temporary) { Remove-Item -LiteralPath $plan.Temporary -Force }
         }
-        try { Restore-LinkLakeServiceSnapshot $serviceName $snapshot }
-        catch { $rollbackErrors.Add("restore service configuration: $($_.Exception.Message)") }
-        try {
-            if (Test-Path -LiteralPath $temporaryBinary) { Remove-Item -LiteralPath $temporaryBinary -Force }
+        Restore-LinkLakeServiceSnapshot $serviceName $snapshot
+        if (Test-Path -LiteralPath $temporaryBinary) { Remove-Item -LiteralPath $temporaryBinary -Force }
+        if ($requiresDatabaseSnapshot) {
+            Remove-LinkLakeArtifactBestEffort $databaseSnapshotDirectory
         }
-        catch { $rollbackErrors.Add("remove staged binary: $($_.Exception.Message)") }
-        try { Restore-LinkLakeDirectoryPlans $directoryPlans }
-        catch { $rollbackErrors.Add("restore directory ACLs: $($_.Exception.Message)") }
-        if ($rollbackErrors.Count -gt 0) { throw ($rollbackErrors -join '; ') }
+        Restore-LinkLakeDirectoryPlans $directoryPlans
+        $script:serviceRecoveryAllowed = $true
     }
-    $recover = { Restore-LinkLakeServiceRuntimeState $serviceName $snapshot }
+    $handoff = {
+        # `candidate-starting` 已在调用 Start-Service 前持久化。此后任何失败都可能
+        # 发生在候选服务接受写入之后：停止候选、保留快照和记录，但绝不能恢复旧库。
+        $script:serviceRecoveryAllowed = $false
+        Stop-LinkLakeServiceChecked $serviceName 10
+        if (-not $script:databaseSnapshotCreated -or
+            [string]::IsNullOrWhiteSpace($script:databaseSnapshotSha256) -or
+            [string]::IsNullOrWhiteSpace($script:rollbackServerBinarySha256) -or
+            [string]::IsNullOrWhiteSpace($script:databaseHandoffRecordPath)) {
+            throw 'Candidate handoff cannot be preserved because its verified database snapshot or record is unavailable.'
+        }
+        $record = Read-LinkLakeServerCandidateHandoffRecord `
+            -HandoffDirectory $databaseSnapshotDirectory -ExpectedDataDirectory $DataDirectory `
+            -ExpectedInstallDirectory $InstallDirectory -ExpectedServiceName $serviceName
+        if ($record.RecordPath -ine $script:databaseHandoffRecordPath -or
+            -not (Test-LinkLakeServerCandidateHandoffStage $record.HandoffDirectory 'candidate-starting' $record)) {
+            throw 'Candidate handoff record was changed or was not marked before candidate service start.'
+        }
+        Assert-LinkLakeServerInstallerSha256 $record.SnapshotPath $record.SnapshotSha256 'candidate handoff database snapshot'
+        $rollbackMaintenanceBinary = Select-LinkLakeServerCandidateHandoffRollbackBinary $record
+        Assert-LinkLakeServerInstallerSha256 $rollbackMaintenanceBinary $record.RollbackBinarySha256 'candidate handoff rollback binary'
+
+        # 将可执行文件、密钥和服务配置尽力还原到旧版本，但故意不启动服务；旧二进制
+        # 在候选 schema 上运行并不安全，数据库快照只能通过显式双确认恢复。
+        if (-not $script:binaryBackedUp -or -not (Test-Path -LiteralPath $backupBinary -PathType Leaf)) {
+            throw 'Candidate handoff rollback binary is no longer available.'
+        }
+        if ($script:binaryReplaced -and (Test-Path -LiteralPath $destinationBinary)) {
+            Remove-Item -LiteralPath $destinationBinary -Force
+        }
+        Move-Item -LiteralPath $backupBinary -Destination $destinationBinary
+        Assert-LinkLakeServerInstallerSha256 $destinationBinary $record.RollbackBinarySha256 'restored server binary after candidate handoff'
+        for ($index = $secretPlans.Count - 1; $index -ge 0; $index--) {
+            $plan = $secretPlans[$index]
+            if ($plan.Replaced -and (Test-Path -LiteralPath $plan.Destination)) {
+                Remove-Item -LiteralPath $plan.Destination -Force
+            }
+            if ($plan.BackedUp -and (Test-Path -LiteralPath $plan.Backup)) {
+                Move-Item -LiteralPath $plan.Backup -Destination $plan.Destination
+            }
+            elseif ($plan.SamePath -and $plan.OriginalAclSddl -and (Test-Path -LiteralPath $plan.Destination)) {
+                $acl = Get-Acl -LiteralPath $plan.Destination
+                $acl.SetSecurityDescriptorSddlForm($plan.OriginalAclSddl)
+                Set-Acl -LiteralPath $plan.Destination -AclObject $acl
+            }
+            if (Test-Path -LiteralPath $plan.Temporary) { Remove-Item -LiteralPath $plan.Temporary -Force }
+        }
+        Restore-LinkLakeServiceSnapshot $serviceName $snapshot
+        if (Test-Path -LiteralPath $temporaryBinary) { Remove-Item -LiteralPath $temporaryBinary -Force }
+        Restore-LinkLakeDirectoryPlans $directoryPlansWithoutSnapshot
+    }
+    $recover = {
+        if (-not $script:serviceRecoveryAllowed) {
+            throw 'Runtime service recovery was skipped because database or binary rollback did not complete.'
+        }
+        Restore-LinkLakeServiceRuntimeState $serviceName $snapshot
+    }
 
     Invoke-LinkLakeTransactionalChange -Stop $stop -Apply $apply -Validate $validate -Start $start `
-        -Rollback $rollback -Recover $recover -WasRunning $snapshot.WasActive -ShouldStart $shouldStart
+        -Rollback $rollback -Recover $recover -CandidateHandoffStarted { $script:databaseCandidateStarted } `
+        -Handoff $handoff -WasRunning $snapshot.WasActive -ShouldStart $shouldStart
 
     Remove-LinkLakeArtifactBestEffort $backupBinary
     Remove-LinkLakeArtifactBestEffort $temporaryBinary
+    if ($requiresDatabaseSnapshot) {
+        Remove-LinkLakeArtifactBestEffort $databaseSnapshotDirectory
+    }
     foreach ($plan in $secretPlans) {
         Remove-LinkLakeArtifactBestEffort $plan.Backup
         Remove-LinkLakeArtifactBestEffort $plan.Temporary

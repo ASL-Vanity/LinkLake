@@ -67,12 +67,13 @@ LinkLake 会查找最长匹配的 Cloudflare Zone，创建 `_acme-challenge` TXT
 
 ```bash
 sudo linklake-server update download
-sudo linklake-server update apply --yes
+sudo linklake-server update apply --yes --data-dir /var/lib/linklake
 sudo linklake-server update status
-sudo linklake-server update rollback --yes
+sudo linklake-server update rollback --yes --data-dir /var/lib/linklake
+sudo linklake-server update recover --yes --data-dir /var/lib/linklake
 ```
 
-更新器只替换 `/usr/local/bin/linklake-server` 或 `/usr/local/bin/linklake-client`（Windows 为安装目录中的对应 `.exe`），不会改动 `/etc/linklake`、`/var/lib/linklake`、ProgramData 中的数据/证书/配置或日志。服务原先运行时，替换后必须恢复并稳定运行；否则自动恢复旧二进制。人工回滚使用最后一份摘要与目标路径均匹配的备份。
+更新器只替换 `/usr/local/bin/linklake-server` 或 `/usr/local/bin/linklake-client`（Windows 为安装目录中的对应 `.exe`），不会改动 `/etc/linklake`、`/var/lib/linklake`、ProgramData 中的数据/证书/配置或日志。服务原先运行时，替换后必须恢复并稳定运行；候选服务接管前失败时会自动恢复旧二进制。服务端替换前会在数据目录外创建经过身份绑定的 SQLite 快照，并在隔离副本中预演候选迁移；候选服务接管前失败时，先恢复数据库快照再恢复旧二进制。服务端会把 `--data-dir` 与已注册服务的 `LINKLAKE_DATA_DIR` 规范化比较，并使用仅存在实际数据目录中的认证密钥保护计划、日志和快照元数据。若断电或故障发生在候选服务可能已接收写入之后，`update recover` 会关闭失败并保留标记，要求人工决定恢复路径，避免自动恢复旧快照而丢失新写入。人工回滚使用最后一份摘要与目标路径均匹配的备份；如果回滚跨越 schema 或迁移台账边界，必须额外提供 `--restore-database-snapshot --confirm-data-loss --yes`，否则会关闭失败。
 
 正式 Release 必须包含 Ed25519 清单和签名。没有生产 CI signing secret 时禁止发布；开发验证可以使用 RFC 测试夹具和 `--development-signature`，但不得把这种状态部署为生产更新。
 

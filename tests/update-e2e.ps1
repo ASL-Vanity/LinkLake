@@ -1,6 +1,6 @@
 param(
     [switch]$SkipBuild,
-    [ValidateSet('client', 'server')]
+    [ValidateSet('client')]
     [string]$Product = 'client'
 )
 
@@ -35,11 +35,15 @@ function Write-Plan {
         [string]$FromVersion,
         [string]$ToVersion
     )
-    $plans = Join-Path $stateRoot 'plans'
-    New-Item -ItemType Directory -Force -Path $plans | Out-Null
-    $planPath = Join-Path $plans "$Name.json"
+    $operationId = [guid]::NewGuid().ToString()
+    $operations = Join-Path $stateRoot 'operations'
+    $operationDirectory = Join-Path $operations $operationId
+    New-Item -ItemType Directory -Force -Path $operationDirectory | Out-Null
+    $planPath = Join-Path $operationDirectory 'plan.json'
     $json = [ordered]@{
-        schema_version = 2
+        schema_version = 3
+        operation_id = $operationId
+        operation_directory = $operationDirectory
         operation = 'apply'
         product = $Product
         state_directory = $stateRoot
@@ -51,9 +55,20 @@ function Write-Plan {
         to_version = $ToVersion
         service_installed = $false
         service_was_running = $false
+        server_database = $null
         created_unix_seconds = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     } | ConvertTo-Json
     [IO.File]::WriteAllText($planPath, $json, [Text.UTF8Encoding]::new($false))
+    $planHash = Get-Sha256 $planPath
+    $active = [ordered]@{
+        schema_version = 3
+        operation_id = $operationId
+        product = $Product
+        plan_path = $planPath
+        plan_sha256 = $planHash
+        created_unix_seconds = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    } | ConvertTo-Json
+    [IO.File]::WriteAllText((Join-Path $stateRoot 'active.json'), $active, [Text.UTF8Encoding]::new($false))
     return $planPath
 }
 

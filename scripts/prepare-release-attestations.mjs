@@ -81,8 +81,17 @@ for (const name of files.keys()) {
 }
 
 const escapedVersion = version.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const macosEvidencePattern = new RegExp(
+  `^linklake(?:-manager)?-${escapedVersion}-macos(?:[-._]|$)`,
+  'i',
+);
+for (const name of files.keys()) {
+  if (macosEvidencePattern.test(name)) {
+    fail(`macOS release evidence is not permitted: ${name}`);
+  }
+}
 const archivePattern = new RegExp(
-  `^linklake(-manager)?-${escapedVersion}-(windows-x86_64\\.zip|linux-x86_64\\.tar\\.gz|macos-(?:x86_64|arm64|aarch64)\\.tar\\.gz)$`,
+  `^linklake(-manager)?-${escapedVersion}-(windows-x86_64\\.zip|linux-x86_64\\.tar\\.gz)$`,
 );
 const [rpmVersion, ...rpmPrereleaseParts] = version.split('-');
 const rpmRelease = rpmPrereleaseParts.length
@@ -114,20 +123,6 @@ for (const name of requiredArchiveSuffixes) {
   if (!primaryAssets.includes(name)) fail(`required release package is missing: ${name}`);
 }
 
-const macCore = primaryAssets.filter((name) =>
-  new RegExp(`^linklake-${escapedVersion}-macos-`).test(name),
-);
-const macManager = primaryAssets.filter((name) =>
-  new RegExp(`^linklake-manager-${escapedVersion}-macos-`).test(name),
-);
-if (macCore.length !== 1 || macManager.length !== 1) {
-  fail('exactly one macOS core package and one macOS manager package are required');
-}
-const coreArchitecture = macCore[0].match(/-macos-(.+)\.tar\.gz$/)?.[1];
-const managerArchitecture = macManager[0].match(/-macos-(.+)\.tar\.gz$/)?.[1];
-if (!coreArchitecture || coreArchitecture !== managerArchitecture) {
-  fail('macOS core and manager package architectures must match');
-}
 if (!primaryAssets.some((name) => name.endsWith('.deb'))) fail('a DEB package is required');
 if (!primaryAssets.some((name) => name.endsWith('.rpm'))) fail('an RPM package is required');
 
