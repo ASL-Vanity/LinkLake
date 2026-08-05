@@ -171,6 +171,7 @@ const LOGIN_FAILURE_MAX_DELAY_SECONDS: u64 = 30;
 const LOGIN_THROTTLE_MAX_IDENTITIES: usize = 1_024;
 const DEFAULT_DRAIN_TIMEOUT_SECONDS: u64 = 30;
 const MAX_DRAIN_TIMEOUT_SECONDS: u64 = 60 * 60;
+#[cfg(windows)]
 const SERVER_UPDATE_SERVICE_NAME: &str = "LinkLakeServer";
 const MAX_SERVICE_ENVIRONMENT_BYTES: usize = 64 * 1024;
 const LISTENER_STARTUP_TIMEOUT_SECONDS: u64 = 10;
@@ -2312,7 +2313,7 @@ fn read_systemd_environment_file(path: &FsPath) -> anyhow::Result<String> {
         metadata.len() <= MAX_SERVICE_ENVIRONMENT_BYTES as u64,
         "configured LinkLakeServer EnvironmentFile exceeds the size limit"
     );
-    let mut file = File::open(path).with_context(|| {
+    let file = File::open(path).with_context(|| {
         format!(
             "cannot read configured LinkLakeServer EnvironmentFile {}",
             path.display()

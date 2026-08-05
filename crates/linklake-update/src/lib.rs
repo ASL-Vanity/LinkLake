@@ -1253,8 +1253,25 @@ fn select_release<'a>(
     requested_channel: UpdateChannel,
     current: &Version,
 ) -> anyhow::Result<SelectedRelease<'a>> {
+    select_release_for_target(
+        product,
+        releases,
+        requested_channel,
+        current,
+        platform_target()?,
+    )
+}
+
+/// 根据已验证的平台目标筛选可用发行版。生产调用必须先经由 `select_release`，
+/// 从而保留当前构建的平台签名与支持策略；独立测试可注入固定的发行夹具目标。
+fn select_release_for_target<'a>(
+    product: UpdateProduct,
+    releases: &'a [GithubRelease],
+    requested_channel: UpdateChannel,
+    current: &Version,
+    target: &str,
+) -> anyhow::Result<SelectedRelease<'a>> {
     let channel = requested_channel.resolve(current);
-    let target = platform_target()?;
     releases
         .iter()
         .filter(|release| !release.draft)
@@ -4848,6 +4865,10 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
 
+    // 签名与清单单元测试必须独立于当前构建平台。macOS 未使用 Developer ID
+    // 签名时，生产代码会明确拒绝官方自动更新；测试夹具不能绕开或改变该门禁。
+    const FIXTURE_TARGET: &str = "windows-x86_64";
+
     fn signing_fixture(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
     }
@@ -4882,12 +4903,8 @@ mod tests {
             created_unix_seconds: 1,
             assets: vec![SignedAsset {
                 component: "client".to_owned(),
-                target: platform_target().unwrap().to_owned(),
-                name: package_asset_name(
-                    UpdateProduct::Client,
-                    &version,
-                    platform_target().unwrap(),
-                ),
+                target: FIXTURE_TARGET.to_owned(),
+                name: package_asset_name(UpdateProduct::Client, &version, FIXTURE_TARGET),
                 sha256: "a".repeat(64),
                 size: 1,
             }],
@@ -5204,7 +5221,7 @@ mod tests {
         let checksum = format!("{digest}  {package_name}\n");
         let signed_asset = SignedAsset {
             component: "client".to_owned(),
-            target: platform_target().unwrap().to_owned(),
+            target: FIXTURE_TARGET.to_owned(),
             name: package_name.to_owned(),
             sha256: digest.clone(),
             size: original.len() as u64,
@@ -5229,34 +5246,42 @@ mod tests {
 
     #[test]
     fn release_selection_respects_channel_and_platform_assets() {
-        let target = platform_target().unwrap();
         let releases = vec![
-            github_release("v1.1.0-rc.1", true, target),
-            github_release("v1.0.0", false, target),
+            github_release("v1.1.0-rc.1", true, FIXTURE_TARGET),
+            github_release("v1.0.0", false, FIXTURE_TARGET),
         ];
         let current = Version::parse("0.9.0").unwrap();
         assert_eq!(
-            select_release(
+            select_release_for_target(
                 UpdateProduct::Client,
                 &releases,
                 UpdateChannel::Stable,
                 &current,
+                FIXTURE_TARGET,
             )
             .unwrap()
             .version,
             Version::parse("1.0.0").unwrap()
         );
         assert_eq!(
-            select_release(
+            select_release_for_target(
                 UpdateProduct::Client,
                 &releases,
                 UpdateChannel::Prerelease,
                 &current,
+                FIXTURE_TARGET,
             )
             .unwrap()
             .version,
             Version::parse("1.1.0-rc.1").unwrap()
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_automatic_updates_fail_closed_without_developer_id() {
+        let error = platform_target().unwrap_err();
+        assert!(error.to_string().contains("Developer ID signed"));
     }
 
     #[test]
@@ -6187,11 +6212,11 @@ mod tests {
             created_unix_seconds: 1,
             assets: vec![SignedAsset {
                 component: "client".to_owned(),
-                target: platform_target().unwrap().to_owned(),
+                target: FIXTURE_TARGET.to_owned(),
                 name: package_asset_name(
                     UpdateProduct::Client,
                     &Version::parse("0.8.0-rc.1").unwrap(),
-                    platform_target().unwrap(),
+                    FIXTURE_TARGET,
                 ),
                 sha256: "a".repeat(64),
                 size: 1,
@@ -6334,7 +6359,7 @@ mod tests {
     fn signed_asset_binding_rejects_wrong_platform_and_release_version() {
         let version = Version::parse("0.8.0").unwrap();
         let manifest = manifest_fixture("fixture", "0.8.0", "0.8.0-rc.1");
-        let name = package_asset_name(UpdateProduct::Client, &version, platform_target().unwrap());
+        let name = package_asset_name(UpdateProduct::Client, &version, FIXTURE_TARGET);
         assert!(matching_signed_asset(
             &manifest,
             UpdateProduct::Client,
@@ -6347,7 +6372,7 @@ mod tests {
             &manifest,
             UpdateProduct::Client,
             &Version::parse("0.8.1").unwrap(),
-            platform_target().unwrap(),
+            FIXTURE_TARGET,
             &name,
         )
         .is_err());

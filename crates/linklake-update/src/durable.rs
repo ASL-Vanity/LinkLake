@@ -717,6 +717,19 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use tempfile::tempdir;
 
+    /// macOS 的 `/var` 是指向 `/private/var` 的系统符号链接。生产代码必须拒绝
+    /// 这类未经解析的受管路径；测试则先将临时目录解析为真实路径，以覆盖后续逻辑。
+    fn managed_test_root(path: &Path) -> PathBuf {
+        #[cfg(target_os = "macos")]
+        {
+            fs::canonicalize(path).expect("temporary test directory must resolve")
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            path.to_path_buf()
+        }
+    }
+
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
     struct ExampleJournal {
         operation: String,
@@ -726,11 +739,12 @@ mod tests {
     #[test]
     fn durable_bytes_replace_in_place_without_temporary_residue() {
         let root = tempdir().unwrap();
-        let path = root.path().join("state.bin");
+        let root_path = managed_test_root(root.path());
+        let path = root_path.join("state.bin");
         write_durable_bytes(&path, b"first", 64).unwrap();
         write_durable_bytes(&path, b"second", 64).unwrap();
         assert_eq!(read_limited_bytes(&path, 64).unwrap(), b"second");
-        let names = fs::read_dir(root.path())
+        let names = fs::read_dir(root_path)
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>();
@@ -740,7 +754,7 @@ mod tests {
     #[test]
     fn durable_json_round_trips() {
         let root = tempdir().unwrap();
-        let path = root.path().join("state.json");
+        let path = managed_test_root(root.path()).join("state.json");
         let expected = ExampleJournal {
             operation: "install".into(),
             generation: 7,
@@ -755,7 +769,7 @@ mod tests {
     #[test]
     fn read_and_write_limits_fail_closed() {
         let root = tempdir().unwrap();
-        let path = root.path().join("bounded.bin");
+        let path = managed_test_root(root.path()).join("bounded.bin");
         assert!(write_durable_bytes(&path, b"too large", 3).is_err());
         fs::write(&path, b"too large").unwrap();
         let error = read_limited_bytes(&path, 3).unwrap_err();
@@ -765,7 +779,7 @@ mod tests {
     #[test]
     fn journal_round_trips_and_detects_payload_tampering() {
         let root = tempdir().unwrap();
-        let path = root.path().join("update.journal");
+        let path = managed_test_root(root.path()).join("update.journal");
         let expected = ExampleJournal {
             operation: "rollback".into(),
             generation: 9,
@@ -790,7 +804,7 @@ mod tests {
     #[test]
     fn journal_rejects_unknown_fields_and_oversized_declarations() {
         let root = tempdir().unwrap();
-        let path = root.path().join("update.journal");
+        let path = managed_test_root(root.path()).join("update.journal");
         let payload = br#"{"operation":"install","generation":1}"#;
         write_journal_bytes(&path, payload, 1024).unwrap();
 
@@ -812,22 +826,24 @@ mod tests {
     #[test]
     fn update_lock_is_exclusive_and_drop_releases_it() {
         let root = tempdir().unwrap();
-        let first = UpdateLock::acquire(root.path()).unwrap();
-        assert!(UpdateLock::acquire(root.path()).is_err());
+        let root_path = managed_test_root(root.path());
+        let first = UpdateLock::acquire(&root_path).unwrap();
+        assert!(UpdateLock::acquire(&root_path).is_err());
         drop(first);
-        drop(UpdateLock::acquire(root.path()).unwrap());
-        assert!(root.path().join(UPDATE_LOCK_NAME).is_file());
+        drop(UpdateLock::acquire(&root_path).unwrap());
+        assert!(root_path.join(UPDATE_LOCK_NAME).is_file());
     }
 
     #[test]
     fn parent_traversal_is_rejected_before_io() {
         let root = tempdir().unwrap();
-        let missing = root.path().join("missing");
+        let root_path = managed_test_root(root.path());
+        let missing = root_path.join("missing");
         let path = missing.join("..").join("state.json");
         let error = write_durable_bytes(&path, b"state", 64).unwrap_err();
         assert!(error.to_string().contains("parent traversal"));
         assert!(!missing.exists());
-        assert!(!root.path().join("state.json").exists());
+        assert!(!root_path.join("state.json").exists());
     }
 
     #[cfg(unix)]
@@ -836,17 +852,21 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let root = tempdir().unwrap();
-        let real = root.path().join("real");
+        let root_path = managed_test_root(root.path());
+        let real = root_path.join("real");
         fs::create_dir(&real).unwrap();
-        let linked_directory = root.path().join("linked-directory");
+        let linked_directory = root_path.join("linked-directory");
         symlink(&real, &linked_directory).unwrap();
-        assert!(write_durable_bytes(&linked_directory.join("state"), b"x", 8).is_err());
+        let directory_error =
+            write_durable_bytes(&linked_directory.join("state"), b"x", 8).unwrap_err();
+        assert!(directory_error.to_string().contains("linked-directory"));
 
         let real_file = real.join("real-state");
         fs::write(&real_file, b"x").unwrap();
-        let linked_file = root.path().join("linked-state");
+        let linked_file = root_path.join("linked-state");
         symlink(&real_file, &linked_file).unwrap();
-        assert!(read_limited_bytes(&linked_file, 8).is_err());
+        let file_error = read_limited_bytes(&linked_file, 8).unwrap_err();
+        assert!(file_error.to_string().contains("linked-state"));
     }
 
     #[cfg(windows)]
@@ -855,9 +875,10 @@ mod tests {
         use std::os::windows::fs::symlink_file;
 
         let root = tempdir().unwrap();
-        let real = root.path().join("real-state");
+        let root_path = managed_test_root(root.path());
+        let real = root_path.join("real-state");
         fs::write(&real, b"x").unwrap();
-        let linked = root.path().join("linked-state");
+        let linked = root_path.join("linked-state");
         if symlink_file(&real, &linked).is_err() {
             // 未启用 Developer Mode 的普通 CI 用户可能没有创建 symlink 的权限。
             return;

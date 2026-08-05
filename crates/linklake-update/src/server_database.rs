@@ -991,7 +991,7 @@ mod tests {
     use tempfile::TempDir;
 
     struct Fixture {
-        root: TempDir,
+        _root: TempDir,
         data_dir: PathBuf,
         database: PathBuf,
         installed: PathBuf,
@@ -1018,7 +1018,7 @@ mod tests {
             fs::write(&rollback, b"installed-server").unwrap();
             fs::write(&snapshot, b"snapshot-v9").unwrap();
             Self {
-                root,
+                _root: root,
                 data_dir: canonicalize_server_update_path(&data_dir).unwrap(),
                 database: canonicalize_server_update_path(&database).unwrap(),
                 installed: canonicalize_server_update_path(&installed).unwrap(),
@@ -1278,7 +1278,9 @@ mod tests {
     fn metadata_round_trip_is_durable_and_strict() {
         let fixture = Fixture::new();
         let metadata = fixture.snapshot_metadata();
-        let path = fixture.root.path().join("state").join("snapshot.json");
+        // `Fixture::snapshot` 已解析为受管目录的真实路径；不能从 TempDir 原始
+        // `/var/...` 路径派生，否则 macOS 的系统 `/var` 链接会被安全检查拒绝。
+        let path = fixture.snapshot.with_file_name("snapshot.json");
         write_snapshot_metadata(&path, &metadata).unwrap();
         assert_eq!(read_snapshot_metadata(&path).unwrap(), metadata);
 
