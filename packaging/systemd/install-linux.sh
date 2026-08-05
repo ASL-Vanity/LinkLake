@@ -21,7 +21,9 @@ case "$mode" in
   server)
     install -m 0755 "$package_root/bin/linklake-server" /usr/local/bin/linklake-server
     install -m 0644 "$package_root/systemd/linklake-server.service" /etc/systemd/system/linklake-server.service
+    install -m 0644 "$package_root/systemd/linklake-update-resume.service" /etc/systemd/system/linklake-update-resume.service
     install -d -o linklake -g linklake -m 0750 /var/lib/linklake /var/log/linklake
+    install -d -o root -g root -m 0700 /var/lib/linklake-updater /var/lib/linklake-updater/server
     if [ ! -e /etc/linklake/server.env ]; then
       install -m 0600 "$package_root/systemd/server.env.example" /etc/linklake/server.env
       echo "Edit /etc/linklake/server.env before starting the service."

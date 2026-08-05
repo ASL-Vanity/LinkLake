@@ -1,6 +1,7 @@
 [Unit]
 Description=LinkLake TCP, UDP, HTTP, and HTTPS tunnel server
-After=network-online.target
+Requires=linklake-update-resume.service
+After=network-online.target linklake-update-resume.service
 Wants=network-online.target
 
 [Service]

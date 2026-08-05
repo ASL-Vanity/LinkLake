@@ -14,6 +14,7 @@ test -f "$checksum"
 required='bin/linklake-server
 bin/linklake-client
 systemd/linklake-server.service
+systemd/linklake-update-resume.service
 systemd/linklake-client.service
 systemd/server.env.example
 systemd/install-linux.sh

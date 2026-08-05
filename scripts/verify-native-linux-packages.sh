@@ -30,6 +30,7 @@ if command -v dpkg-deb >/dev/null 2>&1; then
     /usr/local/bin/linklake-server \
     /usr/local/bin/linklake-client \
     /lib/systemd/system/linklake-server.service \
+    /lib/systemd/system/linklake-update-resume.service \
     /lib/systemd/system/linklake-client.service \
     /etc/linklake/server.env.example \
     /etc/linklake/client.toml.example; do
@@ -56,6 +57,7 @@ if command -v rpm >/dev/null 2>&1; then
     /usr/local/bin/linklake-server \
     /usr/local/bin/linklake-client \
     /lib/systemd/system/linklake-server.service \
+    /lib/systemd/system/linklake-update-resume.service \
     /lib/systemd/system/linklake-client.service \
     /etc/linklake/server.env.example \
     /etc/linklake/client.toml.example; do

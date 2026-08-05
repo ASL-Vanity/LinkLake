@@ -1,0 +1,15 @@
+[Unit]
+Description=Resume an interrupted LinkLake Server update
+Before=linklake-server.service
+ConditionPathExists=/var/lib/linklake-updater/server/active.json
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/bin/linklake-server update recover --yes --state-dir /var/lib/linklake-updater/server --data-dir /var/lib/linklake
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/linklake-updater/server /var/lib/linklake /var/log/linklake

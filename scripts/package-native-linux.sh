@@ -27,9 +27,11 @@ trap 'rm -rf -- "$stage"' EXIT
 install -d "$stage/usr/local/bin" "$stage/lib/systemd/system" "$stage/etc/linklake" \
   "$stage/var/lib/linklake" "$stage/var/log/linklake" \
   "$stage/var/lib/linklake-client" "$stage/var/log/linklake-client"
+install -d -m 0700 "$stage/var/lib/linklake-updater" "$stage/var/lib/linklake-updater/server"
 install -m 0755 "$binary_dir/linklake-server" "$stage/usr/local/bin/"
 install -m 0755 "$binary_dir/linklake-client" "$stage/usr/local/bin/"
 install -m 0644 packaging/systemd/linklake-server.service "$stage/lib/systemd/system/"
+install -m 0644 packaging/systemd/linklake-update-resume.service "$stage/lib/systemd/system/"
 install -m 0644 packaging/systemd/linklake-client.service "$stage/lib/systemd/system/"
 install -m 0600 packaging/systemd/server.env.example "$stage/etc/linklake/server.env.example"
 install -m 0600 examples/linklake-client.toml "$stage/etc/linklake/client.toml.example"
@@ -52,6 +54,8 @@ set -e
 getent group linklake >/dev/null || addgroup --system linklake
 getent passwd linklake >/dev/null || adduser --system --ingroup linklake --home /var/lib/linklake --no-create-home linklake
 chown -R linklake:linklake /var/lib/linklake /var/log/linklake /var/lib/linklake-client /var/log/linklake-client
+chown root:root /var/lib/linklake-updater /var/lib/linklake-updater/server
+chmod 0700 /var/lib/linklake-updater /var/lib/linklake-updater/server
 systemctl daemon-reload >/dev/null 2>&1 || true
 EOF
   chmod 0755 "$stage/DEBIAN/postinst"
@@ -82,11 +86,14 @@ tar -xzf %{SOURCE0} -C %{buildroot}
 getent group linklake >/dev/null || groupadd --system linklake
 getent passwd linklake >/dev/null || useradd --system --gid linklake --home-dir /var/lib/linklake --shell /sbin/nologin linklake
 chown -R linklake:linklake /var/lib/linklake /var/log/linklake /var/lib/linklake-client /var/log/linklake-client
+chown root:root /var/lib/linklake-updater /var/lib/linklake-updater/server
+chmod 0700 /var/lib/linklake-updater /var/lib/linklake-updater/server
 systemctl daemon-reload >/dev/null 2>&1 || true
 %files
 /usr/local/bin/linklake-server
 /usr/local/bin/linklake-client
 /lib/systemd/system/linklake-server.service
+/lib/systemd/system/linklake-update-resume.service
 /lib/systemd/system/linklake-client.service
 %config(noreplace) /etc/linklake/server.env.example
 %config(noreplace) /etc/linklake/client.toml.example
@@ -94,6 +101,8 @@ systemctl daemon-reload >/dev/null 2>&1 || true
 %dir /var/log/linklake
 %dir /var/lib/linklake-client
 %dir /var/log/linklake-client
+%dir /var/lib/linklake-updater
+%dir /var/lib/linklake-updater/server
 EOF
   rpmbuild --define "_topdir $top" -bb "$top/SPECS/linklake.spec"
   find "$top/RPMS" -name '*.rpm' -exec cp {} "$out/" \;

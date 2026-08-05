@@ -166,7 +166,9 @@ jobs:
           ./tests/fleet-health-e2e.ps1 -SkipBuild
       - name: Verify Helm deployment contract
         shell: pwsh
-        run: ./tests/helm-chart-contract.ps1
+        run: |
+          ./tests/helm-chart-contract.ps1
+          ./tests/update-recovery-packaging-contract.ps1
       - name: Run encrypted disaster-recovery end-to-end tests
         shell: pwsh
         run: ./tests/disaster-recovery-e2e.ps1 -SkipBuild

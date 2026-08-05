@@ -14,13 +14,16 @@ case "$mode" in
   server)
     install -m 0755 "$package_root/bin/linklake-server" /usr/local/bin/linklake-server
     install -d -m 0750 /usr/local/var/lib/linklake /usr/local/var/log/linklake
+    install -d -o root -g wheel -m 0700 "/Library/Application Support/LinkLake/updates" \
+      "/Library/Application Support/LinkLake/updates/server"
     if [ ! -e /usr/local/etc/linklake/server.env ]; then
       sed 's#/var/lib/linklake#/usr/local/var/lib/linklake#g; s#/var/log/linklake#/usr/local/var/log/linklake#g' \
         "$package_root/launchd/server.env.example" >/usr/local/etc/linklake/server.env
       chmod 0600 /usr/local/etc/linklake/server.env
     fi
+    install -m 0644 "$package_root/launchd/com.linklake.update-resume.plist" /Library/LaunchDaemons/com.linklake.update-resume.plist
     install -m 0644 "$package_root/launchd/com.linklake.server.plist" /Library/LaunchDaemons/com.linklake.server.plist
-    echo "Edit /usr/local/etc/linklake/server.env, then run: launchctl bootstrap system /Library/LaunchDaemons/com.linklake.server.plist"
+    echo "Edit /usr/local/etc/linklake/server.env, then bootstrap com.linklake.update-resume before com.linklake.server."
     ;;
   client)
     install -m 0755 "$package_root/bin/linklake-client" /usr/local/bin/linklake-client
