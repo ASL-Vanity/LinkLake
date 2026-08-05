@@ -51,14 +51,28 @@ function Invoke-CheckedProcess {
     $id = [guid]::NewGuid().ToString('N')
     $stdoutPath = Join-Path $runRoot "$DisplayName-$id.stdout.log"
     $stderrPath = Join-Path $runRoot "$DisplayName-$id.stderr.log"
-    $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -WorkingDirectory $projectRoot `
-        -NoNewWindow -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $FilePath
+    $startInfo.Arguments = $Arguments -join ' '
+    $startInfo.WorkingDirectory = $projectRoot
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $process = [Diagnostics.Process]::Start($startInfo)
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
     if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
         $null = $process.WaitForExit(5000)
         throw "$DisplayName did not exit within $TimeoutSeconds seconds during ${stage}. Diagnostic output was retained at $stdoutPath and $stderrPath."
     }
-    $output = if (Test-Path -LiteralPath $stdoutPath) { @(Get-Content -LiteralPath $stdoutPath) } else { @() }
+    $process.WaitForExit()
+    $stdout = $stdoutTask.GetAwaiter().GetResult()
+    $stderr = $stderrTask.GetAwaiter().GetResult()
+    [IO.File]::WriteAllText($stdoutPath, $stdout)
+    [IO.File]::WriteAllText($stderrPath, $stderr)
+    $output = @($stdout -split "`r?`n" | Where-Object { $_ -ne '' })
     if ($process.ExitCode -ne 0) {
         throw "$DisplayName failed with exit code $($process.ExitCode) during ${stage}. Diagnostic output was retained at $stdoutPath and $stderrPath."
     }
