@@ -159,6 +159,14 @@ jobs:
           ./tests/update-e2e.ps1 -Product client
           ./tests/update-e2e.ps1 -Product server
           ./tests/manager-update-e2e.ps1 -SkipBuild
+      - name: Run lifecycle and fleet-health end-to-end tests
+        shell: pwsh
+        run: |
+          ./tests/lifecycle-e2e.ps1
+          ./tests/fleet-health-e2e.ps1 -SkipBuild
+      - name: Verify Helm deployment contract
+        shell: pwsh
+        run: ./tests/helm-chart-contract.ps1
       - name: Run encrypted disaster-recovery end-to-end tests
         shell: pwsh
         run: ./tests/disaster-recovery-e2e.ps1 -SkipBuild
