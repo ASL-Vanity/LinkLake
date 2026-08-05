@@ -41,6 +41,30 @@ function Start-HiddenProcess {
     return $process
 }
 
+function Invoke-CheckedProcess {
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments = @(),
+        [string]$DisplayName,
+        [int]$TimeoutSeconds
+    )
+    $id = [guid]::NewGuid().ToString('N')
+    $stdoutPath = Join-Path $runRoot "$DisplayName-$id.stdout.log"
+    $stderrPath = Join-Path $runRoot "$DisplayName-$id.stderr.log"
+    $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -WorkingDirectory $projectRoot `
+        -NoNewWindow -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+        $null = $process.WaitForExit(5000)
+        throw "$DisplayName did not exit within $TimeoutSeconds seconds during ${stage}. Diagnostic output was retained at $stdoutPath and $stderrPath."
+    }
+    $output = if (Test-Path -LiteralPath $stdoutPath) { @(Get-Content -LiteralPath $stdoutPath) } else { @() }
+    if ($process.ExitCode -ne 0) {
+        throw "$DisplayName failed with exit code $($process.ExitCode) during ${stage}. Diagnostic output was retained at $stdoutPath and $stderrPath."
+    }
+    return $output
+}
+
 function Wait-TcpPort {
     param([int]$Port, [int]$Seconds = 30)
     $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
@@ -102,10 +126,8 @@ function Wait-Route {
 
 function Invoke-Probe {
     param([string[]]$Arguments)
-    $output = & $probePath @Arguments 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw "HTTP/2 probe failed during ${stage}: $($output -join [Environment]::NewLine)"
-    }
+    $output = Invoke-CheckedProcess -FilePath $probePath -Arguments $Arguments `
+        -DisplayName 'http2-grpc-probe' -TimeoutSeconds 90
     $json = @($output | Where-Object { $_ -match '^\s*\{' } | Select-Object -Last 1)
     if ($json.Count -ne 1) {
         throw "HTTP/2 probe did not emit one JSON result during ${stage}. Output: $($output -join ' ')"
@@ -128,8 +150,8 @@ try {
         try {
             $env:CARGO_TARGET_DIR = $targetRoot
             $env:CARGO_BUILD_JOBS = '2'
-            & cargo build --workspace --bins --example http2_grpc_probe
-            if ($LASTEXITCODE -ne 0) { throw 'cargo build failed.' }
+            Invoke-CheckedProcess -FilePath 'cargo' -Arguments @('build', '--workspace', '--bins', '--example', 'http2_grpc_probe') `
+                -DisplayName 'cargo-build' -TimeoutSeconds 900 | Out-Null
         } finally {
             $env:CARGO_TARGET_DIR = $previousTarget
             $env:CARGO_BUILD_JOBS = $previousJobs
