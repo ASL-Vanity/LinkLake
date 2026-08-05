@@ -46,6 +46,32 @@ function Initialize-LinkLakeServerUpdateDataDirectoryFixture {
     return $true
 }
 
+function Initialize-LinkLakeServerUpdateAuthenticationKeyFixture {
+    if ($env:OS -ne 'Windows_NT') { return }
+    $keyPath = Join-Path $dataRoot '.linklake-server-update-auth.key'
+    $bytes = for ($index = 0; $index -lt $serverUpdateTestAuthKeyHex.Length; $index += 2) {
+        [Convert]::ToByte($serverUpdateTestAuthKeyHex.Substring($index, 2), 16)
+    }
+    [IO.File]::WriteAllBytes($keyPath, [byte[]]$bytes)
+
+    # 夹具必须复现生产认证密钥的完整边界：Administrator 所有、受保护 DACL，
+    # 且仅 SYSTEM、Administrators、LocalService 可访问。不能让 release 二进制
+    # 因继承 ACL 而接受一个测试专用的弱密钥。
+    $acl = [Security.AccessControl.FileSecurity]::new()
+    $administrators = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+    $system = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+    $localService = [Security.Principal.SecurityIdentifier]::new('S-1-5-19')
+    $allow = [Security.AccessControl.AccessControlType]::Allow
+    $acl.SetOwner($administrators)
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($identity in @($system, $administrators, $localService)) {
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+                $identity, 'FullControl', $allow
+            ))
+    }
+    Set-Acl -LiteralPath $keyPath -AclObject $acl
+}
+
 function Add-LinkLakeServerUpdateUnsafeDataDirectoryRule {
     if ($env:OS -ne 'Windows_NT') { return }
     $acl = Get-Acl -LiteralPath $dataRoot
@@ -277,8 +303,11 @@ try {
     if ($env:LINKLAKE_UPDATE_TEST_SERVER_AUTH_KEY_HEX -ne $serverUpdateTestAuthKeyHex) {
         throw 'The debug server updater test authentication environment was not retained.'
     }
-    # Debug helper uses the injected test key. Do not preseed an on-disk auth key with
-    # weaker inherited permissions, because production validates a separate key DACL.
+    # Debug helper 使用固定测试密钥；同时预置同一字节值并采用生产等价 ACL，
+    # 以便后续 release 二进制的人工回滚路径验证真实的密钥读取和 DACL 门禁。
+    if ($windowsProtectedDataDirectoryFixture) {
+        Initialize-LinkLakeServerUpdateAuthenticationKeyFixture
+    }
     Copy-Item -LiteralPath $debugBinary -Destination $targetBinary
     Copy-Item -LiteralPath $debugBinary -Destination $helperBinary
     $releaseStage = Join-Path (Join-Path $stateRoot 'staging\candidate') $binaryName

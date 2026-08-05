@@ -4384,11 +4384,21 @@ fn canonicalize_windows_security_descriptor_sddl(sddl: &str) -> anyhow::Result<S
         "cannot parse Windows security descriptor: {}",
         std::io::Error::last_os_error()
     );
-    let result = windows_security_descriptor_to_sddl(descriptor);
+    let result = windows_security_descriptor_to_sddl(descriptor)
+        .map(normalize_windows_dacl_auto_inherited_flag);
     unsafe {
         LocalFree(descriptor);
     }
     result
+}
+
+/// NTFS 会在实际落盘时给已受保护的 DACL 补上 `AI`（auto-inherited）控制位，
+/// 即 `D:PAI`；它只记录继承处理已经发生，并不会授权新的 ACE。安装器模板
+/// 使用 `D:P` 表示同一安全边界，因此只在保留 `P` 和全部 ACE 的前提下归一化
+/// 这个平台产生的元数据位。其他控制位、所有者和 ACE 仍必须精确匹配。
+#[cfg(windows)]
+fn normalize_windows_dacl_auto_inherited_flag(sddl: String) -> String {
+    sddl.replacen("D:PAI", "D:P", 1)
 }
 
 #[cfg(windows)]
@@ -5678,6 +5688,16 @@ mod tests {
         assert!(windows_security_descriptor_matches(
             WINDOWS_SERVER_AUTHENTICATION_KEY_SECURITY_DESCRIPTOR,
             "O:BAD:P(A;;FA;;;SY)(A;;FA;;;LS)(A;;FA;;;BA)",
+        )
+        .unwrap());
+        assert!(windows_security_descriptor_matches(
+            WINDOWS_SERVER_DATA_DIRECTORY_SECURITY_DESCRIPTOR,
+            "O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;0x1301bf;;;LS)(A;OICI;FA;;;BA)",
+        )
+        .unwrap());
+        assert!(!windows_security_descriptor_matches(
+            WINDOWS_SERVER_DATA_DIRECTORY_SECURITY_DESCRIPTOR,
+            "O:BAD:AI(A;OICI;FA;;;SY)(A;OICI;0x1301bf;;;LS)(A;OICI;FA;;;BA)",
         )
         .unwrap());
         assert!(!windows_security_descriptor_matches(
