@@ -328,14 +328,6 @@ impl CertificateCatalog {
                 renew_before_days INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
-            INSERT OR IGNORE INTO acme_config (
-                singleton_id, enabled, environment, directory_url, contact_email,
-                terms_accepted, challenge_type, renew_before_days, updated_at
-            ) VALUES (
-                1, 0, 'production',
-                'https://acme-v02.api.letsencrypt.org/directory', '', 0, 'http-01', 30, 0
-            );
-
             CREATE TABLE IF NOT EXISTS http_route_tls_policies (
                 route_id TEXT PRIMARY KEY NOT NULL,
                 mode TEXT NOT NULL,
@@ -372,6 +364,16 @@ impl CertificateCatalog {
             "http_route_tls_policies",
             "certificate_identifier",
             "TEXT",
+        )?;
+        // 旧表必须先补列，再执行引用新列的默认行写入。
+        database.execute_batch(
+            "INSERT OR IGNORE INTO acme_config (
+                singleton_id, enabled, environment, directory_url, contact_email,
+                terms_accepted, challenge_type, renew_before_days, updated_at
+            ) VALUES (
+                1, 0, 'production',
+                'https://acme-v02.api.letsencrypt.org/directory', '', 0, 'http-01', 30, 0
+            );",
         )?;
         Ok(Self { database })
     }
@@ -925,6 +927,81 @@ mod tests {
             Some("*.example.com")
         );
         drop(catalog);
+        fs::remove_dir_all(root).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn legacy_acme_table_is_extended_before_new_columns_are_used() {
+        let root = std::env::temp_dir().join(format!(
+            "linklake-cert-legacy-schema-test-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("test directory should be created");
+        let database_path = root.join("linklake.sqlite3");
+        rusqlite::Connection::open(&database_path)
+            .expect("legacy database should open")
+            .execute_batch(
+                "CREATE TABLE acme_config (
+                    singleton_id INTEGER PRIMARY KEY NOT NULL,
+                    enabled INTEGER NOT NULL,
+                    environment TEXT NOT NULL,
+                    directory_url TEXT NOT NULL,
+                    contact_email TEXT NOT NULL,
+                    terms_accepted INTEGER NOT NULL,
+                    renew_before_days INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                 );
+                 INSERT INTO acme_config VALUES (
+                    1, 1, 'staging',
+                    'https://acme-staging-v02.api.letsencrypt.org/directory',
+                    'legacy@example.com', 1, 20, 42
+                 );
+                 CREATE TABLE http_route_tls_policies (
+                    route_id TEXT PRIMARY KEY NOT NULL,
+                    mode TEXT NOT NULL,
+                    redirect_http_to_https INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                 );
+                 INSERT INTO http_route_tls_policies VALUES (
+                    'legacy-route', 'manual', 1, 43
+                 );",
+            )
+            .expect("legacy schema should write");
+
+        let catalog = CertificateCatalog::open(Some(&root)).expect("legacy catalog should upgrade");
+        let config = catalog
+            .get_acme_config()
+            .expect("legacy config should remain readable");
+        assert_eq!(config.challenge_type, AcmeChallengeType::Http01);
+        assert_eq!(config.contact_email, "legacy@example.com");
+        assert_eq!(config.renew_before_days, 20);
+        drop(catalog);
+
+        let connection =
+            rusqlite::Connection::open(&database_path).expect("database should reopen");
+        let route: (String, i64, Option<String>) = connection
+            .query_row(
+                "SELECT mode, updated_at, certificate_identifier
+                 FROM http_route_tls_policies WHERE route_id = 'legacy-route'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("legacy route should remain readable");
+        assert_eq!(route, ("manual".into(), 43, None));
+        for (table, column) in [
+            ("acme_config", "challenge_type"),
+            ("http_route_tls_policies", "certificate_identifier"),
+        ] {
+            let present: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+                    [table, column],
+                    |row| row.get(0),
+                )
+                .expect("column presence should read");
+            assert!(present, "missing migrated column {table}.{column}");
+        }
+        drop(connection);
         fs::remove_dir_all(root).expect("test directory should be removed");
     }
 

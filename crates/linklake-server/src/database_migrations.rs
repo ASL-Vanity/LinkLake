@@ -1,11 +1,11 @@
-﻿//! SQLite 架构版本检查、迁移前备份与可校验迁移账本。
+//! SQLite 架构版本检查、迁移前备份与可校验迁移账本。
 
 use crate::database::Database;
 use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::{fs, path::Path};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 12;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 13;
 
 const MIGRATION_V10_NAME: &str = "shared_database_foundation";
 const MIGRATION_V10_SQL: &str = "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -63,6 +63,13 @@ const MIGRATION_V12_CONTRACT: &str = "ALTER TABLE clients ADD COLUMN agent_ident
 CREATE UNIQUE INDEX clients_agent_identity_public_key ON clients(agent_identity_public_key) WHERE agent_identity_public_key IS NOT NULL;
 ALTER TABLE management_api_tokens ADD COLUMN fleet_source_instance_id TEXT;";
 
+const MIGRATION_V13_NAME: &str = "certificate_routing_metadata";
+const MIGRATION_V13_CONTRACT: &str = "CREATE TABLE IF NOT EXISTS acme_config (... challenge_type TEXT NOT NULL DEFAULT 'http-01' ...);
+CREATE TABLE IF NOT EXISTS http_route_tls_policies (... certificate_identifier TEXT ...);
+ALTER TABLE acme_config ADD COLUMN challenge_type TEXT NOT NULL DEFAULT 'http-01';
+ALTER TABLE http_route_tls_policies ADD COLUMN certificate_identifier TEXT;
+INSERT OR IGNORE INTO acme_config (... challenge_type ...) VALUES (... 'http-01' ...);";
+
 pub(crate) struct MigrationPlan {
     database: Database,
     from_version: u32,
@@ -111,6 +118,10 @@ impl MigrationPlan {
                     12 => {
                         apply_v12(transaction)?;
                         (MIGRATION_V12_NAME, migration_v12_checksum())
+                    }
+                    13 => {
+                        apply_v13(transaction)?;
+                        (MIGRATION_V13_NAME, migration_v13_checksum())
                     }
                     _ => anyhow::bail!("unsupported database migration version {version}"),
                 };
@@ -211,6 +222,65 @@ fn apply_v12(transaction: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
             [],
         )?;
     }
+    Ok(())
+}
+
+fn apply_v13(transaction: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS acme_config (
+            singleton_id INTEGER PRIMARY KEY NOT NULL CHECK (singleton_id = 1),
+            enabled INTEGER NOT NULL,
+            environment TEXT NOT NULL,
+            directory_url TEXT NOT NULL,
+            contact_email TEXT NOT NULL,
+            terms_accepted INTEGER NOT NULL,
+            challenge_type TEXT NOT NULL DEFAULT 'http-01',
+            renew_before_days INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS http_route_tls_policies (
+            route_id TEXT PRIMARY KEY NOT NULL,
+            mode TEXT NOT NULL,
+            redirect_http_to_https INTEGER NOT NULL,
+            certificate_identifier TEXT,
+            updated_at INTEGER NOT NULL
+        );",
+    )?;
+
+    let challenge_type_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('acme_config') WHERE name = 'challenge_type')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !challenge_type_exists {
+        transaction.execute(
+            "ALTER TABLE acme_config ADD COLUMN challenge_type TEXT NOT NULL DEFAULT 'http-01'",
+            [],
+        )?;
+    }
+
+    let certificate_identifier_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('http_route_tls_policies') WHERE name = 'certificate_identifier')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !certificate_identifier_exists {
+        transaction.execute(
+            "ALTER TABLE http_route_tls_policies ADD COLUMN certificate_identifier TEXT",
+            [],
+        )?;
+    }
+
+    transaction.execute(
+        "INSERT OR IGNORE INTO acme_config (
+            singleton_id, enabled, environment, directory_url, contact_email,
+            terms_accepted, challenge_type, renew_before_days, updated_at
+        ) VALUES (
+            1, 0, 'production',
+            'https://acme-v02.api.letsencrypt.org/directory', '', 0, 'http-01', 30, 0
+        )",
+        [],
+    )?;
     Ok(())
 }
 
@@ -345,6 +415,7 @@ fn verify_migration_ledger(
             10 => (MIGRATION_V10_NAME, migration_checksum(MIGRATION_V10_SQL)),
             11 => (MIGRATION_V11_NAME, migration_v11_checksum()),
             12 => (MIGRATION_V12_NAME, migration_v12_checksum()),
+            13 => (MIGRATION_V13_NAME, migration_v13_checksum()),
             _ => anyhow::bail!("unsupported database migration version {version}"),
         };
         let record = connection
@@ -395,6 +466,10 @@ fn migration_v12_checksum() -> String {
     migration_checksum(MIGRATION_V12_CONTRACT)
 }
 
+fn migration_v13_checksum() -> String {
+    migration_checksum(MIGRATION_V13_CONTRACT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,6 +478,33 @@ mod tests {
 
     fn temporary_directory(prefix: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()))
+    }
+
+    fn seed_v12_migration_ledger(connection: &Connection) {
+        connection
+            .execute_batch(MIGRATION_V10_SQL)
+            .expect("migration ledger should be created");
+        for (version, name, checksum) in [
+            (
+                10_u32,
+                MIGRATION_V10_NAME,
+                migration_checksum(MIGRATION_V10_SQL),
+            ),
+            (11_u32, MIGRATION_V11_NAME, migration_v11_checksum()),
+            (12_u32, MIGRATION_V12_NAME, migration_v12_checksum()),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO schema_migrations (
+                        version, name, checksum_sha256, applied_unix_seconds
+                    ) VALUES (?1, ?2, ?3, 1)",
+                    params![version, name, checksum],
+                )
+                .expect("migration ledger row should be written");
+        }
+        connection
+            .execute_batch("PRAGMA user_version = 12;")
+            .expect("schema version should be written");
     }
 
     #[test]
@@ -467,6 +569,183 @@ mod tests {
     }
 
     #[test]
+    fn schema_nine_runtime_catalogs_are_upgraded_before_first_query() {
+        let root = temporary_directory("linklake-schema-nine-runtime-upgrade");
+        fs::create_dir_all(&root).expect("temporary directory should exist");
+        let database_path = root.join("linklake.sqlite3");
+        Connection::open(&database_path)
+            .expect("legacy database should open")
+            .execute_batch(
+                "CREATE TABLE acme_config (
+                    singleton_id INTEGER PRIMARY KEY NOT NULL,
+                    enabled INTEGER NOT NULL,
+                    environment TEXT NOT NULL,
+                    directory_url TEXT NOT NULL,
+                    contact_email TEXT NOT NULL,
+                    terms_accepted INTEGER NOT NULL,
+                    renew_before_days INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                 );
+                 INSERT INTO acme_config VALUES (
+                    1, 1, 'production',
+                    'https://acme-v02.api.letsencrypt.org/directory',
+                    'legacy@example.com', 1, 30, 1
+                 );
+                 CREATE TABLE http_route_tls_policies (
+                    route_id TEXT PRIMARY KEY NOT NULL,
+                    mode TEXT NOT NULL,
+                    redirect_http_to_https INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                 );
+                 INSERT INTO http_route_tls_policies VALUES (
+                    'legacy-route', 'manual', 1, 9
+                 );
+                 PRAGMA user_version = 9;",
+            )
+            .expect("legacy schema should write");
+
+        let database = Database::persistent(&root).expect("database should lock");
+        let plan = prepare(&database).expect("migration should prepare");
+        plan.finish().expect("versioned migration should finish");
+
+        let connection = database.connect().expect("database should reopen");
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version should read");
+        let challenge_type: String = connection
+            .query_row(
+                "SELECT challenge_type FROM acme_config WHERE singleton_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("migrated ACME config should read");
+        let contact_email: String = connection
+            .query_row(
+                "SELECT contact_email FROM acme_config WHERE singleton_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy ACME data should remain");
+        let route: (String, i64, Option<String>) = connection
+            .query_row(
+                "SELECT mode, updated_at, certificate_identifier
+                 FROM http_route_tls_policies WHERE route_id = 'legacy-route'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("legacy route should remain");
+        let ledger: (String, String) = connection
+            .query_row(
+                "SELECT name, checksum_sha256 FROM schema_migrations WHERE version = 13",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("v13 migration ledger should read");
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(challenge_type, "http-01");
+        assert_eq!(contact_email, "legacy@example.com");
+        assert_eq!(route, ("manual".into(), 9, None));
+        assert_eq!(ledger.0, MIGRATION_V13_NAME);
+        assert_eq!(ledger.1, migration_v13_checksum());
+        drop(connection);
+
+        drop(
+            crate::certificate_catalog::CertificateCatalog::open_with_database(&database)
+                .expect("certificate catalog should open after v13 migration"),
+        );
+        let second_plan = prepare(&database).expect("current schema should verify again");
+        assert_eq!(second_plan.source_version(), CURRENT_SCHEMA_VERSION);
+        assert!(second_plan.backup_path().is_none());
+        second_plan
+            .finish()
+            .expect("current schema should be idempotent");
+        drop(database);
+        fs::remove_dir_all(root).expect("temporary directory should clean up");
+    }
+
+    #[test]
+    fn schema_twelve_failure_residue_is_repaired_by_v13() {
+        let root = temporary_directory("linklake-schema-twelve-certificate-residue");
+        fs::create_dir_all(&root).expect("temporary directory should exist");
+        let database_path = root.join("linklake.sqlite3");
+        let connection = Connection::open(&database_path).expect("database should open");
+        connection
+            .execute_batch(
+                "CREATE TABLE acme_config (
+                    singleton_id INTEGER PRIMARY KEY NOT NULL,
+                    enabled INTEGER NOT NULL,
+                    environment TEXT NOT NULL,
+                    directory_url TEXT NOT NULL,
+                    contact_email TEXT NOT NULL,
+                    terms_accepted INTEGER NOT NULL,
+                    renew_before_days INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                 );
+                 INSERT INTO acme_config VALUES (
+                    1, 1, 'staging', 'https://example.invalid/directory',
+                    'residue@example.com', 1, 17, 44
+                 );
+                 CREATE TABLE http_route_tls_policies (
+                    route_id TEXT PRIMARY KEY NOT NULL,
+                    mode TEXT NOT NULL,
+                    redirect_http_to_https INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                 );
+                 INSERT INTO http_route_tls_policies VALUES (
+                    'residue-route', 'automatic', 0, 45
+                 );",
+            )
+            .expect("failure residue should be written");
+        seed_v12_migration_ledger(&connection);
+        drop(connection);
+
+        let database = Database::persistent(&root).expect("database should lock");
+        let plan = prepare(&database).expect("v12 ledger should verify");
+        assert_eq!(plan.source_version(), 12);
+        plan.finish().expect("v13 repair should finish");
+
+        let connection = database.connect().expect("database should reopen");
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version should read");
+        let acme: (String, i64, String) = connection
+            .query_row(
+                "SELECT contact_email, renew_before_days, challenge_type
+                 FROM acme_config WHERE singleton_id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("ACME residue should remain");
+        let route: (String, i64, Option<String>) = connection
+            .query_row(
+                "SELECT mode, updated_at, certificate_identifier
+                 FROM http_route_tls_policies WHERE route_id = 'residue-route'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("route residue should remain");
+        let v13_rows: u32 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 13",
+                [],
+                |row| row.get(0),
+            )
+            .expect("v13 ledger should read");
+        assert_eq!(version, 13);
+        assert_eq!(acme, ("residue@example.com".into(), 17, "http-01".into()));
+        assert_eq!(route, ("automatic".into(), 45, None));
+        assert_eq!(v13_rows, 1);
+        drop(connection);
+
+        let second_plan = prepare(&database).expect("repaired database should verify");
+        second_plan
+            .finish()
+            .expect("repaired database should be idempotent");
+        drop(database);
+        fs::remove_dir_all(root).expect("temporary directory should clean up");
+    }
+
+    #[test]
     fn current_database_with_changed_checksum_is_rejected() {
         let root = temporary_directory("linklake-migration-checksum");
         fs::create_dir_all(&root).unwrap();
@@ -515,6 +794,29 @@ mod tests {
         let plan = prepare(&database).unwrap();
         assert!(plan.backup_path().is_none());
         plan.finish().unwrap();
+        let connection = database.connect().expect("database should reopen");
+        for (table, column) in [
+            ("acme_config", "challenge_type"),
+            ("http_route_tls_policies", "certificate_identifier"),
+        ] {
+            let present: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+                    [table, column],
+                    |row| row.get(0),
+                )
+                .expect("v13 column should exist after versioned migration");
+            assert!(present, "missing v13 column {table}.{column}");
+        }
+        let challenge_type: String = connection
+            .query_row(
+                "SELECT challenge_type FROM acme_config WHERE singleton_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("default ACME row should exist");
+        assert_eq!(challenge_type, "http-01");
+        drop(connection);
         prepare(&database).expect("current migration ledger should verify");
         drop(database);
         fs::remove_dir_all(root).unwrap();
@@ -679,5 +981,75 @@ mod tests {
         drop(connection);
         drop(database);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_v13_migration_preserves_v12_schema_ledger_and_data() {
+        let root = temporary_directory("linklake-v13-migration-rollback");
+        fs::create_dir_all(&root).expect("temporary directory should exist");
+        let database_path = root.join("linklake.sqlite3");
+        let connection = Connection::open(&database_path).expect("database should open");
+        connection
+            .execute_batch(
+                "CREATE TABLE acme_config (
+                    singleton_id INTEGER PRIMARY KEY NOT NULL,
+                    enabled INTEGER NOT NULL,
+                    environment TEXT NOT NULL,
+                    directory_url TEXT NOT NULL,
+                    contact_email TEXT NOT NULL,
+                    terms_accepted INTEGER NOT NULL,
+                    renew_before_days INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                 );
+                 INSERT INTO acme_config VALUES (
+                    1, 1, 'production', 'https://example.invalid/directory',
+                    'atomic@example.com', 1, 21, 77
+                 );
+                 CREATE VIEW http_route_tls_policies AS
+                    SELECT 'conflict' AS route_id, 'manual' AS mode,
+                           0 AS redirect_http_to_https, 1 AS updated_at;",
+            )
+            .expect("v12 schema should be written");
+        seed_v12_migration_ledger(&connection);
+        drop(connection);
+
+        let database = Database::persistent(&root).expect("database should lock");
+        let plan = prepare(&database).expect("v12 migration should prepare");
+        let error = plan.finish().expect_err("conflicting view must fail v13");
+        assert!(
+            error.to_string().contains("Cannot add a column to a view"),
+            "unexpected v13 migration error: {error:#}"
+        );
+
+        let connection = database.connect().expect("database should reopen");
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version should read");
+        let ledger_rows: u32 = connection
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("ledger should read");
+        let challenge_type_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('acme_config') WHERE name = 'challenge_type')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("column state should read");
+        let acme: (String, i64) = connection
+            .query_row(
+                "SELECT contact_email, updated_at FROM acme_config WHERE singleton_id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("old data should remain");
+        assert_eq!(version, 12);
+        assert_eq!(ledger_rows, 3);
+        assert!(!challenge_type_exists);
+        assert_eq!(acme, ("atomic@example.com".into(), 77));
+        drop(connection);
+        drop(database);
+        fs::remove_dir_all(root).expect("temporary directory should clean up");
     }
 }

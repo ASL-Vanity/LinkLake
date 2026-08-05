@@ -2513,6 +2513,9 @@ async fn run_server(
     if let Some(plan) = migration_plan {
         plan.finish()?;
     }
+    // 版本化账本升级后，先补齐各业务目录的幂等 DDL，再构造任何运行时服务。
+    // 这样旧数据库不会在目录首次查询新增列时才失败。
+    migrate_application_schema(&database)?;
     let certificate_manager = data_dir
         .as_ref()
         .map(|data_dir| CertificateManager::new(data_dir.clone()))
