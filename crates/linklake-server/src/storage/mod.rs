@@ -5,15 +5,27 @@
 //! PostgreSQL 时必须提供连接串，连接或迁移失败会阻止服务端启动。
 
 use crate::{database::Database, postgres_migrations};
-use postgres::{Client, NoTls, Transaction};
+use rustls::{ClientConfig, RootCertStore};
 use serde::Serialize;
 use std::{
     env, fmt,
-    sync::{Arc, Mutex},
+    net::IpAddr,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
+use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio_postgres::{
+    config::{Host, SslMode},
+    Client,
+};
+use tokio_postgres_rustls::MakeRustlsConnect;
 
 pub(crate) const STORAGE_BACKEND_ENV: &str = "LINKLAKE_STORAGE_BACKEND";
 pub(crate) const POSTGRES_URL_ENV: &str = "LINKLAKE_POSTGRES_URL";
+pub(crate) const POSTGRES_POOL_SIZE_ENV: &str = "LINKLAKE_POSTGRES_POOL_SIZE";
+pub(crate) const POSTGRES_INSECURE_LOOPBACK_ENV: &str = "LINKLAKE_POSTGRES_ALLOW_INSECURE_LOOPBACK";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -98,11 +110,11 @@ impl StorageConfig {
 #[derive(Clone)]
 pub(crate) enum CoordinationStorage {
     Sqlite(Database),
-    Postgres(Arc<Mutex<Client>>),
+    Postgres(Arc<PostgresPool>),
 }
 
 impl CoordinationStorage {
-    pub(crate) fn open(config: &StorageConfig, sqlite: &Database) -> anyhow::Result<Self> {
+    pub(crate) async fn open(config: &StorageConfig, sqlite: &Database) -> anyhow::Result<Self> {
         match config.backend {
             StorageBackend::Sqlite => Ok(Self::Sqlite(sqlite.clone())),
             StorageBackend::Postgres => {
@@ -110,10 +122,11 @@ impl CoordinationStorage {
                     .postgres_url
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("PostgreSQL URL was not configured"))?;
-                let mut client = Client::connect(url, NoTls)
-                    .map_err(|error| anyhow::anyhow!("could not connect to PostgreSQL: {error}"))?;
-                postgres_migrations::apply(&mut client)?;
-                Ok(Self::Postgres(Arc::new(Mutex::new(client))))
+                let pool = PostgresPool::connect(url).await?;
+                let mut client = pool.acquire().await;
+                postgres_migrations::apply(&mut client).await?;
+                drop(client);
+                Ok(Self::Postgres(Arc::new(pool)))
             }
         }
     }
@@ -134,32 +147,14 @@ impl CoordinationStorage {
         }
     }
 
-    pub(crate) fn with_postgres<T>(
-        &self,
-        operation: impl FnOnce(&mut Client) -> anyhow::Result<T>,
-    ) -> anyhow::Result<T> {
-        let Self::Postgres(client) = self else {
+    pub(crate) async fn postgres_client(&self) -> anyhow::Result<OwnedMutexGuard<Client>> {
+        let Self::Postgres(pool) = self else {
             anyhow::bail!("operation requires the PostgreSQL coordination backend");
         };
-        let mut client = client
-            .lock()
-            .map_err(|_| anyhow::anyhow!("PostgreSQL client lock poisoned"))?;
-        operation(&mut client)
+        Ok(pool.acquire().await)
     }
 
-    pub(crate) fn with_postgres_transaction<T>(
-        &self,
-        operation: impl FnOnce(&mut Transaction<'_>) -> anyhow::Result<T>,
-    ) -> anyhow::Result<T> {
-        self.with_postgres(|client| {
-            let mut transaction = client.transaction()?;
-            let value = operation(&mut transaction)?;
-            transaction.commit()?;
-            Ok(value)
-        })
-    }
-
-    pub(crate) fn database_unix_seconds(&self) -> anyhow::Result<u64> {
+    pub(crate) async fn database_unix_seconds(&self) -> anyhow::Result<u64> {
         match self {
             Self::Sqlite(database) => database.with_connection(|connection| {
                 let value: i64 = connection.query_row(
@@ -169,14 +164,117 @@ impl CoordinationStorage {
                 )?;
                 nonnegative_time(value)
             }),
-            Self::Postgres(_) => self.with_postgres(|client| {
-                let row = client.query_one(
-                    "SELECT CAST(EXTRACT(EPOCH FROM clock_timestamp()) AS BIGINT)",
-                    &[],
-                )?;
+            Self::Postgres(_) => {
+                let client = self.postgres_client().await?;
+                let row = client
+                    .query_one(
+                        "SELECT CAST(EXTRACT(EPOCH FROM clock_timestamp()) AS BIGINT)",
+                        &[],
+                    )
+                    .await?;
                 nonnegative_time(row.get::<_, i64>(0))
-            }),
+            }
         }
+    }
+}
+
+pub(crate) struct PostgresPool {
+    clients: Vec<Arc<Mutex<Client>>>,
+    next: AtomicUsize,
+}
+
+impl PostgresPool {
+    async fn connect(url: &str) -> anyhow::Result<Self> {
+        let mut config = url
+            .parse::<tokio_postgres::Config>()
+            .map_err(|_| anyhow::anyhow!("PostgreSQL connection configuration is invalid"))?;
+        let insecure_loopback = parse_boolean_environment(POSTGRES_INSECURE_LOOPBACK_ENV)?;
+        if insecure_loopback {
+            anyhow::ensure!(
+                config.get_hosts().iter().all(loopback_host),
+                "{POSTGRES_INSECURE_LOOPBACK_ENV} is only valid for loopback or Unix-socket PostgreSQL hosts"
+            );
+            config.ssl_mode(SslMode::Disable);
+        } else {
+            // Prefer 模式允许服务端拒绝 TLS 后回退明文；生产默认必须彻底禁止回退。
+            config.ssl_mode(SslMode::Require);
+        }
+        config.application_name("linklake-server-ha");
+
+        let pool_size = env::var(POSTGRES_POOL_SIZE_ENV)
+            .ok()
+            .map(|value| value.parse::<usize>())
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("{POSTGRES_POOL_SIZE_ENV} must be an integer"))?
+            .unwrap_or(4);
+        anyhow::ensure!(
+            (1..=32).contains(&pool_size),
+            "{POSTGRES_POOL_SIZE_ENV} must be between 1 and 32"
+        );
+        let tls = postgres_tls_connector()?;
+        let mut clients = Vec::with_capacity(pool_size);
+        for _ in 0..pool_size {
+            let (client, connection) = config.connect(tls.clone()).await.map_err(|_| {
+                anyhow::anyhow!("could not establish a verified PostgreSQL connection")
+            })?;
+            tokio::spawn(async move {
+                if connection.await.is_err() {
+                    // 驱动错误可能包含连接目标信息，因此这里只记录固定消息。
+                    tracing::error!("PostgreSQL connection task stopped");
+                }
+            });
+            clients.push(Arc::new(Mutex::new(client)));
+        }
+        Ok(Self {
+            clients,
+            next: AtomicUsize::new(0),
+        })
+    }
+
+    async fn acquire(&self) -> OwnedMutexGuard<Client> {
+        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.clients.len();
+        self.clients[index].clone().lock_owned().await
+    }
+}
+
+fn postgres_tls_connector() -> anyhow::Result<MakeRustlsConnect> {
+    let native = rustls_native_certs::load_native_certs();
+    let mut roots = RootCertStore::empty();
+    for certificate in native.certs {
+        roots
+            .add(certificate)
+            .map_err(|_| anyhow::anyhow!("could not load a native PostgreSQL trust anchor"))?;
+    }
+    anyhow::ensure!(
+        !roots.is_empty(),
+        "no native trust anchors are available for PostgreSQL TLS verification"
+    );
+    let config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(MakeRustlsConnect::new(config))
+}
+
+fn loopback_host(host: &Host) -> bool {
+    match host {
+        Host::Tcp(host) => {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        }
+        #[cfg(unix)]
+        Host::Unix(_) => true,
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+fn parse_boolean_environment(name: &str) -> anyhow::Result<bool> {
+    match env::var(name).ok().as_deref().map(str::trim) {
+        None | Some("") | Some("0") | Some("false") | Some("FALSE") => Ok(false),
+        Some("1") | Some("true") | Some("TRUE") => Ok(true),
+        Some(_) => anyhow::bail!("{name} must be true or false"),
     }
 }
 

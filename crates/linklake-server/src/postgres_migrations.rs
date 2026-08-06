@@ -1,7 +1,8 @@
 //! PostgreSQL 协调平面的独立迁移账本。
 
-use postgres::Client;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+use tokio_postgres::{Client, Transaction};
 
 pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 1;
 const ADVISORY_LOCK_ID: i64 = 0x4c4c_4841_4d49_4752;
@@ -119,23 +120,29 @@ const MIGRATIONS: &[Migration] = &[Migration {
     sql: MIGRATION_V1_SQL,
 }];
 
-pub(crate) fn apply(client: &mut Client) -> anyhow::Result<()> {
-    let mut transaction = client.transaction()?;
-    transaction.query_one("SELECT pg_advisory_xact_lock($1)", &[&ADVISORY_LOCK_ID])?;
-    transaction.batch_execute(
-        "CREATE TABLE IF NOT EXISTS linklake_postgres_schema_migrations (
-             version BIGINT PRIMARY KEY,
-             name TEXT NOT NULL,
-             checksum_sha256 TEXT NOT NULL,
-             applied_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
-         );",
-    )?;
+pub(crate) async fn apply(client: &mut Client) -> anyhow::Result<()> {
+    let transaction = client.transaction().await?;
+    transaction
+        .query_one("SELECT pg_advisory_xact_lock($1)", &[&ADVISORY_LOCK_ID])
+        .await?;
+    transaction
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS linklake_postgres_schema_migrations (
+                 version BIGINT PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 checksum_sha256 TEXT NOT NULL,
+                 applied_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+             );",
+        )
+        .await?;
 
-    let rows = transaction.query(
-        "SELECT version, name, checksum_sha256
-         FROM linklake_postgres_schema_migrations ORDER BY version",
-        &[],
-    )?;
+    let rows = transaction
+        .query(
+            "SELECT version, name, checksum_sha256
+             FROM linklake_postgres_schema_migrations ORDER BY version",
+            &[],
+        )
+        .await?;
     for row in rows {
         let version: i64 = row.get(0);
         let name: String = row.get(1);
@@ -156,10 +163,13 @@ pub(crate) fn apply(client: &mut Client) -> anyhow::Result<()> {
 
     for migration in MIGRATIONS {
         let checksum = migration_checksum(migration);
-        let existing = transaction.query_opt(
-            "SELECT name, checksum_sha256 FROM linklake_postgres_schema_migrations WHERE version = $1",
-            &[&migration.version],
-        )?;
+        let existing = transaction
+            .query_opt(
+                "SELECT name, checksum_sha256
+                 FROM linklake_postgres_schema_migrations WHERE version = $1",
+                &[&migration.version],
+            )
+            .await?;
         if let Some(row) = existing {
             let name: String = row.get(0);
             let stored: String = row.get(1);
@@ -170,25 +180,131 @@ pub(crate) fn apply(client: &mut Client) -> anyhow::Result<()> {
             );
             continue;
         }
-        transaction.batch_execute(migration.sql)?;
-        transaction.execute(
-            "INSERT INTO linklake_postgres_schema_migrations(version, name, checksum_sha256)
-             VALUES ($1, $2, $3)",
-            &[&migration.version, &migration.name, &checksum],
-        )?;
+        transaction.batch_execute(migration.sql).await?;
+        transaction
+            .execute(
+                "INSERT INTO linklake_postgres_schema_migrations(version, name, checksum_sha256)
+                 VALUES ($1, $2, $3)",
+                &[&migration.version, &migration.name, &checksum],
+            )
+            .await?;
     }
 
     let applied: i64 = transaction
         .query_one(
-            "SELECT COALESCE(MAX(version), 0) FROM linklake_postgres_schema_migrations",
+            "SELECT COALESCE(MAX(version), 0)
+             FROM linklake_postgres_schema_migrations",
             &[],
-        )?
+        )
+        .await?
         .get(0);
     anyhow::ensure!(
         applied == CURRENT_POSTGRES_SCHEMA_VERSION,
         "PostgreSQL migration ledger is incomplete: expected {CURRENT_POSTGRES_SCHEMA_VERSION}, got {applied}"
     );
-    transaction.commit()?;
+    verify_schema_structure(&transaction).await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+async fn verify_schema_structure(transaction: &Transaction<'_>) -> anyhow::Result<()> {
+    const TABLES: &[(&str, &[&str])] = &[
+        (
+            "linklake_ha_members",
+            &[
+                "instance_id",
+                "last_seen_at",
+                "lease_until",
+                "metadata_json",
+            ],
+        ),
+        (
+            "linklake_ha_fencing_sequence",
+            &["singleton_id", "next_token"],
+        ),
+        (
+            "linklake_ha_leader",
+            &["instance_id", "fencing_token", "lease_until"],
+        ),
+        (
+            "linklake_public_port_ownership",
+            &[
+                "protocol",
+                "public_port",
+                "owner_instance_id",
+                "fencing_token",
+                "lease_until",
+            ],
+        ),
+        (
+            "linklake_job_leases",
+            &[
+                "job_key",
+                "job_kind",
+                "owner_instance_id",
+                "fencing_token",
+                "lease_until",
+            ],
+        ),
+        (
+            "linklake_target_health",
+            &[
+                "target_key",
+                "member_alive",
+                "control_channel_healthy",
+                "application_healthy",
+                "effective_healthy",
+                "revision",
+            ],
+        ),
+        (
+            "linklake_fleet_generations",
+            &[
+                "source_instance_id",
+                "generation",
+                "owner_instance_id",
+                "fencing_token",
+                "sync_progress",
+            ],
+        ),
+        (
+            "linklake_fleet_conflicts",
+            &[
+                "conflict_id",
+                "source_instance_id",
+                "resource_kind",
+                "resource_id",
+                "state",
+            ],
+        ),
+    ];
+    for (table, required_columns) in TABLES {
+        let exists: bool = transaction
+            .query_one("SELECT to_regclass($1) IS NOT NULL", &[table])
+            .await?
+            .get(0);
+        anyhow::ensure!(
+            exists,
+            "PostgreSQL migration ledger exists but table {table} is missing"
+        );
+        let rows = transaction
+            .query(
+                "SELECT column_name FROM information_schema.columns
+                 WHERE table_schema = current_schema() AND table_name = $1",
+                &[table],
+            )
+            .await?;
+        let columns = rows
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<HashSet<_>>();
+        for column in *required_columns {
+            anyhow::ensure!(
+                columns.contains(*column),
+                "PostgreSQL migration ledger exists but {table}.{column} is missing"
+            );
+        }
+    }
     Ok(())
 }
 
