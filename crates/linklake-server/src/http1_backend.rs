@@ -20,7 +20,7 @@ use std::{
     },
     time::Instant,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 #[derive(Default)]
 pub(crate) struct Http1BackendCounters {
@@ -61,12 +61,14 @@ impl<E: Error + 'static> Error for Http1BackendAcquireError<E> {
 struct RuntimeState {
     pool: BackendPoolState,
     idle: HashMap<BackendConnectionId, BoxedIo>,
+    capacity: HashMap<BackendConnectionId, OwnedSemaphorePermit>,
 }
 
 /// 每个正向代理策略持有一个池；池键包含策略、目标、协议和 TLS 身份。
 pub(crate) struct Http1BackendPool {
     runtime: Mutex<RuntimeState>,
     connect_gates: Box<[Mutex<()>]>,
+    connection_permits: Arc<Semaphore>,
     counters: Arc<Http1BackendCounters>,
 }
 
@@ -74,15 +76,18 @@ const CONNECT_GATE_SHARDS: usize = 64;
 
 impl Http1BackendPool {
     pub(crate) fn new(limits: BackendPoolLimits, counters: Arc<Http1BackendCounters>) -> Arc<Self> {
+        let maximum_connections = limits.max_connections.get();
         Arc::new(Self {
             runtime: Mutex::new(RuntimeState {
                 pool: BackendPoolState::new(limits),
                 idle: HashMap::new(),
+                capacity: HashMap::new(),
             }),
             connect_gates: (0..CONNECT_GATE_SHARDS)
                 .map(|_| Mutex::new(()))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
+            connection_permits: Arc::new(Semaphore::new(maximum_connections)),
             counters,
         })
     }
@@ -105,6 +110,16 @@ impl Http1BackendPool {
         if let Some(lease) = self.acquire_existing(&origin, true).await {
             return Ok(lease);
         }
+
+        let capacity_permit = self
+            .reserve_connection_capacity(&origin)
+            .await
+            .map_err(|_| {
+                self.counters
+                    .pool_exhausted_total
+                    .fetch_add(1, Ordering::Relaxed);
+                Http1BackendAcquireError::CapacityBusy
+            })?;
 
         let stream = connect().await.map_err(|error| {
             self.counters.failures_total.fetch_add(1, Ordering::Relaxed);
@@ -140,6 +155,9 @@ impl Http1BackendPool {
             return Err(Http1BackendAcquireError::CapacityBusy);
         };
         debug_assert_eq!(metadata.connection_id, registration.connection_id);
+        runtime
+            .capacity
+            .insert(metadata.connection_id, capacity_permit);
         self.counters
             .active_connections
             .fetch_add(1, Ordering::Relaxed);
@@ -162,6 +180,21 @@ impl Http1BackendPool {
         origin.hash(&mut hasher);
         let index = (hasher.finish() as usize) % self.connect_gates.len();
         &self.connect_gates[index]
+    }
+
+    async fn reserve_connection_capacity(
+        &self,
+        origin: &OriginKey,
+    ) -> Result<OwnedSemaphorePermit, BackendRegisterError> {
+        let mut runtime = self.runtime.lock().await;
+        self.prune_locked(&mut runtime, Instant::now());
+        let removals = runtime.pool.prepare_registration(origin)?;
+        self.apply_removals_locked(&mut runtime, removals);
+        drop(runtime);
+        self.connection_permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| BackendRegisterError::CapacityBusy)
     }
 
     pub(crate) async fn invalidate_policy(&self, policy_id: uuid::Uuid) {
@@ -215,6 +248,7 @@ impl Http1BackendPool {
 
     fn apply_removal_locked(&self, runtime: &mut RuntimeState, removal: BackendRemoval) {
         runtime.idle.remove(&removal.connection_id);
+        runtime.capacity.remove(&removal.connection_id);
         self.counters
             .active_connections
             .fetch_sub(1, Ordering::Relaxed);

@@ -1052,7 +1052,13 @@ async fn proxy_request(
 
     let client_upgrade =
         (!public_http2 && is_upgrade_request(&request)).then(|| hyper::upgrade::on(&mut request));
-    prepare_forward_headers(&mut request, peer, &original_host, scheme, native_grpc);
+    if prepare_forward_headers(&mut request, peer, &original_host, scheme, native_grpc).is_err() {
+        context
+            .statistics
+            .failed_requests
+            .fetch_add(1, Ordering::Relaxed);
+        return TrackedBody::plain(StatusCode::BAD_REQUEST, "malformed Connection header");
+    }
     if let Some(settings) = h2c_settings {
         request.headers_mut().insert("http2-settings", settings);
         request.headers_mut().insert(
@@ -1273,7 +1279,22 @@ async fn proxy_request(
         };
         (response, None)
     };
-    clean_response_headers(&mut response);
+    if clean_response_headers(&mut response).is_err() {
+        context
+            .statistics
+            .failed_requests
+            .fetch_add(1, Ordering::Relaxed);
+        if native_grpc {
+            context
+                .statistics
+                .grpc_failures_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        return TrackedBody::plain(
+            StatusCode::BAD_GATEWAY,
+            "backend returned a malformed Connection header",
+        );
+    }
     *response.version_mut() = public_version;
     let grpc = native_grpc.then(|| GrpcBodyState::new(context.statistics.clone(), &response));
     let mut activity = Some(activity);
@@ -1763,7 +1784,7 @@ fn prepare_forward_headers<B>(
     original_host: &str,
     scheme: PublicScheme,
     preserve_te_trailers: bool,
-) {
+) -> Result<(), ()> {
     let client_ip = if scheme == PublicScheme::Http {
         trusted_client_ip(request, peer)
     } else {
@@ -1779,7 +1800,7 @@ fn prepare_forward_headers<B>(
         request.headers_mut(),
         preserve_upgrade,
         preserve_te_trailers,
-    );
+    )?;
     for name in [
         "forwarded",
         "x-real-ip",
@@ -1802,6 +1823,7 @@ fn prepare_forward_headers<B>(
         "x-forwarded-proto",
         HeaderValue::from_static(forwarded_proto),
     );
+    Ok(())
 }
 
 fn trusted_client_ip<B>(request: &Request<B>, peer: SocketAddr) -> IpAddr {
@@ -1832,24 +1854,18 @@ fn trusted_forwarded_proto<B>(request: &Request<B>, peer: SocketAddr) -> &'stati
     }
 }
 
-fn clean_response_headers(response: &mut Response<Incoming>) {
+fn clean_response_headers(response: &mut Response<Incoming>) -> Result<(), ()> {
     let upgrade = response.status() == StatusCode::SWITCHING_PROTOCOLS;
     let preserve_te_trailers = response.version() == Version::HTTP_2;
-    remove_hop_by_hop_headers(response.headers_mut(), upgrade, preserve_te_trailers);
+    remove_hop_by_hop_headers(response.headers_mut(), upgrade, preserve_te_trailers)
 }
 
 fn remove_hop_by_hop_headers(
     headers: &mut hyper::HeaderMap,
     preserve_upgrade: bool,
     preserve_te_trailers: bool,
-) {
-    let connection_headers = headers
-        .get_all(header::CONNECTION)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .filter_map(|value| HeaderName::from_bytes(value.trim().as_bytes()).ok())
-        .collect::<HashSet<_>>();
+) -> Result<(), ()> {
+    let connection_headers = strict_connection_header_names(headers)?;
     for name in connection_headers {
         if preserve_upgrade && name == header::UPGRADE {
             continue;
@@ -1884,6 +1900,25 @@ fn remove_hop_by_hop_headers(
         headers.remove(header::CONNECTION);
         headers.remove(header::UPGRADE);
     }
+    Ok(())
+}
+
+fn strict_connection_header_names(headers: &hyper::HeaderMap) -> Result<HashSet<HeaderName>, ()> {
+    let mut names = HashSet::new();
+    for value in headers.get_all(header::CONNECTION).iter() {
+        let value = value.to_str().map_err(|_| ())?;
+        for token in value.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                return Err(());
+            }
+            let name = HeaderName::from_bytes(token.as_bytes()).map_err(|_| ())?;
+            if !names.insert(name) {
+                return Err(());
+            }
+        }
+    }
+    Ok(names)
 }
 
 fn is_native_grpc_request<B>(request: &Request<B>) -> bool {
@@ -2141,7 +2176,8 @@ mod tests {
             "site.example.com",
             PublicScheme::Http,
             false,
-        );
+        )
+        .unwrap();
         assert!(!request.headers().contains_key("http2-settings"));
     }
 
@@ -2154,7 +2190,7 @@ mod tests {
             header::TRANSFER_ENCODING,
             HeaderValue::from_static("chunked"),
         );
-        remove_hop_by_hop_headers(&mut valid, false, true);
+        remove_hop_by_hop_headers(&mut valid, false, true).unwrap();
         assert_eq!(
             valid.get(header::TE),
             Some(&HeaderValue::from_static("trailers"))
@@ -2169,10 +2205,16 @@ mod tests {
         invalid.insert(header::TE, HeaderValue::from_static("trailers, deflate"));
         invalid.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
         invalid.insert("keep-alive", HeaderValue::from_static("timeout=5"));
-        remove_hop_by_hop_headers(&mut invalid, false, true);
+        remove_hop_by_hop_headers(&mut invalid, false, true).unwrap();
         assert!(!invalid.contains_key(header::TE));
         assert!(!invalid.contains_key(header::CONNECTION));
         assert!(!invalid.contains_key("keep-alive"));
+
+        let mut malformed = hyper::HeaderMap::new();
+        malformed.insert(header::CONNECTION, HeaderValue::from_static("x-hop,,close"));
+        malformed.insert("x-hop", HeaderValue::from_static("must-not-leak"));
+        assert!(remove_hop_by_hop_headers(&mut malformed, false, false).is_err());
+        assert!(malformed.contains_key("x-hop"));
     }
 
     #[test]

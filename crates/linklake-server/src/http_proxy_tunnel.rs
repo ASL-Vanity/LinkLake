@@ -775,13 +775,18 @@ where
     let (mut external_reader, mut external_writer) = split(external);
     let (mut agent_reader, mut agent_writer) = split(agent);
     let request_limiter = limiter.clone();
+    let body_progress = Arc::new(AtomicU64::new(0));
+    let response_keep_alive =
+        client_keep_alive && matches!(body, RequestBody::None | RequestBody::ContentLength(0));
     let completion = {
+        let request_progress = body_progress.clone();
         let request = async {
             let body_bytes = copy_request_body(
                 &mut external_reader,
                 &mut agent_writer,
                 body,
                 request_limiter,
+                Some(request_progress.as_ref()),
             )
             .await?;
             // 普通 HTTP 请求的结束由 Content-Length、chunked 或无请求体语义确定，
@@ -794,7 +799,7 @@ where
                 &mut agent_reader,
                 &mut external_writer,
                 head_request,
-                client_keep_alive,
+                response_keep_alive,
                 limiter,
             )
             .await
@@ -821,7 +826,10 @@ where
             shutdown_with_idle_timeout(&mut external_writer).await?;
             response.backend_reusable = false;
             response.client_reusable = false;
-            (initial_bytes, response)
+            (
+                initial_bytes.saturating_add(body_progress.load(Ordering::Relaxed)),
+                response,
+            )
         }
     };
     Ok(HttpExchangeOutcome {
@@ -894,6 +902,7 @@ async fn copy_request_body<R, W>(
     writer: &mut W,
     body: RequestBody,
     limiter: Option<Arc<BandwidthLimiter>>,
+    progress: Option<&AtomicU64>,
 ) -> std::io::Result<u64>
 where
     R: AsyncRead + Unpin,
@@ -902,9 +911,9 @@ where
     match body {
         RequestBody::None => Ok(0),
         RequestBody::ContentLength(length) => {
-            copy_exact_bytes(external, writer, length, limiter).await
+            copy_exact_bytes(external, writer, length, limiter, progress).await
         }
-        RequestBody::Chunked => copy_chunked_body(external, writer, limiter).await,
+        RequestBody::Chunked => copy_chunked_body(external, writer, limiter, progress).await,
     }
 }
 
@@ -913,6 +922,7 @@ async fn copy_exact_bytes<R, W>(
     writer: &mut W,
     mut remaining: u64,
     limiter: Option<Arc<BandwidthLimiter>>,
+    progress: Option<&AtomicU64>,
 ) -> std::io::Result<u64>
 where
     R: AsyncRead + Unpin,
@@ -934,6 +944,9 @@ where
         }
         write_all_with_idle_timeout(writer, &buffer[..read]).await?;
         transferred = transferred.saturating_add(read as u64);
+        if let Some(progress) = progress {
+            progress.fetch_add(read as u64, Ordering::Relaxed);
+        }
         remaining -= read as u64;
     }
     Ok(transferred)
@@ -943,6 +956,7 @@ async fn copy_chunked_body<R, W>(
     reader: &mut R,
     writer: &mut W,
     limiter: Option<Arc<BandwidthLimiter>>,
+    progress: Option<&AtomicU64>,
 ) -> std::io::Result<u64>
 where
     R: AsyncRead + Unpin,
@@ -961,6 +975,9 @@ where
         })?;
         write_limited(writer, &line, limiter.as_ref()).await?;
         transferred = transferred.saturating_add(line.len() as u64);
+        if let Some(progress) = progress {
+            progress.fetch_add(line.len() as u64, Ordering::Relaxed);
+        }
         if size == 0 {
             let mut trailers = 0_usize;
             loop {
@@ -974,13 +991,17 @@ where
                 }
                 write_limited(writer, &trailer, limiter.as_ref()).await?;
                 transferred = transferred.saturating_add(trailer.len() as u64);
+                if let Some(progress) = progress {
+                    progress.fetch_add(trailer.len() as u64, Ordering::Relaxed);
+                }
                 if trailer == b"\r\n" {
                     return Ok(transferred);
                 }
             }
         }
-        transferred = transferred
-            .saturating_add(copy_exact_bytes(reader, writer, size, limiter.clone()).await?);
+        transferred = transferred.saturating_add(
+            copy_exact_bytes(reader, writer, size, limiter.clone(), progress).await?,
+        );
         let mut terminator = [0_u8; 2];
         read_exact_with_idle_timeout(reader, &mut terminator).await?;
         if terminator != *b"\r\n" {
@@ -991,6 +1012,9 @@ where
         }
         write_limited(writer, &terminator, limiter.as_ref()).await?;
         transferred = transferred.saturating_add(2);
+        if let Some(progress) = progress {
+            progress.fetch_add(2, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1123,9 +1147,9 @@ where
             ResponseBody::None => 0,
             ResponseBody::UntilEof => copy_until_eof(reader, writer, limiter).await?,
             ResponseBody::ContentLength(length) => {
-                copy_exact_bytes(reader, writer, length, limiter).await?
+                copy_exact_bytes(reader, writer, length, limiter, None).await?
             }
-            ResponseBody::Chunked => copy_chunked_body(reader, writer, limiter).await?,
+            ResponseBody::Chunked => copy_chunked_body(reader, writer, limiter, None).await?,
         };
         flush_with_idle_timeout(writer).await?;
         if !response_client_reusable {
@@ -1991,6 +2015,7 @@ mod tests {
             &mut source_reader,
             &mut target_writer,
             super::RequestBody::Chunked,
+            None,
             None,
         )
         .await

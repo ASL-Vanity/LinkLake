@@ -313,11 +313,35 @@ impl BackendPoolState {
         mode: BackendConnectionMode,
         now: Instant,
     ) -> Result<BackendRegistration, BackendRegisterError> {
+        let removals = self.prepare_registration(&origin)?;
+        let connection_id = self.next_available_connection_id();
+        self.entries.insert(
+            connection_id,
+            BackendEntry {
+                origin,
+                mode,
+                active_streams: 0,
+                last_activity: now,
+                draining: false,
+            },
+        );
+        Ok(BackendRegistration {
+            connection_id,
+            removals,
+        })
+    }
+
+    /// 在执行真实网络建连前回收可安全驱逐的空闲项并验证容量。
+    /// 调用方仍需持有独立容量 reservation，避免多个来源同时通过检查。
+    pub fn prepare_registration(
+        &mut self,
+        origin: &OriginKey,
+    ) -> Result<Vec<BackendRemoval>, BackendRegisterError> {
         let mut removals = Vec::new();
-        while self.connection_count_for_origin(&origin)
+        while self.connection_count_for_origin(origin)
             >= self.limits.max_connections_per_origin.get()
         {
-            let Some(connection_id) = self.oldest_idle(Some(&origin)) else {
+            let Some(connection_id) = self.oldest_idle(Some(origin)) else {
                 return Err(BackendRegisterError::CapacityBusy);
             };
             if let Some(removal) = self.remove(connection_id, BackendRemovalReason::OriginCapacity)
@@ -335,21 +359,7 @@ impl BackendPoolState {
             }
         }
 
-        let connection_id = self.next_available_connection_id();
-        self.entries.insert(
-            connection_id,
-            BackendEntry {
-                origin,
-                mode,
-                active_streams: 0,
-                last_activity: now,
-                draining: false,
-            },
-        );
-        Ok(BackendRegistration {
-            connection_id,
-            removals,
-        })
+        Ok(removals)
     }
 
     pub fn acquire(&mut self, origin: &OriginKey, now: Instant) -> Option<BackendLease> {
