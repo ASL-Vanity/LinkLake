@@ -5125,9 +5125,8 @@ async fn check_server_update(
         server_update_busy_error()
     })?;
     let update_state = linklake_update::default_state_directory(UpdateProduct::Server);
-    ensure_server_update_idle(&update_state).map_err(|error| {
+    ensure_server_update_idle(&update_state).inspect_err(|_| {
         record_server_update_rejection(&state, operation, &principal, "active_update");
-        error
     })?;
     let result = match linklake_update::check(
         UpdateProduct::Server,
@@ -5165,18 +5164,16 @@ async fn download_server_update(
     let principal =
         require_interactive_update_administrator(&state, &headers, &request_host, operation)?;
     require_server_update_confirmation(&request.confirmation, UPDATE_DOWNLOAD_CONFIRMATION)
-        .map_err(|error| {
+        .inspect_err(|_| {
             record_server_update_rejection(&state, operation, &principal, "confirmation_mismatch");
-            error
         })?;
     let _operation = state.server_update_operation_lock.try_lock().map_err(|_| {
         record_server_update_rejection(&state, operation, &principal, "operation_lock_busy");
         server_update_busy_error()
     })?;
     let update_state = linklake_update::default_state_directory(UpdateProduct::Server);
-    ensure_server_update_idle(&update_state).map_err(|error| {
+    ensure_server_update_idle(&update_state).inspect_err(|_| {
         record_server_update_rejection(&state, operation, &principal, "active_update");
-        error
     })?;
     let staged = match linklake_update::download(
         UpdateProduct::Server,
@@ -5222,12 +5219,10 @@ async fn apply_server_update(
     let operation = ServerUpdateOperation::Apply;
     let principal =
         require_interactive_update_administrator(&state, &headers, &request_host, operation)?;
-    require_server_update_confirmation(&request.confirmation, UPDATE_APPLY_CONFIRMATION).map_err(
-        |error| {
+    require_server_update_confirmation(&request.confirmation, UPDATE_APPLY_CONFIRMATION)
+        .inspect_err(|_| {
             record_server_update_rejection(&state, operation, &principal, "confirmation_mismatch");
-            error
-        },
-    )?;
+        })?;
     let Some(data_directory) = state.server_update_data_directory.as_deref() else {
         record_server_update_rejection(
             &state,
@@ -5246,9 +5241,8 @@ async fn apply_server_update(
         server_update_busy_error()
     })?;
     let update_state = linklake_update::default_state_directory(UpdateProduct::Server);
-    ensure_server_update_idle(&update_state).map_err(|error| {
+    ensure_server_update_idle(&update_state).inspect_err(|_| {
         record_server_update_rejection(&state, operation, &principal, "active_update");
-        error
     })?;
     let scheduled = match linklake_update::server_apply(
         UPDATE_REPOSITORY,
@@ -14300,9 +14294,8 @@ fn require_interactive_update_administrator(
     operation: ServerUpdateOperation,
 ) -> Result<ManagementPrincipal, CodedApiError> {
     let principal = require_interactive_server_update_administrator(state, headers, operation)?;
-    require_same_origin_update_request(headers, request_host).map_err(|error| {
+    require_same_origin_update_request(headers, request_host).inspect_err(|_| {
         record_server_update_rejection(state, operation, &principal, "same_origin_check_failed");
-        error
     })?;
     Ok(principal)
 }
