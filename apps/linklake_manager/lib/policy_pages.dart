@@ -785,7 +785,16 @@ class _PolicyPageState extends State<PolicyPage> {
         }
         rethrow;
       }
-      if (policy == null) await _showCreatedCredentials(response);
+      if (policy == null) {
+        try {
+          await _showCreatedCredentials(response);
+        } on LinkLakeApiException catch (error) {
+          if (error.code == 'invalid_response') {
+            await widget.onRefresh();
+          }
+          rethrow;
+        }
+      }
       _message(
         policy == null
             ? t('策略已创建', 'Policy created')
@@ -797,8 +806,19 @@ class _PolicyPageState extends State<PolicyPage> {
 
   Future<void> _showCreatedCredentials(Map<String, dynamic> response) async {
     final field = widget.kind.oneTimeCredentialField;
-    final credential = field == null ? null : response[field];
-    if (credential == null || !mounted) return;
+    if (field == null) return;
+    final credential = response[field];
+    if (credential is! String || credential.trim().isEmpty) {
+      throw LinkLakeApiException(
+        500,
+        t(
+          '策略可能已创建，但一次性凭据响应无效。策略列表已刷新，请检查现有策略，避免再次创建重复策略。',
+          'The policy may have been created, but the one-time credential response was invalid. The policy list was refreshed; review the existing policy instead of creating a duplicate.',
+        ),
+        code: 'invalid_response',
+      );
+    }
+    if (!mounted) return;
     final username = response['username'];
     await showDialog<void>(
       context: context,

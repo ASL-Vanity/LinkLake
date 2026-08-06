@@ -19,9 +19,25 @@ void main() {
     );
     expect(RoleCapabilities(ManagementRole.operator).canWritePolicies, isTrue);
     expect(RoleCapabilities(ManagementRole.operator).canManageUsers, isFalse);
+    expect(
+      RoleCapabilities(ManagementRole.operator).canManageSessions,
+      isFalse,
+    );
+    expect(
+      RoleCapabilities(ManagementRole.operator).canManageApiTokens,
+      isFalse,
+    );
     expect(RoleCapabilities(ManagementRole.operator).canManageTotp, isTrue);
     expect(RoleCapabilities(ManagementRole.auditor).canWritePolicies, isFalse);
+    expect(RoleCapabilities(ManagementRole.auditor).canManageUsers, isFalse);
+    expect(RoleCapabilities(ManagementRole.auditor).canManageSessions, isFalse);
+    expect(
+      RoleCapabilities(ManagementRole.auditor).canManageApiTokens,
+      isFalse,
+    );
     expect(RoleCapabilities(ManagementRole.auditor).canManageTotp, isFalse);
+    expect(visibleDestinationIds(ManagementRole.operator), contains('users'));
+    expect(visibleDestinationIds(ManagementRole.auditor), contains('users'));
   });
 
   test('request plans omit administrator-only endpoints for non-admins', () {
@@ -80,19 +96,19 @@ void main() {
       expect(api.calls.contains('/api/v1/api-tokens'), isAdmin);
       expect(api.calls.contains('/api/v1/fleet/overview'), isAdmin);
 
-      if (role == 'operator') {
-        await tester.tap(find.byKey(const Key('nav-users')));
-        await tester.pumpAndSettle();
-        expect(find.text('Account security'), findsOneWidget);
-        expect(find.byKey(const Key('create-user')), findsNothing);
-      }
-
-      if (role == 'auditor') {
+      if (!isAdmin) {
         await tester.tap(find.byKey(const Key('nav-users')));
         await tester.pumpAndSettle();
         expect(find.text('Account security'), findsOneWidget);
         expect(find.text('Account password'), findsOneWidget);
-        expect(find.text('Two-factor authentication'), findsNothing);
+        expect(find.byKey(const Key('create-user')), findsNothing);
+        expect(find.text('Users and sessions'), findsNothing);
+        expect(find.text('Active sessions'), findsNothing);
+        expect(find.text('API tokens'), findsNothing);
+        expect(
+          find.text('Two-factor authentication'),
+          role == 'operator' ? findsOneWidget : findsNothing,
+        );
       }
 
       await tester.tap(find.byKey(const Key('nav-tcp')));
