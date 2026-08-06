@@ -6,9 +6,12 @@
 
 ### 开发计划 / Development plan
 
-- 不再单独发布 `v1.0.1`；管理界面完善、安全远程更新、协议补全、业务健康与 Fleet、PostgreSQL 高可用、平台安装器和依赖现代化统一纳入 `v1.1.0`。
-- 开发阶段不创建版本标签或部署半成品；全部功能冻结后再统一执行完整测试、集中修复、上海灰度、新加坡升级和正式发布。
-- 本节只记录已批准的版本范围，不声明相关功能已经实现；实际完成状态以对应 Issue、合入提交和最终验收证据为准。
+- 中文：不再单独发布 `v1.0.1`；管理界面完善、安全远程更新、协议补全、业务健康与 Fleet、PostgreSQL 高可用、平台安装器和依赖现代化统一纳入 `v1.1.0`。
+  English: The project will not publish a separate `v1.0.1`; management-surface completion, secure remote updates, protocol completion, application health and Fleet, PostgreSQL high availability, platform installers, and dependency modernization are consolidated into `v1.1.0`.
+- 中文：开发阶段不创建版本标签或部署半成品；全部功能冻结后再统一执行完整测试、集中修复、上海灰度、新加坡升级和正式发布。
+  English: No version tag or partial deployment will be created during development; after the complete feature set is frozen, the project will run full testing and consolidated remediation, stage in Shanghai, upgrade Singapore, and publish the formal release.
+- 中文：本节只记录已批准的版本范围，不声明相关功能已经实现；实际完成状态以对应 Issue、合入提交和最终验收证据为准。
+  English: This section records only the approved release scope and does not claim that the listed capabilities are implemented; the corresponding issues, merged commits, and final acceptance evidence remain the source of truth for completion status.
 
 ## 1.0.0 - 2026-08-06
 
