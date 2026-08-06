@@ -309,10 +309,28 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.byKey(const Key('nav-users')), findsOneWidget);
 
+    api.calls.clear();
     api.role = 'auditor';
     await tester.tap(find.byTooltip('Refresh'));
     await tester.pumpAndSettle();
-    expect(find.byKey(const Key('nav-users')), findsNothing);
+    expect(find.byKey(const Key('nav-users')), findsOneWidget);
     expect(find.byKey(const Key('nav-fleet')), findsNothing);
+    for (final path in const [
+      '/api/v1/users',
+      '/api/v1/sessions',
+      '/api/v1/api-tokens',
+      '/api/v1/fleet/overview',
+    ]) {
+      expect(api.calls, isNot(contains(path)));
+    }
+
+    await tester.tap(find.byKey(const Key('nav-users')));
+    await tester.pumpAndSettle();
+    expect(find.text('Account security'), findsOneWidget);
+    expect(find.text('Account password'), findsOneWidget);
+    expect(find.text('Users and sessions'), findsNothing);
+    expect(find.text('Active sessions'), findsNothing);
+    expect(find.text('API tokens'), findsNothing);
+    expect(find.byKey(const Key('create-user')), findsNothing);
   });
 }

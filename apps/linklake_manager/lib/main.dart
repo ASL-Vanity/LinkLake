@@ -13,6 +13,7 @@ import 'manager_theme.dart';
 import 'metric_charts.dart';
 import 'policy_pages.dart';
 import 'rbac.dart';
+import 'refresh_queue.dart';
 import 'server_profiles.dart';
 import 'update_protocol.dart';
 import 'user_management.dart';
@@ -553,8 +554,8 @@ class _DashboardPageState extends State<DashboardPage> {
   String _page = 'overview';
   late bool _chinese;
   late ManagerSettings _settings;
+  late final RefreshQueue _refreshQueue;
   bool _busy = true;
-  bool _refreshing = false;
   String? _error;
   Timer? _timer;
   Map<String, dynamic> _status = {};
@@ -588,11 +589,12 @@ class _DashboardPageState extends State<DashboardPage> {
     _chinese = widget.chinese;
     _settings = widget.settings;
     _identity = Map<String, dynamic>.from(widget.initialIdentity);
-    _refresh();
+    _refreshQueue = RefreshQueue(_performRefresh);
+    unawaited(_refresh());
     unawaited(_refreshManagerUpdateStatus(silent: true));
     _timer = Timer.periodic(
       const Duration(seconds: 10),
-      (_) => _refresh(silent: true),
+      (_) => unawaited(_refresh(silent: true)),
     );
   }
 
@@ -605,13 +607,16 @@ class _DashboardPageState extends State<DashboardPage> {
   @override
   void dispose() {
     _timer?.cancel();
+    _refreshQueue.dispose();
     widget.api.close();
     super.dispose();
   }
 
-  Future<void> _refresh({bool silent = false}) async {
-    if (_refreshing) return;
-    _refreshing = true;
+  Future<void> _refresh({bool silent = false}) =>
+      _refreshQueue.request(silent: silent);
+
+  Future<void> _performRefresh(bool silent) async {
+    if (!mounted) return;
     if (!silent) setState(() => _busy = true);
     try {
       final identity = await widget.api.getObject('/api/v1/auth/me');
@@ -660,7 +665,6 @@ class _DashboardPageState extends State<DashboardPage> {
     } catch (error) {
       if (mounted) setState(() => _error = _refreshError(error));
     } finally {
-      _refreshing = false;
       if (mounted && !silent) setState(() => _busy = false);
     }
   }

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:linklake_manager/policy_pages.dart';
@@ -328,6 +330,65 @@ void main() {
     expect(api.posts.single.$2, isNot(contains('access_key')));
   });
 
+  for (final kind in const [
+    PolicyKind.secret,
+    PolicyKind.socks5,
+    PolicyKind.proxy,
+  ]) {
+    for (final invalidCredential in const <(String, Object?)>[
+      ('null', null),
+      ('empty', ''),
+      ('blank', '   '),
+    ]) {
+      testWidgets(
+        '${kind.name} rejects ${invalidCredential.$1} one-time credentials after refresh',
+        (tester) async {
+          tester.view.physicalSize = const Size(1200, 900);
+          tester.view.devicePixelRatio = 1;
+          addTearDown(tester.view.resetPhysicalSize);
+          addTearDown(tester.view.resetDevicePixelRatio);
+          final api = FakeLinkLakeApi();
+          api.objectResponses[kind.collectionPath] = {
+            'id': '${kind.name}-created',
+            kind.oneTimeCredentialField!: invalidCredential.$2,
+          };
+          final refreshStarted = Completer<void>();
+          final releaseRefresh = Completer<void>();
+          var refreshes = 0;
+          await tester.pumpWidget(
+            policyHarness(
+              api: api,
+              kind: kind,
+              onRefresh: () async {
+                refreshes++;
+                if (!refreshStarted.isCompleted) refreshStarted.complete();
+                await releaseRefresh.future;
+              },
+            ),
+          );
+          await _openAndFillCredentialPolicy(tester, kind);
+          await tester.tap(find.byKey(const Key('save-policy')));
+          await tester.pump();
+          await refreshStarted.future;
+
+          expect(refreshes, 1);
+          expect(
+            find.textContaining('one-time credential response was invalid'),
+            findsNothing,
+          );
+          releaseRefresh.complete();
+          await tester.pumpAndSettle();
+
+          expect(api.posts, hasLength(1));
+          expect(
+            find.textContaining('one-time credential response was invalid'),
+            findsOneWidget,
+          );
+        },
+      );
+    }
+  }
+
   testWidgets('policy toggle and confirmed delete update CRUD state', (
     tester,
   ) async {
@@ -452,4 +513,22 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.textContaining('controlled failure'), findsOneWidget);
   });
+}
+
+Future<void> _openAndFillCredentialPolicy(
+  WidgetTester tester,
+  PolicyKind kind,
+) async {
+  await tester.tap(find.byKey(Key('create-${kind.key}')));
+  await tester.pumpAndSettle();
+  await tester.enterText(find.byKey(const Key('field-name')), 'credential');
+  if (kind == PolicyKind.secret) {
+    await tester.enterText(
+      find.byKey(const Key('field-target_addr')),
+      '127.0.0.1:22',
+    );
+    return;
+  }
+  await tester.enterText(find.byKey(const Key('field-public_port')), '32100');
+  await tester.enterText(find.byKey(const Key('field-username')), 'proxy-user');
 }

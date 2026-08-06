@@ -415,6 +415,7 @@ class _UserManagementPageState extends State<UserManagementPage> {
             ),
           ),
           FilledButton.icon(
+            key: const Key('create-api-token'),
             onPressed: _working || !widget.capabilities.canManageApiTokens
                 ? null
                 : _createApiToken,
@@ -1067,6 +1068,7 @@ class _UserManagementPageState extends State<UserManagementPage> {
     final days = TextEditingController();
     var scope = 'read';
     var submitting = false;
+    var invalidOneTimeCredential = false;
     String? error;
     final created = await showDialog<Map<String, dynamic>>(
       context: context,
@@ -1129,6 +1131,7 @@ class _UserManagementPageState extends State<UserManagementPage> {
                 child: Text(t('取消', 'Cancel')),
               ),
               FilledButton(
+                key: const Key('save-api-token'),
                 onPressed: submitting
                     ? null
                     : () async {
@@ -1166,13 +1169,13 @@ class _UserManagementPageState extends State<UserManagementPage> {
                                               1000 +
                                           expiryDays * 86400,
                               });
-                          final token = value['token']?.toString() ?? '';
-                          if (token.isEmpty) {
-                            throw const LinkLakeApiException(
-                              500,
-                              'server did not return the one-time API token',
-                              code: 'invalid_response',
-                            );
+                          final token = value['token'];
+                          if (token is! String || token.trim().isEmpty) {
+                            invalidOneTimeCredential = true;
+                            if (context.mounted) {
+                              Navigator.pop(dialogContext);
+                            }
+                            return;
                           }
                           if (context.mounted) {
                             Navigator.pop(dialogContext, value);
@@ -1198,6 +1201,10 @@ class _UserManagementPageState extends State<UserManagementPage> {
       ),
     );
     await _disposeControllers([name, days]);
+    if (invalidOneTimeCredential) {
+      await _recoverFromInvalidApiTokenCredential();
+      return;
+    }
     if (created == null || !mounted) return;
     final token = created['token']!.toString();
     await showDialog<void>(
@@ -1214,6 +1221,29 @@ class _UserManagementPageState extends State<UserManagementPage> {
       ),
     );
     await _refreshAfterDialog();
+  }
+
+  Future<void> _recoverFromInvalidApiTokenCredential() async {
+    Object? refreshFailure;
+    try {
+      await widget.onRefresh();
+    } catch (error) {
+      refreshFailure = error;
+    }
+    if (!mounted) return;
+    final message = t(
+      '令牌可能已创建但一次性凭据无效。已强制刷新令牌元数据，请检查现有令牌，避免重复创建。',
+      'The token may have been created, but its one-time credential was invalid. Token metadata was forcibly refreshed; review existing tokens instead of creating a duplicate.',
+    );
+    widget.onError(
+      LinkLakeApiException(
+        500,
+        refreshFailure == null
+            ? message
+            : '$message ${t('刷新失败：', 'Refresh failed:')} $refreshFailure',
+        code: 'invalid_response',
+      ),
+    );
   }
 
   Future<void> _revokeApiToken(Map<String, dynamic> token) async {

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:linklake_manager/rbac.dart';
@@ -180,9 +182,69 @@ void main() {
       expect(api.deletes, contains('/api/v1/sessions/other-session'));
     },
   );
+
+  for (final invalidResponse in const <(String, Map<String, dynamic>)>[
+    ('missing', {'id': 'token-created'}),
+    ('null', {'id': 'token-created', 'token': null}),
+    ('empty', {'id': 'token-created', 'token': ''}),
+    ('blank', {'id': 'token-created', 'token': '   '}),
+  ]) {
+    testWidgets(
+      'API token ${invalidResponse.$1} credential closes creation and refreshes metadata',
+      (tester) async {
+        final api = FakeLinkLakeApi();
+        api.objectResponses['/api/v1/api-tokens'] = invalidResponse.$2;
+        final refreshStarted = Completer<void>();
+        final releaseRefresh = Completer<void>();
+        Object? reportedError;
+        var refreshes = 0;
+        await _pumpPage(
+          tester,
+          api,
+          onRefresh: () async {
+            refreshes++;
+            if (!refreshStarted.isCompleted) refreshStarted.complete();
+            await releaseRefresh.future;
+          },
+          onError: (error) => reportedError = error,
+        );
+
+        await tester.tap(find.byKey(const Key('create-api-token')));
+        await tester.pumpAndSettle();
+        await tester.enterText(
+          find.widgetWithText(TextField, 'Name'),
+          'deployment-token',
+        );
+        await tester.tap(find.byKey(const Key('save-api-token')));
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 600));
+        await refreshStarted.future;
+
+        expect(api.posts, hasLength(1));
+        expect(refreshes, 1);
+        expect(reportedError, isNull);
+        expect(find.byKey(const Key('save-api-token')), findsNothing);
+
+        releaseRefresh.complete();
+        await tester.pumpAndSettle();
+        expect(
+          reportedError.toString(),
+          contains(
+            'The token may have been created, but its one-time credential was invalid',
+          ),
+        );
+        expect(api.posts, hasLength(1));
+      },
+    );
+  }
 }
 
-Future<void> _pumpPage(WidgetTester tester, FakeLinkLakeApi api) async {
+Future<void> _pumpPage(
+  WidgetTester tester,
+  FakeLinkLakeApi api, {
+  Future<void> Function()? onRefresh,
+  void Function(Object)? onError,
+}) async {
   tester.view.physicalSize = const Size(1280, 1000);
   tester.view.devicePixelRatio = 1;
   addTearDown(tester.view.resetPhysicalSize);
@@ -209,8 +271,8 @@ Future<void> _pumpPage(WidgetTester tester, FakeLinkLakeApi api) async {
           apiTokens: const [],
           capabilities: const RoleCapabilities(ManagementRole.administrator),
           chinese: false,
-          onRefresh: () async {},
-          onError: (error) => fail(error.toString()),
+          onRefresh: onRefresh ?? () async {},
+          onError: onError ?? (error) => fail(error.toString()),
         ),
       ),
     ),
