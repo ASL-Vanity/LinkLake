@@ -1,6 +1,6 @@
 # LinkLake
 
-[中文](README.md) | English
+[中文](README.md) | English | [Roadmap](ROADMAP.en.md)
 
 LinkLake is a cross-platform secure tunnel platform implemented from scratch in Rust, with independent core, server, client, and management-plane components.
 
@@ -481,14 +481,7 @@ Packaging scripts honor `SOURCE_DATE_EPOCH`. With the same timestamp, source, to
 
 ## Roadmap
 
-1. Secret tunnels: complete
-2. SOCKS5 TCP: complete
-3. SOCKS5 UDP Associate: complete
-4. HTTP forward proxy / CONNECT: complete
-5. Multi-port and port-range forwarding: complete
-6. TLS SNI pass-through: complete
-7. Multi-node and P2P operation with explicit relay fallback: complete
-8. Flutter management client: first cross-platform release complete
+`v1.0.0` completed the core protocols and the first cross-platform management release. `v1.0.1` focuses on Web UI/Flutter Manager experience and maintainability, `v1.1.0` on real application-health and multi-cloud reliability, and `v1.2.0` on a highly available control plane and backend-protocol extensions. See [`ROADMAP.en.md`](ROADMAP.en.md) for scope, acceptance criteria, and continuing support boundaries.
 
 ## License
 

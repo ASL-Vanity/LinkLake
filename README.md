@@ -1,6 +1,6 @@
 # LinkLake
 
-[English](README.en.md) | 中文
+[English](README.en.md) | 中文 | [路线图](ROADMAP.md)
 
 LinkLake 是一个使用 Rust 从零实现的跨平台安全隧道平台，采用独立的核心、服务端、客户端和管理平面架构。
 
@@ -489,14 +489,7 @@ macOS 开发者可使用 `scripts/package-macos.sh`、`scripts/verify-macos-pack
 
 ## 后续路线
 
-1. Secret 私密隧道：已完成
-2. SOCKS5 TCP：已完成
-3. SOCKS5 UDP Associate：已完成
-4. HTTP Forward Proxy / CONNECT：已完成
-5. 多端口与端口范围：已完成
-6. TLS SNI 透传：已完成
-7. 多节点和显式中继回退的 P2P：已完成
-8. Flutter 管理客户端：已完成首个跨平台版本
+`v1.0.0` 已完成核心协议与首个跨平台管理版本。`v1.0.1` 聚焦 Web UI/Flutter Manager 体验与维护性，`v1.1.0` 聚焦真实业务健康检查和多云可靠性，`v1.2.0` 规划高可用控制平面与后端协议扩展。范围、验收标准和持续支持边界见 [`ROADMAP.md`](ROADMAP.md)。
 
 ## 许可证
 
