@@ -40,8 +40,10 @@ for (const marker of [
   '/api/v1/updates/server/check',
   '/api/v1/updates/server/download',
   '/api/v1/updates/server/apply',
-  "confirmation: 'DOWNLOAD'",
-  "confirmation: 'UPDATE'",
+  "promptForUpdateConfirmation('confirmDownloadUpdate', 'DOWNLOAD')",
+  "promptForUpdateConfirmation('confirmApplyUpdate', 'UPDATE')",
+  'operation_active',
+  'state.dashboard.updateOverview.operation_active = true',
   'Remote client replacement is intentionally unavailable'
 ]) {
   ensure(`${html}\n${app}`.includes(marker), `secure update contract missing: ${marker}`);

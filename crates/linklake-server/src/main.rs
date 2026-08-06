@@ -49,8 +49,8 @@ use anyhow::Context;
 use api_tokens::{ApiTokenCatalog, ApiTokenScope, CreateApiToken, CreatedApiToken};
 use audit_log::{AuditEvent, AuditLog};
 use axum::{
-    extract::{ConnectInfo, Path, Query, Request, State},
-    http::{header, HeaderMap, Method, StatusCode},
+    extract::{ConnectInfo, FromRequestParts, Path, Query, Request, State},
+    http::{header, request::Parts, HeaderMap, Method, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post, put},
@@ -148,6 +148,8 @@ const MANAGEMENT_UI_THEME_BOOTSTRAP: &str = include_str!("../web/theme-bootstrap
 const UPDATE_REPOSITORY: &str = "ASL-Vanity/LinkLake";
 const UPDATE_DOWNLOAD_CONFIRMATION: &str = "DOWNLOAD";
 const UPDATE_APPLY_CONFIRMATION: &str = "UPDATE";
+const UPDATE_CSRF_HEADER: &str = "x-linklake-csrf";
+const UPDATE_CSRF_VALUE: &str = "1";
 #[cfg(test)]
 static MANAGEMENT_UI: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     [
@@ -935,6 +937,7 @@ struct ServerUpdateOverviewResponse {
     channel: UpdateChannel,
     signature_policy: SignaturePolicy,
     status: ServerUpdateStatusView,
+    operation_active: bool,
     apply_available: bool,
     remote_client_update_available: bool,
     confirmation_required: bool,
@@ -1670,6 +1673,50 @@ impl IntoResponse for CodedApiError {
         )
             .into_response()
     }
+}
+
+struct ManagementRequestHost(String);
+
+#[axum::async_trait]
+impl<S> FromRequestParts<S> for ManagementRequestHost
+where
+    S: Send + Sync,
+{
+    type Rejection = CodedApiError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let uri_authority = parts.uri.authority().map(|value| value.as_str());
+        let mut host_values = parts.headers.get_all(header::HOST).iter();
+        let header_host = host_values
+            .next()
+            .map(|value| value.to_str())
+            .transpose()
+            .map_err(|_| invalid_management_request_host())?;
+        if host_values.next().is_some() {
+            return Err(invalid_management_request_host());
+        }
+        if let (Some(uri_authority), Some(header_host)) = (uri_authority, header_host) {
+            if !uri_authority.eq_ignore_ascii_case(header_host) {
+                return Err(invalid_management_request_host());
+            }
+        }
+        let request_host = uri_authority
+            .or(header_host)
+            .ok_or_else(invalid_management_request_host)?;
+        if request_host.contains('@') || request_host.parse::<axum::http::uri::Authority>().is_err()
+        {
+            return Err(invalid_management_request_host());
+        }
+        Ok(Self(request_host.to_owned()))
+    }
+}
+
+fn invalid_management_request_host() -> CodedApiError {
+    CodedApiError(
+        StatusCode::BAD_REQUEST,
+        "invalid_request_host",
+        "the management request host is invalid",
+    )
 }
 
 fn coded_management_error(error: ApiError) -> CodedApiError {
@@ -4921,16 +4968,18 @@ async fn server_update_overview(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<ServerUpdateOverviewResponse>, CodedApiError> {
-    require_administrator(&state, &headers)?;
+    require_interactive_administrator(&state, &headers)?;
     let update_state = linklake_update::default_state_directory(UpdateProduct::Server);
     let status = linklake_update::status(UpdateProduct::Server, &update_state)
         .map_err(|error| server_update_api_error("status", error))?;
+    let operation_active = server_update_operation_active(&update_state)?;
     Ok(Json(ServerUpdateOverviewResponse {
         build: BuildInfo::current("LinkLake Server"),
         repository: UPDATE_REPOSITORY,
         channel: UpdateChannel::Stable,
         signature_policy: SignaturePolicy::Production,
         status: status.into(),
+        operation_active,
         apply_available: state.server_update_data_directory.is_some(),
         remote_client_update_available: false,
         confirmation_required: true,
@@ -4939,21 +4988,34 @@ async fn server_update_overview(
 
 async fn check_server_update(
     State(state): State<Arc<AppState>>,
+    ManagementRequestHost(request_host): ManagementRequestHost,
     headers: HeaderMap,
 ) -> Result<Json<linklake_update::UpdateCheck>, CodedApiError> {
-    let principal = require_interactive_administrator(&state, &headers)?;
-    let _operation = state
-        .server_update_operation_lock
-        .try_lock()
-        .map_err(|_| server_update_busy_error())?;
-    let result = linklake_update::check(
+    let principal =
+        require_interactive_update_administrator(&state, &headers, &request_host, "check")?;
+    let _operation = state.server_update_operation_lock.try_lock().map_err(|_| {
+        record_server_update_rejection(&state, "check", &principal, "operation_lock_busy");
+        server_update_busy_error()
+    })?;
+    let update_state = linklake_update::default_state_directory(UpdateProduct::Server);
+    ensure_server_update_idle(&update_state).map_err(|error| {
+        record_server_update_rejection(&state, "check", &principal, "active_update");
+        error
+    })?;
+    let result = match linklake_update::check(
         UpdateProduct::Server,
         UPDATE_REPOSITORY,
         UpdateChannel::Stable,
         SignaturePolicy::Production,
     )
     .await
-    .map_err(|error| server_update_api_error("check", error))?;
+    {
+        Ok(result) => result,
+        Err(error) => {
+            record_server_update_failure(&state, "check", &principal);
+            return Err(server_update_api_error("check", error));
+        }
+    };
     record_audit(
         &state,
         "server.update.checked",
@@ -4968,17 +5030,27 @@ async fn check_server_update(
 
 async fn download_server_update(
     State(state): State<Arc<AppState>>,
+    ManagementRequestHost(request_host): ManagementRequestHost,
     headers: HeaderMap,
     Json(request): Json<ServerUpdateActionRequest>,
 ) -> Result<Json<ServerUpdateDownloadResponse>, CodedApiError> {
-    let principal = require_interactive_administrator(&state, &headers)?;
-    require_server_update_confirmation(&request.confirmation, UPDATE_DOWNLOAD_CONFIRMATION)?;
-    let _operation = state
-        .server_update_operation_lock
-        .try_lock()
-        .map_err(|_| server_update_busy_error())?;
+    let principal =
+        require_interactive_update_administrator(&state, &headers, &request_host, "download")?;
+    require_server_update_confirmation(&request.confirmation, UPDATE_DOWNLOAD_CONFIRMATION)
+        .map_err(|error| {
+            record_server_update_rejection(&state, "download", &principal, "confirmation_mismatch");
+            error
+        })?;
+    let _operation = state.server_update_operation_lock.try_lock().map_err(|_| {
+        record_server_update_rejection(&state, "download", &principal, "operation_lock_busy");
+        server_update_busy_error()
+    })?;
     let update_state = linklake_update::default_state_directory(UpdateProduct::Server);
-    let staged = linklake_update::download(
+    ensure_server_update_idle(&update_state).map_err(|error| {
+        record_server_update_rejection(&state, "download", &principal, "active_update");
+        error
+    })?;
+    let staged = match linklake_update::download(
         UpdateProduct::Server,
         UPDATE_REPOSITORY,
         UpdateChannel::Stable,
@@ -4987,7 +5059,13 @@ async fn download_server_update(
         SignaturePolicy::Production,
     )
     .await
-    .map_err(|error| server_update_api_error("download", error))?;
+    {
+        Ok(staged) => staged,
+        Err(error) => {
+            record_server_update_failure(&state, "download", &principal);
+            return Err(server_update_api_error("download", error));
+        }
+    };
     record_audit(
         &state,
         "server.update.downloaded",
@@ -5009,25 +5087,41 @@ async fn download_server_update(
 
 async fn apply_server_update(
     State(state): State<Arc<AppState>>,
+    ManagementRequestHost(request_host): ManagementRequestHost,
     headers: HeaderMap,
     Json(request): Json<ServerUpdateActionRequest>,
 ) -> Result<Json<ServerUpdateScheduleResponse>, CodedApiError> {
-    let principal = require_interactive_administrator(&state, &headers)?;
-    require_server_update_confirmation(&request.confirmation, UPDATE_APPLY_CONFIRMATION)?;
-    let data_directory = state
-        .server_update_data_directory
-        .as_deref()
-        .ok_or(CodedApiError(
+    let principal =
+        require_interactive_update_administrator(&state, &headers, &request_host, "apply")?;
+    require_server_update_confirmation(&request.confirmation, UPDATE_APPLY_CONFIRMATION).map_err(
+        |error| {
+            record_server_update_rejection(&state, "apply", &principal, "confirmation_mismatch");
+            error
+        },
+    )?;
+    let Some(data_directory) = state.server_update_data_directory.as_deref() else {
+        record_server_update_rejection(
+            &state,
+            "apply",
+            &principal,
+            "persistent_data_directory_required",
+        );
+        return Err(CodedApiError(
             StatusCode::CONFLICT,
             "server_update_unavailable",
             "server update requires a persistent LINKLAKE_DATA_DIR",
-        ))?;
-    let _operation = state
-        .server_update_operation_lock
-        .try_lock()
-        .map_err(|_| server_update_busy_error())?;
+        ));
+    };
+    let _operation = state.server_update_operation_lock.try_lock().map_err(|_| {
+        record_server_update_rejection(&state, "apply", &principal, "operation_lock_busy");
+        server_update_busy_error()
+    })?;
     let update_state = linklake_update::default_state_directory(UpdateProduct::Server);
-    let scheduled = linklake_update::server_apply(
+    ensure_server_update_idle(&update_state).map_err(|error| {
+        record_server_update_rejection(&state, "apply", &principal, "active_update");
+        error
+    })?;
+    let scheduled = match linklake_update::server_apply(
         UPDATE_REPOSITORY,
         UpdateChannel::Stable,
         &update_state,
@@ -5037,7 +5131,13 @@ async fn apply_server_update(
         SignaturePolicy::Production,
     )
     .await
-    .map_err(|error| server_update_api_error("apply", error))?;
+    {
+        Ok(scheduled) => scheduled,
+        Err(error) => {
+            record_server_update_failure(&state, "apply", &principal);
+            return Err(server_update_api_error("apply", error));
+        }
+    };
     record_audit(
         &state,
         "server.update.scheduled",
@@ -5075,8 +5175,56 @@ fn server_update_busy_error() -> CodedApiError {
     CodedApiError(
         StatusCode::CONFLICT,
         "server_update_busy",
-        "another server update operation is already running",
+        "another server update is active or requires local recovery",
     )
+}
+
+fn server_update_operation_active(update_state: &FsPath) -> Result<bool, CodedApiError> {
+    update_state
+        .join("active.json")
+        .try_exists()
+        .map_err(|error| server_update_api_error("active_status", error.into()))
+}
+
+fn ensure_server_update_idle(update_state: &FsPath) -> Result<(), CodedApiError> {
+    if server_update_operation_active(update_state)? {
+        Err(server_update_busy_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn record_server_update_rejection(
+    state: &AppState,
+    operation: &'static str,
+    principal: &ManagementPrincipal,
+    reason: &'static str,
+) {
+    record_audit(
+        state,
+        &format!("server.update.{operation}.rejected"),
+        "server",
+        &format!(
+            "actor={}; reason={reason}; channel=stable; signature_policy=production",
+            principal.username
+        ),
+    );
+}
+
+fn record_server_update_failure(
+    state: &AppState,
+    operation: &'static str,
+    principal: &ManagementPrincipal,
+) {
+    record_audit(
+        state,
+        &format!("server.update.{operation}.failed"),
+        "server",
+        &format!(
+            "actor={}; reason=secure_update_operation_failed; channel=stable; signature_policy=production",
+            principal.username
+        ),
+    );
 }
 
 fn server_update_api_error(operation: &'static str, error: anyhow::Error) -> CodedApiError {
@@ -13846,6 +13994,13 @@ fn require_interactive_administrator(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<ManagementPrincipal, CodedApiError> {
+    if headers.contains_key(header::AUTHORIZATION) {
+        return Err(CodedApiError(
+            StatusCode::FORBIDDEN,
+            "session_authentication_required",
+            "server updates reject bearer authentication and require an interactive administrator login",
+        ));
+    }
     let principal = require_administrator(state, headers)?;
     if principal.session_id.is_none() {
         return Err(CodedApiError(
@@ -13855,6 +14010,95 @@ fn require_interactive_administrator(
         ));
     }
     Ok(principal)
+}
+
+fn require_interactive_update_administrator(
+    state: &AppState,
+    headers: &HeaderMap,
+    request_host: &str,
+    operation: &'static str,
+) -> Result<ManagementPrincipal, CodedApiError> {
+    let principal = require_interactive_administrator(state, headers)?;
+    require_same_origin_update_request(headers, request_host).map_err(|error| {
+        record_server_update_rejection(state, operation, &principal, "same_origin_check_failed");
+        error
+    })?;
+    Ok(principal)
+}
+
+fn require_same_origin_update_request(
+    headers: &HeaderMap,
+    request_host: &str,
+) -> Result<(), CodedApiError> {
+    if headers
+        .get(UPDATE_CSRF_HEADER)
+        .and_then(|value| value.to_str().ok())
+        != Some(UPDATE_CSRF_VALUE)
+    {
+        return Err(CodedApiError(
+            StatusCode::FORBIDDEN,
+            "csrf_check_failed",
+            "server update requests require the LinkLake CSRF header",
+        ));
+    }
+    if headers
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value != "same-origin")
+    {
+        return Err(CodedApiError(
+            StatusCode::FORBIDDEN,
+            "update_origin_check_failed",
+            "server update requests must originate from the same management origin",
+        ));
+    }
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .ok_or(CodedApiError(
+            StatusCode::FORBIDDEN,
+            "update_origin_check_failed",
+            "server update requests require a same-origin Origin header",
+        ))?;
+    if !management_origin_matches_host(origin, request_host) {
+        return Err(CodedApiError(
+            StatusCode::FORBIDDEN,
+            "update_origin_check_failed",
+            "server update requests must originate from the same management origin",
+        ));
+    }
+    Ok(())
+}
+
+fn management_origin_matches_host(origin: &str, request_host: &str) -> bool {
+    let Ok(origin_uri) = origin.parse::<axum::http::Uri>() else {
+        return false;
+    };
+    let Some(scheme) = origin_uri.scheme_str() else {
+        return false;
+    };
+    let default_port = match scheme {
+        "http" => 80,
+        "https" => 443,
+        _ => return false,
+    };
+    if origin_uri.path() != "/" || origin_uri.query().is_some() {
+        return false;
+    }
+    let Some(origin_authority) = origin_uri.authority() else {
+        return false;
+    };
+    if origin_authority.as_str().contains('@') {
+        return false;
+    }
+    let Ok(request_authority) = request_host.parse::<axum::http::uri::Authority>() else {
+        return false;
+    };
+    origin_authority
+        .host()
+        .eq_ignore_ascii_case(request_authority.host())
+        && origin_authority.port_u16().unwrap_or(default_port)
+            == request_authority.port_u16().unwrap_or(default_port)
 }
 
 fn require_interactive_session(
@@ -13909,9 +14153,9 @@ async fn enforce_management_role(
         && bearer_token(request.headers()).is_none()
         && request
             .headers()
-            .get("x-linklake-csrf")
+            .get(UPDATE_CSRF_HEADER)
             .and_then(|value| value.to_str().ok())
-            != Some("1")
+            != Some(UPDATE_CSRF_VALUE)
     {
         return CodedApiError(
             StatusCode::FORBIDDEN,
@@ -14401,19 +14645,19 @@ mod tests {
         apply_cache_control, auth_me_response, build_metrics_history_response,
         certificate_target_matches, coded_http_route_creation_error, coded_tcp_policy_error,
         collect_slo_metrics, fleet_mutation_target, login_throttle_identity,
-        management_session_cookie, normalize_metrics_history_step, parse_metrics_history_range,
-        release_certificate_job_slot, render_prometheus_metrics,
-        require_server_update_confirmation, reserve_certificate_job_slot,
-        resolve_certificate_identifier_update, select_certificate_maintenance_operation,
-        session_cookie_header, spawn_listener_task, tcp_history_error_total,
-        udp_history_error_total, udp_metrics_response, validate_fleet_source_binding,
-        verify_agent_enrollment_identity, wait_for_listener_startup,
+        management_origin_matches_host, management_session_cookie, normalize_metrics_history_step,
+        parse_metrics_history_range, release_certificate_job_slot, render_prometheus_metrics,
+        require_same_origin_update_request, require_server_update_confirmation,
+        reserve_certificate_job_slot, resolve_certificate_identifier_update,
+        select_certificate_maintenance_operation, session_cookie_header, spawn_listener_task,
+        tcp_history_error_total, udp_history_error_total, udp_metrics_response,
+        validate_fleet_source_binding, verify_agent_enrollment_identity, wait_for_listener_startup,
         wait_for_listener_startup_with_timeout, CertificateOperation, FleetPolicyKind,
         HistoryCounters, HttpTransportCapabilitiesView, ListenerStartupProbe, LoginResponse,
-        LoginThrottle, ManagementPrincipal, MetricsHistory, MetricsHistoryProtocol,
-        MetricsHistorySample, Socks5CapabilitiesView, UserRole, LOGIN_THROTTLE_MAX_IDENTITIES,
-        MANAGEMENT_UI, MANAGEMENT_UI_DOCUMENT, MANAGEMENT_UI_SCRIPT, MANAGEMENT_UI_STYLES,
-        MANAGEMENT_UI_THEME_BOOTSTRAP, METRICS_HISTORY_ARCHIVE_CAPACITY,
+        LoginThrottle, ManagementPrincipal, ManagementRequestHost, MetricsHistory,
+        MetricsHistoryProtocol, MetricsHistorySample, Socks5CapabilitiesView, UserRole,
+        LOGIN_THROTTLE_MAX_IDENTITIES, MANAGEMENT_UI, MANAGEMENT_UI_DOCUMENT, MANAGEMENT_UI_SCRIPT,
+        MANAGEMENT_UI_STYLES, MANAGEMENT_UI_THEME_BOOTSTRAP, METRICS_HISTORY_ARCHIVE_CAPACITY,
         METRICS_HISTORY_ARCHIVE_SAMPLE_INTERVAL_SECONDS, METRICS_HISTORY_CAPACITY,
         METRICS_HISTORY_RECENT_RETENTION_SECONDS, METRICS_HISTORY_RETENTION_SECONDS,
         METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS, SLO_DEFAULT_AVAILABILITY_TARGET,
@@ -14427,6 +14671,7 @@ mod tests {
         tcp_tunnel::TunnelStatistics,
         udp_tunnel::UdpTunnelStatisticsSnapshot,
     };
+    use axum::extract::FromRequestParts;
     use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
     use ed25519_dalek::{Signer, SigningKey};
     use linklake_core::{
@@ -15462,6 +15707,71 @@ mod tests {
     }
 
     #[test]
+    fn server_update_origin_check_requires_same_origin_browser_headers() {
+        for (origin, host) in [
+            ("https://link.example.com", "link.example.com"),
+            ("https://link.example.com", "link.example.com:443"),
+            ("http://127.0.0.1:32100", "127.0.0.1:32100"),
+            ("https://[::1]:32100", "[::1]:32100"),
+        ] {
+            assert!(management_origin_matches_host(origin, host));
+        }
+        for (origin, host) in [
+            ("https://evil.example", "link.example.com"),
+            ("https://link.example.com:8443", "link.example.com:443"),
+            ("ftp://link.example.com", "link.example.com"),
+            ("https://link.example.com/path", "link.example.com"),
+            ("https://user@link.example.com", "link.example.com"),
+            ("null", "link.example.com"),
+        ] {
+            assert!(!management_origin_matches_host(origin, host));
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-linklake-csrf", HeaderValue::from_static("1"));
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://link.example.com"),
+        );
+        headers.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        assert!(require_same_origin_update_request(&headers, "link.example.com").is_ok());
+
+        headers.insert("sec-fetch-site", HeaderValue::from_static("cross-site"));
+        assert!(require_same_origin_update_request(&headers, "link.example.com").is_err());
+        headers.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        headers.remove(header::ORIGIN);
+        assert!(require_same_origin_update_request(&headers, "link.example.com").is_err());
+    }
+
+    #[tokio::test]
+    async fn server_update_host_binding_ignores_untrusted_forwarding_headers() {
+        let request = axum::http::Request::builder()
+            .uri("/api/v1/updates/server/check")
+            .header(header::HOST, "link.example.com")
+            .header(header::FORWARDED, "host=evil.example;proto=https")
+            .header("x-forwarded-host", "evil.example")
+            .body(())
+            .expect("request fixture should build");
+        let (mut parts, _) = request.into_parts();
+        let Ok(ManagementRequestHost(host)) =
+            ManagementRequestHost::from_request_parts(&mut parts, &()).await
+        else {
+            panic!("the original Host header should be accepted");
+        };
+        assert_eq!(host, "link.example.com");
+
+        let request = axum::http::Request::builder()
+            .uri("https://link.example.com/api/v1/updates/server/check")
+            .header(header::HOST, "evil.example")
+            .body(())
+            .expect("request fixture should build");
+        let (mut parts, _) = request.into_parts();
+        assert!(ManagementRequestHost::from_request_parts(&mut parts, &())
+            .await
+            .is_err());
+    }
+
+    #[test]
     fn web_ui_exposes_secure_update_center_without_remote_client_replacement() {
         for marker in [
             "href=\"#/updates\"",
@@ -15469,8 +15779,10 @@ mod tests {
             "/api/v1/updates/server/check",
             "/api/v1/updates/server/download",
             "/api/v1/updates/server/apply",
-            "confirmation: 'DOWNLOAD'",
-            "confirmation: 'UPDATE'",
+            "promptForUpdateConfirmation('confirmDownloadUpdate', 'DOWNLOAD')",
+            "promptForUpdateConfirmation('confirmApplyUpdate', 'UPDATE')",
+            "operation_active",
+            "state.dashboard.updateOverview.operation_active = true",
             "Production signatures only",
             "Remote client replacement is intentionally unavailable",
             "linklake-client update apply --yes",

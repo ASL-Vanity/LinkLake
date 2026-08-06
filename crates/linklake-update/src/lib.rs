@@ -613,6 +613,12 @@ pub async fn download(
     allow_downgrade: bool,
     signature_policy: SignaturePolicy,
 ) -> anyhow::Result<StagedUpdate> {
+    let state_directory = prepare_state_directory(state_directory)?;
+    let _download_lock = UpdateLock::acquire(&state_directory)?;
+    anyhow::ensure!(
+        !state_directory.join("active.json").exists(),
+        "another update is active or requires recovery; recover it before downloading another update"
+    );
     let installation = current_installation(product)?;
     let updater_version = Version::parse(env!("CARGO_PKG_VERSION"))?;
     let channel_version = installation.version.as_ref().unwrap_or(&updater_version);
@@ -627,7 +633,6 @@ pub async fn download(
         )?;
     }
 
-    let state_directory = prepare_state_directory(state_directory)?;
     let downloads = state_directory
         .join("downloads")
         .join(selected.version.to_string());

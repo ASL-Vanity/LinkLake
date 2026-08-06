@@ -134,12 +134,18 @@
         noUpdateScheduled: 'No update operation has been scheduled.',
         updateBusy: 'In progress',
         updateFailed: 'Failed',
+        updateSucceeded: 'Succeeded',
+        updateRolledBack: 'Rolled back',
         updateOperationFailed: 'The secure update operation failed. Check the server log and outbound GitHub connectivity.',
         updateChecked: 'Signed release metadata verified.',
         updateDownloaded: 'Update downloaded and verified.',
         updateScheduled: 'Update scheduled. The server will restart and roll back automatically if validation fails.',
+        updateApplyResponseInterrupted: 'The connection closed while scheduling the update. Do not retry until the server returns and the persisted update status has been refreshed.',
         confirmDownloadUpdate: 'Download the latest stable server package and verify its signed manifest and SHA-256 digest?',
         confirmApplyUpdate: 'Apply the latest stable server update now? The server will restart. Automatic rollback remains enabled.',
+        typeUpdateConfirmation: 'Type {phrase} to continue.',
+        updateConfirmationMismatch: 'The confirmation phrase did not match. No update request was sent.',
+        updateSecurityCheckFailed: 'The update request did not pass the same-origin session security check. Refresh the page and sign in again.',
         updateUnavailable: 'A persistent LINKLAKE_DATA_DIR is required before server updates can be applied.',
         confirmationProtected: 'Interactive administrator confirmation',
         signedManifestProtected: 'Ed25519 signed manifest',
@@ -223,12 +229,18 @@
         noUpdateScheduled: '当前没有已调度的更新操作。',
         updateBusy: '执行中',
         updateFailed: '失败',
+        updateSucceeded: '成功',
+        updateRolledBack: '已回滚',
         updateOperationFailed: '安全更新操作失败，请检查服务端日志和 GitHub 出站连接。',
         updateChecked: '签名版本元数据已验证。',
         updateDownloaded: '更新包已下载并通过校验。',
         updateScheduled: '更新已调度。服务端将重启；如果验证失败会自动回滚。',
+        updateApplyResponseInterrupted: '调度更新时连接已中断。在服务端恢复且持久化更新状态刷新前，请勿重复提交。',
         confirmDownloadUpdate: '下载最新稳定版服务端软件包，并验证签名清单和 SHA-256 摘要吗？',
         confirmApplyUpdate: '现在应用最新稳定版服务端更新吗？服务端将重启，并保留自动回滚保护。',
+        typeUpdateConfirmation: '请输入 {phrase} 以继续。',
+        updateConfirmationMismatch: '确认词不匹配，未发送更新请求。',
+        updateSecurityCheckFailed: '更新请求未通过同源会话安全检查，请刷新页面并重新登录。',
         updateUnavailable: '应用服务端更新前必须配置持久化的 LINKLAKE_DATA_DIR。',
         confirmationProtected: '交互式管理员确认',
         signedManifestProtected: 'Ed25519 签名清单',
@@ -510,7 +522,7 @@
       function readApiErrorCode(code, fallback = 'requestFailed') {
         if (code === 'invalid_public_port') return t('errorInvalidPort', { ports: portPolicyDescription() });
         const map = {
-          unknown_client: 'errorUnknownClient', invalid_name: 'errorInvalidName', invalid_public_port: 'errorInvalidPort', duplicate_public_port: 'errorDuplicatePort', duplicate_tcp_public_port: 'errorDuplicatePort', invalid_target: 'errorInvalidTarget', invalid_hostname: 'errorInvalidHostname', duplicate_hostname: 'errorDuplicateHostname', duplicate_sni_hostname: 'errorDuplicateHostname', invalid_connection_limit: 'errorInvalidLimit', invalid_session_limit: 'errorInvalidLimit', invalid_idle_timeout: 'errorInvalidLimit', invalid_bandwidth_limit: 'errorInvalidLimit', invalid_socks5_username: 'errorInvalidUsername', invalid_http_proxy_username: 'errorInvalidUsername', invalid_port_expression: 'errorInvalidPortExpression', port_count_mismatch: 'errorPortCountMismatch', duplicate_port_in_group: 'errorDuplicatePortInGroup', too_many_port_mappings: 'errorTooManyMappings', unknown_policy: 'errorUnknownPolicy', unknown_udp_tunnel: 'errorUnknownPolicy', unknown_port_group: 'errorUnknownPolicy', unknown_http_route: 'errorUnknownPolicy', unknown_sni_route: 'errorUnknownPolicy', unknown_secret_tunnel: 'errorUnknownPolicy', unknown_socks5_proxy: 'errorUnknownPolicy', unknown_http_proxy: 'errorUnknownPolicy', tcp_policy_storage_error: 'errorStorage', udp_policy_storage_error: 'errorStorage', port_group_policy_storage_error: 'errorStorage', http_route_policy_storage_error: 'errorStorage', sni_route_policy_storage_error: 'errorStorage', secret_policy_storage_error: 'errorStorage', socks5_policy_storage_error: 'errorStorage', http_proxy_policy_storage_error: 'errorStorage', server_update_busy: 'updateBusy', server_update_unavailable: 'updateUnavailable', server_update_failed: 'updateOperationFailed', update_confirmation_required: 'localConfirmationRequired'
+          unknown_client: 'errorUnknownClient', invalid_name: 'errorInvalidName', invalid_public_port: 'errorInvalidPort', duplicate_public_port: 'errorDuplicatePort', duplicate_tcp_public_port: 'errorDuplicatePort', invalid_target: 'errorInvalidTarget', invalid_hostname: 'errorInvalidHostname', duplicate_hostname: 'errorDuplicateHostname', duplicate_sni_hostname: 'errorDuplicateHostname', invalid_connection_limit: 'errorInvalidLimit', invalid_session_limit: 'errorInvalidLimit', invalid_idle_timeout: 'errorInvalidLimit', invalid_bandwidth_limit: 'errorInvalidLimit', invalid_socks5_username: 'errorInvalidUsername', invalid_http_proxy_username: 'errorInvalidUsername', invalid_port_expression: 'errorInvalidPortExpression', port_count_mismatch: 'errorPortCountMismatch', duplicate_port_in_group: 'errorDuplicatePortInGroup', too_many_port_mappings: 'errorTooManyMappings', unknown_policy: 'errorUnknownPolicy', unknown_udp_tunnel: 'errorUnknownPolicy', unknown_port_group: 'errorUnknownPolicy', unknown_http_route: 'errorUnknownPolicy', unknown_sni_route: 'errorUnknownPolicy', unknown_secret_tunnel: 'errorUnknownPolicy', unknown_socks5_proxy: 'errorUnknownPolicy', unknown_http_proxy: 'errorUnknownPolicy', tcp_policy_storage_error: 'errorStorage', udp_policy_storage_error: 'errorStorage', port_group_policy_storage_error: 'errorStorage', http_route_policy_storage_error: 'errorStorage', sni_route_policy_storage_error: 'errorStorage', secret_policy_storage_error: 'errorStorage', socks5_policy_storage_error: 'errorStorage', http_proxy_policy_storage_error: 'errorStorage', server_update_busy: 'updateBusy', server_update_unavailable: 'updateUnavailable', server_update_failed: 'updateOperationFailed', update_confirmation_required: 'localConfirmationRequired', session_authentication_required: 'updateSecurityCheckFailed', csrf_check_failed: 'updateSecurityCheckFailed', update_origin_check_failed: 'updateSecurityCheckFailed'
         };
         if (String(code || '').includes('acme') || String(code || '').includes('certificate') || String(code || '').includes('tls_')) return t('errorAcme');
         return t(map[code] || fallback);
@@ -2464,20 +2476,23 @@
         parent.append(row);
       }
 
-      function updateStateText(status) {
+      function updateStateText(status, operationActive = false) {
         const stateName = String(status?.state || 'idle');
-        if (stateName === 'failed') return t('updateFailed');
-        if (['scheduled', 'waiting', 'applying', 'replacing', 'validating', 'rolling_back'].includes(stateName)) return t('updateBusy');
+        if (stateName === 'failed' || status?.has_error) return t('updateFailed');
+        if (stateName === 'succeeded') return t('updateSucceeded');
+        if (stateName === 'rolled_back') return t('updateRolledBack');
+        if (operationActive || ['scheduled', 'installing', 'waiting', 'applying', 'replacing', 'validating', 'rolling_back'].includes(stateName)) return t('updateBusy');
         return t('updateIdle');
       }
 
-      function updateOperationBusy(status) {
-        return ['scheduled', 'waiting', 'applying', 'replacing', 'validating', 'rolling_back'].includes(String(status?.state || 'idle'));
+      function updateOperationBusy(status, operationActive = false) {
+        return Boolean(operationActive) || ['scheduled', 'installing', 'waiting', 'applying', 'replacing', 'validating', 'rolling_back'].includes(String(status?.state || 'idle'));
       }
 
-      function updateStatusMessage(status) {
+      function updateStatusMessage(status, operationActive = false) {
+        if (operationActive && (!status || status.state === 'idle')) return t('updateBusy');
         if (!status || status.state === 'idle') return t('noUpdateScheduled');
-        return status.message || updateStateText(status);
+        return status.message || updateStateText(status, operationActive);
       }
 
       function renderServerUpdateRelease(check) {
@@ -2502,26 +2517,26 @@
       function renderUpdateCenter() {
         const overview = state.dashboard?.updateOverview;
         const status = overview?.status || { state: 'idle' };
+        const busy = updateOperationBusy(status, overview?.operation_active);
         elements.update_kpis.replaceChildren(
           createKpi(overview?.build?.version || '—', t('installedVersion')),
-          createKpi(updateStateText(status), t('updateState'), updateStatusMessage(status)),
+          createKpi(updateStateText(status, overview?.operation_active), t('updateState'), updateStatusMessage(status, overview?.operation_active)),
           createKpi(t('stableChannel'), t('releaseChannel')),
           createKpi(overview?.signature_policy === 'production' ? t('production') : '—', t('signaturePolicy')),
           createKpi(overview?.remote_client_update_available ? t('enabled') : t('localOnly'), t('clientUpdate'))
         );
-        elements.server_update_state.textContent = updateStateText(status);
-        elements.server_update_state.classList.toggle('warning', status.state === 'failed' || updateOperationBusy(status));
+        elements.server_update_state.textContent = updateStateText(status, overview?.operation_active);
+        elements.server_update_state.classList.toggle('warning', status.state === 'failed' || status.has_error || busy);
         elements.server_update_details.replaceChildren();
         appendUpdateDetail(elements.server_update_details, t('installedVersion'), overview?.build?.version);
         appendUpdateDetail(elements.server_update_details, t('targetPlatform'), overview?.build?.target);
         appendUpdateDetail(elements.server_update_details, t('sourceRepository'), overview?.repository);
-        appendUpdateDetail(elements.server_update_details, t('updateState'), updateStatusMessage(status));
+        appendUpdateDetail(elements.server_update_details, t('updateState'), updateStatusMessage(status, overview?.operation_active));
         elements.server_update_security.replaceChildren();
         [t('signedManifestProtected'), t('confirmationProtected'), t('downgradeBlocked'), t('rollbackProtected')].forEach(value => {
           const item = document.createElement('span'); item.textContent = value; elements.server_update_security.append(item);
         });
         const unavailable = !overview || !overview.apply_available;
-        const busy = updateOperationBusy(status);
         elements.check_server_update.disabled = !overview || busy;
         elements.download_server_update.disabled = !overview || busy;
         elements.apply_server_update.disabled = unavailable || busy;
@@ -2541,11 +2556,22 @@
         finally { setBusy(elements.check_server_update, false); renderUpdateCenter(); }
       }
 
+      function promptForUpdateConfirmation(messageKey, phrase) {
+        const confirmation = window.prompt(`${t(messageKey)}\n\n${t('typeUpdateConfirmation', { phrase })}`, '');
+        if (confirmation === null) return null;
+        if (confirmation !== phrase) {
+          showToast(t('updateConfirmationMismatch'), true);
+          return null;
+        }
+        return confirmation;
+      }
+
       async function downloadServerUpdate() {
-        if (!confirm(t('confirmDownloadUpdate'))) return;
+        const confirmation = promptForUpdateConfirmation('confirmDownloadUpdate', 'DOWNLOAD');
+        if (!confirmation) return;
         setBusy(elements.download_server_update, true, 'saving');
         try {
-          const response = await apiFetch('/api/v1/updates/server/download', { method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, body: JSON.stringify({ confirmation: 'DOWNLOAD' }), timeoutMs: 300000, scope: 'update' });
+          const response = await apiFetch('/api/v1/updates/server/download', { method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, body: JSON.stringify({ confirmation }), timeoutMs: 300000, scope: 'update' });
           if (!response.ok) return showToast(await responseError(response), true);
           const staged = await response.json();
           state.serverUpdateCheck = { ...(state.serverUpdateCheck || {}), latest_version: staged.version, asset_name: staged.archive_name, github_digest: staged.archive_sha256, signature_key_id: staged.signature_key_id, update_available: staged.version !== state.dashboard?.updateOverview?.build?.version };
@@ -2556,18 +2582,27 @@
       }
 
       async function applyServerUpdate() {
-        if (!confirm(t('confirmApplyUpdate'))) return;
+        const confirmation = promptForUpdateConfirmation('confirmApplyUpdate', 'UPDATE');
+        if (!confirmation) return;
         setBusy(elements.apply_server_update, true, 'saving');
         try {
-          const response = await apiFetch('/api/v1/updates/server/apply', { method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, body: JSON.stringify({ confirmation: 'UPDATE' }), timeoutMs: 300000, scope: 'update' });
+          const response = await apiFetch('/api/v1/updates/server/apply', { method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, body: JSON.stringify({ confirmation }), timeoutMs: 300000, scope: 'update' });
           if (!response.ok) return showToast(await responseError(response), true);
           const scheduled = await response.json();
           if (state.dashboard?.updateOverview) {
             state.dashboard.updateOverview.status = { state: scheduled.state, operation: scheduled.operation, from_version: scheduled.from_version, to_version: scheduled.to_version, message: t('updateScheduled') };
+            state.dashboard.updateOverview.operation_active = true;
           }
           renderUpdateCenter();
           showToast(t('updateScheduled'), false, 0);
-        } catch (_) { showToast(t('requestFailed'), true); }
+        } catch (_) {
+          if (state.dashboard?.updateOverview) {
+            state.dashboard.updateOverview.status = { state: 'unknown', message: t('updateApplyResponseInterrupted') };
+            state.dashboard.updateOverview.operation_active = true;
+            renderUpdateCenter();
+          }
+          showToast(t('updateApplyResponseInterrupted'), true, 0);
+        }
         finally { setBusy(elements.apply_server_update, false); renderUpdateCenter(); }
       }
 
@@ -2606,7 +2641,7 @@
 
       function auditCategory(event) {
         const action = event.action || '';
-        if (action.startsWith('management.')) return 'management';
+        if (action.startsWith('management.') || action.startsWith('server.update.')) return 'management';
         if (action.startsWith('client.')) return 'client';
         if (action.startsWith('p2p')) return 'p2p';
         if (action.startsWith('certificate.') || action.startsWith('acme.')) return 'certificate';
