@@ -66,6 +66,8 @@ void main() {
       await tester.pumpAndSettle();
 
       final isAdmin = role == 'administrator';
+      expect(find.byKey(const Key('current-user-identity')), findsOneWidget);
+      expect(find.text('Test User'), findsOneWidget);
       expect(
         find.byKey(const Key('nav-users')),
         isAdmin ? findsOneWidget : findsNothing,

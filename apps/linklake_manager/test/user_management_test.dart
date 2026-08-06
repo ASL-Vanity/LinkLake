@@ -78,6 +78,47 @@ void main() {
     });
   });
 
+  testWidgets('administrator creates and deletes users with server contracts', (
+    tester,
+  ) async {
+    final api = FakeLinkLakeApi();
+    await _pumpPage(tester, api);
+
+    await tester.tap(find.byKey(const Key('create-user')));
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find.widgetWithText(TextField, 'Username'),
+      'new-user',
+    );
+    await tester.enterText(
+      find.widgetWithText(TextField, 'Display name'),
+      'New User',
+    );
+    await tester.enterText(
+      find.widgetWithText(TextField, 'Password (12+ characters)'),
+      'safe-password-123',
+    );
+    await tester.tap(find.byKey(const Key('save-user')));
+    await tester.pumpAndSettle();
+
+    expect(api.posts.first.$1, '/api/v1/users');
+    expect(api.posts.first.$2, {
+      'username': 'new-user',
+      'display_name': 'New User',
+      'role': 'operator',
+      'password': 'safe-password-123',
+      'force_password_change': true,
+    });
+
+    await tester.tap(find.byKey(const Key('user-actions-operator')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Delete').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Confirm').last);
+    await tester.pumpAndSettle();
+    expect(api.deletes, contains('/api/v1/users/operator'));
+  });
+
   testWidgets('password reset and user session revocation use real endpoints', (
     tester,
   ) async {

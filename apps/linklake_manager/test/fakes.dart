@@ -27,7 +27,15 @@ class FakeLinkLakeApi implements LinkLakeApi {
     calls.add(path);
     if (failures.containsKey(path)) _failure(path);
     if (path == '/api/v1/auth/me') {
-      return {'username': 'tester', 'role': role, 'totp_enabled': false};
+      return {
+        'session_id': 'test-session',
+        'username': 'tester',
+        'display_name': 'Test User',
+        'role': role,
+        'authentication_type': 'password_session',
+        'expires_unix_seconds': 2000000000,
+        'totp_enabled': false,
+      };
     }
     return Map<String, dynamic>.from(objectResponses[path] ?? const {});
   }
