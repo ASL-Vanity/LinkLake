@@ -1,6 +1,6 @@
 # LinkLake v1.0 Update Security Model
 
-Date: 2026-08-05
+Release status: implemented and independently verified in `v1.0.0` on 2026-08-06.
 
 ## Threat model and compatibility audit
 
@@ -8,7 +8,7 @@ The audit covered the former client-only updater, server startup order, Windows/
 
 The previous updater already restricted HTTPS hosts and repository paths, checked GitHub and `.sha256` digests, bounded archives, staged binaries, used same-directory replacement, restored services, and rolled back failures. The productization gaps were: no server updater; server version output occurred after startup-related work; checksum and asset shared one publisher trust domain; no stable Manager installation protocol; helper plans were client-specific; and no separation between production and test signing or key-rotation metadata.
 
-The v1.0 design protects against corrupted downloads, asset/checksum disagreement, replacement of GitHub release assets by a compromised repository publisher, path traversal, links and archive bombs, staged-file tampering, wrong-target replacement, concurrent target changes, service recovery failure, installed-version mismatch, server schema/ledger incompatibility, an interrupted database migration or rollback, and forged server recovery state in a writable update directory.
+The v1.0 implementation protects against corrupted downloads, asset/checksum disagreement, replacement of GitHub release assets by a compromised repository publisher, path traversal, links and archive bombs, staged-file tampering, wrong-target replacement, concurrent target changes, service recovery failure, installed-version mismatch, server schema/ledger incompatibility, an interrupted database migration or rollback, and forged server recovery state in a writable update directory.
 
 It does not by itself protect against a malicious build signed by an authorized production key, production-key disclosure, full administrator/root compromise of the running host, operating-system trust-root compromise, or a privileged process indefinitely locking a Manager installation. Mitigations include least-privilege CI, offline production-key generation, protected tags/releases, rotation and revocation, helper timeouts, and automatic rollback.
 
@@ -32,7 +32,7 @@ The formal updater manifest intentionally contains only `windows-x86_64` and `li
 - Rotation first adds a new public key with a future `not_before_version`, ships an updater that trusts old and new keys, then changes CI secrets, and finally assigns the old key a `not_after_version`.
 - Emergency revocation requires another trusted production key. Without one, a new trust root must be distributed through a separate authenticated channel.
 
-The production public key `linklake-production-2026-08-a` is registered for the `1.0.0` release line. Tagged Releases still fail closed unless `LINKLAKE_RELEASE_SIGNING_KEY_ID` selects that registered production key and `LINKLAKE_RELEASE_SIGNING_KEY_B64` contains the matching private seed. Using the development fixture to bypass this check is prohibited.
+The production public key `linklake-production-2026-08-a` signed the verified `v1.0.0` updater manifest and remains registered for the `1.0.x` release line. Every later tagged Release fails closed unless `LINKLAKE_RELEASE_SIGNING_KEY_ID` selects a registered production key valid for that version and `LINKLAKE_RELEASE_SIGNING_KEY_B64` contains the matching private seed. Using the development fixture to bypass this check is prohibited.
 
 ## Replacement invariants
 
