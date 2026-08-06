@@ -39,6 +39,8 @@ const REQUEST_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTION_PAIR_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTION_MAX_LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
 const BACKEND_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
+const EXCHANGE_IO_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_REQUESTS_PER_CONNECTION: usize = 1_000;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_HEADER_COUNT: usize = 200;
@@ -138,6 +140,14 @@ struct HttpResponseTransfer {
     bytes: u64,
     backend_reusable: bool,
     client_reusable: bool,
+}
+
+enum ExchangeCompletion {
+    RequestFinishedFirst {
+        bytes_from_public: u64,
+        response: HttpResponseTransfer,
+    },
+    ResponseFinishedFirst(HttpResponseTransfer),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -745,15 +755,18 @@ fn record_transfer(context: &PublicConnectionContext, from_public: u64, to_publi
     }
 }
 
-async fn forward_http_exchange(
-    external: &mut BufReader<TcpStream>,
+async fn forward_http_exchange<E>(
+    external: &mut E,
     agent: &mut BoxedIo,
     encoded_head: &[u8],
     body: RequestBody,
     head_request: bool,
     client_keep_alive: bool,
     limiter: Option<Arc<BandwidthLimiter>>,
-) -> std::io::Result<HttpExchangeOutcome> {
+) -> std::io::Result<HttpExchangeOutcome>
+where
+    E: AsyncRead + AsyncWrite + Unpin,
+{
     if let Some(limiter) = &limiter {
         limiter.reserve(encoded_head.len()).await;
     }
@@ -762,32 +775,55 @@ async fn forward_http_exchange(
     let (mut external_reader, mut external_writer) = split(external);
     let (mut agent_reader, mut agent_writer) = split(agent);
     let request_limiter = limiter.clone();
-    let request = async {
-        let body_bytes = copy_request_body(
-            &mut external_reader,
-            &mut agent_writer,
-            body,
-            request_limiter,
-        )
-        .await?;
-        // 普通 HTTP 请求的结束由 Content-Length、chunked 或无请求体语义确定，
-        // 不能在响应返回前关闭复用的 TLS 数据通道写半边。部分平台上的 rustls
-        // 会把这个提前 close_notify 与并发读取组合成解密错误，导致响应尚未回传就 EOF。
-        agent_writer.flush().await?;
-        Ok::<u64, std::io::Error>(initial_bytes.saturating_add(body_bytes))
+    let completion = {
+        let request = async {
+            let body_bytes = copy_request_body(
+                &mut external_reader,
+                &mut agent_writer,
+                body,
+                request_limiter,
+            )
+            .await?;
+            // 普通 HTTP 请求的结束由 Content-Length、chunked 或无请求体语义确定，
+            // 不能在响应返回前关闭复用的数据通道写半边。
+            flush_with_idle_timeout(&mut agent_writer).await?;
+            Ok::<u64, std::io::Error>(initial_bytes.saturating_add(body_bytes))
+        };
+        let response = async {
+            copy_http_response(
+                &mut agent_reader,
+                &mut external_writer,
+                head_request,
+                client_keep_alive,
+                limiter,
+            )
+            .await
+        };
+        tokio::pin!(request);
+        tokio::pin!(response);
+        tokio::select! {
+            request = &mut request => ExchangeCompletion::RequestFinishedFirst {
+                bytes_from_public: request?,
+                response: response.await?,
+            },
+            response = &mut response => ExchangeCompletion::ResponseFinishedFirst(response?),
+        }
     };
-    let response = async {
-        copy_http_response(
-            &mut agent_reader,
-            &mut external_writer,
-            head_request,
-            client_keep_alive,
-            limiter,
-        )
-        .await
+    let (bytes_from_public, response) = match completion {
+        ExchangeCompletion::RequestFinishedFirst {
+            bytes_from_public,
+            response,
+        } => (bytes_from_public, response),
+        ExchangeCompletion::ResponseFinishedFirst(mut response) => {
+            // 最终响应先于请求体完成时，不能继续从公网连接读取旧请求体：
+            // 客户端可能在 413 等响应后立即发送下一请求，继续读取会造成请求错位。
+            shutdown_with_idle_timeout(&mut agent_writer).await?;
+            shutdown_with_idle_timeout(&mut external_writer).await?;
+            response.backend_reusable = false;
+            response.client_reusable = false;
+            (initial_bytes, response)
+        }
     };
-    let (bytes_from_public, response) = tokio::try_join!(request, response)?;
-    let _agent = agent_reader.unsplit(agent_writer);
     Ok(HttpExchangeOutcome {
         bytes_from_public,
         bytes_to_public: response.bytes,
@@ -840,15 +876,15 @@ where
 {
     let mut buffer = [0_u8; 16 * 1024];
     loop {
-        let read = reader.read(&mut buffer).await?;
+        let read = read_with_idle_timeout(reader, &mut buffer).await?;
         if read == 0 {
-            writer.shutdown().await?;
+            shutdown_with_idle_timeout(writer).await?;
             return Ok(());
         }
         if let Some(limiter) = &limiter {
             limiter.reserve(read).await;
         }
-        writer.write_all(&buffer[..read]).await?;
+        write_all_with_idle_timeout(writer, &buffer[..read]).await?;
         transferred.fetch_add(read as u64, Ordering::Relaxed);
     }
 }
@@ -886,7 +922,7 @@ where
     let mut transferred = 0_u64;
     while remaining > 0 {
         let wanted = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
-        let read = reader.read(&mut buffer[..wanted]).await?;
+        let read = read_with_idle_timeout(reader, &mut buffer[..wanted]).await?;
         if read == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -896,7 +932,7 @@ where
         if let Some(limiter) = &limiter {
             limiter.reserve(read).await;
         }
-        writer.write_all(&buffer[..read]).await?;
+        write_all_with_idle_timeout(writer, &buffer[..read]).await?;
         transferred = transferred.saturating_add(read as u64);
         remaining -= read as u64;
     }
@@ -946,7 +982,7 @@ where
         transferred = transferred
             .saturating_add(copy_exact_bytes(reader, writer, size, limiter.clone()).await?);
         let mut terminator = [0_u8; 2];
-        reader.read_exact(&mut terminator).await?;
+        read_exact_with_idle_timeout(reader, &mut terminator).await?;
         if terminator != *b"\r\n" {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -965,7 +1001,7 @@ where
     let mut line = Vec::new();
     while line.len() <= maximum {
         let mut byte = [0_u8; 1];
-        if reader.read(&mut byte).await? == 0 {
+        if read_with_idle_timeout(reader, &mut byte).await? == 0 {
             break;
         }
         line.push(byte[0]);
@@ -993,7 +1029,57 @@ where
     if let Some(limiter) = limiter {
         limiter.reserve(bytes.len()).await;
     }
-    writer.write_all(bytes).await
+    write_all_with_idle_timeout(writer, bytes).await
+}
+
+fn idle_timeout_error(message: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::TimedOut, message)
+}
+
+async fn read_with_idle_timeout<R>(reader: &mut R, buffer: &mut [u8]) -> std::io::Result<usize>
+where
+    R: AsyncRead + Unpin,
+{
+    timeout(EXCHANGE_IO_IDLE_TIMEOUT, reader.read(buffer))
+        .await
+        .map_err(|_| idle_timeout_error("HTTP proxy read idle timeout"))?
+}
+
+async fn read_exact_with_idle_timeout<R>(reader: &mut R, buffer: &mut [u8]) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    timeout(EXCHANGE_IO_IDLE_TIMEOUT, reader.read_exact(buffer))
+        .await
+        .map_err(|_| idle_timeout_error("HTTP proxy exact read idle timeout"))??;
+    Ok(())
+}
+
+async fn write_all_with_idle_timeout<W>(writer: &mut W, bytes: &[u8]) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    timeout(EXCHANGE_IO_IDLE_TIMEOUT, writer.write_all(bytes))
+        .await
+        .map_err(|_| idle_timeout_error("HTTP proxy write idle timeout"))?
+}
+
+async fn flush_with_idle_timeout<W>(writer: &mut W) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    timeout(EXCHANGE_IO_IDLE_TIMEOUT, writer.flush())
+        .await
+        .map_err(|_| idle_timeout_error("HTTP proxy flush idle timeout"))?
+}
+
+async fn shutdown_with_idle_timeout<W>(writer: &mut W) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    timeout(EXCHANGE_IO_IDLE_TIMEOUT, writer.shutdown())
+        .await
+        .map_err(|_| idle_timeout_error("HTTP proxy shutdown idle timeout"))?
 }
 
 async fn copy_http_response<R, W>(
@@ -1009,7 +1095,9 @@ where
 {
     let mut transferred = 0_u64;
     loop {
-        let response = read_http_response_head(reader).await?;
+        let response = timeout(RESPONSE_HEADER_TIMEOUT, read_http_response_head(reader))
+            .await
+            .map_err(|_| idle_timeout_error("HTTP backend response header timed out"))??;
         if response.status == 101 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -1039,9 +1127,9 @@ where
             }
             ResponseBody::Chunked => copy_chunked_body(reader, writer, limiter).await?,
         };
-        writer.flush().await?;
+        flush_with_idle_timeout(writer).await?;
         if !response_client_reusable {
-            writer.shutdown().await?;
+            shutdown_with_idle_timeout(writer).await?;
         }
         return Ok(HttpResponseTransfer {
             bytes: transferred.saturating_add(body_bytes),
@@ -1167,14 +1255,14 @@ where
     let mut buffer = [0_u8; 16 * 1024];
     let mut transferred = 0_u64;
     loop {
-        let read = reader.read(&mut buffer).await?;
+        let read = read_with_idle_timeout(reader, &mut buffer).await?;
         if read == 0 {
             return Ok(transferred);
         }
         if let Some(limiter) = &limiter {
             limiter.reserve(read).await;
         }
-        writer.write_all(&buffer[..read]).await?;
+        write_all_with_idle_timeout(writer, &buffer[..read]).await?;
         transferred = transferred.saturating_add(read as u64);
     }
 }
@@ -1569,7 +1657,7 @@ fn build_forward_head(
 fn connection_tokens(headers: &[(String, String)]) -> HashSet<String> {
     headers
         .iter()
-        .filter(|(name, _)| name == "connection")
+        .filter(|(name, _)| matches!(name.as_str(), "connection" | "proxy-connection"))
         .flat_map(|(_, value)| value.split(','))
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty())
@@ -1834,13 +1922,62 @@ mod tests {
         let headers = vec![
             ("host".to_owned(), "example.com".to_owned()),
             ("connection".to_owned(), "X-Remove".to_owned()),
+            ("proxy-connection".to_owned(), "X-Remove-Too".to_owned()),
             ("x-remove".to_owned(), "secret".to_owned()),
+            ("x-remove-too".to_owned(), "secret".to_owned()),
             ("x-keep".to_owned(), "ok".to_owned()),
         ];
         let encoded =
             String::from_utf8(build_forward_head("GET", "/", &headers, "example.com")).unwrap();
         assert!(!encoded.contains("x-remove"));
+        assert!(!encoded.contains("x-remove-too"));
         assert!(encoded.contains("x-keep: ok"));
+    }
+
+    #[tokio::test]
+    async fn early_final_response_cancels_unfinished_request_body_and_forces_close() {
+        let (external, mut public) = duplex(4096);
+        let (agent, mut backend) = duplex(4096);
+        let backend_task = tokio::spawn(async move {
+            let mut backend = BufReader::new(&mut backend);
+            loop {
+                let mut line = Vec::new();
+                backend.read_until(b'\n', &mut line).await.unwrap();
+                if line == b"\r\n" {
+                    break;
+                }
+            }
+            backend
+                .get_mut()
+                .write_all(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let exchange = tokio::spawn(async move {
+            let mut external = BufReader::new(external);
+            let mut agent: BoxedIo = Box::new(agent);
+            super::forward_http_exchange(
+                &mut external,
+                &mut agent,
+                b"POST / HTTP/1.1\r\nhost: example.test\r\ncontent-length: 4\r\n\r\n",
+                super::RequestBody::ContentLength(4),
+                false,
+                true,
+                None,
+            )
+            .await
+        });
+        let mut response = Vec::new();
+        public.read_to_end(&mut response).await.unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(1), exchange)
+            .await
+            .expect("early final response must cancel the pending body read")
+            .unwrap()
+            .unwrap();
+        assert!(!outcome.backend_reusable);
+        assert!(!outcome.client_reusable);
+        assert!(response.starts_with(b"HTTP/1.1 413"));
+        backend_task.await.unwrap();
     }
 
     #[tokio::test]

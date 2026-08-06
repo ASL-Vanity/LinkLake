@@ -13,6 +13,7 @@ use std::{
     error::Error,
     fmt,
     future::Future,
+    hash::{DefaultHasher, Hash, Hasher},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
@@ -65,9 +66,11 @@ struct RuntimeState {
 /// 每个正向代理策略持有一个池；池键包含策略、目标、协议和 TLS 身份。
 pub(crate) struct Http1BackendPool {
     runtime: Mutex<RuntimeState>,
-    connect_gate: Mutex<()>,
+    connect_gates: Box<[Mutex<()>]>,
     counters: Arc<Http1BackendCounters>,
 }
+
+const CONNECT_GATE_SHARDS: usize = 64;
 
 impl Http1BackendPool {
     pub(crate) fn new(limits: BackendPoolLimits, counters: Arc<Http1BackendCounters>) -> Arc<Self> {
@@ -76,7 +79,10 @@ impl Http1BackendPool {
                 pool: BackendPoolState::new(limits),
                 idle: HashMap::new(),
             }),
-            connect_gate: Mutex::new(()),
+            connect_gates: (0..CONNECT_GATE_SHARDS)
+                .map(|_| Mutex::new(()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             counters,
         })
     }
@@ -95,7 +101,7 @@ impl Http1BackendPool {
         }
 
         // 串行化建连可避免同一波突发在观察到空池后同时越过每源上限。
-        let _gate = self.connect_gate.lock().await;
+        let _gate = self.connect_gate(&origin).lock().await;
         if let Some(lease) = self.acquire_existing(&origin, true).await {
             return Ok(lease);
         }
@@ -149,6 +155,13 @@ impl Http1BackendPool {
             stream: Some(stream),
             finished: false,
         })
+    }
+
+    fn connect_gate(&self, origin: &OriginKey) -> &Mutex<()> {
+        let mut hasher = DefaultHasher::new();
+        origin.hash(&mut hasher);
+        let index = (hasher.finish() as usize) % self.connect_gates.len();
+        &self.connect_gates[index]
     }
 
     pub(crate) async fn invalidate_policy(&self, policy_id: uuid::Uuid) {
@@ -228,7 +241,7 @@ impl Http1BackendPool {
         if reusable {
             if let Some(removal) = runtime.pool.release(connection_id, Instant::now()) {
                 self.apply_removal_locked(&mut runtime, removal);
-            } else {
+            } else if runtime.pool.contains(connection_id) {
                 runtime.idle.insert(connection_id, stream);
             }
         } else if let Some(removal) = runtime.pool.disconnected(connection_id) {
@@ -341,5 +354,30 @@ mod tests {
         assert_eq!(counters.reused_total.load(Ordering::Relaxed), 1);
         reused.discard().await;
         assert_eq!(counters.active_connections.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn policy_invalidation_prevents_late_lease_from_reentering_idle_pool() {
+        let limits = BackendPoolLimits::new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let counters = Arc::new(Http1BackendCounters::default());
+        let pool = Http1BackendPool::new(limits, counters);
+        let lease = pool
+            .acquire_or_connect(origin(80), || async {
+                let (client, _server) = duplex(1024);
+                Ok::<BoxedIo, std::io::Error>(Box::new(client))
+            })
+            .await
+            .unwrap();
+        pool.invalidate_policy(Uuid::from_u128(1)).await;
+        lease.recycle().await;
+
+        let runtime = pool.runtime.lock().await;
+        assert!(runtime.idle.is_empty());
+        assert_eq!(runtime.pool.snapshot().connections, 0);
     }
 }
