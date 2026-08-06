@@ -1,7 +1,7 @@
 //! PostgreSQL 协调平面的独立迁移账本。
 
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use tokio_postgres::{Client, Transaction};
 
 pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 3;
@@ -165,6 +165,18 @@ struct Migration {
     sql: &'static str,
 }
 
+struct ColumnExpectation {
+    name: &'static str,
+    postgres_type: &'static str,
+    nullable: bool,
+}
+
+struct TableExpectation {
+    name: &'static str,
+    primary_key: &'static [&'static str],
+    columns: &'static [ColumnExpectation],
+}
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -271,115 +283,218 @@ pub(crate) async fn apply(client: &mut Client) -> anyhow::Result<()> {
 }
 
 async fn verify_schema_structure(transaction: &Transaction<'_>) -> anyhow::Result<()> {
-    const TABLES: &[(&str, &[&str])] = &[
-        (
-            "linklake_ha_members",
-            &[
-                "instance_id",
-                "incarnation_id",
-                "last_seen_at",
-                "lease_until",
-                "metadata_json",
+    const TABLES: &[TableExpectation] = &[
+        TableExpectation {
+            name: "linklake_ha_members",
+            primary_key: &["instance_id"],
+            columns: &[
+                required("instance_id", "text"),
+                required("incarnation_id", "text"),
+                required("started_at", "timestamptz"),
+                required("last_seen_at", "timestamptz"),
+                required("lease_until", "timestamptz"),
+                required("metadata_json", "jsonb"),
             ],
-        ),
-        (
-            "linklake_ha_fencing_sequence",
-            &["singleton_id", "next_token"],
-        ),
-        (
-            "linklake_ha_leader",
-            &[
-                "instance_id",
-                "incarnation_id",
-                "fencing_token",
-                "lease_until",
+        },
+        TableExpectation {
+            name: "linklake_ha_fencing_sequence",
+            primary_key: &["singleton_id"],
+            columns: &[
+                required("singleton_id", "int2"),
+                required("next_token", "int8"),
             ],
-        ),
-        (
-            "linklake_public_port_ownership",
-            &[
-                "protocol",
-                "public_port",
-                "lease_id",
-                "owner_instance_id",
-                "owner_incarnation_id",
-                "fencing_token",
-                "lease_until",
+        },
+        TableExpectation {
+            name: "linklake_ha_leader",
+            primary_key: &["singleton_id"],
+            columns: &[
+                required("singleton_id", "int2"),
+                required("instance_id", "text"),
+                required("incarnation_id", "text"),
+                required("fencing_token", "int8"),
+                required("acquired_at", "timestamptz"),
+                required("renewed_at", "timestamptz"),
+                required("lease_until", "timestamptz"),
             ],
-        ),
-        (
-            "linklake_job_leases",
-            &[
-                "job_key",
-                "job_kind",
-                "lease_id",
-                "owner_instance_id",
-                "owner_incarnation_id",
-                "fencing_token",
-                "lease_until",
+        },
+        TableExpectation {
+            name: "linklake_public_port_ownership",
+            primary_key: &["protocol", "public_port"],
+            columns: &[
+                required("protocol", "text"),
+                required("public_port", "int4"),
+                required("lease_id", "text"),
+                required("owner_instance_id", "text"),
+                required("owner_incarnation_id", "text"),
+                required("fencing_token", "int8"),
+                required("policy_id", "text"),
+                required("acquired_at", "timestamptz"),
+                required("renewed_at", "timestamptz"),
+                required("lease_until", "timestamptz"),
             ],
-        ),
-        (
-            "linklake_target_health",
-            &[
-                "target_key",
-                "member_alive",
-                "control_channel_healthy",
-                "application_healthy",
-                "effective_healthy",
-                "revision",
+        },
+        TableExpectation {
+            name: "linklake_job_leases",
+            primary_key: &["job_key"],
+            columns: &[
+                required("job_key", "text"),
+                required("job_kind", "text"),
+                required("lease_id", "text"),
+                required("owner_instance_id", "text"),
+                required("owner_incarnation_id", "text"),
+                required("fencing_token", "int8"),
+                required("acquired_at", "timestamptz"),
+                required("renewed_at", "timestamptz"),
+                required("lease_until", "timestamptz"),
+                optional("last_completed_at", "timestamptz"),
+                optional("last_error_code", "text"),
             ],
-        ),
-        (
-            "linklake_fleet_generations",
-            &[
-                "source_instance_id",
-                "generation",
-                "owner_instance_id",
-                "owner_incarnation_id",
-                "fencing_token",
-                "sync_progress",
+        },
+        TableExpectation {
+            name: "linklake_target_health",
+            primary_key: &["target_key"],
+            columns: &[
+                required("target_key", "text"),
+                required("member_alive", "bool"),
+                required("control_channel_healthy", "bool"),
+                required("application_healthy", "bool"),
+                required("effective_healthy", "bool"),
+                required("consecutive_successes", "int4"),
+                required("consecutive_failures", "int4"),
+                required("weight", "int4"),
+                required("revision", "int8"),
+                optional("last_probe_at", "timestamptz"),
+                required("last_transition_at", "timestamptz"),
+                optional("last_error_summary", "text"),
             ],
-        ),
-        (
-            "linklake_fleet_conflicts",
-            &[
-                "conflict_id",
-                "source_instance_id",
-                "resource_kind",
-                "resource_id",
-                "state",
+        },
+        TableExpectation {
+            name: "linklake_fleet_generations",
+            primary_key: &["source_instance_id"],
+            columns: &[
+                required("source_instance_id", "text"),
+                required("generation", "int8"),
+                required("revision", "text"),
+                required("owner_instance_id", "text"),
+                required("owner_incarnation_id", "text"),
+                required("fencing_token", "int8"),
+                required("resource_count", "int8"),
+                required("sync_state", "text"),
+                required("sync_progress", "int4"),
+                required("updated_at", "timestamptz"),
             ],
-        ),
+        },
+        TableExpectation {
+            name: "linklake_fleet_conflicts",
+            primary_key: &["conflict_id"],
+            columns: &[
+                required("conflict_id", "text"),
+                required("source_instance_id", "text"),
+                required("generation", "int8"),
+                required("resource_kind", "text"),
+                required("resource_id", "text"),
+                optional("owner_instance_id", "text"),
+                required("conflict_code", "text"),
+                required("detail_summary", "text"),
+                required("state", "text"),
+                required("detected_at", "timestamptz"),
+                optional("resolved_at", "timestamptz"),
+                optional("resolution", "text"),
+            ],
+        },
     ];
-    for (table, required_columns) in TABLES {
+    for table in TABLES {
         let exists: bool = transaction
-            .query_one("SELECT to_regclass($1) IS NOT NULL", &[table])
+            .query_one("SELECT to_regclass($1) IS NOT NULL", &[&table.name])
             .await?
             .get(0);
         anyhow::ensure!(
             exists,
-            "PostgreSQL migration ledger exists but table {table} is missing"
+            "PostgreSQL migration ledger exists but table {} is missing",
+            table.name
         );
         let rows = transaction
             .query(
-                "SELECT column_name FROM information_schema.columns
+                "SELECT column_name, udt_name, is_nullable = 'YES'
+                 FROM information_schema.columns
                  WHERE table_schema = current_schema() AND table_name = $1",
-                &[table],
+                &[&table.name],
             )
             .await?;
         let columns = rows
             .iter()
-            .map(|row| row.get::<_, String>(0))
-            .collect::<HashSet<_>>();
-        for column in *required_columns {
+            .map(|row| {
+                (
+                    row.get::<_, String>(0),
+                    (row.get::<_, String>(1), row.get::<_, bool>(2)),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        for expected in table.columns {
+            let Some((postgres_type, nullable)) = columns.get(expected.name) else {
+                anyhow::bail!(
+                    "PostgreSQL migration ledger exists but {}.{} is missing",
+                    table.name,
+                    expected.name
+                );
+            };
             anyhow::ensure!(
-                columns.contains(*column),
-                "PostgreSQL migration ledger exists but {table}.{column} is missing"
+                postgres_type == expected.postgres_type && *nullable == expected.nullable,
+                "PostgreSQL schema mismatch for {}.{}: expected type {} nullable={}, got type {} nullable={}",
+                table.name,
+                expected.name,
+                expected.postgres_type,
+                expected.nullable,
+                postgres_type,
+                nullable
             );
         }
+        let primary_key = transaction
+            .query(
+                "SELECT attribute.attname
+                 FROM pg_index AS idx
+                 JOIN pg_class AS relation ON relation.oid = idx.indrelid
+                 JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+                 JOIN LATERAL unnest(idx.indkey) WITH ORDINALITY AS key(attnum, position)
+                   ON TRUE
+                 JOIN pg_attribute AS attribute
+                   ON attribute.attrelid = relation.oid AND attribute.attnum = key.attnum
+                 WHERE namespace.nspname = current_schema()
+                   AND relation.relname = $1 AND idx.indisprimary
+                 ORDER BY key.position",
+                &[&table.name],
+            )
+            .await?
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            primary_key.len() == table.primary_key.len()
+                && primary_key
+                    .iter()
+                    .zip(table.primary_key.iter())
+                    .all(|(actual, expected)| actual == expected),
+            "PostgreSQL primary key mismatch for {}",
+            table.name
+        );
     }
     Ok(())
+}
+
+const fn required(name: &'static str, postgres_type: &'static str) -> ColumnExpectation {
+    ColumnExpectation {
+        name,
+        postgres_type,
+        nullable: false,
+    }
+}
+
+const fn optional(name: &'static str, postgres_type: &'static str) -> ColumnExpectation {
+    ColumnExpectation {
+        name,
+        postgres_type,
+        nullable: true,
+    }
 }
 
 fn migration_checksum(migration: &Migration) -> String {

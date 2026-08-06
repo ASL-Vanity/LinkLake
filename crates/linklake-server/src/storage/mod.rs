@@ -10,12 +10,12 @@ use serde::Serialize;
 use std::{
     env, fmt,
     net::IpAddr,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
+    ops::{Deref, DerefMut},
+    sync::Arc,
+    time::Duration,
 };
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::sync::{mpsc, Mutex, OwnedMutexGuard};
+use tokio::time::timeout;
 use tokio_postgres::{
     config::{Host, SslMode},
     Client,
@@ -26,6 +26,9 @@ pub(crate) const STORAGE_BACKEND_ENV: &str = "LINKLAKE_STORAGE_BACKEND";
 pub(crate) const POSTGRES_URL_ENV: &str = "LINKLAKE_POSTGRES_URL";
 pub(crate) const POSTGRES_POOL_SIZE_ENV: &str = "LINKLAKE_POSTGRES_POOL_SIZE";
 pub(crate) const POSTGRES_INSECURE_LOOPBACK_ENV: &str = "LINKLAKE_POSTGRES_ALLOW_INSECURE_LOOPBACK";
+pub(crate) const POSTGRES_ACQUIRE_TIMEOUT_ENV: &str = "LINKLAKE_POSTGRES_ACQUIRE_TIMEOUT_SECONDS";
+pub(crate) const POSTGRES_CONNECT_TIMEOUT_ENV: &str = "LINKLAKE_POSTGRES_CONNECT_TIMEOUT_SECONDS";
+pub(crate) const POSTGRES_HEALTH_TIMEOUT_ENV: &str = "LINKLAKE_POSTGRES_HEALTH_TIMEOUT_SECONDS";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -122,11 +125,11 @@ impl CoordinationStorage {
                     .postgres_url
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("PostgreSQL URL was not configured"))?;
-                let pool = PostgresPool::connect(url).await?;
-                let mut client = pool.acquire().await;
+                let pool = Arc::new(PostgresPool::connect(url).await?);
+                let mut client = pool.acquire().await?;
                 postgres_migrations::apply(&mut client).await?;
                 drop(client);
-                Ok(Self::Postgres(Arc::new(pool)))
+                Ok(Self::Postgres(pool))
             }
         }
     }
@@ -147,11 +150,11 @@ impl CoordinationStorage {
         }
     }
 
-    pub(crate) async fn postgres_client(&self) -> anyhow::Result<OwnedMutexGuard<Client>> {
+    pub(crate) async fn postgres_client(&self) -> anyhow::Result<PostgresClientGuard> {
         let Self::Postgres(pool) = self else {
             anyhow::bail!("operation requires the PostgreSQL coordination backend");
         };
-        Ok(pool.acquire().await)
+        pool.acquire().await
     }
 
     pub(crate) async fn database_unix_seconds(&self) -> anyhow::Result<u64> {
@@ -179,8 +182,14 @@ impl CoordinationStorage {
 }
 
 pub(crate) struct PostgresPool {
-    clients: Vec<Arc<Mutex<Client>>>,
-    next: AtomicUsize,
+    config: tokio_postgres::Config,
+    tls: MakeRustlsConnect,
+    slots: Vec<Arc<Mutex<Option<Client>>>>,
+    available_tx: mpsc::Sender<usize>,
+    available_rx: Mutex<mpsc::Receiver<usize>>,
+    acquire_timeout: Duration,
+    connect_timeout: Duration,
+    health_timeout: Duration,
 }
 
 impl PostgresPool {
@@ -196,7 +205,7 @@ impl PostgresPool {
             );
             config.ssl_mode(SslMode::Disable);
         } else {
-            // Prefer 模式允许服务端拒绝 TLS 后回退明文；生产默认必须彻底禁止回退。
+            // Require 模式禁止服务端回退到明文；生产默认必须保持 TLS 校验。
             config.ssl_mode(SslMode::Require);
         }
         config.application_name("linklake-server-ha");
@@ -211,30 +220,133 @@ impl PostgresPool {
             (1..=32).contains(&pool_size),
             "{POSTGRES_POOL_SIZE_ENV} must be between 1 and 32"
         );
+        let acquire_timeout = parse_duration_environment(POSTGRES_ACQUIRE_TIMEOUT_ENV, 5, 1, 60)?;
+        let connect_timeout = parse_duration_environment(POSTGRES_CONNECT_TIMEOUT_ENV, 10, 1, 120)?;
+        let health_timeout = parse_duration_environment(POSTGRES_HEALTH_TIMEOUT_ENV, 3, 1, 30)?;
         let tls = postgres_tls_connector()?;
-        let mut clients = Vec::with_capacity(pool_size);
-        for _ in 0..pool_size {
-            let (client, connection) = config.connect(tls.clone()).await.map_err(|_| {
-                anyhow::anyhow!("could not establish a verified PostgreSQL connection")
+        let (available_tx, available_rx) = mpsc::channel(pool_size);
+        let mut slots = Vec::with_capacity(pool_size);
+        for index in 0..pool_size {
+            let client = connect_postgres_client(&config, &tls, connect_timeout).await?;
+            slots.push(Arc::new(Mutex::new(Some(client))));
+            available_tx.try_send(index).map_err(|_| {
+                anyhow::anyhow!("could not initialize the PostgreSQL connection pool")
             })?;
-            tokio::spawn(async move {
-                if connection.await.is_err() {
-                    // 驱动错误可能包含连接目标信息，因此这里只记录固定消息。
-                    tracing::error!("PostgreSQL connection task stopped");
-                }
-            });
-            clients.push(Arc::new(Mutex::new(client)));
         }
         Ok(Self {
-            clients,
-            next: AtomicUsize::new(0),
+            config,
+            tls,
+            slots,
+            available_tx,
+            available_rx: Mutex::new(available_rx),
+            acquire_timeout,
+            connect_timeout,
+            health_timeout,
         })
     }
 
-    async fn acquire(&self) -> OwnedMutexGuard<Client> {
-        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.clients.len();
-        self.clients[index].clone().lock_owned().await
+    async fn acquire(self: &Arc<Self>) -> anyhow::Result<PostgresClientGuard> {
+        let index = timeout(self.acquire_timeout, async {
+            let mut receiver = self.available_rx.lock().await;
+            receiver.recv().await
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for a PostgreSQL connection"))?
+        .ok_or_else(|| anyhow::anyhow!("PostgreSQL connection pool is closed"))?;
+        let lease = PostgresSlotLease {
+            pool: self.clone(),
+            index,
+        };
+        let mut client = self.slots[index].clone().lock_owned().await;
+        let healthy = if let Some(existing) = client.as_ref() {
+            !existing.is_closed()
+                && matches!(
+                    timeout(self.health_timeout, existing.simple_query("SELECT 1")).await,
+                    Ok(Ok(_))
+                )
+        } else {
+            false
+        };
+        if !healthy {
+            *client = None;
+            let replacement =
+                connect_postgres_client(&self.config, &self.tls, self.connect_timeout).await?;
+            *client = Some(replacement);
+        }
+        Ok(PostgresClientGuard {
+            client: Some(client),
+            lease: Some(lease),
+        })
     }
+}
+
+pub(crate) struct PostgresClientGuard {
+    // 先释放客户端锁，再把槽位归还可用队列。
+    client: Option<OwnedMutexGuard<Option<Client>>>,
+    lease: Option<PostgresSlotLease>,
+}
+
+impl Deref for PostgresClientGuard {
+    type Target = Client;
+
+    fn deref(&self) -> &Self::Target {
+        self.client
+            .as_ref()
+            .and_then(|client| client.as_ref())
+            .expect("PostgreSQL pool guard must contain a connected client")
+    }
+}
+
+impl DerefMut for PostgresClientGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.client
+            .as_mut()
+            .and_then(|client| client.as_mut())
+            .expect("PostgreSQL pool guard must contain a connected client")
+    }
+}
+
+impl Drop for PostgresClientGuard {
+    fn drop(&mut self) {
+        if let Some(client) = self.client.as_mut() {
+            if client.as_ref().is_some_and(Client::is_closed) {
+                **client = None;
+            }
+        }
+        drop(self.client.take());
+        drop(self.lease.take());
+    }
+}
+
+struct PostgresSlotLease {
+    pool: Arc<PostgresPool>,
+    index: usize,
+}
+
+impl Drop for PostgresSlotLease {
+    fn drop(&mut self) {
+        if self.pool.available_tx.try_send(self.index).is_err() {
+            tracing::error!("PostgreSQL pool slot could not be returned");
+        }
+    }
+}
+
+async fn connect_postgres_client(
+    config: &tokio_postgres::Config,
+    tls: &MakeRustlsConnect,
+    connect_timeout: Duration,
+) -> anyhow::Result<Client> {
+    let (client, connection) = timeout(connect_timeout, config.connect(tls.clone()))
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out establishing a verified PostgreSQL connection"))?
+        .map_err(|_| anyhow::anyhow!("could not establish a verified PostgreSQL connection"))?;
+    tokio::spawn(async move {
+        if connection.await.is_err() {
+            // 驱动错误可能包含连接目标信息，因此这里只记录固定消息。
+            tracing::error!("PostgreSQL connection task stopped");
+        }
+    });
+    Ok(client)
 }
 
 fn postgres_tls_connector() -> anyhow::Result<MakeRustlsConnect> {
@@ -276,6 +388,25 @@ fn parse_boolean_environment(name: &str) -> anyhow::Result<bool> {
         Some("1") | Some("true") | Some("TRUE") => Ok(true),
         Some(_) => anyhow::bail!("{name} must be true or false"),
     }
+}
+
+fn parse_duration_environment(
+    name: &str,
+    default_seconds: u64,
+    minimum_seconds: u64,
+    maximum_seconds: u64,
+) -> anyhow::Result<Duration> {
+    let seconds = env::var(name)
+        .ok()
+        .map(|value| value.trim().parse::<u64>())
+        .transpose()
+        .map_err(|_| anyhow::anyhow!("{name} must be an integer"))?
+        .unwrap_or(default_seconds);
+    anyhow::ensure!(
+        (minimum_seconds..=maximum_seconds).contains(&seconds),
+        "{name} must be between {minimum_seconds} and {maximum_seconds} seconds"
+    );
+    Ok(Duration::from_secs(seconds))
 }
 
 fn nonnegative_time(value: i64) -> anyhow::Result<u64> {
