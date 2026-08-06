@@ -13890,10 +13890,24 @@ async fn change_password(
         StatusCode::UNAUTHORIZED,
         "missing management session",
     ))?;
-    let changed = state
+    let mut admin_auth = state
         .admin_auth
         .lock()
-        .expect("administrator registry lock poisoned")
+        .expect("administrator registry lock poisoned");
+    let identity = admin_auth
+        .authenticate_session(&session)
+        .map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not verify session",
+            )
+        })?
+        .ok_or(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "invalid management session",
+        ))?;
+    let username = identity.username;
+    let changed = admin_auth
         .change_password(&session, &request.new_password)
         .map_err(|error| {
             if error.to_string().contains("at least 12 characters") {
@@ -13908,6 +13922,7 @@ async fn change_password(
                 )
             }
         })?;
+    drop(admin_auth);
     if !changed {
         return Err(ApiError(
             StatusCode::UNAUTHORIZED,
@@ -13917,7 +13932,7 @@ async fn change_password(
     record_audit(
         &state,
         "management.password.changed",
-        "administrator",
+        &username,
         "password updated",
     );
     Ok(StatusCode::NO_CONTENT)
