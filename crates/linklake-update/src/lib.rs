@@ -29,7 +29,8 @@ mod manager;
 mod server_database;
 use durable::{
     read_limited_bytes, read_limited_json as read_durable_json, remove_durable_file,
-    write_durable_bytes, write_durable_json, write_journal_json, UpdateLock,
+    update_operation_active as durable_update_operation_active, write_durable_bytes,
+    write_durable_json, write_journal_json, UpdateLock,
 };
 pub use manager::{
     manager_apply, manager_download, manager_rollback, manager_status, run_manager_helper,
@@ -1098,6 +1099,14 @@ pub fn status(product: UpdateProduct, state_directory: &Path) -> anyhow::Result<
         });
     }
     read_durable_json(&path, MAX_UPDATE_STATE_BYTES)
+}
+
+/// 只读、非阻塞地汇总跨进程更新锁与可恢复活动标记。
+///
+/// 返回后不会继续持有任何锁，适合管理界面轮询；调用方如需启动更新，仍必须由实际
+/// 更新命令重新取得排他锁，不能把本函数当作授权或互斥原语。
+pub fn update_operation_active(state_directory: &Path) -> anyhow::Result<bool> {
+    durable_update_operation_active(state_directory)
 }
 
 pub fn run_helper(plan_path: &Path, expected_plan_sha256: &str) -> anyhow::Result<()> {

@@ -4968,11 +4968,11 @@ async fn server_update_overview(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<ServerUpdateOverviewResponse>, CodedApiError> {
-    require_interactive_administrator(&state, &headers)?;
+    require_interactive_server_update_administrator(&state, &headers, "overview")?;
     let update_state = linklake_update::default_state_directory(UpdateProduct::Server);
     let status = linklake_update::status(UpdateProduct::Server, &update_state)
         .map_err(|error| server_update_api_error("status", error))?;
-    let operation_active = server_update_operation_active(&update_state)?;
+    let operation_active = server_update_operation_active(&state, &update_state)?;
     Ok(Json(ServerUpdateOverviewResponse {
         build: BuildInfo::current("LinkLake Server"),
         repository: UPDATE_REPOSITORY,
@@ -5179,15 +5179,23 @@ fn server_update_busy_error() -> CodedApiError {
     )
 }
 
-fn server_update_operation_active(update_state: &FsPath) -> Result<bool, CodedApiError> {
-    update_state
-        .join("active.json")
-        .try_exists()
-        .map_err(|error| server_update_api_error("active_status", error.into()))
+fn server_update_operation_active(
+    state: &AppState,
+    update_state: &FsPath,
+) -> Result<bool, CodedApiError> {
+    // 进程内门闩只在只读、非阻塞的跨进程探测期间短暂持有，避免状态快照与新命令交错。
+    let _gate = match state.server_update_operation_lock.try_lock() {
+        Ok(gate) => gate,
+        Err(_) => return Ok(true),
+    };
+    linklake_update::update_operation_active(update_state)
+        .map_err(|error| server_update_api_error("active_status", error))
 }
 
 fn ensure_server_update_idle(update_state: &FsPath) -> Result<(), CodedApiError> {
-    if server_update_operation_active(update_state)? {
+    if linklake_update::update_operation_active(update_state)
+        .map_err(|error| server_update_api_error("active_status", error))?
+    {
         Err(server_update_busy_error())
     } else {
         Ok(())
@@ -5208,6 +5216,20 @@ fn record_server_update_rejection(
             "actor={}; reason={reason}; channel=stable; signature_policy=production",
             principal.username
         ),
+    );
+}
+
+fn record_server_update_authentication_rejection(
+    state: &AppState,
+    operation: &'static str,
+    reason: &'static str,
+) {
+    // 认证失败审计只写固定代码；不得把 Authorization、Cookie 或底层错误正文落盘。
+    record_audit(
+        state,
+        &format!("server.update.{operation}.authentication_rejected"),
+        "server",
+        &format!("reason={reason}; channel=stable; signature_policy=production"),
     );
 }
 
@@ -13990,26 +14012,122 @@ fn require_administrator(
     Ok(principal)
 }
 
-fn require_interactive_administrator(
+fn require_interactive_server_update_administrator(
     state: &AppState,
     headers: &HeaderMap,
+    operation: &'static str,
 ) -> Result<ManagementPrincipal, CodedApiError> {
+    let session = match strict_management_session_cookie(headers) {
+        Ok(session) => session,
+        Err(()) => {
+            record_server_update_authentication_rejection(
+                state,
+                operation,
+                "invalid_session_cookie",
+            );
+            return Err(CodedApiError(
+                StatusCode::UNAUTHORIZED,
+                "session_authentication_required",
+                "server updates require a valid interactive administrator session",
+            ));
+        }
+    };
+    if headers.contains_key(header::AUTHORIZATION) && session.is_some() {
+        record_server_update_authentication_rejection(
+            state,
+            operation,
+            "mixed_authorization_and_session",
+        );
+        return Err(CodedApiError(
+            StatusCode::FORBIDDEN,
+            "session_authentication_required",
+            "server updates reject mixed bearer and session authentication",
+        ));
+    }
     if headers.contains_key(header::AUTHORIZATION) {
+        record_server_update_authentication_rejection(
+            state,
+            operation,
+            "bearer_authentication_forbidden",
+        );
         return Err(CodedApiError(
             StatusCode::FORBIDDEN,
             "session_authentication_required",
             "server updates reject bearer authentication and require an interactive administrator login",
         ));
     }
-    let principal = require_administrator(state, headers)?;
-    if principal.session_id.is_none() {
+    let Some(session) = session else {
+        record_server_update_authentication_rejection(
+            state,
+            operation,
+            "interactive_session_missing",
+        );
         return Err(CodedApiError(
-            StatusCode::FORBIDDEN,
+            StatusCode::UNAUTHORIZED,
             "session_authentication_required",
             "server updates require an interactive administrator login",
         ));
+    };
+    let authentication = {
+        let admin_auth = state
+            .admin_auth
+            .lock()
+            .expect("administrator registry lock poisoned");
+        admin_auth.authenticate_session(&session)
+    };
+    let identity = match authentication {
+        Ok(Some(identity)) => identity,
+        Ok(None) => {
+            record_server_update_authentication_rejection(
+                state,
+                operation,
+                "invalid_or_expired_session",
+            );
+            return Err(CodedApiError(
+                StatusCode::UNAUTHORIZED,
+                "session_authentication_required",
+                "server updates require a valid interactive administrator session",
+            ));
+        }
+        Err(_) => {
+            record_server_update_authentication_rejection(
+                state,
+                operation,
+                "session_verification_failed",
+            );
+            return Err(CodedApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "management_authorization_failed",
+                "could not verify the interactive administrator session",
+            ));
+        }
+    };
+    if identity.password_change_required {
+        record_server_update_authentication_rejection(state, operation, "password_change_required");
+        return Err(CodedApiError(
+            StatusCode::FORBIDDEN,
+            "password_change_required",
+            "password change is required before server update management",
+        ));
     }
-    Ok(principal)
+    if identity.role != UserRole::Administrator {
+        record_server_update_authentication_rejection(
+            state,
+            operation,
+            "administrator_role_required",
+        );
+        return Err(CodedApiError(
+            StatusCode::FORBIDDEN,
+            "administrator_required",
+            "administrator role is required",
+        ));
+    }
+    Ok(ManagementPrincipal {
+        username: identity.username,
+        role: identity.role,
+        session_id: Some(identity.session_id),
+        fleet_source_instance_id: None,
+    })
 }
 
 fn require_interactive_update_administrator(
@@ -14018,7 +14136,7 @@ fn require_interactive_update_administrator(
     request_host: &str,
     operation: &'static str,
 ) -> Result<ManagementPrincipal, CodedApiError> {
-    let principal = require_interactive_administrator(state, headers)?;
+    let principal = require_interactive_server_update_administrator(state, headers, operation)?;
     require_same_origin_update_request(headers, request_host).map_err(|error| {
         record_server_update_rejection(state, operation, &principal, "same_origin_check_failed");
         error
@@ -14030,31 +14148,42 @@ fn require_same_origin_update_request(
     headers: &HeaderMap,
     request_host: &str,
 ) -> Result<(), CodedApiError> {
-    if headers
-        .get(UPDATE_CSRF_HEADER)
-        .and_then(|value| value.to_str().ok())
-        != Some(UPDATE_CSRF_VALUE)
-    {
+    let csrf = strict_single_header_value(headers, UPDATE_CSRF_HEADER).map_err(|()| {
+        CodedApiError(
+            StatusCode::FORBIDDEN,
+            "csrf_check_failed",
+            "server update requests require exactly one valid LinkLake CSRF header",
+        )
+    })?;
+    if csrf != Some(UPDATE_CSRF_VALUE) {
         return Err(CodedApiError(
             StatusCode::FORBIDDEN,
             "csrf_check_failed",
             "server update requests require the LinkLake CSRF header",
         ));
     }
-    if headers
-        .get("sec-fetch-site")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value != "same-origin")
-    {
+    let fetch_site = strict_single_header_value(headers, "sec-fetch-site").map_err(|()| {
+        CodedApiError(
+            StatusCode::FORBIDDEN,
+            "update_origin_check_failed",
+            "server update requests require at most one valid Sec-Fetch-Site header",
+        )
+    })?;
+    if fetch_site.is_some_and(|value| value != "same-origin") {
         return Err(CodedApiError(
             StatusCode::FORBIDDEN,
             "update_origin_check_failed",
             "server update requests must originate from the same management origin",
         ));
     }
-    let origin = headers
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok())
+    let origin = strict_single_header_value(headers, "origin")
+        .map_err(|()| {
+            CodedApiError(
+                StatusCode::FORBIDDEN,
+                "update_origin_check_failed",
+                "server update requests require exactly one valid Origin header",
+            )
+        })?
         .ok_or(CodedApiError(
             StatusCode::FORBIDDEN,
             "update_origin_check_failed",
@@ -14094,11 +14223,58 @@ fn management_origin_matches_host(origin: &str, request_host: &str) -> bool {
     let Ok(request_authority) = request_host.parse::<axum::http::uri::Authority>() else {
         return false;
     };
+    let Some(origin_port) = strict_authority_port(origin_authority, default_port) else {
+        return false;
+    };
+    let Some(request_port) = strict_authority_port(&request_authority, default_port) else {
+        return false;
+    };
     origin_authority
         .host()
         .eq_ignore_ascii_case(request_authority.host())
-        && origin_authority.port_u16().unwrap_or(default_port)
-            == request_authority.port_u16().unwrap_or(default_port)
+        && origin_port == request_port
+}
+
+fn strict_authority_port(authority: &axum::http::uri::Authority, default_port: u16) -> Option<u16> {
+    let suffix = authority.as_str().strip_prefix(authority.host())?;
+    if suffix.is_empty() {
+        return Some(default_port);
+    }
+    let explicit = suffix.strip_prefix(':')?;
+    if explicit.is_empty() || !explicit.bytes().all(|value| value.is_ascii_digit()) {
+        return None;
+    }
+    explicit.parse::<u16>().ok()
+}
+
+fn strict_single_header_value<'a>(
+    headers: &'a HeaderMap,
+    name: &'static str,
+) -> Result<Option<&'a str>, ()> {
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(());
+    }
+    value.to_str().map(Some).map_err(|_| ())
+}
+
+fn strict_management_session_cookie(headers: &HeaderMap) -> Result<Option<String>, ()> {
+    let mut session = None;
+    for value in headers.get_all(header::COOKIE).iter() {
+        let value = value.to_str().map_err(|_| ())?;
+        for item in value.split(';').map(str::trim) {
+            if let Some(cookie) = item.strip_prefix("linklake_session=") {
+                if session.is_some() || cookie.is_empty() {
+                    return Err(());
+                }
+                session = Some(cookie.to_owned());
+            }
+        }
+    }
+    Ok(session)
 }
 
 fn require_interactive_session(
@@ -14140,6 +14316,21 @@ async fn enforce_management_role(
         return next.run(request).await;
     }
 
+    let server_update_operation = match path {
+        "/api/v1/updates/server" => Some("overview"),
+        "/api/v1/updates/server/check" => Some("check"),
+        "/api/v1/updates/server/download" => Some("download"),
+        "/api/v1/updates/server/apply" => Some("apply"),
+        _ => None,
+    };
+    if let Some(operation) = server_update_operation {
+        if let Err(error) =
+            require_interactive_server_update_administrator(&state, request.headers(), operation)
+        {
+            return error.into_response();
+        }
+    }
+
     let users_or_sessions = path == "/api/v1/users"
         || path.starts_with("/api/v1/users/")
         || path == "/api/v1/sessions"
@@ -14151,10 +14342,9 @@ async fn enforce_management_role(
     if write
         && management_session_cookie(request.headers()).is_some()
         && bearer_token(request.headers()).is_none()
-        && request
-            .headers()
-            .get(UPDATE_CSRF_HEADER)
-            .and_then(|value| value.to_str().ok())
+        && strict_single_header_value(request.headers(), UPDATE_CSRF_HEADER)
+            .ok()
+            .flatten()
             != Some(UPDATE_CSRF_VALUE)
     {
         return CodedApiError(
@@ -14164,7 +14354,7 @@ async fn enforce_management_role(
         )
         .into_response();
     }
-    if users_or_sessions || write {
+    if server_update_operation.is_none() && (users_or_sessions || write) {
         match management_principal(&state, request.headers()) {
             Ok(principal)
                 if principal.role == UserRole::Administrator
@@ -15722,6 +15912,12 @@ mod tests {
             ("ftp://link.example.com", "link.example.com"),
             ("https://link.example.com/path", "link.example.com"),
             ("https://user@link.example.com", "link.example.com"),
+            ("https://link.example.com:", "link.example.com"),
+            ("https://link.example.com:not-a-port", "link.example.com"),
+            ("https://link.example.com:65536", "link.example.com"),
+            ("https://link.example.com", "link.example.com:"),
+            ("https://link.example.com", "link.example.com:not-a-port"),
+            ("https://link.example.com", "link.example.com:65536"),
             ("null", "link.example.com"),
         ] {
             assert!(!management_origin_matches_host(origin, host));
@@ -15734,6 +15930,25 @@ mod tests {
             HeaderValue::from_static("https://link.example.com"),
         );
         headers.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        assert!(require_same_origin_update_request(&headers, "link.example.com").is_ok());
+
+        headers.append("x-linklake-csrf", HeaderValue::from_static("1"));
+        assert!(require_same_origin_update_request(&headers, "link.example.com").is_err());
+        headers.remove("x-linklake-csrf");
+        headers.insert("x-linklake-csrf", HeaderValue::from_static("1"));
+        headers.append(
+            header::ORIGIN,
+            HeaderValue::from_static("https://link.example.com"),
+        );
+        assert!(require_same_origin_update_request(&headers, "link.example.com").is_err());
+        headers.remove(header::ORIGIN);
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://link.example.com"),
+        );
+        headers.append("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        assert!(require_same_origin_update_request(&headers, "link.example.com").is_err());
+        headers.remove("sec-fetch-site");
         assert!(require_same_origin_update_request(&headers, "link.example.com").is_ok());
 
         headers.insert("sec-fetch-site", HeaderValue::from_static("cross-site"));

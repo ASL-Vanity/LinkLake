@@ -58,6 +58,64 @@ impl UpdateLock {
     }
 }
 
+/// 以只读、非阻塞方式判断更新状态目录是否正被其他进程使用。
+///
+/// 此检查不会创建或改写 `update.lock`，取得探测锁后也会立即释放，因此不会影响
+/// 正常的更新命令。`active.json` 作为跨重启恢复标记，与进程锁共同构成活动状态。
+pub(crate) fn update_operation_active(state_directory: &Path) -> Result<bool> {
+    let state_directory = match fs::symlink_metadata(state_directory) {
+        Ok(_) => validate_existing_directory(state_directory)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "cannot inspect update state directory {}",
+                    state_directory.display()
+                )
+            })
+        }
+    };
+
+    let active_path = state_directory.join("active.json");
+    match fs::symlink_metadata(&active_path) {
+        Ok(_) => {
+            validate_managed_file_path(&active_path, false)?;
+            return Ok(true);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "cannot inspect active update marker {}",
+                    active_path.display()
+                )
+            })
+        }
+    }
+
+    let lock_path = state_directory.join(UPDATE_LOCK_NAME);
+    match fs::symlink_metadata(&lock_path) {
+        Ok(_) => {
+            validate_managed_file_path(&lock_path, false)?;
+            lock_file_is_held(&lock_path)
+        }
+        Err(error) if lock_probe_error_means_held(&error) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error)
+            .with_context(|| format!("cannot inspect update lock {}", lock_path.display())),
+    }
+}
+
+#[cfg(windows)]
+fn lock_probe_error_means_held(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(32 | 33))
+}
+
+#[cfg(not(windows))]
+fn lock_probe_error_means_held(_error: &std::io::Error) -> bool {
+    false
+}
+
 impl Drop for UpdateLock {
     fn drop(&mut self) {
         unlock_file(&self.file);
@@ -573,16 +631,58 @@ fn lock_file_exclusive(file: &File, path: &Path) -> Result<()> {
     Err(error).with_context(|| format!("cannot lock {}", path.display()))
 }
 
+#[cfg(unix)]
+fn lock_file_is_held(path: &Path) -> Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    let file = open_regular_file_no_follow(path)?;
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        unlock_file(&file);
+        return Ok(false);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return Ok(true);
+    }
+    Err(error).with_context(|| format!("cannot probe update lock {}", path.display()))
+}
+
 #[cfg(windows)]
 fn lock_file_exclusive(_file: &File, _path: &Path) -> Result<()> {
     // `share_mode(0)` 已在打开句柄时完成排他加锁。
     Ok(())
 }
 
+#[cfg(windows)]
+fn lock_file_is_held(path: &Path) -> Result<bool> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    configure_lock_open_options(&mut options);
+    match options.open(path) {
+        Ok(file) => {
+            validate_open_regular_file(path, &file)?;
+            Ok(false)
+        }
+        Err(error) if matches!(error.raw_os_error(), Some(32 | 33)) => Ok(true),
+        Err(error) => {
+            Err(error).with_context(|| format!("cannot probe update lock {}", path.display()))
+        }
+    }
+}
+
 #[cfg(not(any(unix, windows)))]
 fn lock_file_exclusive(_file: &File, path: &Path) -> Result<()> {
     anyhow::bail!(
         "process-level update locking is unsupported on this platform: {}",
+        path.display()
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
+fn lock_file_is_held(path: &Path) -> Result<bool> {
+    anyhow::bail!(
+        "process-level update lock inspection is unsupported on this platform: {}",
         path.display()
     )
 }
@@ -828,10 +928,15 @@ mod tests {
         let root = tempdir().unwrap();
         let root_path = managed_test_root(root.path());
         let first = UpdateLock::acquire(&root_path).unwrap();
+        assert!(update_operation_active(&root_path).unwrap());
         assert!(UpdateLock::acquire(&root_path).is_err());
         drop(first);
+        assert!(!update_operation_active(&root_path).unwrap());
         drop(UpdateLock::acquire(&root_path).unwrap());
         assert!(root_path.join(UPDATE_LOCK_NAME).is_file());
+
+        fs::write(root_path.join("active.json"), b"{}").unwrap();
+        assert!(update_operation_active(&root_path).unwrap());
     }
 
     #[test]
