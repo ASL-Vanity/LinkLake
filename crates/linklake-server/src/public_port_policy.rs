@@ -1,6 +1,12 @@
 use linklake_core::public_ports::PortRanges;
 use serde::Serialize;
-use std::net::SocketAddr;
+use std::{
+    collections::HashSet,
+    error::Error,
+    fmt,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
 
 const DEFAULT_PUBLIC_PORTS: &str = "32000-32999";
 const DEFAULT_RESERVED_TCP_PORTS: &str = "22";
@@ -19,6 +25,93 @@ pub(crate) struct PublicPortPolicyView {
     pub(crate) udp_allowed: String,
     pub(crate) tcp_reserved: String,
     pub(crate) udp_reserved: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DynamicPortProtocol {
+    Tcp,
+}
+
+/// 动态端口租约接口不假定存储位置；当前本地实现由单进程持有，HA 线可替换为分布式租约。
+pub(crate) trait DynamicPortLease: Send + Sync {
+    fn protocol(&self) -> DynamicPortProtocol;
+    fn port(&self) -> u16;
+}
+
+pub(crate) trait DynamicPortLeaseProvider: Send + Sync {
+    fn acquire_tcp(
+        &self,
+        policy: &PublicPortPolicy,
+    ) -> Result<Box<dyn DynamicPortLease>, DynamicPortLeaseError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DynamicPortLeaseError {
+    Exhausted,
+}
+
+impl fmt::Display for DynamicPortLeaseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("no dynamic TCP public port is available")
+    }
+}
+
+impl Error for DynamicPortLeaseError {}
+
+#[derive(Clone, Default)]
+pub(crate) struct LocalDynamicPortLeaseProvider {
+    state: Arc<Mutex<LocalDynamicPortLeaseState>>,
+}
+
+#[derive(Default)]
+struct LocalDynamicPortLeaseState {
+    tcp: HashSet<u16>,
+    next_tcp: u16,
+}
+
+struct LocalDynamicPortLease {
+    state: Arc<Mutex<LocalDynamicPortLeaseState>>,
+    port: u16,
+}
+
+impl DynamicPortLease for LocalDynamicPortLease {
+    fn protocol(&self) -> DynamicPortProtocol {
+        DynamicPortProtocol::Tcp
+    }
+
+    fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+impl Drop for LocalDynamicPortLease {
+    fn drop(&mut self) {
+        self.state
+            .lock()
+            .expect("dynamic port lease lock poisoned")
+            .tcp
+            .remove(&self.port);
+    }
+}
+
+impl DynamicPortLeaseProvider for LocalDynamicPortLeaseProvider {
+    fn acquire_tcp(
+        &self,
+        policy: &PublicPortPolicy,
+    ) -> Result<Box<dyn DynamicPortLease>, DynamicPortLeaseError> {
+        let mut state = self.state.lock().expect("dynamic port lease lock poisoned");
+        let cursor = state.next_tcp.max(1) as u32;
+        let port = (0..u16::MAX as u32)
+            .map(|offset| ((cursor - 1 + offset) % u16::MAX as u32 + 1) as u16)
+            .find(|port| policy.allows_tcp(*port) && !state.tcp.contains(port))
+            .ok_or(DynamicPortLeaseError::Exhausted)?;
+        state.tcp.insert(port);
+        state.next_tcp = port.wrapping_add(1).max(1);
+        Ok(Box::new(LocalDynamicPortLease {
+            state: self.state.clone(),
+            port,
+        }))
+    }
 }
 
 impl PublicPortPolicy {
@@ -138,7 +231,7 @@ fn has_available_port(allowed: &PortRanges, reserved: &PortRanges) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::PublicPortPolicy;
+    use super::{DynamicPortLeaseProvider, LocalDynamicPortLeaseProvider, PublicPortPolicy};
 
     #[test]
     fn development_policy_keeps_previous_defaults() {
@@ -158,5 +251,18 @@ mod tests {
         assert!(policy.allows_tcp(50_000));
         assert!(!policy.allows_udp(53));
         assert!(policy.allows_udp(10_000));
+    }
+
+    #[test]
+    fn local_dynamic_leases_are_unique_rotating_and_released_on_drop() {
+        let policy = PublicPortPolicy::for_test("32000-32001", "32000", "", "");
+        let provider = LocalDynamicPortLeaseProvider::default();
+        let first = provider.acquire_tcp(&policy).unwrap();
+        let second = provider.acquire_tcp(&policy).unwrap();
+        assert_ne!(first.port(), second.port());
+        assert!(provider.acquire_tcp(&policy).is_err());
+        let released = first.port();
+        drop(first);
+        assert_eq!(provider.acquire_tcp(&policy).unwrap().port(), released);
     }
 }

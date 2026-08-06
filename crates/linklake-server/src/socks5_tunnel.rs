@@ -2,6 +2,7 @@ use crate::traffic_control::{TrafficDecision, TrafficPolicyKind};
 use crate::{
     client_registry::Authentication,
     dual_stack_udp::{bind_public_socket, DualStackUdpSocket, PublicUdpEndpoint},
+    public_port_policy::{DynamicPortLease, DynamicPortProtocol},
     record_audit,
     tcp_tunnel::{copy_bidirectional_with_limit, BandwidthLimiter},
     tunnel_catalog::socks5_password_matches,
@@ -18,7 +19,7 @@ use linklake_core::{
     UdpDataPlaneControlFrame, UdpSessionCloseReason,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -28,7 +29,7 @@ use std::{
 };
 use tokio::{
     io::{split, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
-    net::{TcpListener, TcpStream},
+    net::{lookup_host, TcpListener, TcpStream},
     sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore},
     time::{interval, timeout, Instant, MissedTickBehavior},
 };
@@ -38,6 +39,11 @@ const CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(35);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTION_PAIR_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTION_MAX_LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
+const BIND_ACCEPT_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+const BIND_DNS_TIMEOUT: Duration = Duration::from_secs(5);
+const BIND_MAX_RESOLVED_ADDRESSES: usize = 16;
+const BIND_MAX_REJECTED_PEERS: usize = 32;
+const BIND_MAX_PORT_ATTEMPTS: usize = 128;
 
 pub(crate) struct Socks5ProxyRegistration {
     registration_id: Uuid,
@@ -54,6 +60,14 @@ pub(crate) struct Socks5ProxyStatistics {
     pub(crate) rejected_connections: AtomicU64,
     pub(crate) unsupported_commands: AtomicU64,
     pub(crate) bind_rejected_total: AtomicU64,
+    pub(crate) bind_requests_total: AtomicU64,
+    pub(crate) bind_active_leases: AtomicUsize,
+    pub(crate) bind_first_replies_total: AtomicU64,
+    pub(crate) bind_second_replies_total: AtomicU64,
+    pub(crate) bind_accept_timeouts_total: AtomicU64,
+    pub(crate) bind_peer_rejections_total: AtomicU64,
+    pub(crate) bind_failures_total: AtomicU64,
+    pub(crate) bind_cancellations_total: AtomicU64,
     pub(crate) handshake_errors: AtomicU64,
     pub(crate) handshake_timeouts: AtomicU64,
     pub(crate) bytes_from_public: AtomicU64,
@@ -102,6 +116,27 @@ enum Socks5Request {
     UdpAssociate {
         requested: Option<UdpAssociationRequest>,
     },
+    Bind {
+        constraint: BindPeerConstraint,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Socks5RequestHost {
+    Ip(IpAddr),
+    Domain(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BindPeerConstraint {
+    host: Option<Socks5RequestHost>,
+    port: Option<u16>,
+}
+
+struct BoundListener {
+    _lease: Box<dyn DynamicPortLease>,
+    listener: TcpListener,
+    advertised: SocketAddr,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -728,6 +763,10 @@ async fn serve_public_connection(
             return;
         }
     };
+    context
+        .statistics
+        .requests_total
+        .fetch_add(1, Ordering::Relaxed);
     let (target_host, target_port) = match request {
         Socks5Request::Connect { host, port } => (host, port),
         Socks5Request::UdpAssociate { requested } => {
@@ -735,11 +774,16 @@ async fn serve_public_connection(
             finish_connection(&context.statistics);
             return;
         }
+        Socks5Request::Bind { constraint } => {
+            context
+                .statistics
+                .bind_requests_total
+                .fetch_add(1, Ordering::Relaxed);
+            serve_bind(&context, &mut external, constraint, &mut stop).await;
+            finish_connection(&context.statistics);
+            return;
+        }
     };
-    context
-        .statistics
-        .requests_total
-        .fetch_add(1, Ordering::Relaxed);
     let Ok(pending_permit) = context
         .state
         .pending_connection_permits
@@ -947,6 +991,284 @@ async fn serve_udp_association(
         .fetch_sub(1, Ordering::Relaxed);
 }
 
+async fn serve_bind(
+    context: &PublicConnectionContext,
+    external: &mut TcpStream,
+    constraint: BindPeerConstraint,
+    stop: &mut watch::Receiver<()>,
+) {
+    let allowed_ips = match resolve_bind_constraint(&constraint).await {
+        Ok(allowed) => allowed,
+        Err(()) => {
+            context
+                .statistics
+                .bind_failures_total
+                .fetch_add(1, Ordering::Relaxed);
+            let _ = write_socks5_reply(external, 0x04).await;
+            return;
+        }
+    };
+    let bound = match bind_dynamic_listener(context, external).await {
+        Ok(bound) => bound,
+        Err(()) => {
+            context
+                .statistics
+                .bind_failures_total
+                .fetch_add(1, Ordering::Relaxed);
+            let _ = write_socks5_reply(external, 0x01).await;
+            return;
+        }
+    };
+    let lease_activity = BindLeaseActivity::begin(context.statistics.clone());
+    if write_socks5_bound_reply(external, 0x00, bound.advertised)
+        .await
+        .is_err()
+    {
+        context
+            .statistics
+            .bind_cancellations_total
+            .fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    context
+        .statistics
+        .bind_first_replies_total
+        .fetch_add(1, Ordering::Relaxed);
+
+    let deadline = Instant::now() + BIND_ACCEPT_TIMEOUT;
+    let mut rejected = 0_usize;
+    let mut peek = [0_u8; 1];
+    let accepted = loop {
+        let event = tokio::select! {
+            _ = stop.changed() => {
+                context.statistics.bind_cancellations_total.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            result = tokio::time::timeout_at(deadline, bound.listener.accept()) => result,
+            control = external.peek(&mut peek) => {
+                let _ = control;
+                context.statistics.bind_cancellations_total.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
+        let (incoming, peer) = match event {
+            Ok(Ok(accepted)) => accepted,
+            Ok(Err(_)) => {
+                context
+                    .statistics
+                    .bind_failures_total
+                    .fetch_add(1, Ordering::Relaxed);
+                let _ = write_socks5_reply(external, 0x01).await;
+                return;
+            }
+            Err(_) => {
+                context
+                    .statistics
+                    .bind_accept_timeouts_total
+                    .fetch_add(1, Ordering::Relaxed);
+                let _ = write_socks5_reply(external, 0x06).await;
+                return;
+            }
+        };
+        let traffic_allowed = context
+            .state
+            .traffic_controls
+            .lock()
+            .expect("traffic control catalog lock poisoned")
+            .authorize(
+                TrafficPolicyKind::Socks5,
+                context.policy_id,
+                peer.ip(),
+                crate::unix_seconds(),
+            )
+            .is_ok_and(|decision| decision == TrafficDecision::Allowed);
+        let global_permit = context
+            .state
+            .global_connection_permits
+            .clone()
+            .try_acquire_owned();
+        if traffic_allowed && bind_peer_matches(&constraint, &allowed_ips, peer) {
+            if let Ok(global_permit) = global_permit {
+                break (incoming, peer, global_permit);
+            }
+        }
+        rejected = rejected.saturating_add(1);
+        context
+            .statistics
+            .bind_peer_rejections_total
+            .fetch_add(1, Ordering::Relaxed);
+        drop(incoming);
+        if rejected >= BIND_MAX_REJECTED_PEERS {
+            context
+                .statistics
+                .bind_failures_total
+                .fetch_add(1, Ordering::Relaxed);
+            let _ = write_socks5_reply(external, 0x02).await;
+            return;
+        }
+    };
+    let (mut incoming, peer, _incoming_global_permit) = accepted;
+    drop(bound);
+    drop(lease_activity);
+    if write_socks5_bound_reply(external, 0x00, peer)
+        .await
+        .is_err()
+    {
+        context
+            .statistics
+            .bind_cancellations_total
+            .fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    context
+        .statistics
+        .bind_second_replies_total
+        .fetch_add(1, Ordering::Relaxed);
+    let transfer = tokio::select! {
+        _ = stop.changed() => None,
+        result = timeout(
+            CONNECTION_MAX_LIFETIME,
+            copy_bidirectional_with_limit(
+                external,
+                &mut incoming,
+                context.bandwidth_limiter.clone(),
+            ),
+        ) => Some(result),
+    };
+    match transfer {
+        Some(Ok(Ok((from_public, to_public)))) => {
+            context
+                .statistics
+                .bytes_from_public
+                .fetch_add(from_public, Ordering::Relaxed);
+            context
+                .statistics
+                .bytes_to_public
+                .fetch_add(to_public, Ordering::Relaxed);
+            if let Err(error) = context
+                .state
+                .traffic_controls
+                .lock()
+                .expect("traffic control catalog lock poisoned")
+                .record_bytes(
+                    TrafficPolicyKind::Socks5,
+                    context.policy_id,
+                    from_public.saturating_add(to_public),
+                    crate::unix_seconds(),
+                )
+            {
+                tracing::warn!("Could not persist SOCKS5 BIND traffic usage: {error}");
+            }
+        }
+        Some(Ok(Err(error))) => {
+            context
+                .statistics
+                .transfer_errors
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::warn!("SOCKS5 BIND transfer failed: {error}");
+        }
+        Some(Err(_)) => {
+            context
+                .statistics
+                .lifetime_timeouts
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        None => {}
+    }
+}
+
+struct BindLeaseActivity {
+    statistics: Arc<Socks5ProxyStatistics>,
+}
+
+impl BindLeaseActivity {
+    fn begin(statistics: Arc<Socks5ProxyStatistics>) -> Self {
+        statistics
+            .bind_active_leases
+            .fetch_add(1, Ordering::Relaxed);
+        Self { statistics }
+    }
+}
+
+impl Drop for BindLeaseActivity {
+    fn drop(&mut self) {
+        self.statistics
+            .bind_active_leases
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+async fn bind_dynamic_listener(
+    context: &PublicConnectionContext,
+    external: &TcpStream,
+) -> Result<BoundListener, ()> {
+    for _ in 0..BIND_MAX_PORT_ATTEMPTS {
+        let lease = context
+            .state
+            .dynamic_port_leases
+            .acquire_tcp(&context.state.public_port_policy)
+            .map_err(|_| ())?;
+        debug_assert_eq!(lease.protocol(), DynamicPortProtocol::Tcp);
+        let port = lease.port();
+        let listener = match TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).await {
+            Ok(listener) => listener,
+            Err(_) => {
+                drop(lease);
+                continue;
+            }
+        };
+        let advertised = external
+            .local_addr()
+            .map(|address| bind_reply_address(address.ip(), port))
+            .unwrap_or_else(|_| SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)));
+        return Ok(BoundListener {
+            _lease: lease,
+            listener,
+            advertised,
+        });
+    }
+    Err(())
+}
+
+async fn resolve_bind_constraint(
+    constraint: &BindPeerConstraint,
+) -> Result<Option<HashSet<IpAddr>>, ()> {
+    match &constraint.host {
+        None => Ok(None),
+        Some(Socks5RequestHost::Ip(ip)) => Ok(Some(HashSet::from([*ip]))),
+        Some(Socks5RequestHost::Domain(domain)) => {
+            let port = constraint.port.unwrap_or(0);
+            let resolved = timeout(BIND_DNS_TIMEOUT, lookup_host((domain.as_str(), port)))
+                .await
+                .map_err(|_| ())?
+                .map_err(|_| ())?;
+            let addresses = resolved
+                .take(BIND_MAX_RESOLVED_ADDRESSES)
+                .map(|address| address.ip())
+                .collect::<HashSet<_>>();
+            (!addresses.is_empty()).then_some(Some(addresses)).ok_or(())
+        }
+    }
+}
+
+fn bind_peer_matches(
+    constraint: &BindPeerConstraint,
+    allowed_ips: &Option<HashSet<IpAddr>>,
+    peer: SocketAddr,
+) -> bool {
+    allowed_ips
+        .as_ref()
+        .is_none_or(|addresses| addresses.contains(&peer.ip()))
+        && constraint.port.is_none_or(|port| port == peer.port())
+}
+
+fn bind_reply_address(local_ip: IpAddr, port: u16) -> SocketAddr {
+    match local_ip {
+        IpAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
+        IpAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
+    }
+}
+
 async fn perform_handshake(
     stream: &mut TcpStream,
     expected_username: &[u8],
@@ -1026,7 +1348,7 @@ async fn perform_handshake(
                 .read_exact(&mut address)
                 .await
                 .map_err(|_| HandshakeError::Protocol)?;
-            Ipv4Addr::from(address).to_string()
+            Socks5RequestHost::Ip(IpAddr::V4(Ipv4Addr::from(address)))
         }
         0x03 => {
             let length = stream
@@ -1047,7 +1369,7 @@ async fn perform_handshake(
                 let _ = write_socks5_reply(stream, 0x08).await;
                 return Err(HandshakeError::Protocol);
             }
-            domain
+            Socks5RequestHost::Domain(domain)
         }
         0x04 => {
             let mut address = [0_u8; 16];
@@ -1055,7 +1377,7 @@ async fn perform_handshake(
                 .read_exact(&mut address)
                 .await
                 .map_err(|_| HandshakeError::Protocol)?;
-            Ipv6Addr::from(address).to_string()
+            Socks5RequestHost::Ip(IpAddr::V6(Ipv6Addr::from(address)))
         }
         _ => {
             let _ = write_socks5_reply(stream, 0x08).await;
@@ -1067,11 +1389,30 @@ async fn perform_handshake(
         .await
         .map_err(|_| HandshakeError::Protocol)?;
     match request[1] {
-        0x01 if port != 0 => Ok(Socks5Request::Connect { host, port }),
+        0x01 if port != 0 => Ok(Socks5Request::Connect {
+            host: match host {
+                Socks5RequestHost::Ip(ip) => ip.to_string(),
+                Socks5RequestHost::Domain(domain) => domain,
+            },
+            port,
+        }),
+        0x02 => {
+            let host = match host {
+                Socks5RequestHost::Ip(ip) if ip.is_unspecified() => None,
+                host => Some(host),
+            };
+            Ok(Socks5Request::Bind {
+                constraint: BindPeerConstraint {
+                    host,
+                    port: (port != 0).then_some(port),
+                },
+            })
+        }
         0x03 => {
-            let address = host
-                .parse::<IpAddr>()
-                .map_err(|_| HandshakeError::Protocol)?;
+            let Socks5RequestHost::Ip(address) = host else {
+                let _ = write_socks5_reply(stream, 0x08).await;
+                return Err(HandshakeError::Protocol);
+            };
             let requested = UdpAssociationRequest {
                 ip: (!address.is_unspecified()).then_some(address),
                 port: (port != 0).then_some(port),
@@ -1096,11 +1437,7 @@ fn record_unsupported_command(statistics: &Socks5ProxyStatistics, command: u8) {
     statistics
         .unsupported_commands
         .fetch_add(1, Ordering::Relaxed);
-    if command == 0x02 {
-        statistics
-            .bind_rejected_total
-            .fetch_add(1, Ordering::Relaxed);
-    }
+    let _ = command;
 }
 
 fn accept_socks5_udp_datagram(encoded: &[u8], statistics: &Socks5ProxyStatistics) -> bool {
@@ -1438,7 +1775,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bind_is_deterministically_rejected_with_command_not_supported() {
+    async fn bind_handshake_preserves_peer_address_and_port_constraint() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         let password = format!("llp_{}", "b".repeat(64));
@@ -1454,23 +1791,23 @@ mod tests {
             .write_all(&[0x05, 0x02, 0x00, 0x01, 127, 0, 0, 1, 0, 80])
             .await
             .unwrap();
-        let mut reply = [0_u8; 10];
-        client.read_exact(&mut reply).await.unwrap();
-        assert_eq!(reply[0], 0x05);
-        assert_eq!(reply[1], 0x07);
         assert_eq!(
-            server.await.unwrap(),
-            Err(HandshakeError::UnsupportedCommand { command: 0x02 })
+            server.await.unwrap().unwrap(),
+            Socks5Request::Bind {
+                constraint: BindPeerConstraint {
+                    host: Some(Socks5RequestHost::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST))),
+                    port: Some(80),
+                }
+            }
         );
     }
 
     #[test]
-    fn unsupported_bind_and_udp_fragmentation_have_independent_counters() {
+    fn unsupported_commands_and_udp_fragmentation_have_independent_counters() {
         let statistics = Socks5ProxyStatistics::default();
-        record_unsupported_command(&statistics, 0x02);
         record_unsupported_command(&statistics, 0x04);
-        assert_eq!(statistics.unsupported_commands.load(Ordering::Relaxed), 2);
-        assert_eq!(statistics.bind_rejected_total.load(Ordering::Relaxed), 1);
+        assert_eq!(statistics.unsupported_commands.load(Ordering::Relaxed), 1);
+        assert_eq!(statistics.bind_rejected_total.load(Ordering::Relaxed), 0);
 
         let valid = [0, 0, 0, 1, 127, 0, 0, 1, 0, 53];
         let fragmented = [0, 0, 1, 1, 127, 0, 0, 1, 0, 53];
@@ -1485,6 +1822,30 @@ mod tests {
             1
         );
         assert_eq!(statistics.udp_dropped_datagrams.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn bind_peer_constraint_requires_both_resolved_address_and_requested_port() {
+        let constraint = BindPeerConstraint {
+            host: Some(Socks5RequestHost::Domain("peer.example".to_owned())),
+            port: Some(25_000),
+        };
+        let allowed = Some(HashSet::from([IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))]));
+        assert!(bind_peer_matches(
+            &constraint,
+            &allowed,
+            SocketAddr::from(([192, 0, 2, 10], 25_000))
+        ));
+        assert!(!bind_peer_matches(
+            &constraint,
+            &allowed,
+            SocketAddr::from(([192, 0, 2, 11], 25_000))
+        ));
+        assert!(!bind_peer_matches(
+            &constraint,
+            &allowed,
+            SocketAddr::from(([192, 0, 2, 10], 25_001))
+        ));
     }
 
     #[test]
