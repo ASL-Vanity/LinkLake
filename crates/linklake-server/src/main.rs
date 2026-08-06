@@ -145,6 +145,9 @@ const MANAGEMENT_UI_DOCUMENT: &str = include_str!("../web/index.html");
 const MANAGEMENT_UI_STYLES: &str = include_str!("../web/linklake.css");
 const MANAGEMENT_UI_SCRIPT: &str = include_str!("../web/linklake.js");
 const MANAGEMENT_UI_THEME_BOOTSTRAP: &str = include_str!("../web/theme-bootstrap.js");
+const UPDATE_REPOSITORY: &str = "ASL-Vanity/LinkLake";
+const UPDATE_DOWNLOAD_CONFIRMATION: &str = "DOWNLOAD";
+const UPDATE_APPLY_CONFIRMATION: &str = "UPDATE";
 #[cfg(test)]
 static MANAGEMENT_UI: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     [
@@ -416,6 +419,8 @@ struct AppState {
     fleet: Mutex<FleetCatalog>,
     policy_service: PolicyService,
     policy_mutation_lock: AsyncMutex<()>,
+    server_update_data_directory: Option<PathBuf>,
+    server_update_operation_lock: AsyncMutex<()>,
     fleet_health: Mutex<FleetHealthCatalog>,
     traffic_controls: Mutex<TrafficControlCatalog>,
     management_cookies_secure: bool,
@@ -896,6 +901,68 @@ struct StatusResponse {
     p2p_nodes_total: usize,
     clients: usize,
     udp_public_bind_mode: &'static str,
+}
+
+#[derive(Serialize)]
+struct ServerUpdateStatusView {
+    state: String,
+    operation: Option<String>,
+    from_version: Option<String>,
+    to_version: Option<String>,
+    message: String,
+    has_error: bool,
+    updated_unix_seconds: u64,
+}
+
+impl From<linklake_update::UpdateStatus> for ServerUpdateStatusView {
+    fn from(status: linklake_update::UpdateStatus) -> Self {
+        Self {
+            state: status.state,
+            operation: status.operation,
+            from_version: status.from_version,
+            to_version: status.to_version,
+            message: status.message,
+            has_error: status.error.is_some(),
+            updated_unix_seconds: status.updated_unix_seconds,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ServerUpdateOverviewResponse {
+    build: BuildInfo,
+    repository: &'static str,
+    channel: UpdateChannel,
+    signature_policy: SignaturePolicy,
+    status: ServerUpdateStatusView,
+    apply_available: bool,
+    remote_client_update_available: bool,
+    confirmation_required: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServerUpdateActionRequest {
+    confirmation: String,
+}
+
+#[derive(Serialize)]
+struct ServerUpdateDownloadResponse {
+    version: String,
+    archive_name: String,
+    archive_sha256: String,
+    binary_sha256: String,
+    signature_key_id: String,
+    downloaded_unix_seconds: u64,
+}
+
+#[derive(Serialize)]
+struct ServerUpdateScheduleResponse {
+    state: String,
+    operation_id: Uuid,
+    operation: String,
+    from_version: String,
+    to_version: String,
 }
 
 #[derive(Serialize)]
@@ -3877,6 +3944,8 @@ async fn run_server(
         fleet: Mutex::new(FleetCatalog::open_with_database(&database)?),
         policy_service,
         policy_mutation_lock: AsyncMutex::new(()),
+        server_update_data_directory: data_dir.clone(),
+        server_update_operation_lock: AsyncMutex::new(()),
         fleet_health: Mutex::new(FleetHealthCatalog::open_with_database(&database)?),
         traffic_controls: Mutex::new(TrafficControlCatalog::open_with_database(&database)?),
         management_cookies_secure,
@@ -3978,6 +4047,13 @@ async fn run_server(
             axum::routing::delete(revoke_session),
         )
         .route("/api/v1/status", get(status))
+        .route("/api/v1/updates/server", get(server_update_overview))
+        .route("/api/v1/updates/server/check", post(check_server_update))
+        .route(
+            "/api/v1/updates/server/download",
+            post(download_server_update),
+        )
+        .route("/api/v1/updates/server/apply", post(apply_server_update))
         .route("/api/v1/public-port-policy", get(get_public_port_policy))
         .route("/api/v1/metrics", get(metrics))
         .route("/api/v1/metrics/prometheus", get(prometheus_metrics))
@@ -4839,6 +4915,177 @@ async fn get_public_port_policy(
 ) -> Result<Json<PublicPortPolicyView>, ApiError> {
     authorize_management(&state, &headers)?;
     Ok(Json(state.public_port_policy.view()))
+}
+
+async fn server_update_overview(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<ServerUpdateOverviewResponse>, CodedApiError> {
+    require_administrator(&state, &headers)?;
+    let update_state = linklake_update::default_state_directory(UpdateProduct::Server);
+    let status = linklake_update::status(UpdateProduct::Server, &update_state)
+        .map_err(|error| server_update_api_error("status", error))?;
+    Ok(Json(ServerUpdateOverviewResponse {
+        build: BuildInfo::current("LinkLake Server"),
+        repository: UPDATE_REPOSITORY,
+        channel: UpdateChannel::Stable,
+        signature_policy: SignaturePolicy::Production,
+        status: status.into(),
+        apply_available: state.server_update_data_directory.is_some(),
+        remote_client_update_available: false,
+        confirmation_required: true,
+    }))
+}
+
+async fn check_server_update(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<linklake_update::UpdateCheck>, CodedApiError> {
+    let principal = require_interactive_administrator(&state, &headers)?;
+    let _operation = state
+        .server_update_operation_lock
+        .try_lock()
+        .map_err(|_| server_update_busy_error())?;
+    let result = linklake_update::check(
+        UpdateProduct::Server,
+        UPDATE_REPOSITORY,
+        UpdateChannel::Stable,
+        SignaturePolicy::Production,
+    )
+    .await
+    .map_err(|error| server_update_api_error("check", error))?;
+    record_audit(
+        &state,
+        "server.update.checked",
+        &result.latest_version,
+        &format!(
+            "actor={}; available={}; channel=stable; signature_policy=production",
+            principal.username, result.update_available
+        ),
+    );
+    Ok(Json(result))
+}
+
+async fn download_server_update(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<ServerUpdateActionRequest>,
+) -> Result<Json<ServerUpdateDownloadResponse>, CodedApiError> {
+    let principal = require_interactive_administrator(&state, &headers)?;
+    require_server_update_confirmation(&request.confirmation, UPDATE_DOWNLOAD_CONFIRMATION)?;
+    let _operation = state
+        .server_update_operation_lock
+        .try_lock()
+        .map_err(|_| server_update_busy_error())?;
+    let update_state = linklake_update::default_state_directory(UpdateProduct::Server);
+    let staged = linklake_update::download(
+        UpdateProduct::Server,
+        UPDATE_REPOSITORY,
+        UpdateChannel::Stable,
+        &update_state,
+        false,
+        SignaturePolicy::Production,
+    )
+    .await
+    .map_err(|error| server_update_api_error("download", error))?;
+    record_audit(
+        &state,
+        "server.update.downloaded",
+        &staged.version,
+        &format!(
+            "actor={}; channel=stable; signature_policy=production; key_id={}",
+            principal.username, staged.signature_key_id
+        ),
+    );
+    Ok(Json(ServerUpdateDownloadResponse {
+        version: staged.version,
+        archive_name: staged.archive_name,
+        archive_sha256: staged.archive_sha256,
+        binary_sha256: staged.binary_sha256,
+        signature_key_id: staged.signature_key_id,
+        downloaded_unix_seconds: staged.downloaded_unix_seconds,
+    }))
+}
+
+async fn apply_server_update(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<ServerUpdateActionRequest>,
+) -> Result<Json<ServerUpdateScheduleResponse>, CodedApiError> {
+    let principal = require_interactive_administrator(&state, &headers)?;
+    require_server_update_confirmation(&request.confirmation, UPDATE_APPLY_CONFIRMATION)?;
+    let data_directory = state
+        .server_update_data_directory
+        .as_deref()
+        .ok_or(CodedApiError(
+            StatusCode::CONFLICT,
+            "server_update_unavailable",
+            "server update requires a persistent LINKLAKE_DATA_DIR",
+        ))?;
+    let _operation = state
+        .server_update_operation_lock
+        .try_lock()
+        .map_err(|_| server_update_busy_error())?;
+    let update_state = linklake_update::default_state_directory(UpdateProduct::Server);
+    let scheduled = linklake_update::server_apply(
+        UPDATE_REPOSITORY,
+        UpdateChannel::Stable,
+        &update_state,
+        data_directory,
+        false,
+        true,
+        SignaturePolicy::Production,
+    )
+    .await
+    .map_err(|error| server_update_api_error("apply", error))?;
+    record_audit(
+        &state,
+        "server.update.scheduled",
+        &scheduled.operation_id.to_string(),
+        &format!(
+            "actor={}; from={}; to={}; channel=stable; signature_policy=production",
+            principal.username, scheduled.from_version, scheduled.to_version
+        ),
+    );
+    Ok(Json(ServerUpdateScheduleResponse {
+        state: scheduled.state,
+        operation_id: scheduled.operation_id,
+        operation: scheduled.operation,
+        from_version: scheduled.from_version,
+        to_version: scheduled.to_version,
+    }))
+}
+
+fn require_server_update_confirmation(
+    actual: &str,
+    expected: &'static str,
+) -> Result<(), CodedApiError> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "update_confirmation_required",
+            "the exact update confirmation phrase is required",
+        ))
+    }
+}
+
+fn server_update_busy_error() -> CodedApiError {
+    CodedApiError(
+        StatusCode::CONFLICT,
+        "server_update_busy",
+        "another server update operation is already running",
+    )
+}
+
+fn server_update_api_error(operation: &'static str, error: anyhow::Error) -> CodedApiError {
+    tracing::error!(%error, operation, "Secure server update operation failed");
+    CodedApiError(
+        StatusCode::BAD_GATEWAY,
+        "server_update_failed",
+        "secure server update operation failed; inspect the server log",
+    )
 }
 
 async fn status(
@@ -13595,6 +13842,21 @@ fn require_administrator(
     Ok(principal)
 }
 
+fn require_interactive_administrator(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<ManagementPrincipal, CodedApiError> {
+    let principal = require_administrator(state, headers)?;
+    if principal.session_id.is_none() {
+        return Err(CodedApiError(
+            StatusCode::FORBIDDEN,
+            "session_authentication_required",
+            "server updates require an interactive administrator login",
+        ));
+    }
+    Ok(principal)
+}
+
 fn require_interactive_session(
     state: &AppState,
     headers: &HeaderMap,
@@ -14140,7 +14402,8 @@ mod tests {
         certificate_target_matches, coded_http_route_creation_error, coded_tcp_policy_error,
         collect_slo_metrics, fleet_mutation_target, login_throttle_identity,
         management_session_cookie, normalize_metrics_history_step, parse_metrics_history_range,
-        release_certificate_job_slot, render_prometheus_metrics, reserve_certificate_job_slot,
+        release_certificate_job_slot, render_prometheus_metrics,
+        require_server_update_confirmation, reserve_certificate_job_slot,
         resolve_certificate_identifier_update, select_certificate_maintenance_operation,
         session_cookie_header, spawn_listener_task, tcp_history_error_total,
         udp_history_error_total, udp_metrics_response, validate_fleet_source_binding,
@@ -14154,7 +14417,8 @@ mod tests {
         METRICS_HISTORY_ARCHIVE_SAMPLE_INTERVAL_SECONDS, METRICS_HISTORY_CAPACITY,
         METRICS_HISTORY_RECENT_RETENTION_SECONDS, METRICS_HISTORY_RETENTION_SECONDS,
         METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS, SLO_DEFAULT_AVAILABILITY_TARGET,
-        SLO_FAST_BURN_THRESHOLD, SLO_SLOW_BURN_THRESHOLD,
+        SLO_FAST_BURN_THRESHOLD, SLO_SLOW_BURN_THRESHOLD, UPDATE_APPLY_CONFIRMATION,
+        UPDATE_DOWNLOAD_CONFIRMATION,
     };
     use crate::{
         admin_auth::SessionIdentity,
@@ -15158,7 +15422,11 @@ mod tests {
         assert!(MANAGEMENT_UI.contains("drawClientInsightCharts()"));
         assert!(MANAGEMENT_UI.contains("drawGroupedHorizontalChart"));
         assert!(MANAGEMENT_UI.contains("data-i18n-aria-label"));
-        assert!(MANAGEMENT_UI.contains("resizeFrame = requestAnimationFrame(() => {"));
+        assert!(MANAGEMENT_UI.contains("new ResizeObserver(entries => {"));
+        assert!(MANAGEMENT_UI.contains("scheduleResponsiveRender()"));
+        assert!(MANAGEMENT_UI.contains("requestAnimationFrame(() => {"));
+        assert!(MANAGEMENT_UI.contains("window.devicePixelRatio || 1"));
+        assert!(MANAGEMENT_UI.contains("chartResizeObserver.observe(elements.workspace)"));
         assert!(MANAGEMENT_UI
             .contains("if (!elements.appearance_popover.classList.contains('hidden'))"));
         assert!(MANAGEMENT_UI
@@ -15172,6 +15440,48 @@ mod tests {
         ] {
             assert!(MANAGEMENT_UI.contains(&format!("id=\"{id}\"")));
         }
+    }
+
+    #[test]
+    fn server_update_api_requires_exact_confirmation_phrases() {
+        assert!(require_server_update_confirmation(
+            UPDATE_DOWNLOAD_CONFIRMATION,
+            UPDATE_DOWNLOAD_CONFIRMATION
+        )
+        .is_ok());
+        assert!(require_server_update_confirmation(
+            UPDATE_APPLY_CONFIRMATION,
+            UPDATE_APPLY_CONFIRMATION
+        )
+        .is_ok());
+        for invalid in ["", "download", " DOWNLOAD", "UPDATE ", "yes"] {
+            assert!(
+                require_server_update_confirmation(invalid, UPDATE_APPLY_CONFIRMATION).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn web_ui_exposes_secure_update_center_without_remote_client_replacement() {
+        for marker in [
+            "href=\"#/updates\"",
+            "id=\"updates-view\"",
+            "/api/v1/updates/server/check",
+            "/api/v1/updates/server/download",
+            "/api/v1/updates/server/apply",
+            "confirmation: 'DOWNLOAD'",
+            "confirmation: 'UPDATE'",
+            "Production signatures only",
+            "Remote client replacement is intentionally unavailable",
+            "linklake-client update apply --yes",
+        ] {
+            assert!(
+                MANAGEMENT_UI.contains(marker),
+                "Web UI secure update center is missing {marker}"
+            );
+        }
+        assert!(!MANAGEMENT_UI.contains("development_signature: true"));
+        assert!(!MANAGEMENT_UI.contains("allow_downgrade: true"));
     }
 
     #[test]

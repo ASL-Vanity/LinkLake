@@ -99,7 +99,53 @@
         protocolTrendChartLabel: 'Protocol traffic, workload and error trend',
         policyStatusChartLabel: 'Policy availability and workload chart',
         clientStatusChartLabel: 'Client availability chart',
-        clientPlatformChartLabel: 'Client platform and configuration chart'
+        clientPlatformChartLabel: 'Client platform and configuration chart',
+        systemManagement: 'System',
+        updateCenter: 'Update center',
+        updateCenterHelp: 'Inspect signed release status and perform explicitly confirmed server maintenance.',
+        serverUpdate: 'Server update',
+        serverUpdateHelp: 'Check, verify and schedule a signed stable release.',
+        clientUpdate: 'Client update',
+        clientUpdateHelp: 'Clients update locally so the server cannot silently replace endpoint binaries.',
+        localOnly: 'Local only',
+        clientUpdateBoundary: 'Remote client replacement is intentionally unavailable. Run the signed updater on each client host or through your own authorized device-management system.',
+        productionSignatureOnly: 'Production signatures only',
+        production: 'Production',
+        signaturePolicy: 'Signature policy',
+        downgradeBlocked: 'Downgrades blocked',
+        localConfirmationRequired: 'Local confirmation required',
+        checkForUpdates: 'Check for updates',
+        downloadUpdate: 'Download and verify',
+        applyUpdate: 'Apply update',
+        rollbackRecovery: 'Rollback and recovery',
+        rollbackRecoveryHelp: 'Database-aware rollback and interrupted-update recovery remain local administrator operations because they can require explicit data-loss consent.',
+        installedVersion: 'Installed version',
+        targetPlatform: 'Target platform',
+        sourceRepository: 'Source repository',
+        releaseChannel: 'Release channel',
+        updateState: 'Update state',
+        latestVersion: 'Latest version',
+        signingKey: 'Signing key',
+        packageDigest: 'Package SHA-256',
+        updateAvailable: 'Update available',
+        upToDate: 'Up to date',
+        stableChannel: 'Stable',
+        updateIdle: 'Idle',
+        noUpdateScheduled: 'No update operation has been scheduled.',
+        updateBusy: 'In progress',
+        updateFailed: 'Failed',
+        updateOperationFailed: 'The secure update operation failed. Check the server log and outbound GitHub connectivity.',
+        updateChecked: 'Signed release metadata verified.',
+        updateDownloaded: 'Update downloaded and verified.',
+        updateScheduled: 'Update scheduled. The server will restart and roll back automatically if validation fails.',
+        confirmDownloadUpdate: 'Download the latest stable server package and verify its signed manifest and SHA-256 digest?',
+        confirmApplyUpdate: 'Apply the latest stable server update now? The server will restart. Automatic rollback remains enabled.',
+        updateUnavailable: 'A persistent LINKLAKE_DATA_DIR is required before server updates can be applied.',
+        confirmationProtected: 'Interactive administrator confirmation',
+        signedManifestProtected: 'Ed25519 signed manifest',
+        rollbackProtected: 'Automatic validation and rollback',
+        remoteClientUpdateDisabled: 'Remote client update disabled',
+        releaseDetails: 'Release details'
       });
 
       Object.assign(WORDS.zh, {
@@ -142,7 +188,53 @@
         protocolTrendChartLabel: '协议流量、负载与错误趋势图',
         policyStatusChartLabel: '策略可用性与负载图',
         clientStatusChartLabel: '客户端可用性图',
-        clientPlatformChartLabel: '客户端平台与配置图'
+        clientPlatformChartLabel: '客户端平台与配置图',
+        systemManagement: '系统',
+        updateCenter: '更新中心',
+        updateCenterHelp: '查看签名版本状态，并执行需要明确确认的服务端维护操作。',
+        serverUpdate: '服务端更新',
+        serverUpdateHelp: '检查、校验并调度经过签名的稳定版本。',
+        clientUpdate: '客户端更新',
+        clientUpdateHelp: '客户端在本机完成更新，服务端不能静默替换端点程序。',
+        localOnly: '仅本机',
+        clientUpdateBoundary: '当前有意不提供远程替换客户端程序的能力。请在每台客户端主机上运行签名更新器，或使用你已授权的设备管理系统。',
+        productionSignatureOnly: '仅信任生产签名',
+        production: '生产',
+        signaturePolicy: '签名策略',
+        downgradeBlocked: '禁止降级',
+        localConfirmationRequired: '需要本机确认',
+        checkForUpdates: '检查更新',
+        downloadUpdate: '下载并校验',
+        applyUpdate: '应用更新',
+        rollbackRecovery: '回滚与恢复',
+        rollbackRecoveryHelp: '数据库感知回滚和中断更新恢复仍由本机管理员执行，因为它们可能需要明确的数据丢失确认。',
+        installedVersion: '已安装版本',
+        targetPlatform: '目标平台',
+        sourceRepository: '来源仓库',
+        releaseChannel: '更新通道',
+        updateState: '更新状态',
+        latestVersion: '最新版本',
+        signingKey: '签名密钥',
+        packageDigest: '软件包 SHA-256',
+        updateAvailable: '有可用更新',
+        upToDate: '已是最新版',
+        stableChannel: '稳定版',
+        updateIdle: '空闲',
+        noUpdateScheduled: '当前没有已调度的更新操作。',
+        updateBusy: '执行中',
+        updateFailed: '失败',
+        updateOperationFailed: '安全更新操作失败，请检查服务端日志和 GitHub 出站连接。',
+        updateChecked: '签名版本元数据已验证。',
+        updateDownloaded: '更新包已下载并通过校验。',
+        updateScheduled: '更新已调度。服务端将重启；如果验证失败会自动回滚。',
+        confirmDownloadUpdate: '下载最新稳定版服务端软件包，并验证签名清单和 SHA-256 摘要吗？',
+        confirmApplyUpdate: '现在应用最新稳定版服务端更新吗？服务端将重启，并保留自动回滚保护。',
+        updateUnavailable: '应用服务端更新前必须配置持久化的 LINKLAKE_DATA_DIR。',
+        confirmationProtected: '交互式管理员确认',
+        signedManifestProtected: 'Ed25519 签名清单',
+        rollbackProtected: '自动验证与回滚',
+        remoteClientUpdateDisabled: '已禁用远程客户端更新',
+        releaseDetails: '版本详情'
       });
 
       const POLICY_TYPES = {
@@ -287,6 +379,7 @@
         userEditor: { mode: 'create', username: null },
         resetUsername: null,
         alertEditorId: null,
+        serverUpdateCheck: null,
         toastTimer: null,
         activeControllers: new Set()
       };
@@ -296,7 +389,7 @@
         'overview-view', 'overview-kpis', 'traffic-chart', 'traffic-tooltip', 'traffic-chart-summary', 'export-metrics', 'service-health-summary', 'overview-alert-panel', 'overview-alerts', 'overview-alert-more',
         'metrics-view', 'metrics-kpis', 'activity-chart', 'failure-chart', 'tcp-metric-panel', 'udp-metric-panel', 'proxy-metric-panel', 'web-metric-panel', 'network-health-panel', 'system-metric-panel',
         'services-view', 'service-insights', 'service-trend-title', 'service-insight-kpis', 'service-trend-chart', 'service-status-chart', 'new-policy', 'export-policies', 'import-policies', 'import-policies-file', 'service-toolbar', 'service-search', 'service-status-filter', 'service-count', 'service-bulk-toolbar', 'select-visible-policies', 'selected-policy-count', 'bulk-enable-policies', 'bulk-disable-policies', 'bulk-client-target', 'bulk-migrate-policies', 'bulk-delete-policies', 'service-list', 'acme-page',
-        'p2p-view', 'p2p-list', 'fleet-view', 'new-fleet-peer', 'preview-fleet-sync', 'apply-fleet-sync', 'fleet-summary', 'fleet-conflicts', 'fleet-list', 'clients-view', 'client-insight-kpis', 'client-status-chart', 'client-platform-chart', 'client-search', 'client-status-filter', 'client-count', 'clients-list', 'users-view', 'new-user', 'user-search', 'user-role-filter', 'user-count', 'users-list', 'sessions-view', 'totp-status', 'totp-action', 'new-api-token', 'api-tokens-list', 'sessions-list', 'alerts-view', 'new-alert-rule', 'alert-channels', 'alert-events', 'alert-rules', 'activity-view', 'audit-search', 'audit-category', 'audit-count', 'audit-list', 'audit-load-more', 'export-audit',
+        'p2p-view', 'p2p-list', 'fleet-view', 'new-fleet-peer', 'preview-fleet-sync', 'apply-fleet-sync', 'fleet-summary', 'fleet-conflicts', 'fleet-list', 'clients-view', 'client-insight-kpis', 'client-status-chart', 'client-platform-chart', 'client-search', 'client-status-filter', 'client-count', 'clients-list', 'users-view', 'new-user', 'user-search', 'user-role-filter', 'user-count', 'users-list', 'sessions-view', 'totp-status', 'totp-action', 'new-api-token', 'api-tokens-list', 'sessions-list', 'updates-view', 'update-kpis', 'server-update-state', 'server-update-details', 'server-update-security', 'check-server-update', 'download-server-update', 'apply-server-update', 'server-update-release', 'alerts-view', 'new-alert-rule', 'alert-channels', 'alert-events', 'alert-rules', 'activity-view', 'audit-search', 'audit-category', 'audit-count', 'audit-list', 'audit-load-more', 'export-audit',
         'drawer-backdrop', 'policy-drawer', 'drawer-title', 'drawer-subtitle', 'drawer-close', 'drawer-cancel', 'policy-form', 'policy-fields', 'drawer-submit',
         'password-modal', 'password-modal-close', 'password-form', 'account-new-password', 'account-confirm-password', 'password-cancel',
         'user-modal', 'user-modal-title', 'user-modal-help', 'user-modal-close', 'user-form', 'user-username', 'user-display-name', 'user-role', 'user-password-label', 'user-password', 'user-enabled-label', 'user-enabled', 'user-force-change-label', 'user-force-change', 'user-cancel',
@@ -309,6 +402,10 @@
       ].map(id => [id.replaceAll('-', '_'), document.getElementById(id)]));
 
       const systemTheme = matchMedia('(prefers-color-scheme: dark)');
+      let chartRenderFrame = null;
+      let chartResizeObserver = null;
+      let pixelRatioMedia = null;
+      const observedChartSizes = new WeakMap();
       const acmeDirectories = {
         production: 'https://acme-v02.api.letsencrypt.org/directory',
         staging: 'https://acme-staging-v02.api.letsencrypt.org/directory'
@@ -347,7 +444,7 @@
           safeStorageSet('linklake-palette', palette);
         }
         updateThemeButtons();
-        requestAnimationFrame(drawCharts);
+        scheduleResponsiveRender();
       }
 
       function updateThemeButtons() {
@@ -413,7 +510,7 @@
       function readApiErrorCode(code, fallback = 'requestFailed') {
         if (code === 'invalid_public_port') return t('errorInvalidPort', { ports: portPolicyDescription() });
         const map = {
-          unknown_client: 'errorUnknownClient', invalid_name: 'errorInvalidName', invalid_public_port: 'errorInvalidPort', duplicate_public_port: 'errorDuplicatePort', duplicate_tcp_public_port: 'errorDuplicatePort', invalid_target: 'errorInvalidTarget', invalid_hostname: 'errorInvalidHostname', duplicate_hostname: 'errorDuplicateHostname', duplicate_sni_hostname: 'errorDuplicateHostname', invalid_connection_limit: 'errorInvalidLimit', invalid_session_limit: 'errorInvalidLimit', invalid_idle_timeout: 'errorInvalidLimit', invalid_bandwidth_limit: 'errorInvalidLimit', invalid_socks5_username: 'errorInvalidUsername', invalid_http_proxy_username: 'errorInvalidUsername', invalid_port_expression: 'errorInvalidPortExpression', port_count_mismatch: 'errorPortCountMismatch', duplicate_port_in_group: 'errorDuplicatePortInGroup', too_many_port_mappings: 'errorTooManyMappings', unknown_policy: 'errorUnknownPolicy', unknown_udp_tunnel: 'errorUnknownPolicy', unknown_port_group: 'errorUnknownPolicy', unknown_http_route: 'errorUnknownPolicy', unknown_sni_route: 'errorUnknownPolicy', unknown_secret_tunnel: 'errorUnknownPolicy', unknown_socks5_proxy: 'errorUnknownPolicy', unknown_http_proxy: 'errorUnknownPolicy', tcp_policy_storage_error: 'errorStorage', udp_policy_storage_error: 'errorStorage', port_group_policy_storage_error: 'errorStorage', http_route_policy_storage_error: 'errorStorage', sni_route_policy_storage_error: 'errorStorage', secret_policy_storage_error: 'errorStorage', socks5_policy_storage_error: 'errorStorage', http_proxy_policy_storage_error: 'errorStorage'
+          unknown_client: 'errorUnknownClient', invalid_name: 'errorInvalidName', invalid_public_port: 'errorInvalidPort', duplicate_public_port: 'errorDuplicatePort', duplicate_tcp_public_port: 'errorDuplicatePort', invalid_target: 'errorInvalidTarget', invalid_hostname: 'errorInvalidHostname', duplicate_hostname: 'errorDuplicateHostname', duplicate_sni_hostname: 'errorDuplicateHostname', invalid_connection_limit: 'errorInvalidLimit', invalid_session_limit: 'errorInvalidLimit', invalid_idle_timeout: 'errorInvalidLimit', invalid_bandwidth_limit: 'errorInvalidLimit', invalid_socks5_username: 'errorInvalidUsername', invalid_http_proxy_username: 'errorInvalidUsername', invalid_port_expression: 'errorInvalidPortExpression', port_count_mismatch: 'errorPortCountMismatch', duplicate_port_in_group: 'errorDuplicatePortInGroup', too_many_port_mappings: 'errorTooManyMappings', unknown_policy: 'errorUnknownPolicy', unknown_udp_tunnel: 'errorUnknownPolicy', unknown_port_group: 'errorUnknownPolicy', unknown_http_route: 'errorUnknownPolicy', unknown_sni_route: 'errorUnknownPolicy', unknown_secret_tunnel: 'errorUnknownPolicy', unknown_socks5_proxy: 'errorUnknownPolicy', unknown_http_proxy: 'errorUnknownPolicy', tcp_policy_storage_error: 'errorStorage', udp_policy_storage_error: 'errorStorage', port_group_policy_storage_error: 'errorStorage', http_route_policy_storage_error: 'errorStorage', sni_route_policy_storage_error: 'errorStorage', secret_policy_storage_error: 'errorStorage', socks5_policy_storage_error: 'errorStorage', http_proxy_policy_storage_error: 'errorStorage', server_update_busy: 'updateBusy', server_update_unavailable: 'updateUnavailable', server_update_failed: 'updateOperationFailed', update_confirmation_required: 'localConfirmationRequired'
         };
         if (String(code || '').includes('acme') || String(code || '').includes('certificate') || String(code || '').includes('tls_')) return t('errorAcme');
         return t(map[code] || fallback);
@@ -468,11 +565,11 @@
           history.replaceState(null, '', '#/overview');
           return { view: 'overview', service: state.route.service || 'tcp' };
         }
-        if (['users', 'sessions', 'fleet'].includes(parts[0]) && state.identity?.role !== 'administrator') {
+        if (['users', 'sessions', 'fleet', 'updates'].includes(parts[0]) && state.identity?.role !== 'administrator') {
           history.replaceState(null, '', '#/overview');
           return { view: 'overview', service: state.route.service || 'tcp' };
         }
-        if (['overview', 'metrics', 'clients', 'p2p', 'fleet', 'users', 'sessions', 'alerts', 'activity'].includes(parts[0])) return { view: parts[0], service: state.route.service || 'tcp' };
+        if (['overview', 'metrics', 'clients', 'p2p', 'fleet', 'users', 'sessions', 'updates', 'alerts', 'activity'].includes(parts[0])) return { view: parts[0], service: state.route.service || 'tcp' };
         history.replaceState(null, '', '#/overview');
         return { view: 'overview', service: state.route.service || 'tcp' };
       }
@@ -491,6 +588,7 @@
           fleet: [t('fleet'), t('fleetHelp')],
           users: [t('userManagement'), t('userManagementHelp')],
           sessions: [t('securitySessions'), t('securitySessionsHelp')],
+          updates: [t('updateCenter'), t('updateCenterHelp')],
           alerts: [t('alertManagement'), t('alertManagementHelp')],
           activity: [t('activity'), t('activitySubtitle')]
         };
@@ -502,7 +600,7 @@
         const [title, subtitle] = routeCopy();
         elements.workspace_title.textContent = title;
         elements.workspace_subtitle.textContent = subtitle;
-        const views = { overview: elements.overview_view, metrics: elements.metrics_view, services: elements.services_view, clients: elements.clients_view, p2p: elements.p2p_view, fleet: elements.fleet_view, users: elements.users_view, sessions: elements.sessions_view, alerts: elements.alerts_view, activity: elements.activity_view };
+        const views = { overview: elements.overview_view, metrics: elements.metrics_view, services: elements.services_view, clients: elements.clients_view, p2p: elements.p2p_view, fleet: elements.fleet_view, users: elements.users_view, sessions: elements.sessions_view, updates: elements.updates_view, alerts: elements.alerts_view, activity: elements.activity_view };
         Object.entries(views).forEach(([name, element]) => element.classList.toggle('hidden', name !== state.route.view));
         elements.workspace_service_actions.classList.toggle('hidden', state.route.view !== 'services' || state.route.service === 'acme');
         elements.workspace_fleet_actions.classList.toggle('hidden', state.route.view !== 'fleet');
@@ -510,7 +608,10 @@
         elements.workspace_alert_actions.classList.toggle('hidden', state.route.view !== 'alerts' || state.identity?.role === 'auditor');
         document.querySelectorAll('[data-route-prefix]').forEach(link => link.classList.toggle('active', link.dataset.routePrefix === state.route.view));
         document.querySelectorAll('[data-service-route]').forEach(link => link.classList.toggle('active', state.route.view === 'services' && link.dataset.serviceRoute === state.route.service));
-        if (!state.dashboard) return;
+        if (!state.dashboard) {
+          scheduleResponsiveRender();
+          return;
+        }
         if (state.route.view === 'overview') renderOverview();
         else if (state.route.view === 'metrics') renderMetrics();
         else if (state.route.view === 'services') renderServices();
@@ -519,8 +620,10 @@
         else if (state.route.view === 'fleet') renderFleet();
         else if (state.route.view === 'users') renderUsers();
         else if (state.route.view === 'sessions') renderSessions();
+        else if (state.route.view === 'updates') renderUpdateCenter();
         else if (state.route.view === 'alerts') renderAlerts();
         else renderAudit();
+        scheduleResponsiveRender();
       }
 
       function updateIdentityUi() {
@@ -660,7 +763,7 @@
       function canvasSetup(canvas) {
         if (!canvas || canvas.offsetParent === null) return null;
         const rect = canvas.getBoundingClientRect();
-        const ratio = Math.min(window.devicePixelRatio || 1, 2);
+        const ratio = Math.max(1, Math.min(window.devicePixelRatio || 1, 3));
         const width = Math.max(1, Math.round(rect.width));
         const height = Math.max(1, Math.round(rect.height));
         if (canvas.width !== Math.round(width * ratio) || canvas.height !== Math.round(height * ratio)) {
@@ -2352,6 +2455,122 @@
         await loadManagementData({ forceHistory: false });
       }
 
+      function appendUpdateDetail(parent, label, value) {
+        const row = document.createElement('div');
+        row.className = 'update-detail';
+        const name = document.createElement('span'); name.textContent = label;
+        const content = document.createElement('strong'); content.textContent = value || '—';
+        row.append(name, content);
+        parent.append(row);
+      }
+
+      function updateStateText(status) {
+        const stateName = String(status?.state || 'idle');
+        if (stateName === 'failed') return t('updateFailed');
+        if (['scheduled', 'waiting', 'applying', 'replacing', 'validating', 'rolling_back'].includes(stateName)) return t('updateBusy');
+        return t('updateIdle');
+      }
+
+      function updateOperationBusy(status) {
+        return ['scheduled', 'waiting', 'applying', 'replacing', 'validating', 'rolling_back'].includes(String(status?.state || 'idle'));
+      }
+
+      function updateStatusMessage(status) {
+        if (!status || status.state === 'idle') return t('noUpdateScheduled');
+        return status.message || updateStateText(status);
+      }
+
+      function renderServerUpdateRelease(check) {
+        elements.server_update_release.replaceChildren();
+        elements.server_update_release.classList.toggle('hidden', !check);
+        if (!check) return;
+        const heading = document.createElement('strong');
+        heading.textContent = `${t('releaseDetails')}: ${check.latest_version || '—'} · ${check.update_available ? t('updateAvailable') : t('upToDate')}`;
+        const asset = document.createElement('span'); asset.textContent = check.asset_name || '';
+        const key = document.createElement('span'); key.textContent = `${t('signingKey')}: ${check.signature_key_id || '—'}`;
+        const digest = document.createElement('span'); digest.textContent = `${t('packageDigest')}: ${check.github_digest || '—'}`;
+        elements.server_update_release.append(heading, asset, key, digest);
+        try {
+          const release = new URL(check.release_url);
+          if (release.protocol === 'https:' && release.hostname === 'github.com') {
+            const link = document.createElement('a'); link.href = release.href; link.target = '_blank'; link.rel = 'noopener noreferrer'; link.textContent = release.href;
+            elements.server_update_release.append(link);
+          }
+        } catch (_) {}
+      }
+
+      function renderUpdateCenter() {
+        const overview = state.dashboard?.updateOverview;
+        const status = overview?.status || { state: 'idle' };
+        elements.update_kpis.replaceChildren(
+          createKpi(overview?.build?.version || '—', t('installedVersion')),
+          createKpi(updateStateText(status), t('updateState'), updateStatusMessage(status)),
+          createKpi(t('stableChannel'), t('releaseChannel')),
+          createKpi(overview?.signature_policy === 'production' ? t('production') : '—', t('signaturePolicy')),
+          createKpi(overview?.remote_client_update_available ? t('enabled') : t('localOnly'), t('clientUpdate'))
+        );
+        elements.server_update_state.textContent = updateStateText(status);
+        elements.server_update_state.classList.toggle('warning', status.state === 'failed' || updateOperationBusy(status));
+        elements.server_update_details.replaceChildren();
+        appendUpdateDetail(elements.server_update_details, t('installedVersion'), overview?.build?.version);
+        appendUpdateDetail(elements.server_update_details, t('targetPlatform'), overview?.build?.target);
+        appendUpdateDetail(elements.server_update_details, t('sourceRepository'), overview?.repository);
+        appendUpdateDetail(elements.server_update_details, t('updateState'), updateStatusMessage(status));
+        elements.server_update_security.replaceChildren();
+        [t('signedManifestProtected'), t('confirmationProtected'), t('downgradeBlocked'), t('rollbackProtected')].forEach(value => {
+          const item = document.createElement('span'); item.textContent = value; elements.server_update_security.append(item);
+        });
+        const unavailable = !overview || !overview.apply_available;
+        const busy = updateOperationBusy(status);
+        elements.check_server_update.disabled = !overview || busy;
+        elements.download_server_update.disabled = !overview || busy;
+        elements.apply_server_update.disabled = unavailable || busy;
+        elements.apply_server_update.title = unavailable ? t('updateUnavailable') : '';
+        renderServerUpdateRelease(state.serverUpdateCheck);
+      }
+
+      async function checkServerUpdate() {
+        setBusy(elements.check_server_update, true, 'saving');
+        try {
+          const response = await apiFetch('/api/v1/updates/server/check', { method: 'POST', headers: { Accept: 'application/json' }, timeoutMs: 45000, scope: 'update' });
+          if (!response.ok) return showToast(await responseError(response), true);
+          state.serverUpdateCheck = await response.json();
+          renderUpdateCenter();
+          showToast(t('updateChecked'));
+        } catch (_) { showToast(t('requestFailed'), true); }
+        finally { setBusy(elements.check_server_update, false); renderUpdateCenter(); }
+      }
+
+      async function downloadServerUpdate() {
+        if (!confirm(t('confirmDownloadUpdate'))) return;
+        setBusy(elements.download_server_update, true, 'saving');
+        try {
+          const response = await apiFetch('/api/v1/updates/server/download', { method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, body: JSON.stringify({ confirmation: 'DOWNLOAD' }), timeoutMs: 300000, scope: 'update' });
+          if (!response.ok) return showToast(await responseError(response), true);
+          const staged = await response.json();
+          state.serverUpdateCheck = { ...(state.serverUpdateCheck || {}), latest_version: staged.version, asset_name: staged.archive_name, github_digest: staged.archive_sha256, signature_key_id: staged.signature_key_id, update_available: staged.version !== state.dashboard?.updateOverview?.build?.version };
+          renderUpdateCenter();
+          showToast(t('updateDownloaded'));
+        } catch (_) { showToast(t('requestFailed'), true); }
+        finally { setBusy(elements.download_server_update, false); renderUpdateCenter(); }
+      }
+
+      async function applyServerUpdate() {
+        if (!confirm(t('confirmApplyUpdate'))) return;
+        setBusy(elements.apply_server_update, true, 'saving');
+        try {
+          const response = await apiFetch('/api/v1/updates/server/apply', { method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, body: JSON.stringify({ confirmation: 'UPDATE' }), timeoutMs: 300000, scope: 'update' });
+          if (!response.ok) return showToast(await responseError(response), true);
+          const scheduled = await response.json();
+          if (state.dashboard?.updateOverview) {
+            state.dashboard.updateOverview.status = { state: scheduled.state, operation: scheduled.operation, from_version: scheduled.from_version, to_version: scheduled.to_version, message: t('updateScheduled') };
+          }
+          renderUpdateCenter();
+          showToast(t('updateScheduled'), false, 0);
+        } catch (_) { showToast(t('requestFailed'), true); }
+        finally { setBusy(elements.apply_server_update, false); renderUpdateCenter(); }
+      }
+
       function renderAlerts() {
         const dashboard = state.dashboard;
         const channels = dashboard.alertChannels || {};
@@ -2455,6 +2674,52 @@
           drawServiceStatusChart();
         }
         if (state.route.view === 'clients') drawClientInsightCharts();
+      }
+
+      function scheduleResponsiveRender() {
+        if (chartRenderFrame !== null) return;
+        chartRenderFrame = requestAnimationFrame(() => {
+          chartRenderFrame = null;
+          if (!elements.appearance_popover.classList.contains('hidden')) {
+            positionPopover(elements.appearance_popover, elements.appearance_button);
+          }
+          drawCharts();
+        });
+      }
+
+      function setupChartResizeObserver() {
+        if (!('ResizeObserver' in window)) return;
+        chartResizeObserver?.disconnect();
+        chartResizeObserver = new ResizeObserver(entries => {
+          let changed = false;
+          entries.forEach(entry => {
+            const width = Math.round(entry.contentRect.width * 2) / 2;
+            const height = Math.round(entry.contentRect.height * 2) / 2;
+            const previous = observedChartSizes.get(entry.target);
+            if (!previous || previous.width !== width || previous.height !== height) {
+              observedChartSizes.set(entry.target, { width, height });
+              changed = true;
+            }
+          });
+          if (changed) scheduleResponsiveRender();
+        });
+        document.querySelectorAll('.chart-wrap').forEach(container => chartResizeObserver.observe(container));
+        chartResizeObserver.observe(elements.workspace);
+      }
+
+      function setupPixelRatioObserver() {
+        const ratio = window.devicePixelRatio || 1;
+        const query = matchMedia(`(resolution: ${ratio}dppx)`);
+        const refresh = () => {
+          if (pixelRatioMedia?.removeEventListener) pixelRatioMedia.removeEventListener('change', refresh);
+          else if (pixelRatioMedia?.removeListener) pixelRatioMedia.removeListener(refresh);
+          pixelRatioMedia = null;
+          setupPixelRatioObserver();
+          scheduleResponsiveRender();
+        };
+        pixelRatioMedia = query;
+        if (query.addEventListener) query.addEventListener('change', refresh, { once: true });
+        else if (query.addListener) query.addListener(refresh);
       }
 
       function policyInitialValues(type, policy = null) {
@@ -3021,7 +3286,7 @@
 
       function emptyDashboard() {
         const metrics = new Proxy({}, { get(target, key) { return key in target ? target[key] : 0; } });
-        return { status: {}, metrics, events: [], users: [], sessions: [], apiTokens: [], fleetOverview: { peers: [], conflicts: [], failover_order: [] }, alertRules: [], alertEvents: [], alertChannels: {}, tcpPolicies: [], udpPolicies: [], portGroups: [], httpRoutes: [], sniRoutes: [], secretPolicies: [], socks5Policies: [], httpProxyPolicies: [], clients: [], p2pNodes: [], publicPortPolicy: { tcp_allowed: '32000-32999', udp_allowed: '32000-32999', tcp_reserved: '', udp_reserved: '' }, acme: { enabled: false, environment: 'staging', directory_url: acmeDirectories.staging, contact_email: '', terms_accepted: false, renew_before_days: 30, account_registered: false } };
+        return { status: {}, metrics, events: [], users: [], sessions: [], apiTokens: [], updateOverview: null, fleetOverview: { peers: [], conflicts: [], failover_order: [] }, alertRules: [], alertEvents: [], alertChannels: {}, tcpPolicies: [], udpPolicies: [], portGroups: [], httpRoutes: [], sniRoutes: [], secretPolicies: [], socks5Policies: [], httpProxyPolicies: [], clients: [], p2pNodes: [], publicPortPolicy: { tcp_allowed: '32000-32999', udp_allowed: '32000-32999', tcp_reserved: '', udp_reserved: '' }, acme: { enabled: false, environment: 'staging', directory_url: acmeDirectories.staging, contact_email: '', terms_accepted: false, renew_before_days: 30, account_registered: false } };
       }
 
       function managementRequestPlan({ includeHistory = false } = {}) {
@@ -3038,6 +3303,7 @@
         if (state.route.view === 'clients') return [...common, { key: 'clients', url: '/api/v1/clients' }];
         if (state.route.view === 'users') return [...common, { key: 'users', url: '/api/v1/users' }];
         if (state.route.view === 'sessions') return [...common, { key: 'sessions', url: '/api/v1/sessions' }, { key: 'apiTokens', url: '/api/v1/api-tokens' }];
+        if (state.route.view === 'updates') return [...common, { key: 'updateOverview', url: '/api/v1/updates/server' }];
         if (state.route.view === 'alerts') return [...common, { key: 'alertRules', url: '/api/v1/alerts/rules' }, { key: 'alertEvents', url: '/api/v1/alerts/events?active=true&limit=100' }, { key: 'alertChannels', url: '/api/v1/alerts/channels' }];
         if (state.route.view === 'activity') return [...common, { key: 'events', url: `/api/v1/audit?limit=${Math.min(100, state.auditLimit)}` }];
         if (state.route.service === 'acme') return [...common, { key: 'acme', url: '/api/v1/acme/config' }];
@@ -3238,6 +3504,9 @@
         elements.alert_rule_close.addEventListener('click', closeAlertRuleModal);
         elements.alert_rule_cancel.addEventListener('click', closeAlertRuleModal);
         elements.alert_rule_modal.addEventListener('click', event => { if (event.target === elements.alert_rule_modal) closeAlertRuleModal(); });
+        elements.check_server_update.addEventListener('click', checkServerUpdate);
+        elements.download_server_update.addEventListener('click', downloadServerUpdate);
+        elements.apply_server_update.addEventListener('click', applyServerUpdate);
         elements.refresh.addEventListener('click', () => loadManagementData({ forceHistory: true }));
         elements.overview_alert_more.addEventListener('click', () => { location.hash = '#/alerts'; });
         elements.export_metrics.addEventListener('click', () => { window.location.href = `/api/v1/metrics/history/export?range=${encodeURIComponent(state.trendRange)}&protocol=total&format=csv`; });
@@ -3320,21 +3589,13 @@
             else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
           }
         });
-        let resizeFrame = null;
-        window.addEventListener('resize', () => {
-          if (resizeFrame) cancelAnimationFrame(resizeFrame);
-          resizeFrame = requestAnimationFrame(() => {
-            resizeFrame = null;
-            if (!elements.appearance_popover.classList.contains('hidden')) {
-              positionPopover(elements.appearance_popover, elements.appearance_button);
-            }
-            drawCharts();
-          });
-        });
+        window.addEventListener('resize', scheduleResponsiveRender, { passive: true });
         document.addEventListener('visibilitychange', () => {
           if (!document.hidden && state.identity) loadManagementData({ forceHistory: false }).catch(() => {});
         });
         setupTrafficTooltip();
+        setupChartResizeObserver();
+        setupPixelRatioObserver();
       }
 
       function safeStorageGet(key, fallback = null) {

@@ -110,6 +110,8 @@
             <div class="nav-group-label admin-only" data-i18n="accessControl">Access control</div>
             <a class="nav-link admin-only" href="#/users" data-view="users" data-route-prefix="users"><span class="nav-icon">♙</span><span data-i18n="userManagement">Users</span></a>
             <a class="nav-link admin-only" href="#/sessions" data-view="sessions" data-route-prefix="sessions"><span class="nav-icon">◫</span><span data-i18n="securitySessions">Security & sessions</span></a>
+            <div class="nav-group-label admin-only" data-i18n="systemManagement">System</div>
+            <a class="nav-link admin-only" href="#/updates" data-view="updates" data-route-prefix="updates"><span class="nav-icon">⇧</span><span data-i18n="updateCenter">Updates</span></a>
             <a class="nav-link" href="#/alerts" data-view="alerts" data-route-prefix="alerts"><span class="nav-icon">△</span><span data-i18n="alerts">Alerts</span></a>
             <a class="nav-link" href="#/activity" data-view="activity" data-route-prefix="activity"><span class="nav-icon">◌</span><span data-i18n="activity">Activity</span></a>
           </nav>
@@ -190,6 +192,38 @@
             <div class="data-table-wrap" style="margin-bottom:12px"><table class="data-table"><thead><tr><th data-i18n="name">Name</th><th data-i18n="scope">Scope</th><th data-i18n="createdAt">Created</th><th data-i18n="expiresAt">Expires</th><th data-i18n="lastUsed">Last used</th><th data-i18n="actions">Actions</th></tr></thead><tbody id="api-tokens-list"></tbody></table></div>
             <h3 style="margin:18px 0 10px" data-i18n="activeSignIns">Active sign-ins</h3>
             <div class="data-table-wrap"><table class="data-table"><thead><tr><th data-i18n="username">Username</th><th data-i18n="sessionId">Session ID</th><th>IP</th><th data-i18n="device">Device</th><th data-i18n="createdAt">Created</th><th data-i18n="expiresAt">Expires</th><th data-i18n="actions">Actions</th></tr></thead><tbody id="sessions-list"></tbody></table></div>
+          </section>
+
+          <section id="updates-view" class="view-panel hidden">
+            <div id="update-kpis" class="kpi-grid"></div>
+            <div class="update-grid">
+              <section class="panel update-card">
+                <div class="panel-heading"><div><h3 data-i18n="serverUpdate">Server update</h3><p data-i18n="serverUpdateHelp">Check, verify and schedule a signed stable release.</p></div><span id="server-update-state" class="badge"></span></div>
+                <div id="server-update-details" class="update-details"></div>
+                <div id="server-update-security" class="security-checklist"></div>
+                <div class="inline-actions update-actions">
+                  <button id="check-server-update" class="soft-button" type="button" data-i18n="checkForUpdates">Check for updates</button>
+                  <button id="download-server-update" class="soft-button" type="button" data-i18n="downloadUpdate">Download and verify</button>
+                  <button id="apply-server-update" class="primary-button" type="button" data-i18n="applyUpdate">Apply update</button>
+                </div>
+                <div id="server-update-release" class="update-release hidden" aria-live="polite"></div>
+              </section>
+              <section class="panel update-card">
+                <div class="panel-heading"><div><h3 data-i18n="clientUpdate">Client update</h3><p data-i18n="clientUpdateHelp">Clients update locally so the server cannot silently replace endpoint binaries.</p></div><span class="badge warning" data-i18n="localOnly">Local only</span></div>
+                <p class="role-note" data-i18n="clientUpdateBoundary">Remote client replacement is intentionally unavailable. Run the signed updater on each client host or through your own authorized device-management system.</p>
+                <div class="command-list">
+                  <code>linklake-client check-update</code>
+                  <code>linklake-client update download</code>
+                  <code>linklake-client update apply --yes</code>
+                </div>
+                <div class="security-checklist">
+                  <span data-i18n="productionSignatureOnly">Production signatures only</span>
+                  <span data-i18n="downgradeBlocked">Downgrades blocked</span>
+                  <span data-i18n="localConfirmationRequired">Local confirmation required</span>
+                </div>
+              </section>
+            </div>
+            <section class="panel update-warning"><h3 data-i18n="rollbackRecovery">Rollback and recovery</h3><p data-i18n="rollbackRecoveryHelp">Database-aware rollback and interrupted-update recovery remain local administrator operations because they can require explicit data-loss consent.</p></section>
           </section>
 
           <section id="alerts-view" class="view-panel hidden">
