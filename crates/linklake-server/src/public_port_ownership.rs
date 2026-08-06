@@ -598,11 +598,11 @@ async fn renew_postgres_lease(
     transaction
         .query_opt(
             "UPDATE linklake_public_port_ownership
-             SET renewed_at = to_timestamp($8), lease_until = to_timestamp($9)
+             SET renewed_at = to_timestamp($8::bigint), lease_until = to_timestamp($9::bigint)
              WHERE protocol = $1 AND public_port = $2 AND lease_id = $3
                AND owner_instance_id = $4 AND owner_incarnation_id = $5
                AND fencing_token = $6 AND policy_id = $7
-               AND lease_until > to_timestamp($8)
+               AND lease_until > to_timestamp($8::bigint)
              RETURNING protocol, public_port, lease_id, owner_instance_id,
                  owner_incarnation_id, fencing_token, policy_id,
                  CAST(EXTRACT(EPOCH FROM acquired_at) AS BIGINT),
@@ -644,7 +644,8 @@ async fn replace_postgres_lease(
                  fencing_token, policy_id,
                  acquired_at, renewed_at, lease_until
              ) VALUES ($1, $2, $3, $4, $5, $6, $7,
-                 to_timestamp($8), to_timestamp($8), to_timestamp($9))
+                 to_timestamp($8::bigint), to_timestamp($8::bigint),
+                 to_timestamp($9::bigint))
              ON CONFLICT(protocol, public_port) DO UPDATE SET
                  lease_id = EXCLUDED.lease_id,
                  owner_instance_id = EXCLUDED.owner_instance_id,

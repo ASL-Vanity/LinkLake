@@ -196,7 +196,8 @@ impl HaCoordinator {
                         transaction
                             .query_one(
                                 "UPDATE linklake_ha_members
-                                 SET last_seen_at = to_timestamp($3), lease_until = to_timestamp($4),
+                                 SET last_seen_at = to_timestamp($3::bigint),
+                                     lease_until = to_timestamp($4::bigint),
                                      metadata_json = $5::jsonb
                                  WHERE instance_id = $1 AND incarnation_id = $2
                                  RETURNING instance_id, incarnation_id,
@@ -215,16 +216,16 @@ impl HaCoordinator {
                             .await?
                     }
                     Some(current) if current.lease_until_unix_seconds > now => {
-                        anyhow::bail!(
-                            "another incarnation is active for this HA instance ID"
-                        );
+                        anyhow::bail!("another incarnation is active for this HA instance ID");
                     }
                     Some(_) => {
                         transaction
                             .query_one(
                                 "UPDATE linklake_ha_members
-                                 SET incarnation_id = $2, started_at = to_timestamp($3),
-                                     last_seen_at = to_timestamp($3), lease_until = to_timestamp($4),
+                                 SET incarnation_id = $2,
+                                     started_at = to_timestamp($3::bigint),
+                                     last_seen_at = to_timestamp($3::bigint),
+                                     lease_until = to_timestamp($4::bigint),
                                      metadata_json = $5::jsonb
                                  WHERE instance_id = $1
                                  RETURNING instance_id, incarnation_id,
@@ -248,8 +249,9 @@ impl HaCoordinator {
                                 "INSERT INTO linklake_ha_members(
                                      instance_id, incarnation_id, started_at, last_seen_at,
                                      lease_until, metadata_json
-                                 ) VALUES ($1, $2, to_timestamp($3), to_timestamp($3),
-                                     to_timestamp($4), $5::jsonb)
+                                 ) VALUES ($1, $2, to_timestamp($3::bigint),
+                                     to_timestamp($3::bigint), to_timestamp($4::bigint),
+                                     $5::jsonb)
                                  RETURNING instance_id, incarnation_id,
                                      CAST(EXTRACT(EPOCH FROM started_at) AS BIGINT),
                                      CAST(EXTRACT(EPOCH FROM last_seen_at) AS BIGINT),
@@ -657,9 +659,10 @@ impl HaCoordinator {
         transaction
             .query_opt(
                 "UPDATE linklake_ha_leader
-                 SET renewed_at = to_timestamp($4), lease_until = to_timestamp($5)
+                 SET renewed_at = to_timestamp($4::bigint),
+                     lease_until = to_timestamp($5::bigint)
                  WHERE singleton_id = 1 AND instance_id = $1 AND incarnation_id = $2
-                   AND fencing_token = $3 AND lease_until > to_timestamp($4)
+                   AND fencing_token = $3 AND lease_until > to_timestamp($4::bigint)
                  RETURNING instance_id, incarnation_id, fencing_token,
                      CAST(EXTRACT(EPOCH FROM acquired_at) AS BIGINT),
                      CAST(EXTRACT(EPOCH FROM renewed_at) AS BIGINT),
@@ -696,7 +699,8 @@ impl HaCoordinator {
                 "INSERT INTO linklake_ha_leader(
                      singleton_id, instance_id, incarnation_id, fencing_token,
                      acquired_at, renewed_at, lease_until
-                 ) VALUES (1, $1, $2, $3, to_timestamp($4), to_timestamp($4), to_timestamp($5))
+                 ) VALUES (1, $1, $2, $3, to_timestamp($4::bigint),
+                     to_timestamp($4::bigint), to_timestamp($5::bigint))
                  ON CONFLICT(singleton_id) DO UPDATE SET
                      instance_id = EXCLUDED.instance_id,
                      incarnation_id = EXCLUDED.incarnation_id,

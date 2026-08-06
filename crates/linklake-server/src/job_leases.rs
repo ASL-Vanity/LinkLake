@@ -368,13 +368,15 @@ impl JobLeases {
                 let changed = transaction
                     .execute(
                         "UPDATE linklake_job_leases
-                         SET renewed_at = to_timestamp($7), lease_until = to_timestamp($7),
+                         SET renewed_at = to_timestamp($7::bigint),
+                             lease_until = to_timestamp($7::bigint),
                              last_completed_at = CASE WHEN $8::text IS NULL
-                                 THEN to_timestamp($7) ELSE last_completed_at END,
+                                 THEN to_timestamp($7::bigint) ELSE last_completed_at END,
                              last_error_code = $8
                          WHERE job_key = $1 AND job_kind = $2 AND lease_id = $3
                            AND owner_instance_id = $4 AND owner_incarnation_id = $5
-                           AND fencing_token = $6 AND lease_until > to_timestamp($7)",
+                           AND fencing_token = $6
+                           AND lease_until > to_timestamp($7::bigint)",
                         &[
                             &job_key,
                             &job_kind,
@@ -565,10 +567,11 @@ async fn renew_postgres_job(
     transaction
         .query_opt(
             "UPDATE linklake_job_leases
-             SET renewed_at = to_timestamp($7), lease_until = to_timestamp($8)
+             SET renewed_at = to_timestamp($7::bigint),
+                 lease_until = to_timestamp($8::bigint)
              WHERE job_key = $1 AND job_kind = $2 AND lease_id = $3
                AND owner_instance_id = $4 AND owner_incarnation_id = $5
-               AND fencing_token = $6 AND lease_until > to_timestamp($7)
+               AND fencing_token = $6 AND lease_until > to_timestamp($7::bigint)
              RETURNING job_key, job_kind, lease_id, owner_instance_id,
                  owner_incarnation_id, fencing_token,
                  CAST(EXTRACT(EPOCH FROM acquired_at) AS BIGINT),
@@ -609,8 +612,8 @@ async fn replace_postgres_job(
                  job_key, job_kind, lease_id, owner_instance_id, owner_incarnation_id,
                  fencing_token, acquired_at, renewed_at, lease_until,
                  last_completed_at, last_error_code
-             ) VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7), to_timestamp($7),
-                 to_timestamp($8), NULL, NULL)
+             ) VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7::bigint),
+                 to_timestamp($7::bigint), to_timestamp($8::bigint), NULL, NULL)
              ON CONFLICT(job_key) DO UPDATE SET
                  lease_id = EXCLUDED.lease_id,
                  owner_instance_id = EXCLUDED.owner_instance_id,
