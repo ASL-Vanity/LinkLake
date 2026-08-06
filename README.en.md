@@ -481,7 +481,7 @@ Packaging scripts honor `SOURCE_DATE_EPOCH`. With the same timestamp, source, to
 
 ## Roadmap
 
-`v1.0.0` completed the core protocols and the first cross-platform management release. `v1.0.1` focuses on Web UI/Flutter Manager experience and maintainability, `v1.1.0` on real application-health and multi-cloud reliability, and `v1.2.0` on a highly available control plane and backend-protocol extensions. See [`ROADMAP.en.md`](ROADMAP.en.md) for scope, acceptance criteria, and continuing support boundaries.
+`v1.0.0` completed the core protocols and the first cross-platform management release. The project will not publish a separate `v1.0.1`; management-surface completion, secure remote updates, protocol completion, application health and Fleet, PostgreSQL high availability, platform installers, and dependency modernization are consolidated into `v1.1.0`. Complete testing, staging, and release begin only after the feature set is frozen. See [`ROADMAP.en.md`](ROADMAP.en.md) for scope, acceptance criteria, and continuing support boundaries.
 
 ## License
 
