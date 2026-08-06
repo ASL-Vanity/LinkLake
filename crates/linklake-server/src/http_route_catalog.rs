@@ -305,6 +305,10 @@ impl HttpRouteCatalog {
         value
             .map(
                 |(policy_id, max_connections, transport, server_name, trust_profile)| {
+                    anyhow::ensure!(
+                        (1..=1024).contains(&max_connections),
+                        "HTTP route runtime connection limit is invalid"
+                    );
                     Ok(HttpRouteRuntimePolicy {
                         policy_id: Uuid::parse_str(&policy_id)?,
                         max_connections: max_connections as usize,

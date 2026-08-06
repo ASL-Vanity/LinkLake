@@ -334,6 +334,11 @@ struct H2cUpgradeActivity {
     statistics: Arc<HttpRouteStatistics>,
 }
 
+enum H2cTransferError {
+    Timeout,
+    Io,
+}
+
 impl H2cUpgradeActivity {
     fn begin(statistics: Arc<HttpRouteStatistics>) -> Self {
         statistics
@@ -1328,12 +1333,12 @@ async fn proxy_request(
                                 copy_bidirectional(&mut client, &mut backend),
                             )
                             .await
-                            .map_err(|_| ())
-                            .and_then(|result| result.map_err(|_| ()))
+                            .map_err(|_| H2cTransferError::Timeout)
+                            .and_then(|result| result.map_err(|_| H2cTransferError::Io))
                         } else {
                             copy_bidirectional(&mut client, &mut backend)
                                 .await
-                                .map_err(|_| ())
+                                .map_err(|_| H2cTransferError::Io)
                         }
                     } => Some(result),
                 };
@@ -1365,9 +1370,14 @@ async fn proxy_request(
                             tracing::warn!("Could not persist h2c upgrade traffic usage: {error}");
                         }
                     }
-                    Some(Err(())) => {
+                    Some(Err(H2cTransferError::Timeout)) => {
                         h2c_statistics
                             .h2c_upgrade_timeouts_total
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    Some(Err(H2cTransferError::Io)) => {
+                        h2c_statistics
+                            .h2c_upgrade_failures_total
                             .fetch_add(1, Ordering::Relaxed);
                     }
                     None => {}
@@ -1868,6 +1878,7 @@ fn remove_hop_by_hop_headers(
         headers.remove(header::TRAILER);
     }
     headers.remove("proxy-connection");
+    headers.remove("http2-settings");
     headers.remove("keep-alive");
     if !preserve_upgrade {
         headers.remove(header::CONNECTION);
@@ -1899,15 +1910,7 @@ fn is_upgrade_request<B>(request: &Request<B>) -> bool {
 }
 
 fn h2c_upgrade_settings<B>(request: &Request<B>) -> Result<Option<HeaderValue>, &'static str> {
-    let upgrade_values = request
-        .headers()
-        .get_all(header::UPGRADE)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>();
+    let upgrade_values = strict_header_tokens(request.headers(), header::UPGRADE)?;
     if !upgrade_values
         .iter()
         .any(|value| value.eq_ignore_ascii_case("h2c"))
@@ -1920,20 +1923,17 @@ fn h2c_upgrade_settings<B>(request: &Request<B>) -> Result<Option<HeaderValue>, 
     {
         return Err("invalid h2c Upgrade header");
     }
-    let connection_tokens = request
-        .headers()
-        .get_all(header::CONNECTION)
+    let connection_tokens = strict_header_tokens(request.headers(), header::CONNECTION)?;
+    if connection_tokens
         .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .map(str::trim)
-        .collect::<Vec<_>>();
-    if !connection_tokens
-        .iter()
-        .any(|value| value.eq_ignore_ascii_case("upgrade"))
-        || !connection_tokens
+        .filter(|value| value.eq_ignore_ascii_case("upgrade"))
+        .count()
+        != 1
+        || connection_tokens
             .iter()
-            .any(|value| value.eq_ignore_ascii_case("http2-settings"))
+            .filter(|value| value.eq_ignore_ascii_case("http2-settings"))
+            .count()
+            != 1
     {
         return Err("h2c requires Connection: Upgrade, HTTP2-Settings");
     }
@@ -1973,6 +1973,52 @@ fn h2c_upgrade_settings<B>(request: &Request<B>) -> Result<Option<HeaderValue>, 
         }
     }
     Ok(Some(settings_value))
+}
+
+fn strict_header_tokens(
+    headers: &hyper::HeaderMap,
+    name: HeaderName,
+) -> Result<Vec<String>, &'static str> {
+    let mut tokens = Vec::new();
+    let mut normalized = HashSet::new();
+    for value in headers.get_all(name).iter() {
+        let value = value
+            .to_str()
+            .map_err(|_| "upgrade control header is not valid ASCII")?;
+        for token in value.split(',') {
+            let token = token.trim();
+            if token.is_empty()
+                || !token.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric()
+                        || matches!(
+                            byte,
+                            b'!' | b'#'
+                                | b'$'
+                                | b'%'
+                                | b'&'
+                                | b'\''
+                                | b'*'
+                                | b'+'
+                                | b'-'
+                                | b'.'
+                                | b'^'
+                                | b'_'
+                                | b'`'
+                                | b'|'
+                                | b'~'
+                        )
+                })
+            {
+                return Err("upgrade control header contains an invalid token");
+            }
+            let key = token.to_ascii_lowercase();
+            if !normalized.insert(key) {
+                return Err("upgrade control header contains a duplicate token");
+            }
+            tokens.push(token.to_owned());
+        }
+    }
+    Ok(tokens)
 }
 
 async fn send_error(stream: &mut BoxedIo, message: &str) {
@@ -2054,6 +2100,49 @@ mod tests {
             .body(())
             .unwrap();
         assert!(h2c_upgrade_settings(&missing_token).is_err());
+
+        let mut invalid = Request::builder()
+            .version(Version::HTTP_11)
+            .header(header::CONNECTION, "Upgrade, HTTP2-Settings")
+            .header("http2-settings", "")
+            .body(())
+            .unwrap();
+        invalid.headers_mut().insert(
+            header::UPGRADE,
+            HeaderValue::from_bytes(b"h2c,\xff").unwrap(),
+        );
+        assert!(h2c_upgrade_settings(&invalid).is_err());
+
+        let duplicate_connection = Request::builder()
+            .version(Version::HTTP_11)
+            .header(header::UPGRADE, "h2c")
+            .header(header::CONNECTION, "Upgrade, HTTP2-Settings, upgrade")
+            .header("http2-settings", "")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            h2c_upgrade_settings(&duplicate_connection),
+            Err("upgrade control header contains a duplicate token")
+        );
+    }
+
+    #[test]
+    fn unvalidated_http2_settings_are_always_removed() {
+        let mut request = Request::builder()
+            .version(Version::HTTP_11)
+            .header(header::UPGRADE, "websocket")
+            .header(header::CONNECTION, "Upgrade")
+            .header("http2-settings", "unexpected")
+            .body(())
+            .unwrap();
+        prepare_forward_headers(
+            &mut request,
+            SocketAddr::from(([192, 0, 2, 10], 50_000)),
+            "site.example.com",
+            PublicScheme::Http,
+            false,
+        );
+        assert!(!request.headers().contains_key("http2-settings"));
     }
 
     #[test]

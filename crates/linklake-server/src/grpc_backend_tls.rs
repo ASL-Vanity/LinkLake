@@ -9,12 +9,12 @@ use rustls_pki_types::{pem::PemObject, CertificateDer, ServerName};
 use std::{
     error::Error,
     fmt,
-    fs::File,
+    fs::{self, File},
     io::BufReader,
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, LazyLock,
     },
     time::Duration,
 };
@@ -26,6 +26,12 @@ use tokio_rustls::{
 
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const TRUST_PROFILE_DIRECTORY_ENV: &str = "LINKLAKE_GRPC_TRUST_PROFILE_DIR";
+const MAX_TRUST_PROFILE_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_TRUST_PROFILE_CERTIFICATES: usize = 64;
+const MAX_TRUST_PROFILE_DER_BYTES: usize = 1024 * 1024;
+
+static SYSTEM_ROOTS: LazyLock<Result<RootCertStore, GrpcBackendTlsError>> =
+    LazyLock::new(load_system_roots);
 
 #[derive(Default)]
 pub(crate) struct GrpcBackendTlsCounters {
@@ -36,12 +42,15 @@ pub(crate) struct GrpcBackendTlsCounters {
     pub(crate) profile_trust_connections_total: AtomicU64,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum GrpcBackendTlsError {
     InvalidServerName,
     SystemTrustUnavailable,
     TrustProfileDirectoryMissing,
     TrustProfileUnreadable,
+    TrustProfileOutsideDirectory,
+    TrustProfileNotRegularFile,
+    TrustProfileTooLarge,
     TrustProfileEmpty,
     InvalidTrustCertificate,
     HandshakeTimeout,
@@ -56,6 +65,11 @@ impl fmt::Display for GrpcBackendTlsError {
             Self::SystemTrustUnavailable => "system TLS trust store is unavailable",
             Self::TrustProfileDirectoryMissing => "gRPC trust profile directory is not configured",
             Self::TrustProfileUnreadable => "gRPC trust profile cannot be read",
+            Self::TrustProfileOutsideDirectory => {
+                "gRPC trust profile resolves outside the configured directory"
+            }
+            Self::TrustProfileNotRegularFile => "gRPC trust profile is not a regular file",
+            Self::TrustProfileTooLarge => "gRPC trust profile exceeds the configured budget",
             Self::TrustProfileEmpty => "gRPC trust profile contains no certificates",
             Self::InvalidTrustCertificate => "gRPC trust profile contains an invalid certificate",
             Self::HandshakeTimeout => "gRPC backend TLS handshake timed out",
@@ -190,6 +204,10 @@ impl GrpcTlsConnector {
 }
 
 fn system_roots() -> Result<RootCertStore, GrpcBackendTlsError> {
+    SYSTEM_ROOTS.clone()
+}
+
+fn load_system_roots() -> Result<RootCertStore, GrpcBackendTlsError> {
     let native = rustls_native_certs::load_native_certs();
     let mut roots = RootCertStore::empty();
     for certificate in native.certs {
@@ -204,23 +222,51 @@ fn system_roots() -> Result<RootCertStore, GrpcBackendTlsError> {
 }
 
 fn profile_roots(profile: &str) -> Result<RootCertStore, GrpcBackendTlsError> {
-    let directory = std::env::var_os(TRUST_PROFILE_DIRECTORY_ENV)
+    let configured_directory = std::env::var_os(TRUST_PROFILE_DIRECTORY_ENV)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .ok_or(GrpcBackendTlsError::TrustProfileDirectoryMissing)?;
-    let path = directory.join(format!("{profile}.pem"));
-    let file = File::open(path).map_err(|_| GrpcBackendTlsError::TrustProfileUnreadable)?;
-    let certificates = CertificateDer::pem_reader_iter(BufReader::new(file))
-        .collect::<Result<Vec<_>, _>>()
+    let directory = fs::canonicalize(configured_directory)
         .map_err(|_| GrpcBackendTlsError::TrustProfileUnreadable)?;
-    if certificates.is_empty() {
-        return Err(GrpcBackendTlsError::TrustProfileEmpty);
+    if !fs::metadata(&directory)
+        .map_err(|_| GrpcBackendTlsError::TrustProfileUnreadable)?
+        .is_dir()
+    {
+        return Err(GrpcBackendTlsError::TrustProfileUnreadable);
+    }
+    let path = fs::canonicalize(directory.join(format!("{profile}.pem")))
+        .map_err(|_| GrpcBackendTlsError::TrustProfileUnreadable)?;
+    if !path.starts_with(&directory) {
+        return Err(GrpcBackendTlsError::TrustProfileOutsideDirectory);
+    }
+    let file = File::open(&path).map_err(|_| GrpcBackendTlsError::TrustProfileUnreadable)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| GrpcBackendTlsError::TrustProfileUnreadable)?;
+    if !metadata.is_file() {
+        return Err(GrpcBackendTlsError::TrustProfileNotRegularFile);
+    }
+    if metadata.len() > MAX_TRUST_PROFILE_FILE_BYTES {
+        return Err(GrpcBackendTlsError::TrustProfileTooLarge);
     }
     let mut roots = RootCertStore::empty();
-    for certificate in certificates {
+    let mut certificate_count = 0_usize;
+    let mut der_bytes = 0_usize;
+    for certificate in CertificateDer::pem_reader_iter(BufReader::new(file)) {
+        let certificate = certificate.map_err(|_| GrpcBackendTlsError::TrustProfileUnreadable)?;
+        certificate_count = certificate_count.saturating_add(1);
+        der_bytes = der_bytes.saturating_add(certificate.as_ref().len());
+        if certificate_count > MAX_TRUST_PROFILE_CERTIFICATES
+            || der_bytes > MAX_TRUST_PROFILE_DER_BYTES
+        {
+            return Err(GrpcBackendTlsError::TrustProfileTooLarge);
+        }
         roots
             .add(certificate)
             .map_err(|_| GrpcBackendTlsError::InvalidTrustCertificate)?;
+    }
+    if certificate_count == 0 {
+        return Err(GrpcBackendTlsError::TrustProfileEmpty);
     }
     Ok(roots)
 }
