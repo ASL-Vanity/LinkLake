@@ -150,6 +150,124 @@ const UPDATE_DOWNLOAD_CONFIRMATION: &str = "DOWNLOAD";
 const UPDATE_APPLY_CONFIRMATION: &str = "UPDATE";
 const UPDATE_CSRF_HEADER: &str = "x-linklake-csrf";
 const UPDATE_CSRF_VALUE: &str = "1";
+const SERVER_UPDATE_AUTH_AUDIT_WINDOW: Duration = Duration::from_secs(60);
+const SERVER_UPDATE_OPERATION_COUNT: usize = 4;
+const SERVER_UPDATE_AUTH_REASON_COUNT: usize = 8;
+const SERVER_UPDATE_AUTH_AUDIT_BUCKET_COUNT: usize =
+    SERVER_UPDATE_OPERATION_COUNT * SERVER_UPDATE_AUTH_REASON_COUNT;
+
+#[derive(Clone, Copy)]
+enum ServerUpdateOperation {
+    Overview,
+    Check,
+    Download,
+    Apply,
+}
+
+impl ServerUpdateOperation {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Overview => "overview",
+            Self::Check => "check",
+            Self::Download => "download",
+            Self::Apply => "apply",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Overview => 0,
+            Self::Check => 1,
+            Self::Download => 2,
+            Self::Apply => 3,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ServerUpdateAuthenticationRejectionReason {
+    InvalidSessionCookie,
+    MixedAuthorizationAndSession,
+    BearerAuthenticationForbidden,
+    InteractiveSessionMissing,
+    InvalidOrExpiredSession,
+    SessionVerificationFailed,
+    PasswordChangeRequired,
+    AdministratorRoleRequired,
+}
+
+impl ServerUpdateAuthenticationRejectionReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidSessionCookie => "invalid_session_cookie",
+            Self::MixedAuthorizationAndSession => "mixed_authorization_and_session",
+            Self::BearerAuthenticationForbidden => "bearer_authentication_forbidden",
+            Self::InteractiveSessionMissing => "interactive_session_missing",
+            Self::InvalidOrExpiredSession => "invalid_or_expired_session",
+            Self::SessionVerificationFailed => "session_verification_failed",
+            Self::PasswordChangeRequired => "password_change_required",
+            Self::AdministratorRoleRequired => "administrator_role_required",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::InvalidSessionCookie => 0,
+            Self::MixedAuthorizationAndSession => 1,
+            Self::BearerAuthenticationForbidden => 2,
+            Self::InteractiveSessionMissing => 3,
+            Self::InvalidOrExpiredSession => 4,
+            Self::SessionVerificationFailed => 5,
+            Self::PasswordChangeRequired => 6,
+            Self::AdministratorRoleRequired => 7,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ServerUpdateAuthenticationAuditBucket {
+    last_recorded: Instant,
+    suppressed_count: u64,
+}
+
+struct ServerUpdateAuthenticationAuditLimiter {
+    buckets: [Option<ServerUpdateAuthenticationAuditBucket>; SERVER_UPDATE_AUTH_AUDIT_BUCKET_COUNT],
+}
+
+impl Default for ServerUpdateAuthenticationAuditLimiter {
+    fn default() -> Self {
+        Self {
+            buckets: [None; SERVER_UPDATE_AUTH_AUDIT_BUCKET_COUNT],
+        }
+    }
+}
+
+impl ServerUpdateAuthenticationAuditLimiter {
+    fn observe(
+        &mut self,
+        operation: ServerUpdateOperation,
+        reason: ServerUpdateAuthenticationRejectionReason,
+        now: Instant,
+    ) -> Option<u64> {
+        let index = operation.index() * SERVER_UPDATE_AUTH_REASON_COUNT + reason.index();
+        let bucket = &mut self.buckets[index];
+        let Some(current) = bucket.as_mut() else {
+            *bucket = Some(ServerUpdateAuthenticationAuditBucket {
+                last_recorded: now,
+                suppressed_count: 0,
+            });
+            return Some(0);
+        };
+        if now.duration_since(current.last_recorded) < SERVER_UPDATE_AUTH_AUDIT_WINDOW {
+            current.suppressed_count = current.suppressed_count.saturating_add(1);
+            return None;
+        }
+        let suppressed_count = current.suppressed_count;
+        current.last_recorded = now;
+        current.suppressed_count = 0;
+        Some(suppressed_count)
+    }
+}
 #[cfg(test)]
 static MANAGEMENT_UI: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     [
@@ -417,6 +535,7 @@ struct AppState {
     login_throttle: Mutex<LoginThrottle>,
     login_hash_permits: Arc<Semaphore>,
     audit: Mutex<AuditLog>,
+    server_update_authentication_audit_limiter: Mutex<ServerUpdateAuthenticationAuditLimiter>,
     alerts: Mutex<AlertCatalog>,
     fleet: Mutex<FleetCatalog>,
     policy_service: PolicyService,
@@ -3987,6 +4106,9 @@ async fn run_server(
         login_throttle: Mutex::new(LoginThrottle::default()),
         login_hash_permits: Arc::new(Semaphore::new(LOGIN_HASH_CONCURRENCY)),
         audit: Mutex::new(AuditLog::open_with_database(&database)?),
+        server_update_authentication_audit_limiter: Mutex::new(
+            ServerUpdateAuthenticationAuditLimiter::default(),
+        ),
         alerts: Mutex::new(AlertCatalog::open_with_database(&database)?),
         fleet: Mutex::new(FleetCatalog::open_with_database(&database)?),
         policy_service,
@@ -4968,7 +5090,11 @@ async fn server_update_overview(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<ServerUpdateOverviewResponse>, CodedApiError> {
-    require_interactive_server_update_administrator(&state, &headers, "overview")?;
+    require_interactive_server_update_administrator(
+        &state,
+        &headers,
+        ServerUpdateOperation::Overview,
+    )?;
     let update_state = linklake_update::default_state_directory(UpdateProduct::Server);
     let status = linklake_update::status(UpdateProduct::Server, &update_state)
         .map_err(|error| server_update_api_error("status", error))?;
@@ -4991,15 +5117,16 @@ async fn check_server_update(
     ManagementRequestHost(request_host): ManagementRequestHost,
     headers: HeaderMap,
 ) -> Result<Json<linklake_update::UpdateCheck>, CodedApiError> {
+    let operation = ServerUpdateOperation::Check;
     let principal =
-        require_interactive_update_administrator(&state, &headers, &request_host, "check")?;
+        require_interactive_update_administrator(&state, &headers, &request_host, operation)?;
     let _operation = state.server_update_operation_lock.try_lock().map_err(|_| {
-        record_server_update_rejection(&state, "check", &principal, "operation_lock_busy");
+        record_server_update_rejection(&state, operation, &principal, "operation_lock_busy");
         server_update_busy_error()
     })?;
     let update_state = linklake_update::default_state_directory(UpdateProduct::Server);
     ensure_server_update_idle(&update_state).map_err(|error| {
-        record_server_update_rejection(&state, "check", &principal, "active_update");
+        record_server_update_rejection(&state, operation, &principal, "active_update");
         error
     })?;
     let result = match linklake_update::check(
@@ -5012,7 +5139,7 @@ async fn check_server_update(
     {
         Ok(result) => result,
         Err(error) => {
-            record_server_update_failure(&state, "check", &principal);
+            record_server_update_failure(&state, operation, &principal);
             return Err(server_update_api_error("check", error));
         }
     };
@@ -5034,20 +5161,21 @@ async fn download_server_update(
     headers: HeaderMap,
     Json(request): Json<ServerUpdateActionRequest>,
 ) -> Result<Json<ServerUpdateDownloadResponse>, CodedApiError> {
+    let operation = ServerUpdateOperation::Download;
     let principal =
-        require_interactive_update_administrator(&state, &headers, &request_host, "download")?;
+        require_interactive_update_administrator(&state, &headers, &request_host, operation)?;
     require_server_update_confirmation(&request.confirmation, UPDATE_DOWNLOAD_CONFIRMATION)
         .map_err(|error| {
-            record_server_update_rejection(&state, "download", &principal, "confirmation_mismatch");
+            record_server_update_rejection(&state, operation, &principal, "confirmation_mismatch");
             error
         })?;
     let _operation = state.server_update_operation_lock.try_lock().map_err(|_| {
-        record_server_update_rejection(&state, "download", &principal, "operation_lock_busy");
+        record_server_update_rejection(&state, operation, &principal, "operation_lock_busy");
         server_update_busy_error()
     })?;
     let update_state = linklake_update::default_state_directory(UpdateProduct::Server);
     ensure_server_update_idle(&update_state).map_err(|error| {
-        record_server_update_rejection(&state, "download", &principal, "active_update");
+        record_server_update_rejection(&state, operation, &principal, "active_update");
         error
     })?;
     let staged = match linklake_update::download(
@@ -5062,7 +5190,7 @@ async fn download_server_update(
     {
         Ok(staged) => staged,
         Err(error) => {
-            record_server_update_failure(&state, "download", &principal);
+            record_server_update_failure(&state, operation, &principal);
             return Err(server_update_api_error("download", error));
         }
     };
@@ -5091,18 +5219,19 @@ async fn apply_server_update(
     headers: HeaderMap,
     Json(request): Json<ServerUpdateActionRequest>,
 ) -> Result<Json<ServerUpdateScheduleResponse>, CodedApiError> {
+    let operation = ServerUpdateOperation::Apply;
     let principal =
-        require_interactive_update_administrator(&state, &headers, &request_host, "apply")?;
+        require_interactive_update_administrator(&state, &headers, &request_host, operation)?;
     require_server_update_confirmation(&request.confirmation, UPDATE_APPLY_CONFIRMATION).map_err(
         |error| {
-            record_server_update_rejection(&state, "apply", &principal, "confirmation_mismatch");
+            record_server_update_rejection(&state, operation, &principal, "confirmation_mismatch");
             error
         },
     )?;
     let Some(data_directory) = state.server_update_data_directory.as_deref() else {
         record_server_update_rejection(
             &state,
-            "apply",
+            operation,
             &principal,
             "persistent_data_directory_required",
         );
@@ -5113,12 +5242,12 @@ async fn apply_server_update(
         ));
     };
     let _operation = state.server_update_operation_lock.try_lock().map_err(|_| {
-        record_server_update_rejection(&state, "apply", &principal, "operation_lock_busy");
+        record_server_update_rejection(&state, operation, &principal, "operation_lock_busy");
         server_update_busy_error()
     })?;
     let update_state = linklake_update::default_state_directory(UpdateProduct::Server);
     ensure_server_update_idle(&update_state).map_err(|error| {
-        record_server_update_rejection(&state, "apply", &principal, "active_update");
+        record_server_update_rejection(&state, operation, &principal, "active_update");
         error
     })?;
     let scheduled = match linklake_update::server_apply(
@@ -5134,7 +5263,7 @@ async fn apply_server_update(
     {
         Ok(scheduled) => scheduled,
         Err(error) => {
-            record_server_update_failure(&state, "apply", &principal);
+            record_server_update_failure(&state, operation, &principal);
             return Err(server_update_api_error("apply", error));
         }
     };
@@ -5204,13 +5333,13 @@ fn ensure_server_update_idle(update_state: &FsPath) -> Result<(), CodedApiError>
 
 fn record_server_update_rejection(
     state: &AppState,
-    operation: &'static str,
+    operation: ServerUpdateOperation,
     principal: &ManagementPrincipal,
     reason: &'static str,
 ) {
     record_audit(
         state,
-        &format!("server.update.{operation}.rejected"),
+        &format!("server.update.{}.rejected", operation.as_str()),
         "server",
         &format!(
             "actor={}; reason={reason}; channel=stable; signature_policy=production",
@@ -5221,26 +5350,41 @@ fn record_server_update_rejection(
 
 fn record_server_update_authentication_rejection(
     state: &AppState,
-    operation: &'static str,
-    reason: &'static str,
+    operation: ServerUpdateOperation,
+    reason: ServerUpdateAuthenticationRejectionReason,
 ) {
-    // 认证失败审计只写固定代码；不得把 Authorization、Cookie 或底层错误正文落盘。
+    let suppressed_count = state
+        .server_update_authentication_audit_limiter
+        .lock()
+        .expect("server update authentication audit limiter lock poisoned")
+        .observe(operation, reason, Instant::now());
+    let Some(suppressed_count) = suppressed_count else {
+        return;
+    };
+    // operation 和 reason 都来自封闭枚举；审计不得写 Authorization、Cookie 或错误正文。
     record_audit(
         state,
-        &format!("server.update.{operation}.authentication_rejected"),
+        &format!(
+            "server.update.{}.authentication_rejected",
+            operation.as_str()
+        ),
         "server",
-        &format!("reason={reason}; channel=stable; signature_policy=production"),
+        &format!(
+            "reason={}; suppressed_count={suppressed_count}; window_seconds={}; channel=stable; signature_policy=production",
+            reason.as_str(),
+            SERVER_UPDATE_AUTH_AUDIT_WINDOW.as_secs()
+        ),
     );
 }
 
 fn record_server_update_failure(
     state: &AppState,
-    operation: &'static str,
+    operation: ServerUpdateOperation,
     principal: &ManagementPrincipal,
 ) {
     record_audit(
         state,
-        &format!("server.update.{operation}.failed"),
+        &format!("server.update.{}.failed", operation.as_str()),
         "server",
         &format!(
             "actor={}; reason=secure_update_operation_failed; channel=stable; signature_policy=production",
@@ -14015,7 +14159,7 @@ fn require_administrator(
 fn require_interactive_server_update_administrator(
     state: &AppState,
     headers: &HeaderMap,
-    operation: &'static str,
+    operation: ServerUpdateOperation,
 ) -> Result<ManagementPrincipal, CodedApiError> {
     let session = match strict_management_session_cookie(headers) {
         Ok(session) => session,
@@ -14023,7 +14167,7 @@ fn require_interactive_server_update_administrator(
             record_server_update_authentication_rejection(
                 state,
                 operation,
-                "invalid_session_cookie",
+                ServerUpdateAuthenticationRejectionReason::InvalidSessionCookie,
             );
             return Err(CodedApiError(
                 StatusCode::UNAUTHORIZED,
@@ -14036,7 +14180,7 @@ fn require_interactive_server_update_administrator(
         record_server_update_authentication_rejection(
             state,
             operation,
-            "mixed_authorization_and_session",
+            ServerUpdateAuthenticationRejectionReason::MixedAuthorizationAndSession,
         );
         return Err(CodedApiError(
             StatusCode::FORBIDDEN,
@@ -14048,7 +14192,7 @@ fn require_interactive_server_update_administrator(
         record_server_update_authentication_rejection(
             state,
             operation,
-            "bearer_authentication_forbidden",
+            ServerUpdateAuthenticationRejectionReason::BearerAuthenticationForbidden,
         );
         return Err(CodedApiError(
             StatusCode::FORBIDDEN,
@@ -14060,7 +14204,7 @@ fn require_interactive_server_update_administrator(
         record_server_update_authentication_rejection(
             state,
             operation,
-            "interactive_session_missing",
+            ServerUpdateAuthenticationRejectionReason::InteractiveSessionMissing,
         );
         return Err(CodedApiError(
             StatusCode::UNAUTHORIZED,
@@ -14081,7 +14225,7 @@ fn require_interactive_server_update_administrator(
             record_server_update_authentication_rejection(
                 state,
                 operation,
-                "invalid_or_expired_session",
+                ServerUpdateAuthenticationRejectionReason::InvalidOrExpiredSession,
             );
             return Err(CodedApiError(
                 StatusCode::UNAUTHORIZED,
@@ -14093,7 +14237,7 @@ fn require_interactive_server_update_administrator(
             record_server_update_authentication_rejection(
                 state,
                 operation,
-                "session_verification_failed",
+                ServerUpdateAuthenticationRejectionReason::SessionVerificationFailed,
             );
             return Err(CodedApiError(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -14103,7 +14247,11 @@ fn require_interactive_server_update_administrator(
         }
     };
     if identity.password_change_required {
-        record_server_update_authentication_rejection(state, operation, "password_change_required");
+        record_server_update_authentication_rejection(
+            state,
+            operation,
+            ServerUpdateAuthenticationRejectionReason::PasswordChangeRequired,
+        );
         return Err(CodedApiError(
             StatusCode::FORBIDDEN,
             "password_change_required",
@@ -14114,7 +14262,7 @@ fn require_interactive_server_update_administrator(
         record_server_update_authentication_rejection(
             state,
             operation,
-            "administrator_role_required",
+            ServerUpdateAuthenticationRejectionReason::AdministratorRoleRequired,
         );
         return Err(CodedApiError(
             StatusCode::FORBIDDEN,
@@ -14134,7 +14282,7 @@ fn require_interactive_update_administrator(
     state: &AppState,
     headers: &HeaderMap,
     request_host: &str,
-    operation: &'static str,
+    operation: ServerUpdateOperation,
 ) -> Result<ManagementPrincipal, CodedApiError> {
     let principal = require_interactive_server_update_administrator(state, headers, operation)?;
     require_same_origin_update_request(headers, request_host).map_err(|error| {
@@ -14317,10 +14465,10 @@ async fn enforce_management_role(
     }
 
     let server_update_operation = match path {
-        "/api/v1/updates/server" => Some("overview"),
-        "/api/v1/updates/server/check" => Some("check"),
-        "/api/v1/updates/server/download" => Some("download"),
-        "/api/v1/updates/server/apply" => Some("apply"),
+        "/api/v1/updates/server" => Some(ServerUpdateOperation::Overview),
+        "/api/v1/updates/server/check" => Some(ServerUpdateOperation::Check),
+        "/api/v1/updates/server/download" => Some(ServerUpdateOperation::Download),
+        "/api/v1/updates/server/apply" => Some(ServerUpdateOperation::Apply),
         _ => None,
     };
     if let Some(operation) = server_update_operation {
@@ -14845,14 +14993,16 @@ mod tests {
         wait_for_listener_startup_with_timeout, CertificateOperation, FleetPolicyKind,
         HistoryCounters, HttpTransportCapabilitiesView, ListenerStartupProbe, LoginResponse,
         LoginThrottle, ManagementPrincipal, ManagementRequestHost, MetricsHistory,
-        MetricsHistoryProtocol, MetricsHistorySample, Socks5CapabilitiesView, UserRole,
-        LOGIN_THROTTLE_MAX_IDENTITIES, MANAGEMENT_UI, MANAGEMENT_UI_DOCUMENT, MANAGEMENT_UI_SCRIPT,
-        MANAGEMENT_UI_STYLES, MANAGEMENT_UI_THEME_BOOTSTRAP, METRICS_HISTORY_ARCHIVE_CAPACITY,
-        METRICS_HISTORY_ARCHIVE_SAMPLE_INTERVAL_SECONDS, METRICS_HISTORY_CAPACITY,
-        METRICS_HISTORY_RECENT_RETENTION_SECONDS, METRICS_HISTORY_RETENTION_SECONDS,
-        METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS, SLO_DEFAULT_AVAILABILITY_TARGET,
-        SLO_FAST_BURN_THRESHOLD, SLO_SLOW_BURN_THRESHOLD, UPDATE_APPLY_CONFIRMATION,
-        UPDATE_DOWNLOAD_CONFIRMATION,
+        MetricsHistoryProtocol, MetricsHistorySample, ServerUpdateAuthenticationAuditLimiter,
+        ServerUpdateAuthenticationRejectionReason, ServerUpdateOperation, Socks5CapabilitiesView,
+        UserRole, LOGIN_THROTTLE_MAX_IDENTITIES, MANAGEMENT_UI, MANAGEMENT_UI_DOCUMENT,
+        MANAGEMENT_UI_SCRIPT, MANAGEMENT_UI_STYLES, MANAGEMENT_UI_THEME_BOOTSTRAP,
+        METRICS_HISTORY_ARCHIVE_CAPACITY, METRICS_HISTORY_ARCHIVE_SAMPLE_INTERVAL_SECONDS,
+        METRICS_HISTORY_CAPACITY, METRICS_HISTORY_RECENT_RETENTION_SECONDS,
+        METRICS_HISTORY_RETENTION_SECONDS, METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS,
+        SERVER_UPDATE_AUTH_AUDIT_BUCKET_COUNT, SERVER_UPDATE_AUTH_AUDIT_WINDOW,
+        SLO_DEFAULT_AVAILABILITY_TARGET, SLO_FAST_BURN_THRESHOLD, SLO_SLOW_BURN_THRESHOLD,
+        UPDATE_APPLY_CONFIRMATION, UPDATE_DOWNLOAD_CONFIRMATION,
     };
     use crate::{
         admin_auth::SessionIdentity,
@@ -15894,6 +16044,33 @@ mod tests {
                 require_server_update_confirmation(invalid, UPDATE_APPLY_CONFIRMATION).is_err()
             );
         }
+    }
+
+    #[test]
+    fn server_update_authentication_audit_has_fixed_bounded_keys_and_coalesces() {
+        assert_eq!(SERVER_UPDATE_AUTH_AUDIT_BUCKET_COUNT, 32);
+        let mut limiter = ServerUpdateAuthenticationAuditLimiter::default();
+        let started = Instant::now();
+        let operation = ServerUpdateOperation::Overview;
+        let reason = ServerUpdateAuthenticationRejectionReason::InteractiveSessionMissing;
+
+        assert_eq!(limiter.observe(operation, reason, started), Some(0));
+        assert_eq!(
+            limiter.observe(operation, reason, started + Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(
+            limiter.observe(operation, reason, started + SERVER_UPDATE_AUTH_AUDIT_WINDOW),
+            Some(1)
+        );
+        assert_eq!(
+            limiter.observe(
+                ServerUpdateOperation::Check,
+                ServerUpdateAuthenticationRejectionReason::BearerAuthenticationForbidden,
+                started,
+            ),
+            Some(0)
+        );
     }
 
     #[test]
