@@ -19,7 +19,9 @@ void main() {
     );
     expect(RoleCapabilities(ManagementRole.operator).canWritePolicies, isTrue);
     expect(RoleCapabilities(ManagementRole.operator).canManageUsers, isFalse);
+    expect(RoleCapabilities(ManagementRole.operator).canManageTotp, isTrue);
     expect(RoleCapabilities(ManagementRole.auditor).canWritePolicies, isFalse);
+    expect(RoleCapabilities(ManagementRole.auditor).canManageTotp, isFalse);
   });
 
   test('request plans omit administrator-only endpoints for non-admins', () {
@@ -66,11 +68,12 @@ void main() {
       await tester.pumpAndSettle();
 
       final isAdmin = role == 'administrator';
+      final hasAccountSecurity = role != 'auditor';
       expect(find.byKey(const Key('current-user-identity')), findsOneWidget);
       expect(find.text('Test User'), findsOneWidget);
       expect(
         find.byKey(const Key('nav-users')),
-        isAdmin ? findsOneWidget : findsNothing,
+        hasAccountSecurity ? findsOneWidget : findsNothing,
       );
       expect(
         find.byKey(const Key('nav-fleet')),
@@ -80,6 +83,13 @@ void main() {
       expect(api.calls.contains('/api/v1/sessions'), isAdmin);
       expect(api.calls.contains('/api/v1/api-tokens'), isAdmin);
       expect(api.calls.contains('/api/v1/fleet/overview'), isAdmin);
+
+      if (role == 'operator') {
+        await tester.tap(find.byKey(const Key('nav-users')));
+        await tester.pumpAndSettle();
+        expect(find.text('Account security'), findsOneWidget);
+        expect(find.byKey(const Key('create-user')), findsNothing);
+      }
 
       await tester.tap(find.byKey(const Key('nav-tcp')));
       await tester.pumpAndSettle();

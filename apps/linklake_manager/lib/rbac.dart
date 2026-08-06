@@ -81,7 +81,7 @@ List<String> visibleDestinationIds(ManagementRole role) => [
   'p2p',
   if (role == ManagementRole.administrator) 'fleet',
   'alerts',
-  if (role == ManagementRole.administrator) 'users',
+  if (role != ManagementRole.auditor) 'users',
   'diagnostics',
   'audit',
 ];

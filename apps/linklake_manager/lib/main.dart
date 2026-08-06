@@ -1165,7 +1165,10 @@ class _DashboardPageState extends State<DashboardPage> {
       'p2p': (Icons.hub_outlined, 'P2P'),
       'fleet': (Icons.cloud_sync_outlined, t('多云', 'Multi-cloud')),
       'alerts': (Icons.warning_amber_outlined, t('告警', 'Alerts')),
-      'users': (Icons.manage_accounts_outlined, t('用户', 'Users')),
+      'users': (
+        Icons.manage_accounts_outlined,
+        _capabilities.canManageUsers ? t('用户', 'Users') : t('账户', 'Account'),
+      ),
       'diagnostics': (Icons.build_outlined, t('诊断', 'Diagnostics')),
       'audit': (Icons.receipt_long_outlined, t('审计', 'Audit')),
     };
@@ -1189,7 +1192,8 @@ class _DashboardPageState extends State<DashboardPage> {
     'p2p' => _p2pPage(),
     'fleet' when _capabilities.canViewFleet => _fleetPage(),
     'alerts' => _alertsPage(),
-    'users' when _capabilities.canManageUsers => _usersPage(),
+    'users' when _capabilities.canManageUsers || _capabilities.canManageTotp =>
+      _usersPage(),
     'diagnostics' => _diagnosticsPage(),
     _ => _auditPage(),
   };

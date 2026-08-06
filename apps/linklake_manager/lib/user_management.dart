@@ -98,65 +98,75 @@ class _UserManagementPageState extends State<UserManagementPage> {
   }
 
   @override
-  Widget build(BuildContext context) => Padding(
-    padding: const EdgeInsets.all(24),
-    child: ListView(
-      children: [
-        Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    t('用户与会话', 'Users and sessions'),
-                    style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                      fontWeight: FontWeight.w700,
+  Widget build(BuildContext context) {
+    final canManageDirectory = widget.capabilities.canManageUsers;
+    return Padding(
+      padding: const EdgeInsets.all(24),
+      child: ListView(
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      canManageDirectory
+                          ? t('用户与会话', 'Users and sessions')
+                          : t('账户安全', 'Account security'),
+                      style: Theme.of(context).textTheme.headlineSmall
+                          ?.copyWith(fontWeight: FontWeight.w700),
                     ),
-                  ),
-                  const SizedBox(height: 3),
-                  Text(
-                    t(
-                      '管理角色、启用状态、密码和交互式会话',
-                      'Manage roles, enabled state, passwords, and interactive sessions',
+                    const SizedBox(height: 3),
+                    Text(
+                      canManageDirectory
+                          ? t(
+                              '管理角色、启用状态、密码和交互式会话',
+                              'Manage roles, enabled state, passwords, and interactive sessions',
+                            )
+                          : t(
+                              '管理当前账户的双因素认证',
+                              'Manage two-factor authentication for the current account',
+                            ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
+              if (canManageDirectory)
+                FilledButton.icon(
+                  key: const Key('create-user'),
+                  onPressed: _working ? null : () => _showUserEditor(),
+                  icon: const Icon(Icons.person_add_alt_1),
+                  label: Text(t('新建用户', 'New user')),
+                ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          _totpCard(),
+          if (canManageDirectory) ...[
+            const SizedBox(height: 18),
+            if (_users.isEmpty)
+              _emptyCard(t('暂无用户', 'No users'))
+            else
+              for (final user in _users) _userCard(user),
+            const SizedBox(height: 22),
+            _apiTokenSection(),
+            const SizedBox(height: 22),
+            Text(
+              t('活动会话', 'Active sessions'),
+              style: Theme.of(context).textTheme.titleMedium,
             ),
-            FilledButton.icon(
-              key: const Key('create-user'),
-              onPressed: _working || !widget.capabilities.canManageUsers
-                  ? null
-                  : () => _showUserEditor(),
-              icon: const Icon(Icons.person_add_alt_1),
-              label: Text(t('新建用户', 'New user')),
-            ),
+            const SizedBox(height: 8),
+            if (_sessions.isEmpty)
+              _emptyCard(t('暂无活动会话', 'No active sessions'))
+            else
+              for (final session in _sessions) _sessionCard(session),
           ],
-        ),
-        const SizedBox(height: 16),
-        _totpCard(),
-        const SizedBox(height: 18),
-        if (_users.isEmpty)
-          _emptyCard(t('暂无用户', 'No users'))
-        else
-          for (final user in _users) _userCard(user),
-        const SizedBox(height: 22),
-        _apiTokenSection(),
-        const SizedBox(height: 22),
-        Text(
-          t('活动会话', 'Active sessions'),
-          style: Theme.of(context).textTheme.titleMedium,
-        ),
-        const SizedBox(height: 8),
-        if (_sessions.isEmpty)
-          _emptyCard(t('暂无活动会话', 'No active sessions'))
-        else
-          for (final session in _sessions) _sessionCard(session),
-      ],
-    ),
-  );
+        ],
+      ),
+    );
+  }
 
   Widget _totpCard() {
     final enabled = widget.identity['totp_enabled'] == true;
