@@ -12,7 +12,13 @@ use crate::{
 use bytes::Bytes;
 use linklake_core::{
     read_control_frame, read_udp_data_plane_control_frame,
-    socks5_udp::{decode_socks5_udp_datagram, Socks5UdpError},
+    socks5_fragment::{
+        Socks5FragmentConfig, Socks5FragmentError, Socks5FragmentOutcome, Socks5FragmentReassembler,
+    },
+    socks5_udp::{
+        decode_socks5_udp_datagram, decode_socks5_udp_fragment, encode_socks5_udp_datagram,
+        Socks5UdpError,
+    },
     udp_protocol::{fragment_datagram, UdpDirection, UdpFragment, MAX_UDP_DATAGRAM_BYTES},
     udp_reassembly::{UdpReassembler, UdpReassemblyConfig, UdpReassemblyOutcome},
     write_control_frame, write_udp_data_plane_control_frame, BoxedIo, ControlFrame,
@@ -84,6 +90,16 @@ pub(crate) struct Socks5ProxyStatistics {
     pub(crate) udp_dropped_datagrams: AtomicU64,
     pub(crate) udp_dropped_bandwidth_limit: AtomicU64,
     pub(crate) udp_fragmentation_unsupported_total: AtomicU64,
+    pub(crate) udp_fragments_from_public_total: AtomicU64,
+    pub(crate) udp_fragmented_datagrams_completed_total: AtomicU64,
+    pub(crate) udp_fragment_duplicates_total: AtomicU64,
+    pub(crate) udp_fragment_rejections_total: AtomicU64,
+    pub(crate) udp_fragment_budget_rejections_total: AtomicU64,
+    pub(crate) udp_fragment_timeouts_total: AtomicU64,
+    pub(crate) udp_fragment_source_rejections_total: AtomicU64,
+    pub(crate) udp_fragment_inflight_datagrams: AtomicUsize,
+    pub(crate) udp_fragment_buffered_fragments: AtomicUsize,
+    pub(crate) udp_fragment_buffered_bytes: AtomicUsize,
 }
 
 #[derive(Clone)]
@@ -444,6 +460,7 @@ async fn run_udp_runtime(
     });
     let connection = authenticated.connection.clone();
     let mut reassembler = UdpReassembler::new(UdpReassemblyConfig::default())?;
+    let mut socks_fragments = Socks5FragmentReassembler::new(Socks5FragmentConfig::default())?;
     let mut receive_buffer = vec![0_u8; MAX_UDP_DATAGRAM_BYTES];
     let mut next_datagram_id = 1_u64;
     let mut usage_pending = 0_u64;
@@ -454,6 +471,8 @@ async fn run_udp_runtime(
             _ = stop.changed() => break,
             command = commands.recv() => match command {
                 Some(UdpRuntimeCommand::Close(session_id)) => {
+                    socks_fragments.discard_session(&session_id);
+                    update_socks5_fragment_gauges(&statistics, &socks_fragments);
                     let _ = write_udp_data_plane_control_frame(
                         &mut authenticated.control_send,
                         &UdpDataPlaneControlFrame::CloseSession {
@@ -465,7 +484,10 @@ async fn run_udp_runtime(
                 None => break,
             },
             control = control_events_rx.recv() => match control {
-                Some(Ok(UdpDataPlaneControlFrame::CloseSession { .. })) => {}
+                Some(Ok(UdpDataPlaneControlFrame::CloseSession { session_id, .. })) => {
+                    socks_fragments.discard_session(&session_id);
+                    update_socks5_fragment_gauges(&statistics, &socks_fragments);
+                }
                 Some(Ok(UdpDataPlaneControlFrame::Error { code, message })) => {
                     anyhow::bail!("SOCKS5 UDP data plane closed ({code}): {message}");
                 }
@@ -478,8 +500,17 @@ async fn run_udp_runtime(
                 let received = incoming.length;
                 let source = incoming.source;
                 let encoded = &receive_buffer[..received];
-                if !accept_socks5_udp_datagram(encoded, &statistics) {
-                    continue;
+                let socks_fragment = match decode_socks5_udp_fragment(encoded) {
+                    Ok(fragment) => fragment,
+                    Err(_) => {
+                        statistics.udp_dropped_datagrams.fetch_add(1, Ordering::Relaxed);
+                        statistics.udp_fragment_rejections_total.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                };
+                let fragmented = socks_fragment.sequence != 0;
+                if fragmented {
+                    statistics.udp_fragments_from_public_total.fetch_add(1, Ordering::Relaxed);
                 }
                 let Some(session_id) = association_for_source(
                     &context.associations,
@@ -487,6 +518,9 @@ async fn run_udp_runtime(
                     context.state.lifecycle.accepts_new_work(),
                 ) else {
                     statistics.udp_dropped_datagrams.fetch_add(1, Ordering::Relaxed);
+                    if fragmented {
+                        statistics.udp_fragment_source_rejections_total.fetch_add(1, Ordering::Relaxed);
+                    }
                     continue;
                 };
                 if let Some(limiter) = &context.bandwidth_limiter {
@@ -496,6 +530,61 @@ async fn run_udp_runtime(
                         continue;
                     }
                 }
+                statistics.udp_bytes_from_public.fetch_add(received as u64, Ordering::Relaxed);
+                usage_pending = usage_pending.saturating_add(received as u64);
+                let reassembled = match socks_fragments.push(
+                    session_id,
+                    socks_fragment,
+                    std::time::Instant::now(),
+                ) {
+                    Ok(Socks5FragmentOutcome::Complete { datagram, fragmented }) => {
+                        if fragmented {
+                            statistics
+                                .udp_fragmented_datagrams_completed_total
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        Some((datagram, fragmented))
+                    }
+                    Ok(Socks5FragmentOutcome::Pending) => {
+                        update_socks5_fragment_gauges(&statistics, &socks_fragments);
+                        None
+                    }
+                    Ok(Socks5FragmentOutcome::Duplicate) => {
+                        statistics
+                            .udp_fragment_duplicates_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        update_socks5_fragment_gauges(&statistics, &socks_fragments);
+                        None
+                    }
+                    Err(error) => {
+                        statistics.udp_dropped_datagrams.fetch_add(1, Ordering::Relaxed);
+                        statistics.udp_fragment_rejections_total.fetch_add(1, Ordering::Relaxed);
+                        if socks5_fragment_budget_error(error) {
+                            statistics
+                                .udp_fragment_budget_rejections_total
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        update_socks5_fragment_gauges(&statistics, &socks_fragments);
+                        None
+                    }
+                };
+                let Some((datagram, was_fragmented)) = reassembled else {
+                    continue;
+                };
+                let normalized;
+                let encoded = if was_fragmented {
+                    normalized = match encode_socks5_udp_datagram(&datagram) {
+                        Ok(encoded) => encoded,
+                        Err(_) => {
+                            statistics.udp_dropped_datagrams.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    };
+                    normalized.as_slice()
+                } else {
+                    encoded
+                };
+                update_socks5_fragment_gauges(&statistics, &socks_fragments);
                 let frames = match fragment_datagram(
                     UdpDirection::PublicToTarget,
                     session_id,
@@ -519,8 +608,6 @@ async fn run_udp_runtime(
                 }
                 if sent {
                     statistics.udp_datagrams_from_public.fetch_add(1, Ordering::Relaxed);
-                    statistics.udp_bytes_from_public.fetch_add(received as u64, Ordering::Relaxed);
-                    usage_pending = usage_pending.saturating_add(received as u64);
                 } else {
                     statistics.udp_dropped_datagrams.fetch_add(1, Ordering::Relaxed);
                 }
@@ -592,6 +679,14 @@ async fn run_udp_runtime(
                     expired.incomplete_datagrams as u64,
                     Ordering::Relaxed,
                 );
+                let expired = socks_fragments.expire(std::time::Instant::now());
+                statistics
+                    .udp_fragment_timeouts_total
+                    .fetch_add(expired.datagrams as u64, Ordering::Relaxed);
+                statistics
+                    .udp_dropped_datagrams
+                    .fetch_add(expired.datagrams as u64, Ordering::Relaxed);
+                update_socks5_fragment_gauges(&statistics, &socks_fragments);
             }
         }
     }
@@ -612,6 +707,15 @@ async fn run_udp_runtime(
         }
     }
     control_reader.abort();
+    statistics
+        .udp_fragment_inflight_datagrams
+        .store(0, Ordering::Relaxed);
+    statistics
+        .udp_fragment_buffered_fragments
+        .store(0, Ordering::Relaxed);
+    statistics
+        .udp_fragment_buffered_bytes
+        .store(0, Ordering::Relaxed);
     connection.close(0_u32.into(), b"SOCKS5 UDP runtime stopped");
     Ok(())
 }
@@ -659,6 +763,37 @@ fn association_for_source(
         association.public_endpoint = Some(source);
     }
     Some(id)
+}
+
+fn socks5_fragment_budget_error(error: Socks5FragmentError) -> bool {
+    matches!(
+        error,
+        Socks5FragmentError::SequenceLimit
+            | Socks5FragmentError::ReorderGap
+            | Socks5FragmentError::DatagramByteBudget
+            | Socks5FragmentError::SessionFragmentBudget
+            | Socks5FragmentError::SessionByteBudget
+            | Socks5FragmentError::SessionInflightBudget
+            | Socks5FragmentError::GlobalFragmentBudget
+            | Socks5FragmentError::GlobalByteBudget
+            | Socks5FragmentError::GlobalInflightBudget
+    )
+}
+
+fn update_socks5_fragment_gauges(
+    statistics: &Socks5ProxyStatistics,
+    reassembler: &Socks5FragmentReassembler<Uuid>,
+) {
+    let snapshot = reassembler.snapshot();
+    statistics
+        .udp_fragment_inflight_datagrams
+        .store(snapshot.inflight_datagrams, Ordering::Relaxed);
+    statistics
+        .udp_fragment_buffered_fragments
+        .store(snapshot.buffered_fragments, Ordering::Relaxed);
+    statistics
+        .udp_fragment_buffered_bytes
+        .store(snapshot.buffered_bytes, Ordering::Relaxed);
 }
 
 async fn accept_public_connections(

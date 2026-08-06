@@ -1,7 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use thiserror::Error;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum Socks5UdpTarget {
     Ip(IpAddr),
     Domain(String),
@@ -9,6 +9,15 @@ pub enum Socks5UdpTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Socks5UdpDatagram {
+    pub target: Socks5UdpTarget,
+    pub port: u16,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Socks5UdpFragment {
+    pub sequence: u8,
+    pub final_fragment: bool,
     pub target: Socks5UdpTarget,
     pub port: u16,
     pub payload: Vec<u8>,
@@ -22,6 +31,8 @@ pub enum Socks5UdpError {
     InvalidReserved,
     #[error("SOCKS5 UDP fragmentation is not supported")]
     FragmentationUnsupported,
+    #[error("SOCKS5 UDP fragment sequence is invalid")]
+    InvalidFragmentSequence,
     #[error("SOCKS5 UDP address type is unsupported")]
     UnsupportedAddressType,
     #[error("SOCKS5 UDP domain is invalid")]
@@ -33,14 +44,29 @@ pub enum Socks5UdpError {
 }
 
 pub fn decode_socks5_udp_datagram(encoded: &[u8]) -> Result<Socks5UdpDatagram, Socks5UdpError> {
+    let fragment = decode_socks5_udp_fragment(encoded)?;
+    if fragment.sequence != 0 || fragment.final_fragment {
+        return Err(Socks5UdpError::FragmentationUnsupported);
+    }
+    Ok(Socks5UdpDatagram {
+        target: fragment.target,
+        port: fragment.port,
+        payload: fragment.payload,
+    })
+}
+
+pub fn decode_socks5_udp_fragment(encoded: &[u8]) -> Result<Socks5UdpFragment, Socks5UdpError> {
     if encoded.len() < 7 {
         return Err(Socks5UdpError::TooShort);
     }
     if encoded[0] != 0 || encoded[1] != 0 {
         return Err(Socks5UdpError::InvalidReserved);
     }
-    if encoded[2] != 0 {
-        return Err(Socks5UdpError::FragmentationUnsupported);
+    let fragment_byte = encoded[2];
+    let sequence = fragment_byte & 0x7f;
+    let final_fragment = fragment_byte & 0x80 != 0;
+    if final_fragment && sequence == 0 {
+        return Err(Socks5UdpError::InvalidFragmentSequence);
     }
     let (target, port_offset) = match encoded[3] {
         0x01 => {
@@ -80,39 +106,65 @@ pub fn decode_socks5_udp_datagram(encoded: &[u8]) -> Result<Socks5UdpDatagram, S
     if port == 0 {
         return Err(Socks5UdpError::InvalidPort);
     }
-    Ok(Socks5UdpDatagram {
+    Ok(Socks5UdpFragment {
+        sequence,
+        final_fragment,
         target,
         port,
         payload: encoded[port_offset + 2..].to_vec(),
     })
 }
 
-pub fn encode_socks5_udp_response(
-    source: SocketAddr,
-    payload: &[u8],
-) -> Result<Vec<u8>, Socks5UdpError> {
-    let header_len: usize = if source.is_ipv4() { 10 } else { 22 };
-    let total = header_len
-        .checked_add(payload.len())
+pub fn encode_socks5_udp_datagram(datagram: &Socks5UdpDatagram) -> Result<Vec<u8>, Socks5UdpError> {
+    let address_bytes = match &datagram.target {
+        Socks5UdpTarget::Ip(IpAddr::V4(_)) => 1 + 4,
+        Socks5UdpTarget::Ip(IpAddr::V6(_)) => 1 + 16,
+        Socks5UdpTarget::Domain(domain) => {
+            if !valid_domain(domain) || domain.len() > u8::MAX as usize {
+                return Err(Socks5UdpError::InvalidDomain);
+            }
+            2 + domain.len()
+        }
+    };
+    let total = 3_usize
+        .checked_add(address_bytes)
+        .and_then(|value| value.checked_add(2))
+        .and_then(|value| value.checked_add(datagram.payload.len()))
         .ok_or(Socks5UdpError::TooLarge)?;
     if total > u16::MAX as usize {
         return Err(Socks5UdpError::TooLarge);
     }
     let mut encoded = Vec::with_capacity(total);
     encoded.extend_from_slice(&[0, 0, 0]);
-    match source.ip() {
-        IpAddr::V4(address) => {
+    match &datagram.target {
+        Socks5UdpTarget::Ip(IpAddr::V4(address)) => {
             encoded.push(0x01);
             encoded.extend_from_slice(&address.octets());
         }
-        IpAddr::V6(address) => {
+        Socks5UdpTarget::Ip(IpAddr::V6(address)) => {
             encoded.push(0x04);
             encoded.extend_from_slice(&address.octets());
         }
+        Socks5UdpTarget::Domain(domain) => {
+            encoded.push(0x03);
+            encoded.push(domain.len() as u8);
+            encoded.extend_from_slice(domain.as_bytes());
+        }
     }
-    encoded.extend_from_slice(&source.port().to_be_bytes());
-    encoded.extend_from_slice(payload);
+    encoded.extend_from_slice(&datagram.port.to_be_bytes());
+    encoded.extend_from_slice(&datagram.payload);
     Ok(encoded)
+}
+
+pub fn encode_socks5_udp_response(
+    source: SocketAddr,
+    payload: &[u8],
+) -> Result<Vec<u8>, Socks5UdpError> {
+    encode_socks5_udp_datagram(&Socks5UdpDatagram {
+        target: Socks5UdpTarget::Ip(source.ip()),
+        port: source.port(),
+        payload: payload.to_vec(),
+    })
 }
 
 fn valid_domain(value: &str) -> bool {
@@ -133,7 +185,8 @@ fn valid_domain(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_socks5_udp_datagram, encode_socks5_udp_response, Socks5UdpError, Socks5UdpTarget,
+        decode_socks5_udp_datagram, decode_socks5_udp_fragment, encode_socks5_udp_datagram,
+        encode_socks5_udp_response, Socks5UdpDatagram, Socks5UdpError, Socks5UdpTarget,
     };
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -176,6 +229,14 @@ mod tests {
             decode_socks5_udp_datagram(&[0, 0, 1, 1, 127, 0, 0, 1, 0, 53]),
             Err(Socks5UdpError::FragmentationUnsupported)
         );
+        let final_fragment = decode_socks5_udp_fragment(&[0, 0, 0x82, 1, 127, 0, 0, 1, 0, 53, 1])
+            .expect("valid final fragment should decode");
+        assert_eq!(final_fragment.sequence, 2);
+        assert!(final_fragment.final_fragment);
+        assert_eq!(
+            decode_socks5_udp_fragment(&[0, 0, 0x80, 1, 127, 0, 0, 1, 0, 53]),
+            Err(Socks5UdpError::InvalidFragmentSequence)
+        );
         assert_eq!(
             decode_socks5_udp_datagram(&[0, 0, 0, 3, 3, b'a', b'.', b'.', 0, 53]),
             Err(Socks5UdpError::InvalidDomain)
@@ -196,5 +257,16 @@ mod tests {
             assert_eq!(decoded.port, source.port());
             assert_eq!(decoded.payload, b"reply");
         }
+    }
+
+    #[test]
+    fn generic_encoder_preserves_domain_targets() {
+        let datagram = Socks5UdpDatagram {
+            target: Socks5UdpTarget::Domain("dns.example".to_owned()),
+            port: 53,
+            payload: b"query".to_vec(),
+        };
+        let encoded = encode_socks5_udp_datagram(&datagram).unwrap();
+        assert_eq!(decode_socks5_udp_datagram(&encoded).unwrap(), datagram);
     }
 }
