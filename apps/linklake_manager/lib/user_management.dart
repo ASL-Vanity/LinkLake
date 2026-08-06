@@ -125,9 +125,14 @@ class _UserManagementPageState extends State<UserManagementPage> {
                               '管理角色、启用状态、密码和交互式会话',
                               'Manage roles, enabled state, passwords, and interactive sessions',
                             )
+                          : widget.capabilities.canManageTotp
+                          ? t(
+                              '管理当前账户的密码和双因素认证',
+                              'Manage the current account password and two-factor authentication',
+                            )
                           : t(
-                              '管理当前账户的双因素认证',
-                              'Manage two-factor authentication for the current account',
+                              '管理当前账户密码',
+                              'Manage the current account password',
                             ),
                     ),
                   ],
@@ -143,7 +148,11 @@ class _UserManagementPageState extends State<UserManagementPage> {
             ],
           ),
           const SizedBox(height: 16),
-          _totpCard(),
+          _passwordCard(),
+          if (widget.capabilities.canManageTotp) ...[
+            const SizedBox(height: 12),
+            _totpCard(),
+          ],
           if (canManageDirectory) ...[
             const SizedBox(height: 18),
             if (_users.isEmpty)
@@ -167,6 +176,23 @@ class _UserManagementPageState extends State<UserManagementPage> {
       ),
     );
   }
+
+  Widget _passwordCard() => Card(
+    child: ListTile(
+      leading: const Icon(Icons.password_outlined),
+      title: Text(t('账户密码', 'Account password')),
+      subtitle: Text(
+        t(
+          '修改当前账户密码，并撤销该账户的其他活动会话',
+          'Change the current account password and revoke its other active sessions',
+        ),
+      ),
+      trailing: FilledButton.tonal(
+        onPressed: _working ? null : _changeCurrentPassword,
+        child: Text(t('修改', 'Change')),
+      ),
+    ),
+  );
 
   Widget _totpCard() {
     final enabled = widget.identity['totp_enabled'] == true;
@@ -750,6 +776,121 @@ class _UserManagementPageState extends State<UserManagementPage> {
     );
     await _disposeControllers([password]);
     if (reset == true) await _refreshAfterDialog();
+  }
+
+  Future<void> _changeCurrentPassword() async {
+    final password = TextEditingController();
+    final confirmation = TextEditingController();
+    var submitting = false;
+    String? error;
+    final changed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) => PopScope(
+          canPop: !submitting,
+          child: AlertDialog(
+            title: Text(t('修改账户密码', 'Change account password')),
+            content: SizedBox(
+              width: 440,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextField(
+                    controller: password,
+                    enabled: !submitting,
+                    obscureText: true,
+                    decoration: InputDecoration(
+                      labelText: t(
+                        '新密码（至少 12 位）',
+                        'New password (12+ characters)',
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: confirmation,
+                    enabled: !submitting,
+                    obscureText: true,
+                    decoration: InputDecoration(
+                      labelText: t('确认新密码', 'Confirm new password'),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    t(
+                      '当前会话会保留，其他会话将被撤销。',
+                      'The current session is preserved; other sessions are revoked.',
+                    ),
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                  if (error != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 10),
+                      child: Text(
+                        error!,
+                        style: TextStyle(
+                          color: Theme.of(context).colorScheme.error,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: submitting
+                    ? null
+                    : () => Navigator.pop(dialogContext, false),
+                child: Text(t('取消', 'Cancel')),
+              ),
+              FilledButton(
+                onPressed: submitting
+                    ? null
+                    : () async {
+                        try {
+                          if (password.text.length < 12) {
+                            throw FormatException(
+                              t(
+                                '密码必须至少包含 12 个字符',
+                                'Password must contain at least 12 characters',
+                              ),
+                            );
+                          }
+                          if (password.text != confirmation.text) {
+                            throw FormatException(
+                              t('两次输入的密码不一致', 'Passwords do not match'),
+                            );
+                          }
+                          setDialogState(() {
+                            submitting = true;
+                            error = null;
+                          });
+                          await widget.api.changePassword(password.text);
+                          if (context.mounted) {
+                            Navigator.pop(dialogContext, true);
+                          }
+                        } catch (value) {
+                          if (!context.mounted) return;
+                          setDialogState(() {
+                            submitting = false;
+                            error = value.toString();
+                          });
+                        }
+                      },
+                child: submitting
+                    ? const SizedBox.square(
+                        dimension: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : Text(t('修改密码', 'Change password')),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    await _disposeControllers([password, confirmation]);
+    if (changed == true) await _refreshAfterDialog();
   }
 
   Future<void> _revokeUserSessions(Map<String, dynamic> user) async {

@@ -68,13 +68,9 @@ void main() {
       await tester.pumpAndSettle();
 
       final isAdmin = role == 'administrator';
-      final hasAccountSecurity = role != 'auditor';
       expect(find.byKey(const Key('current-user-identity')), findsOneWidget);
       expect(find.text('Test User'), findsOneWidget);
-      expect(
-        find.byKey(const Key('nav-users')),
-        hasAccountSecurity ? findsOneWidget : findsNothing,
-      );
+      expect(find.byKey(const Key('nav-users')), findsOneWidget);
       expect(
         find.byKey(const Key('nav-fleet')),
         isAdmin ? findsOneWidget : findsNothing,
@@ -89,6 +85,14 @@ void main() {
         await tester.pumpAndSettle();
         expect(find.text('Account security'), findsOneWidget);
         expect(find.byKey(const Key('create-user')), findsNothing);
+      }
+
+      if (role == 'auditor') {
+        await tester.tap(find.byKey(const Key('nav-users')));
+        await tester.pumpAndSettle();
+        expect(find.text('Account security'), findsOneWidget);
+        expect(find.text('Account password'), findsOneWidget);
+        expect(find.text('Two-factor authentication'), findsNothing);
       }
 
       await tester.tap(find.byKey(const Key('nav-tcp')));
@@ -151,7 +155,7 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    expect(find.byKey(const Key('nav-users')), findsNothing);
+    expect(find.byKey(const Key('nav-users')), findsOneWidget);
     expect(api.calls, isNot(contains('/api/v1/users')));
     await tester.tap(find.byKey(const Key('nav-tcp')));
     await tester.pumpAndSettle();

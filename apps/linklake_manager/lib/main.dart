@@ -1192,8 +1192,7 @@ class _DashboardPageState extends State<DashboardPage> {
     'p2p' => _p2pPage(),
     'fleet' when _capabilities.canViewFleet => _fleetPage(),
     'alerts' => _alertsPage(),
-    'users' when _capabilities.canManageUsers || _capabilities.canManageTotp =>
-      _usersPage(),
+    'users' => _usersPage(),
     'diagnostics' => _diagnosticsPage(),
     _ => _auditPage(),
   };
