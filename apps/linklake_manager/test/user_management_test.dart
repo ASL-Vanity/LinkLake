@@ -39,6 +39,8 @@ void main() {
       );
       expect(policy.canDelete(currentUser), isFalse);
       expect(policy.canChangeRoleOrEnabled(currentUser), isFalse);
+      expect(policy.canResetPassword(currentUser), isFalse);
+      expect(policy.canRevokeUserSessions(currentUser), isFalse);
       expect(
         policy.canRevokeSession(const {'session_id': 'current-session'}),
         isFalse,
@@ -47,6 +49,15 @@ void main() {
       expect(
         policy.canRevokeSession(const {'session_id': 'other-session'}),
         isTrue,
+      );
+      const unidentified = UserActionPolicy(
+        currentUsername: 'admin',
+        currentSessionId: null,
+        enabledAdministratorCount: 1,
+      );
+      expect(
+        unidentified.canRevokeSession(const {'session_id': 'other-session'}),
+        isFalse,
       );
     },
   );

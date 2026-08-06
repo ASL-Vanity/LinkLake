@@ -201,8 +201,8 @@ class _MetricsHistoryPanelState extends State<MetricsHistoryPanel> {
     try {
       final value = await widget.api.getObject(path);
       final series = MetricsHistorySeries.fromJson(value);
-      _cache[path] = (DateTime.now(), series);
       if (!mounted || generation != _generation) return;
+      _cache[path] = (DateTime.now(), series);
       setState(() {
         _series = series;
         _loading = false;

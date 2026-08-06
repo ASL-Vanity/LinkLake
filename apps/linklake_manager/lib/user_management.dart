@@ -29,7 +29,13 @@ class UserActionPolicy {
   bool canDelete(Map<String, dynamic> user) =>
       !isCurrentUser(user) && !isLastEnabledAdministrator(user);
 
+  bool canResetPassword(Map<String, dynamic> user) => !isCurrentUser(user);
+
+  bool canRevokeUserSessions(Map<String, dynamic> user) => !isCurrentUser(user);
+
   bool canRevokeSession(Map<String, dynamic> session) =>
+      currentSessionId != null &&
+      session['session_id'] != null &&
       session['session_id']?.toString() != currentSessionId;
 }
 
@@ -266,18 +272,36 @@ class _UserManagementPageState extends State<UserManagementPage> {
                 ),
                 PopupMenuItem(
                   value: 'password',
-                  child: ListTile(
-                    contentPadding: EdgeInsets.zero,
-                    leading: const Icon(Icons.password_outlined),
-                    title: Text(t('重置密码', 'Reset password')),
+                  enabled: _actionPolicy.canResetPassword(user),
+                  child: Tooltip(
+                    message: current
+                        ? t(
+                            '不能从用户管理中重置当前账户的密码',
+                            'The current account cannot be reset from user administration',
+                          )
+                        : '',
+                    child: ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: const Icon(Icons.password_outlined),
+                      title: Text(t('重置密码', 'Reset password')),
+                    ),
                   ),
                 ),
                 PopupMenuItem(
                   value: 'revoke',
-                  child: ListTile(
-                    contentPadding: EdgeInsets.zero,
-                    leading: const Icon(Icons.phonelink_erase_outlined),
-                    title: Text(t('撤销用户会话', 'Revoke user sessions')),
+                  enabled: _actionPolicy.canRevokeUserSessions(user),
+                  child: Tooltip(
+                    message: current
+                        ? t(
+                            '当前账户必须通过退出登录结束当前会话',
+                            'Use sign out to end the current account session',
+                          )
+                        : '',
+                    child: ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: const Icon(Icons.phonelink_erase_outlined),
+                      title: Text(t('撤销用户会话', 'Revoke user sessions')),
+                    ),
                   ),
                 ),
                 PopupMenuItem(
@@ -399,263 +423,330 @@ class _UserManagementPageState extends State<UserManagementPage> {
     var role = user?['role']?.toString() ?? 'operator';
     var enabled = user?['enabled'] != false;
     var forcePasswordChange = true;
+    var submitting = false;
     String? error;
     final saved = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => StatefulBuilder(
-        builder: (context, setDialogState) => AlertDialog(
-          title: Text(
-            creating ? t('新建用户', 'New user') : t('编辑用户', 'Edit user'),
+        builder: (context, setDialogState) => PopScope(
+          canPop: !submitting,
+          child: AlertDialog(
+            title: Text(
+              creating ? t('新建用户', 'New user') : t('编辑用户', 'Edit user'),
+            ),
+            content: SizedBox(
+              width: 480,
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    TextField(
+                      controller: username,
+                      enabled: creating && !submitting,
+                      decoration: InputDecoration(
+                        labelText: t('用户名', 'Username'),
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    TextField(
+                      controller: displayName,
+                      enabled: !submitting,
+                      decoration: InputDecoration(
+                        labelText: t('显示名称', 'Display name'),
+                      ),
+                    ),
+                    if (creating) ...[
+                      const SizedBox(height: 10),
+                      TextField(
+                        controller: password,
+                        enabled: !submitting,
+                        obscureText: true,
+                        decoration: InputDecoration(
+                          labelText: t(
+                            '密码（至少 12 位）',
+                            'Password (12+ characters)',
+                          ),
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 10),
+                    DropdownButtonFormField<String>(
+                      initialValue: role,
+                      items: const [
+                        DropdownMenuItem(
+                          value: 'administrator',
+                          child: Text('administrator'),
+                        ),
+                        DropdownMenuItem(
+                          value: 'operator',
+                          child: Text('operator'),
+                        ),
+                        DropdownMenuItem(
+                          value: 'auditor',
+                          child: Text('auditor'),
+                        ),
+                      ],
+                      onChanged: mutableRole && !submitting
+                          ? (value) =>
+                                setDialogState(() => role = value ?? role)
+                          : null,
+                      decoration: InputDecoration(labelText: t('角色', 'Role')),
+                    ),
+                    if (creating)
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        value: forcePasswordChange,
+                        onChanged: submitting
+                            ? null
+                            : (value) => setDialogState(
+                                () => forcePasswordChange = value,
+                              ),
+                        title: Text(
+                          t(
+                            '下次登录强制修改密码',
+                            'Require password change at next sign-in',
+                          ),
+                        ),
+                      )
+                    else
+                      SwitchListTile(
+                        key: const Key('edit-user-enabled'),
+                        contentPadding: EdgeInsets.zero,
+                        value: enabled,
+                        onChanged: mutableRole && !submitting
+                            ? (value) => setDialogState(() => enabled = value)
+                            : null,
+                        title: Text(t('启用用户', 'User enabled')),
+                      ),
+                    if (!mutableRole && !creating)
+                      Text(
+                        policy.isCurrentUser(user)
+                            ? t(
+                                '当前用户不能在此处停用或降权',
+                                'The current user cannot be disabled or demoted here',
+                              )
+                            : t(
+                                '最后一个已启用的管理员不能停用或降权',
+                                'The last enabled administrator cannot be disabled or demoted',
+                              ),
+                        style: Theme.of(context).textTheme.bodySmall,
+                      ),
+                    if (error != null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 10),
+                        child: Text(
+                          error!,
+                          style: TextStyle(
+                            color: Theme.of(context).colorScheme.error,
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: submitting
+                    ? null
+                    : () => Navigator.pop(dialogContext, false),
+                child: Text(t('取消', 'Cancel')),
+              ),
+              FilledButton(
+                key: const Key('save-user'),
+                onPressed: submitting
+                    ? null
+                    : () async {
+                        try {
+                          if (displayName.text.trim().isEmpty) {
+                            throw FormatException(
+                              t('请输入显示名称', 'Enter a display name'),
+                            );
+                          }
+                          if (creating && password.text.length < 12) {
+                            throw FormatException(
+                              t(
+                                '密码必须至少包含 12 个字符',
+                                'Password must contain at least 12 characters',
+                              ),
+                            );
+                          }
+                          setDialogState(() {
+                            submitting = true;
+                            error = null;
+                          });
+                          if (creating) {
+                            await widget.api.postObject('/api/v1/users', {
+                              'username': username.text.trim(),
+                              'display_name': displayName.text.trim(),
+                              'role': role,
+                              'password': password.text,
+                              'force_password_change': forcePasswordChange,
+                            });
+                          } else {
+                            await widget.api.putObject(
+                              '/api/v1/users/${Uri.encodeComponent(username.text)}',
+                              {
+                                'display_name': displayName.text.trim(),
+                                'role': role,
+                                'enabled': enabled,
+                              },
+                            );
+                          }
+                          if (context.mounted) {
+                            Navigator.pop(dialogContext, true);
+                          }
+                        } catch (value) {
+                          if (!context.mounted) return;
+                          setDialogState(() {
+                            submitting = false;
+                            error = value.toString();
+                          });
+                        }
+                      },
+                child: submitting
+                    ? const SizedBox.square(
+                        dimension: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : Text(t('保存', 'Save')),
+              ),
+            ],
           ),
-          content: SizedBox(
-            width: 480,
-            child: SingleChildScrollView(
+        ),
+      ),
+    );
+    await _disposeControllers([username, displayName, password]);
+    if (saved == true) await _refreshAfterDialog();
+  }
+
+  Future<void> _resetPassword(Map<String, dynamic> user) async {
+    if (!widget.capabilities.canManageUsers ||
+        !_actionPolicy.canResetPassword(user)) {
+      return;
+    }
+    final password = TextEditingController();
+    var forcePasswordChange = true;
+    var submitting = false;
+    String? error;
+    final reset = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) => PopScope(
+          canPop: !submitting,
+          child: AlertDialog(
+            title: Text(t('重置密码', 'Reset password')),
+            content: SizedBox(
+              width: 440,
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   TextField(
-                    controller: username,
-                    enabled: creating,
+                    controller: password,
+                    enabled: !submitting,
+                    obscureText: true,
                     decoration: InputDecoration(
-                      labelText: t('用户名', 'Username'),
+                      labelText: t(
+                        '新密码（至少 12 位）',
+                        'New password (12+ characters)',
+                      ),
                     ),
                   ),
-                  const SizedBox(height: 10),
-                  TextField(
-                    controller: displayName,
-                    decoration: InputDecoration(
-                      labelText: t('显示名称', 'Display name'),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    value: forcePasswordChange,
+                    onChanged: submitting
+                        ? null
+                        : (value) =>
+                              setDialogState(() => forcePasswordChange = value),
+                    title: Text(
+                      t(
+                        '下次登录强制修改密码',
+                        'Require password change at next sign-in',
+                      ),
                     ),
                   ),
-                  if (creating) ...[
-                    const SizedBox(height: 10),
-                    TextField(
-                      controller: password,
-                      obscureText: true,
-                      decoration: InputDecoration(
-                        labelText: t(
-                          '密码（至少 12 位）',
-                          'Password (12+ characters)',
-                        ),
-                      ),
+                  Text(
+                    t(
+                      '重置后该用户的所有现有会话都会被撤销。',
+                      'Resetting also revokes every existing session for this user.',
                     ),
-                  ],
-                  const SizedBox(height: 10),
-                  DropdownButtonFormField<String>(
-                    initialValue: role,
-                    items: const [
-                      DropdownMenuItem(
-                        value: 'administrator',
-                        child: Text('administrator'),
-                      ),
-                      DropdownMenuItem(
-                        value: 'operator',
-                        child: Text('operator'),
-                      ),
-                      DropdownMenuItem(
-                        value: 'auditor',
-                        child: Text('auditor'),
-                      ),
-                    ],
-                    onChanged: mutableRole
-                        ? (value) => setDialogState(() => role = value ?? role)
-                        : null,
-                    decoration: InputDecoration(labelText: t('角色', 'Role')),
+                    style: Theme.of(context).textTheme.bodySmall,
                   ),
-                  if (creating)
-                    SwitchListTile(
-                      contentPadding: EdgeInsets.zero,
-                      value: forcePasswordChange,
-                      onChanged: (value) =>
-                          setDialogState(() => forcePasswordChange = value),
-                      title: Text(
-                        t(
-                          '下次登录强制修改密码',
-                          'Require password change at next sign-in',
-                        ),
-                      ),
-                    )
-                  else
-                    SwitchListTile(
-                      key: const Key('edit-user-enabled'),
-                      contentPadding: EdgeInsets.zero,
-                      value: enabled,
-                      onChanged: mutableRole
-                          ? (value) => setDialogState(() => enabled = value)
-                          : null,
-                      title: Text(t('启用用户', 'User enabled')),
-                    ),
-                  if (!mutableRole && !creating)
-                    Text(
-                      policy.isCurrentUser(user)
-                          ? t(
-                              '当前用户不能在此处停用或降权',
-                              'The current user cannot be disabled or demoted here',
-                            )
-                          : t(
-                              '最后一个已启用的管理员不能停用或降权',
-                              'The last enabled administrator cannot be disabled or demoted',
-                            ),
-                      style: Theme.of(context).textTheme.bodySmall,
-                    ),
                   if (error != null)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 10),
-                      child: Text(
-                        error!,
-                        style: TextStyle(
-                          color: Theme.of(context).colorScheme.error,
-                        ),
+                    Text(
+                      error!,
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.error,
                       ),
                     ),
                 ],
               ),
             ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext, false),
-              child: Text(t('取消', 'Cancel')),
-            ),
-            FilledButton(
-              key: const Key('save-user'),
-              onPressed: () async {
-                try {
-                  if (displayName.text.trim().isEmpty) {
-                    throw FormatException(t('请输入显示名称', 'Enter a display name'));
-                  }
-                  if (creating) {
-                    if (password.text.length < 12) {
-                      throw FormatException(
-                        t(
-                          '密码必须至少包含 12 个字符',
-                          'Password must contain at least 12 characters',
-                        ),
-                      );
-                    }
-                    await widget.api.postObject('/api/v1/users', {
-                      'username': username.text.trim(),
-                      'display_name': displayName.text.trim(),
-                      'role': role,
-                      'password': password.text,
-                      'force_password_change': forcePasswordChange,
-                    });
-                  } else {
-                    await widget.api.putObject(
-                      '/api/v1/users/${Uri.encodeComponent(username.text)}',
-                      {
-                        'display_name': displayName.text.trim(),
-                        'role': role,
-                        'enabled': enabled,
+            actions: [
+              TextButton(
+                onPressed: submitting
+                    ? null
+                    : () => Navigator.pop(dialogContext, false),
+                child: Text(t('取消', 'Cancel')),
+              ),
+              FilledButton(
+                key: const Key('confirm-reset-password'),
+                onPressed: submitting
+                    ? null
+                    : () async {
+                        try {
+                          if (password.text.length < 12) {
+                            throw FormatException(
+                              t(
+                                '密码必须至少包含 12 个字符',
+                                'Password must contain at least 12 characters',
+                              ),
+                            );
+                          }
+                          setDialogState(() {
+                            submitting = true;
+                            error = null;
+                          });
+                          await widget.api.post(
+                            '/api/v1/users/${Uri.encodeComponent(user['username'].toString())}/reset-password',
+                            {
+                              'new_password': password.text,
+                              'force_password_change': forcePasswordChange,
+                            },
+                          );
+                          if (context.mounted) {
+                            Navigator.pop(dialogContext, true);
+                          }
+                        } catch (value) {
+                          if (!context.mounted) return;
+                          setDialogState(() {
+                            submitting = false;
+                            error = value.toString();
+                          });
+                        }
                       },
-                    );
-                  }
-                  if (dialogContext.mounted) Navigator.pop(dialogContext, true);
-                } catch (value) {
-                  setDialogState(() => error = value.toString());
-                }
-              },
-              child: Text(t('保存', 'Save')),
-            ),
-          ],
-        ),
-      ),
-    );
-    await _disposeControllers([username, displayName, password]);
-    if (saved == true) await widget.onRefresh();
-  }
-
-  Future<void> _resetPassword(Map<String, dynamic> user) async {
-    if (!widget.capabilities.canManageUsers) return;
-    final password = TextEditingController();
-    var forcePasswordChange = true;
-    String? error;
-    final reset = await showDialog<bool>(
-      context: context,
-      builder: (dialogContext) => StatefulBuilder(
-        builder: (context, setDialogState) => AlertDialog(
-          title: Text(t('重置密码', 'Reset password')),
-          content: SizedBox(
-            width: 440,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                TextField(
-                  controller: password,
-                  obscureText: true,
-                  decoration: InputDecoration(
-                    labelText: t(
-                      '新密码（至少 12 位）',
-                      'New password (12+ characters)',
-                    ),
-                  ),
-                ),
-                SwitchListTile(
-                  contentPadding: EdgeInsets.zero,
-                  value: forcePasswordChange,
-                  onChanged: (value) =>
-                      setDialogState(() => forcePasswordChange = value),
-                  title: Text(
-                    t('下次登录强制修改密码', 'Require password change at next sign-in'),
-                  ),
-                ),
-                Text(
-                  t(
-                    '重置后该用户的所有现有会话都会被撤销。',
-                    'Resetting also revokes every existing session for this user.',
-                  ),
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
-                if (error != null)
-                  Text(
-                    error!,
-                    style: TextStyle(
-                      color: Theme.of(context).colorScheme.error,
-                    ),
-                  ),
-              ],
-            ),
+                child: submitting
+                    ? const SizedBox.square(
+                        dimension: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : Text(t('重置密码', 'Reset password')),
+              ),
+            ],
           ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext, false),
-              child: Text(t('取消', 'Cancel')),
-            ),
-            FilledButton(
-              key: const Key('confirm-reset-password'),
-              onPressed: () async {
-                try {
-                  if (password.text.length < 12) {
-                    throw FormatException(
-                      t(
-                        '密码必须至少包含 12 个字符',
-                        'Password must contain at least 12 characters',
-                      ),
-                    );
-                  }
-                  await widget.api.post(
-                    '/api/v1/users/${Uri.encodeComponent(user['username'].toString())}/reset-password',
-                    {
-                      'new_password': password.text,
-                      'force_password_change': forcePasswordChange,
-                    },
-                  );
-                  if (dialogContext.mounted) Navigator.pop(dialogContext, true);
-                } catch (value) {
-                  setDialogState(() => error = value.toString());
-                }
-              },
-              child: Text(t('重置密码', 'Reset password')),
-            ),
-          ],
         ),
       ),
     );
     await _disposeControllers([password]);
-    if (reset == true) await widget.onRefresh();
+    if (reset == true) await _refreshAfterDialog();
   }
 
   Future<void> _revokeUserSessions(Map<String, dynamic> user) async {
+    if (!widget.capabilities.canManageSessions ||
+        !_actionPolicy.canRevokeUserSessions(user)) {
+      return;
+    }
     final confirmed = await _confirm(
       t(
         '撤销 ${user['username']} 的所有会话？',
@@ -671,7 +762,9 @@ class _UserManagementPageState extends State<UserManagementPage> {
   }
 
   Future<void> _deleteUser(Map<String, dynamic> user) async {
-    if (!_actionPolicy.canDelete(user)) return;
+    if (!widget.capabilities.canManageUsers || !_actionPolicy.canDelete(user)) {
+      return;
+    }
     final confirmed = await _confirm(
       t(
         '删除用户 ${user['username']}？此操作会同时撤销其会话。',
@@ -687,7 +780,10 @@ class _UserManagementPageState extends State<UserManagementPage> {
   }
 
   Future<void> _revokeSession(Map<String, dynamic> session) async {
-    if (!_actionPolicy.canRevokeSession(session)) return;
+    if (!widget.capabilities.canManageSessions ||
+        !_actionPolicy.canRevokeSession(session)) {
+      return;
+    }
     final confirmed = await _confirm(t('撤销该会话？', 'Revoke this session?'));
     if (!confirmed) return;
     await _runAction(
@@ -712,8 +808,15 @@ class _UserManagementPageState extends State<UserManagementPage> {
         );
         secret = setup['secret']?.toString();
         uri = setup['provisioning_uri']?.toString();
+        if (secret == null || secret.isEmpty || uri == null || uri.isEmpty) {
+          throw const LinkLakeApiException(
+            500,
+            'server did not return a TOTP setup secret',
+            code: 'invalid_response',
+          );
+        }
       } catch (value) {
-        widget.onError(value);
+        if (mounted) widget.onError(value);
         code.dispose();
         return;
       }
@@ -722,65 +825,89 @@ class _UserManagementPageState extends State<UserManagementPage> {
       code.dispose();
       return;
     }
+    var submitting = false;
     final changed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => StatefulBuilder(
-        builder: (context, setDialogState) => AlertDialog(
-          title: Text(
-            enabled
-                ? t('关闭双因素认证', 'Disable two-factor authentication')
-                : t('设置双因素认证', 'Set up two-factor authentication'),
-          ),
-          content: SizedBox(
-            width: 520,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                if (!enabled) ...[
-                  SelectableText('${t('设置密钥', 'Setup key')}: $secret'),
-                  const SizedBox(height: 8),
-                  SelectableText(uri ?? ''),
-                  const SizedBox(height: 12),
-                ],
-                TextField(
-                  controller: code,
-                  autofocus: true,
-                  keyboardType: TextInputType.number,
-                  maxLength: 6,
-                  decoration: InputDecoration(
-                    labelText: t('动态验证码', 'Verification code'),
-                    errorText: error,
-                    counterText: '',
+        builder: (context, setDialogState) => PopScope(
+          canPop: !submitting,
+          child: AlertDialog(
+            title: Text(
+              enabled
+                  ? t('关闭双因素认证', 'Disable two-factor authentication')
+                  : t('设置双因素认证', 'Set up two-factor authentication'),
+            ),
+            content: SizedBox(
+              width: 520,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (!enabled) ...[
+                    SelectableText('${t('设置密钥', 'Setup key')}: $secret'),
+                    const SizedBox(height: 8),
+                    SelectableText(uri ?? ''),
+                    const SizedBox(height: 12),
+                  ],
+                  TextField(
+                    controller: code,
+                    enabled: !submitting,
+                    autofocus: true,
+                    keyboardType: TextInputType.number,
+                    maxLength: 6,
+                    decoration: InputDecoration(
+                      labelText: t('动态验证码', 'Verification code'),
+                      errorText: error,
+                      counterText: '',
+                    ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
+            actions: [
+              TextButton(
+                onPressed: submitting
+                    ? null
+                    : () => Navigator.pop(dialogContext, false),
+                child: Text(t('取消', 'Cancel')),
+              ),
+              FilledButton(
+                onPressed: submitting
+                    ? null
+                    : () async {
+                        try {
+                          setDialogState(() {
+                            submitting = true;
+                            error = null;
+                          });
+                          await widget.api.post(
+                            '/api/v1/auth/totp/${enabled ? 'disable' : 'enable'}',
+                            {'code': code.text},
+                          );
+                          if (context.mounted) {
+                            Navigator.pop(dialogContext, true);
+                          }
+                        } catch (value) {
+                          if (!context.mounted) return;
+                          setDialogState(() {
+                            submitting = false;
+                            error = value.toString();
+                          });
+                        }
+                      },
+                child: submitting
+                    ? const SizedBox.square(
+                        dimension: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : Text(enabled ? t('关闭', 'Disable') : t('启用', 'Enable')),
+              ),
+            ],
           ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext, false),
-              child: Text(t('取消', 'Cancel')),
-            ),
-            FilledButton(
-              onPressed: () async {
-                try {
-                  await widget.api.post(
-                    '/api/v1/auth/totp/${enabled ? 'disable' : 'enable'}',
-                    {'code': code.text},
-                  );
-                  if (dialogContext.mounted) Navigator.pop(dialogContext, true);
-                } catch (value) {
-                  setDialogState(() => error = value.toString());
-                }
-              },
-              child: Text(enabled ? t('关闭', 'Disable') : t('启用', 'Enable')),
-            ),
-          ],
         ),
       ),
     );
     await _disposeControllers([code]);
-    if (changed == true) await widget.onRefresh();
+    if (changed == true) await _refreshAfterDialog();
   }
 
   Future<void> _createApiToken() async {
@@ -788,92 +915,145 @@ class _UserManagementPageState extends State<UserManagementPage> {
     final name = TextEditingController();
     final days = TextEditingController();
     var scope = 'read';
+    var submitting = false;
     String? error;
     final created = await showDialog<Map<String, dynamic>>(
       context: context,
       builder: (dialogContext) => StatefulBuilder(
-        builder: (context, setDialogState) => AlertDialog(
-          title: Text(t('新建 API 令牌', 'New API token')),
-          content: SizedBox(
-            width: 460,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                TextField(
-                  controller: name,
-                  decoration: InputDecoration(labelText: t('名称', 'Name')),
-                ),
-                const SizedBox(height: 10),
-                DropdownButtonFormField<String>(
-                  initialValue: scope,
-                  items: const [
-                    DropdownMenuItem(value: 'read', child: Text('read')),
-                    DropdownMenuItem(value: 'write', child: Text('write')),
-                    DropdownMenuItem(
-                      value: 'administrator',
-                      child: Text('administrator'),
-                    ),
-                  ],
-                  onChanged: (value) =>
-                      setDialogState(() => scope = value ?? scope),
-                  decoration: InputDecoration(labelText: t('权限范围', 'Scope')),
-                ),
-                const SizedBox(height: 10),
-                TextField(
-                  controller: days,
-                  keyboardType: TextInputType.number,
-                  decoration: InputDecoration(
-                    labelText: t('有效天数（可选）', 'Expiry days (optional)'),
+        builder: (context, setDialogState) => PopScope(
+          canPop: !submitting,
+          child: AlertDialog(
+            title: Text(t('新建 API 令牌', 'New API token')),
+            content: SizedBox(
+              width: 460,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextField(
+                    controller: name,
+                    enabled: !submitting,
+                    decoration: InputDecoration(labelText: t('名称', 'Name')),
                   ),
-                ),
-                if (error != null)
-                  Text(
-                    error!,
-                    style: TextStyle(
-                      color: Theme.of(context).colorScheme.error,
+                  const SizedBox(height: 10),
+                  DropdownButtonFormField<String>(
+                    initialValue: scope,
+                    items: const [
+                      DropdownMenuItem(value: 'read', child: Text('read')),
+                      DropdownMenuItem(value: 'write', child: Text('write')),
+                      DropdownMenuItem(
+                        value: 'administrator',
+                        child: Text('administrator'),
+                      ),
+                    ],
+                    onChanged: submitting
+                        ? null
+                        : (value) =>
+                              setDialogState(() => scope = value ?? scope),
+                    decoration: InputDecoration(labelText: t('权限范围', 'Scope')),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: days,
+                    enabled: !submitting,
+                    keyboardType: TextInputType.number,
+                    decoration: InputDecoration(
+                      labelText: t('有效天数（可选）', 'Expiry days (optional)'),
                     ),
                   ),
-              ],
+                  if (error != null)
+                    Text(
+                      error!,
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.error,
+                      ),
+                    ),
+                ],
+              ),
             ),
+            actions: [
+              TextButton(
+                onPressed: submitting
+                    ? null
+                    : () => Navigator.pop(dialogContext),
+                child: Text(t('取消', 'Cancel')),
+              ),
+              FilledButton(
+                onPressed: submitting
+                    ? null
+                    : () async {
+                        try {
+                          final tokenName = name.text.trim();
+                          if (tokenName.isEmpty) {
+                            throw FormatException(
+                              t('请输入令牌名称', 'Enter a token name'),
+                            );
+                          }
+                          final expiryText = days.text.trim();
+                          final expiryDays = expiryText.isEmpty
+                              ? null
+                              : int.tryParse(expiryText);
+                          if (expiryText.isNotEmpty &&
+                              (expiryDays == null || expiryDays <= 0)) {
+                            throw FormatException(
+                              t(
+                                '有效天数必须是正整数',
+                                'Expiry days must be a positive integer',
+                              ),
+                            );
+                          }
+                          setDialogState(() {
+                            submitting = true;
+                            error = null;
+                          });
+                          final value = await widget.api
+                              .postObject('/api/v1/api-tokens', {
+                                'name': tokenName,
+                                'scope': scope,
+                                'expires_unix_seconds': expiryDays == null
+                                    ? null
+                                    : DateTime.now().millisecondsSinceEpoch ~/
+                                              1000 +
+                                          expiryDays * 86400,
+                              });
+                          final token = value['token']?.toString() ?? '';
+                          if (token.isEmpty) {
+                            throw const LinkLakeApiException(
+                              500,
+                              'server did not return the one-time API token',
+                              code: 'invalid_response',
+                            );
+                          }
+                          if (context.mounted) {
+                            Navigator.pop(dialogContext, value);
+                          }
+                        } catch (value) {
+                          if (!context.mounted) return;
+                          setDialogState(() {
+                            submitting = false;
+                            error = value.toString();
+                          });
+                        }
+                      },
+                child: submitting
+                    ? const SizedBox.square(
+                        dimension: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : Text(t('创建', 'Create')),
+              ),
+            ],
           ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext),
-              child: Text(t('取消', 'Cancel')),
-            ),
-            FilledButton(
-              onPressed: () async {
-                try {
-                  final expiryDays = int.tryParse(days.text);
-                  final value = await widget.api
-                      .postObject('/api/v1/api-tokens', {
-                        'name': name.text.trim(),
-                        'scope': scope,
-                        'expires_unix_seconds': expiryDays == null
-                            ? null
-                            : DateTime.now().millisecondsSinceEpoch ~/ 1000 +
-                                  expiryDays * 86400,
-                      });
-                  if (dialogContext.mounted) {
-                    Navigator.pop(dialogContext, value);
-                  }
-                } catch (value) {
-                  setDialogState(() => error = value.toString());
-                }
-              },
-              child: Text(t('创建', 'Create')),
-            ),
-          ],
         ),
       ),
     );
     await _disposeControllers([name, days]);
     if (created == null || !mounted) return;
+    final token = created['token']!.toString();
     await showDialog<void>(
       context: context,
       builder: (context) => AlertDialog(
         title: Text(t('请立即复制令牌', 'Copy this token now')),
-        content: SelectableText(created['token']?.toString() ?? ''),
+        content: SelectableText(token),
         actions: [
           FilledButton(
             onPressed: () => Navigator.pop(context),
@@ -882,29 +1062,41 @@ class _UserManagementPageState extends State<UserManagementPage> {
         ],
       ),
     );
-    await widget.onRefresh();
+    await _refreshAfterDialog();
   }
 
   Future<void> _revokeApiToken(Map<String, dynamic> token) async {
+    if (!widget.capabilities.canManageApiTokens) return;
     final confirmed = await _confirm(
       t('撤销该 API 令牌？', 'Revoke this API token?'),
     );
     if (!confirmed) return;
     await _runAction(
-      () => widget.api.delete('/api/v1/api-tokens/${token['id']}'),
+      () => widget.api.delete(
+        '/api/v1/api-tokens/${Uri.encodeComponent(token['id'].toString())}',
+      ),
     );
   }
 
   Future<void> _runAction(Future<void> Function() action) async {
-    if (_working) return;
+    if (_working || !mounted) return;
     setState(() => _working = true);
     try {
       await action();
-      await widget.onRefresh();
+      if (mounted) await widget.onRefresh();
     } catch (error) {
-      widget.onError(error);
+      if (mounted) widget.onError(error);
     } finally {
       if (mounted) setState(() => _working = false);
+    }
+  }
+
+  Future<void> _refreshAfterDialog() async {
+    if (!mounted) return;
+    try {
+      await widget.onRefresh();
+    } catch (error) {
+      if (mounted) widget.onError(error);
     }
   }
 
@@ -917,25 +1109,27 @@ class _UserManagementPageState extends State<UserManagementPage> {
     }
   }
 
-  Future<bool> _confirm(String message) async =>
-      await showDialog<bool>(
-        context: context,
-        builder: (dialogContext) => AlertDialog(
-          title: Text(t('确认操作', 'Confirm action')),
-          content: Text(message),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext, false),
-              child: Text(t('取消', 'Cancel')),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.pop(dialogContext, true),
-              child: Text(t('确认', 'Confirm')),
-            ),
-          ],
-        ),
-      ) ??
-      false;
+  Future<bool> _confirm(String message) async {
+    if (!mounted) return false;
+    return await showDialog<bool>(
+          context: context,
+          builder: (dialogContext) => AlertDialog(
+            title: Text(t('确认操作', 'Confirm action')),
+            content: Text(message),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext, false),
+                child: Text(t('取消', 'Cancel')),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(dialogContext, true),
+                child: Text(t('确认', 'Confirm')),
+              ),
+            ],
+          ),
+        ) ??
+        false;
+  }
 
   Widget _emptyCard(String message) => Card(
     child: Padding(padding: const EdgeInsets.all(18), child: Text(message)),
