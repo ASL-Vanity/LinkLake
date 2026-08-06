@@ -5,11 +5,13 @@ use rusqlite::{params, OptionalExtension, Transaction as SqliteTransaction};
 use serde::Serialize;
 use std::time::Duration;
 use tokio_postgres::Transaction as PostgresTransaction;
+use uuid::Uuid;
 
 const SQLITE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS job_leases (
     job_key TEXT PRIMARY KEY NOT NULL,
     job_kind TEXT NOT NULL,
+    lease_id TEXT NOT NULL,
     owner_instance_id TEXT NOT NULL,
     owner_incarnation_id TEXT NOT NULL,
     fencing_token INTEGER NOT NULL CHECK(fencing_token > 0),
@@ -32,6 +34,7 @@ const MAX_ERROR_CODE_BYTES: usize = 128;
 pub(crate) struct JobLease {
     pub(crate) job_key: String,
     pub(crate) job_kind: String,
+    pub(crate) lease_id: Uuid,
     pub(crate) owner_instance_id: String,
     pub(crate) owner_incarnation_id: String,
     pub(crate) fencing_token: u64,
@@ -52,10 +55,7 @@ impl JobLeases {
     pub(crate) fn open(coordinator: HaCoordinator, lease: Duration) -> anyhow::Result<Self> {
         let lease_seconds = lease_seconds(lease)?;
         if let CoordinationStorage::Sqlite(database) = coordinator.storage() {
-            database.with_connection(|connection| {
-                connection.execute_batch(SQLITE_SCHEMA)?;
-                Ok(())
-            })?;
+            database.with_transaction(ensure_sqlite_schema)?;
         }
         Ok(Self {
             coordinator,
@@ -63,7 +63,7 @@ impl JobLeases {
         })
     }
 
-    pub(crate) async fn acquire_or_renew(
+    pub(crate) async fn acquire(
         &self,
         job_key: &str,
         job_kind: &str,
@@ -88,40 +88,18 @@ impl JobLeases {
                 )?;
                 match mode {
                     ClaimMode::Conflict => Ok(None),
-                    ClaimMode::Renew => {
-                        let lease_until = now.saturating_add(self.lease_seconds);
-                        let changed = transaction.execute(
-                            "UPDATE job_leases
-                             SET renewed_unix_seconds = ?6, lease_until_unix_seconds = ?7
-                             WHERE job_key = ?1 AND job_kind = ?2 AND owner_instance_id = ?3
-                               AND owner_incarnation_id = ?4 AND fencing_token = ?5
-                               AND lease_until_unix_seconds > ?6",
-                            params![
-                                job_key,
-                                job_kind,
-                                self.coordinator.instance_id(),
-                                self.coordinator.incarnation_id(),
-                                as_i64(fencing_token)?,
-                                as_i64(now)?,
-                                as_i64(lease_until)?,
-                            ],
-                        )?;
-                        anyhow::ensure!(changed == 1, "job lease changed during renewal");
-                        read_sqlite_job(transaction, &job_key)?
-                            .map(Some)
-                            .ok_or_else(|| anyhow::anyhow!("job lease disappeared after renewal"))
-                    }
                     ClaimMode::Fresh => {
+                        let lease_id = Uuid::new_v4();
                         let lease_until = now.saturating_add(self.lease_seconds);
                         let changed = transaction.execute(
                             "INSERT INTO job_leases(
-                                 job_key, job_kind, owner_instance_id, owner_incarnation_id,
-                                 fencing_token, acquired_unix_seconds, renewed_unix_seconds,
-                                 lease_until_unix_seconds, last_completed_unix_seconds,
-                                 last_error_code
-                             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, NULL, NULL)
+                                 job_key, job_kind, lease_id, owner_instance_id,
+                                 owner_incarnation_id, fencing_token, acquired_unix_seconds,
+                                 renewed_unix_seconds, lease_until_unix_seconds,
+                                 last_completed_unix_seconds, last_error_code
+                             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, NULL, NULL)
                              ON CONFLICT(job_key) DO UPDATE SET
-                                 job_kind = excluded.job_kind,
+                                 lease_id = excluded.lease_id,
                                  owner_instance_id = excluded.owner_instance_id,
                                  owner_incarnation_id = excluded.owner_incarnation_id,
                                  fencing_token = excluded.fencing_token,
@@ -132,6 +110,7 @@ impl JobLeases {
                             params![
                                 job_key,
                                 job_kind,
+                                lease_id.to_string(),
                                 self.coordinator.instance_id(),
                                 self.coordinator.incarnation_id(),
                                 as_i64(fencing_token)?,
@@ -167,32 +146,23 @@ impl JobLeases {
                 )?;
                 let lease = match mode {
                     ClaimMode::Conflict => None,
-                    ClaimMode::Renew => Some(
-                        renew_postgres_job(
-                            &transaction,
-                            &job_key,
-                            &job_kind,
-                            self.coordinator.instance_id(),
-                            self.coordinator.incarnation_id(),
-                            fencing_token,
-                            now,
-                            now.saturating_add(self.lease_seconds),
+                    ClaimMode::Fresh => {
+                        let lease_id = Uuid::new_v4();
+                        Some(
+                            replace_postgres_job(
+                                &transaction,
+                                &job_key,
+                                &job_kind,
+                                lease_id,
+                                self.coordinator.instance_id(),
+                                self.coordinator.incarnation_id(),
+                                fencing_token,
+                                now,
+                                now.saturating_add(self.lease_seconds),
+                            )
+                            .await?,
                         )
-                        .await?,
-                    ),
-                    ClaimMode::Fresh => Some(
-                        replace_postgres_job(
-                            &transaction,
-                            &job_key,
-                            &job_kind,
-                            self.coordinator.instance_id(),
-                            self.coordinator.incarnation_id(),
-                            fencing_token,
-                            now,
-                            now.saturating_add(self.lease_seconds),
-                        )
-                        .await?,
-                    ),
+                    }
                 };
                 transaction.commit().await?;
                 Ok(lease)
@@ -200,30 +170,118 @@ impl JobLeases {
         }
     }
 
-    pub(crate) async fn complete(&self, job_key: &str, fencing_token: u64) -> anyhow::Result<bool> {
-        self.finish(job_key, fencing_token, None).await
+    pub(crate) async fn renew(
+        &self,
+        job_key: &str,
+        job_kind: &str,
+        lease_id: Uuid,
+        fencing_token: u64,
+    ) -> anyhow::Result<Option<JobLease>> {
+        let job_key = normalize_identifier(job_key, "job key", MAX_JOB_KEY_BYTES)?;
+        let job_kind = normalize_identifier(job_kind, "job kind", MAX_JOB_KIND_BYTES)?;
+        anyhow::ensure!(fencing_token > 0, "fencing token must be positive");
+        match self.coordinator.storage() {
+            CoordinationStorage::Sqlite(database) => database.with_transaction(|transaction| {
+                self.coordinator
+                    .assert_sqlite_transaction_fence(transaction, fencing_token)?;
+                let now = sqlite_now(transaction)?;
+                let lease_until = now.saturating_add(self.lease_seconds);
+                let changed = transaction.execute(
+                    "UPDATE job_leases
+                     SET renewed_unix_seconds = ?7, lease_until_unix_seconds = ?8
+                     WHERE job_key = ?1 AND job_kind = ?2 AND lease_id = ?3
+                       AND owner_instance_id = ?4 AND owner_incarnation_id = ?5
+                       AND fencing_token = ?6 AND lease_until_unix_seconds > ?7",
+                    params![
+                        job_key,
+                        job_kind,
+                        lease_id.to_string(),
+                        self.coordinator.instance_id(),
+                        self.coordinator.incarnation_id(),
+                        as_i64(fencing_token)?,
+                        as_i64(now)?,
+                        as_i64(lease_until)?,
+                    ],
+                )?;
+                anyhow::ensure!(changed <= 1, "multiple job leases were renewed");
+                if changed == 0 {
+                    return Ok(None);
+                }
+                read_sqlite_job(transaction, &job_key)?
+                    .map(Some)
+                    .ok_or_else(|| anyhow::anyhow!("job lease disappeared after renewal"))
+            }),
+            CoordinationStorage::Postgres(_) => {
+                let mut client = self.coordinator.storage().postgres_client().await?;
+                let transaction = client.transaction().await?;
+                self.coordinator
+                    .assert_postgres_transaction_fence(&transaction, fencing_token)
+                    .await?;
+                lock_postgres_job(&transaction, &job_key).await?;
+                let now = postgres_now(&transaction).await?;
+                let lease = renew_postgres_job(
+                    &transaction,
+                    &job_key,
+                    &job_kind,
+                    lease_id,
+                    self.coordinator.instance_id(),
+                    self.coordinator.incarnation_id(),
+                    fencing_token,
+                    now,
+                    now.saturating_add(self.lease_seconds),
+                )
+                .await?;
+                transaction.commit().await?;
+                Ok(lease)
+            }
+        }
+    }
+
+    pub(crate) async fn complete(
+        &self,
+        job_key: &str,
+        job_kind: &str,
+        lease_id: Uuid,
+        fencing_token: u64,
+    ) -> anyhow::Result<bool> {
+        self.finish(job_key, job_kind, lease_id, fencing_token, None)
+            .await
     }
 
     pub(crate) async fn fail(
         &self,
         job_key: &str,
+        job_kind: &str,
+        lease_id: Uuid,
         fencing_token: u64,
         error_code: &str,
     ) -> anyhow::Result<bool> {
         let error_code = normalize_identifier(error_code, "job error code", MAX_ERROR_CODE_BYTES)?;
-        self.finish(job_key, fencing_token, Some(error_code)).await
+        self.finish(job_key, job_kind, lease_id, fencing_token, Some(error_code))
+            .await
     }
 
     pub(crate) async fn active(&self) -> anyhow::Result<Vec<JobLease>> {
         match self.coordinator.storage() {
             CoordinationStorage::Sqlite(database) => database.with_connection(|connection| {
                 let mut statement = connection.prepare(
-                    "SELECT job_key, job_kind, owner_instance_id, owner_incarnation_id,
-                            fencing_token, acquired_unix_seconds, renewed_unix_seconds,
-                            lease_until_unix_seconds, last_completed_unix_seconds, last_error_code
-                     FROM job_leases
-                     WHERE lease_until_unix_seconds > CAST(unixepoch('now') AS INTEGER)
-                     ORDER BY job_key",
+                    "SELECT job.job_key, job.job_kind, job.lease_id, job.owner_instance_id,
+                            job.owner_incarnation_id, job.fencing_token,
+                            job.acquired_unix_seconds, job.renewed_unix_seconds,
+                            job.lease_until_unix_seconds, job.last_completed_unix_seconds,
+                            job.last_error_code
+                     FROM job_leases AS job
+                     JOIN ha_leader AS leader
+                       ON leader.instance_id = job.owner_instance_id
+                      AND leader.incarnation_id = job.owner_incarnation_id
+                      AND leader.fencing_token = job.fencing_token
+                     JOIN ha_members AS member
+                       ON member.instance_id = job.owner_instance_id
+                      AND member.incarnation_id = job.owner_incarnation_id
+                     WHERE job.lease_until_unix_seconds > CAST(unixepoch('now') AS INTEGER)
+                       AND leader.lease_until_unix_seconds > CAST(unixepoch('now') AS INTEGER)
+                       AND member.lease_until_unix_seconds > CAST(unixepoch('now') AS INTEGER)
+                     ORDER BY job.job_key",
                 )?;
                 let rows = statement.query_map([], sqlite_job_row)?;
                 rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -232,16 +290,25 @@ impl JobLeases {
                 let client = self.coordinator.storage().postgres_client().await?;
                 client
                     .query(
-                        "SELECT job_key, job_kind, owner_instance_id, owner_incarnation_id,
-                            fencing_token,
-                            CAST(EXTRACT(EPOCH FROM acquired_at) AS BIGINT),
-                            CAST(EXTRACT(EPOCH FROM renewed_at) AS BIGINT),
-                            CAST(EXTRACT(EPOCH FROM lease_until) AS BIGINT),
-                            CAST(EXTRACT(EPOCH FROM last_completed_at) AS BIGINT),
-                            last_error_code
-                         FROM linklake_job_leases
-                         WHERE lease_until > clock_timestamp()
-                         ORDER BY job_key",
+                        "SELECT job.job_key, job.job_kind, job.lease_id, job.owner_instance_id,
+                            job.owner_incarnation_id, job.fencing_token,
+                            CAST(EXTRACT(EPOCH FROM job.acquired_at) AS BIGINT),
+                            CAST(EXTRACT(EPOCH FROM job.renewed_at) AS BIGINT),
+                            CAST(EXTRACT(EPOCH FROM job.lease_until) AS BIGINT),
+                            CAST(EXTRACT(EPOCH FROM job.last_completed_at) AS BIGINT),
+                            job.last_error_code
+                         FROM linklake_job_leases AS job
+                         JOIN linklake_ha_leader AS leader
+                           ON leader.instance_id = job.owner_instance_id
+                          AND leader.incarnation_id = job.owner_incarnation_id
+                          AND leader.fencing_token = job.fencing_token
+                         JOIN linklake_ha_members AS member
+                           ON member.instance_id = job.owner_instance_id
+                          AND member.incarnation_id = job.owner_incarnation_id
+                         WHERE job.lease_until > clock_timestamp()
+                           AND leader.lease_until > clock_timestamp()
+                           AND member.lease_until > clock_timestamp()
+                         ORDER BY job.job_key",
                         &[],
                     )
                     .await?
@@ -255,10 +322,13 @@ impl JobLeases {
     async fn finish(
         &self,
         job_key: &str,
+        job_kind: &str,
+        lease_id: Uuid,
         fencing_token: u64,
         error_code: Option<String>,
     ) -> anyhow::Result<bool> {
         let job_key = normalize_identifier(job_key, "job key", MAX_JOB_KEY_BYTES)?;
+        let job_kind = normalize_identifier(job_kind, "job kind", MAX_JOB_KIND_BYTES)?;
         anyhow::ensure!(fencing_token > 0, "fencing token must be positive");
         match self.coordinator.storage() {
             CoordinationStorage::Sqlite(database) => database.with_transaction(|transaction| {
@@ -267,13 +337,16 @@ impl JobLeases {
                 let now = sqlite_now(transaction)?;
                 let changed = transaction.execute(
                     "UPDATE job_leases
-                     SET renewed_unix_seconds = ?5, lease_until_unix_seconds = ?5,
-                         last_completed_unix_seconds = CASE WHEN ?6 IS NULL THEN ?5 ELSE last_completed_unix_seconds END,
-                         last_error_code = ?6
-                     WHERE job_key = ?1 AND owner_instance_id = ?2 AND owner_incarnation_id = ?3
-                       AND fencing_token = ?4 AND lease_until_unix_seconds > ?5",
+                     SET renewed_unix_seconds = ?7, lease_until_unix_seconds = ?7,
+                         last_completed_unix_seconds = CASE WHEN ?8 IS NULL THEN ?7 ELSE last_completed_unix_seconds END,
+                         last_error_code = ?8
+                     WHERE job_key = ?1 AND job_kind = ?2 AND lease_id = ?3
+                       AND owner_instance_id = ?4 AND owner_incarnation_id = ?5
+                       AND fencing_token = ?6 AND lease_until_unix_seconds > ?7",
                     params![
                         job_key,
+                        job_kind,
+                        lease_id.to_string(),
                         self.coordinator.instance_id(),
                         self.coordinator.incarnation_id(),
                         as_i64(fencing_token)?,
@@ -295,15 +368,17 @@ impl JobLeases {
                 let changed = transaction
                     .execute(
                         "UPDATE linklake_job_leases
-                         SET renewed_at = to_timestamp($5), lease_until = to_timestamp($5),
-                             last_completed_at = CASE WHEN $6::text IS NULL
-                                 THEN to_timestamp($5) ELSE last_completed_at END,
-                             last_error_code = $6
-                         WHERE job_key = $1 AND owner_instance_id = $2
-                           AND owner_incarnation_id = $3 AND fencing_token = $4
-                           AND lease_until > to_timestamp($5)",
+                         SET renewed_at = to_timestamp($7), lease_until = to_timestamp($7),
+                             last_completed_at = CASE WHEN $8::text IS NULL
+                                 THEN to_timestamp($7) ELSE last_completed_at END,
+                             last_error_code = $8
+                         WHERE job_key = $1 AND job_kind = $2 AND lease_id = $3
+                           AND owner_instance_id = $4 AND owner_incarnation_id = $5
+                           AND fencing_token = $6 AND lease_until > to_timestamp($7)",
                         &[
                             &job_key,
+                            &job_kind,
+                            &lease_id.to_string(),
                             &self.coordinator.instance_id(),
                             &self.coordinator.incarnation_id(),
                             &as_i64(fencing_token)?,
@@ -320,10 +395,67 @@ impl JobLeases {
     }
 }
 
+fn ensure_sqlite_schema(transaction: &SqliteTransaction<'_>) -> anyhow::Result<()> {
+    transaction.execute_batch(SQLITE_SCHEMA)?;
+    if sqlite_column_is_required(transaction, "job_leases", "lease_id")? {
+        return Ok(());
+    }
+
+    // 升级时重新生成租约身份，确保重启前遗留 worker 无法完成或续租新账本中的任务。
+    anyhow::ensure!(
+        !sqlite_table_exists(transaction, "job_leases_lease_upgrade")?,
+        "unfinished job lease schema upgrade was detected"
+    );
+    transaction.execute_batch(
+        "ALTER TABLE job_leases RENAME TO job_leases_lease_upgrade;
+         DROP INDEX IF EXISTS job_leases_owner;",
+    )?;
+    transaction.execute_batch(SQLITE_SCHEMA)?;
+    transaction.execute(
+        "INSERT INTO job_leases(
+             job_key, job_kind, lease_id, owner_instance_id, owner_incarnation_id,
+             fencing_token, acquired_unix_seconds, renewed_unix_seconds,
+             lease_until_unix_seconds, last_completed_unix_seconds, last_error_code
+         )
+         SELECT job_key, job_kind, lower(hex(randomblob(16))), owner_instance_id,
+                owner_incarnation_id, fencing_token, acquired_unix_seconds,
+                renewed_unix_seconds, lease_until_unix_seconds,
+                last_completed_unix_seconds, last_error_code
+         FROM job_leases_lease_upgrade",
+        [],
+    )?;
+    transaction.execute_batch("DROP TABLE job_leases_lease_upgrade;")?;
+    Ok(())
+}
+
+fn sqlite_column_is_required(
+    transaction: &SqliteTransaction<'_>,
+    table: &str,
+    column: &str,
+) -> anyhow::Result<bool> {
+    let mut statement = transaction.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, String>(1)? == column {
+            return Ok(row.get::<_, i64>(3)? == 1);
+        }
+    }
+    Ok(false)
+}
+
+fn sqlite_table_exists(transaction: &SqliteTransaction<'_>, table: &str) -> anyhow::Result<bool> {
+    Ok(transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1
+         )",
+        [table],
+        |row| row.get(0),
+    )?)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ClaimMode {
     Conflict,
-    Renew,
     Fresh,
 }
 
@@ -338,6 +470,10 @@ fn claim_mode(
     let Some(current) = current else {
         return Ok(ClaimMode::Fresh);
     };
+    anyhow::ensure!(
+        current.job_kind == job_kind,
+        "job key is permanently bound to a different job kind"
+    );
     if current.fencing_token > fencing_token {
         anyhow::bail!("job lease contains a newer fencing token");
     }
@@ -352,10 +488,7 @@ fn claim_mode(
     if current.lease_until_unix_seconds <= now {
         return Ok(ClaimMode::Fresh);
     }
-    if current.job_kind != job_kind {
-        return Ok(ClaimMode::Conflict);
-    }
-    Ok(ClaimMode::Renew)
+    Ok(ClaimMode::Conflict)
 }
 
 fn read_sqlite_job(
@@ -364,7 +497,7 @@ fn read_sqlite_job(
 ) -> anyhow::Result<Option<JobLease>> {
     transaction
         .query_row(
-            "SELECT job_key, job_kind, owner_instance_id, owner_incarnation_id,
+            "SELECT job_key, job_kind, lease_id, owner_instance_id, owner_incarnation_id,
                     fencing_token, acquired_unix_seconds, renewed_unix_seconds,
                     lease_until_unix_seconds, last_completed_unix_seconds, last_error_code
              FROM job_leases WHERE job_key = ?1",
@@ -376,20 +509,24 @@ fn read_sqlite_job(
 }
 
 fn sqlite_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobLease> {
+    let lease_id = Uuid::parse_str(&row.get::<_, String>(2)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(error))
+    })?;
     Ok(JobLease {
         job_key: row.get(0)?,
         job_kind: row.get(1)?,
-        owner_instance_id: row.get(2)?,
-        owner_incarnation_id: row.get(3)?,
-        fencing_token: sqlite_positive(row.get(4)?, 4, "job fencing token")?,
-        acquired_unix_seconds: sqlite_nonnegative(row.get(5)?, 5, "job acquired time")?,
-        renewed_unix_seconds: sqlite_nonnegative(row.get(6)?, 6, "job renewed time")?,
-        lease_until_unix_seconds: sqlite_nonnegative(row.get(7)?, 7, "job lease time")?,
+        lease_id,
+        owner_instance_id: row.get(3)?,
+        owner_incarnation_id: row.get(4)?,
+        fencing_token: sqlite_positive(row.get(5)?, 5, "job fencing token")?,
+        acquired_unix_seconds: sqlite_nonnegative(row.get(6)?, 6, "job acquired time")?,
+        renewed_unix_seconds: sqlite_nonnegative(row.get(7)?, 7, "job renewed time")?,
+        lease_until_unix_seconds: sqlite_nonnegative(row.get(8)?, 8, "job lease time")?,
         last_completed_unix_seconds: row
-            .get::<_, Option<i64>>(8)?
-            .map(|value| sqlite_nonnegative(value, 8, "job completion time"))
+            .get::<_, Option<i64>>(9)?
+            .map(|value| sqlite_nonnegative(value, 9, "job completion time"))
             .transpose()?,
-        last_error_code: row.get(9)?,
+        last_error_code: row.get(10)?,
     })
 }
 
@@ -399,7 +536,7 @@ async fn read_postgres_job_for_update(
 ) -> anyhow::Result<Option<JobLease>> {
     transaction
         .query_opt(
-            "SELECT job_key, job_kind, owner_instance_id, owner_incarnation_id,
+            "SELECT job_key, job_kind, lease_id, owner_instance_id, owner_incarnation_id,
                 fencing_token,
                 CAST(EXTRACT(EPOCH FROM acquired_at) AS BIGINT),
                 CAST(EXTRACT(EPOCH FROM renewed_at) AS BIGINT),
@@ -418,21 +555,22 @@ async fn renew_postgres_job(
     transaction: &PostgresTransaction<'_>,
     job_key: &str,
     job_kind: &str,
+    lease_id: Uuid,
     owner_instance_id: &str,
     owner_incarnation_id: &str,
     fencing_token: u64,
     now: u64,
     lease_until: u64,
-) -> anyhow::Result<JobLease> {
-    let row = transaction
+) -> anyhow::Result<Option<JobLease>> {
+    transaction
         .query_opt(
             "UPDATE linklake_job_leases
-             SET renewed_at = to_timestamp($6), lease_until = to_timestamp($7)
-             WHERE job_key = $1 AND job_kind = $2 AND owner_instance_id = $3
-               AND owner_incarnation_id = $4 AND fencing_token = $5
-               AND lease_until > to_timestamp($6)
-             RETURNING job_key, job_kind, owner_instance_id, owner_incarnation_id,
-                 fencing_token,
+             SET renewed_at = to_timestamp($7), lease_until = to_timestamp($8)
+             WHERE job_key = $1 AND job_kind = $2 AND lease_id = $3
+               AND owner_instance_id = $4 AND owner_incarnation_id = $5
+               AND fencing_token = $6 AND lease_until > to_timestamp($7)
+             RETURNING job_key, job_kind, lease_id, owner_instance_id,
+                 owner_incarnation_id, fencing_token,
                  CAST(EXTRACT(EPOCH FROM acquired_at) AS BIGINT),
                  CAST(EXTRACT(EPOCH FROM renewed_at) AS BIGINT),
                  CAST(EXTRACT(EPOCH FROM lease_until) AS BIGINT),
@@ -441,6 +579,7 @@ async fn renew_postgres_job(
             &[
                 &job_key,
                 &job_kind,
+                &lease_id.to_string(),
                 &owner_instance_id,
                 &owner_incarnation_id,
                 &as_i64(fencing_token)?,
@@ -449,14 +588,15 @@ async fn renew_postgres_job(
             ],
         )
         .await?
-        .ok_or_else(|| anyhow::anyhow!("job lease changed during renewal"))?;
-    postgres_job(&row)
+        .map(|row| postgres_job(&row))
+        .transpose()
 }
 
 async fn replace_postgres_job(
     transaction: &PostgresTransaction<'_>,
     job_key: &str,
     job_kind: &str,
+    lease_id: Uuid,
     owner_instance_id: &str,
     owner_incarnation_id: &str,
     fencing_token: u64,
@@ -466,12 +606,13 @@ async fn replace_postgres_job(
     let row = transaction
         .query_one(
             "INSERT INTO linklake_job_leases(
-                 job_key, job_kind, owner_instance_id, owner_incarnation_id, fencing_token,
-                 acquired_at, renewed_at, lease_until, last_completed_at, last_error_code
-             ) VALUES ($1, $2, $3, $4, $5, to_timestamp($6), to_timestamp($6),
-                 to_timestamp($7), NULL, NULL)
+                 job_key, job_kind, lease_id, owner_instance_id, owner_incarnation_id,
+                 fencing_token, acquired_at, renewed_at, lease_until,
+                 last_completed_at, last_error_code
+             ) VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7), to_timestamp($7),
+                 to_timestamp($8), NULL, NULL)
              ON CONFLICT(job_key) DO UPDATE SET
-                 job_kind = EXCLUDED.job_kind,
+                 lease_id = EXCLUDED.lease_id,
                  owner_instance_id = EXCLUDED.owner_instance_id,
                  owner_incarnation_id = EXCLUDED.owner_incarnation_id,
                  fencing_token = EXCLUDED.fencing_token,
@@ -479,8 +620,8 @@ async fn replace_postgres_job(
                  renewed_at = EXCLUDED.renewed_at,
                  lease_until = EXCLUDED.lease_until,
                  last_error_code = NULL
-             RETURNING job_key, job_kind, owner_instance_id, owner_incarnation_id,
-                 fencing_token,
+             RETURNING job_key, job_kind, lease_id, owner_instance_id,
+                 owner_incarnation_id, fencing_token,
                  CAST(EXTRACT(EPOCH FROM acquired_at) AS BIGINT),
                  CAST(EXTRACT(EPOCH FROM renewed_at) AS BIGINT),
                  CAST(EXTRACT(EPOCH FROM lease_until) AS BIGINT),
@@ -489,6 +630,7 @@ async fn replace_postgres_job(
             &[
                 &job_key,
                 &job_kind,
+                &lease_id.to_string(),
                 &owner_instance_id,
                 &owner_incarnation_id,
                 &as_i64(fencing_token)?,
@@ -504,17 +646,18 @@ fn postgres_job(row: &tokio_postgres::Row) -> anyhow::Result<JobLease> {
     Ok(JobLease {
         job_key: row.get(0),
         job_kind: row.get(1),
-        owner_instance_id: row.get(2),
-        owner_incarnation_id: row.get(3),
-        fencing_token: positive(row.get(4), "job fencing token")?,
-        acquired_unix_seconds: nonnegative(row.get(5), "job acquired time")?,
-        renewed_unix_seconds: nonnegative(row.get(6), "job renewed time")?,
-        lease_until_unix_seconds: nonnegative(row.get(7), "job lease time")?,
+        lease_id: Uuid::parse_str(&row.get::<_, String>(2))?,
+        owner_instance_id: row.get(3),
+        owner_incarnation_id: row.get(4),
+        fencing_token: positive(row.get(5), "job fencing token")?,
+        acquired_unix_seconds: nonnegative(row.get(6), "job acquired time")?,
+        renewed_unix_seconds: nonnegative(row.get(7), "job renewed time")?,
+        lease_until_unix_seconds: nonnegative(row.get(8), "job lease time")?,
         last_completed_unix_seconds: row
-            .get::<_, Option<i64>>(8)
+            .get::<_, Option<i64>>(9)
             .map(|value| nonnegative(value, "job completion time"))
             .transpose()?,
-        last_error_code: row.get(9),
+        last_error_code: row.get(10),
     })
 }
 

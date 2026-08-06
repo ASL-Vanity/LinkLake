@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use tokio_postgres::{Client, Transaction};
 
-pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 2;
+pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 3;
 const ADVISORY_LOCK_ID: i64 = 0x4c4c_4841_4d49_4752;
 
 const MIGRATION_V1_NAME: &str = "ha_coordination_foundation";
@@ -136,6 +136,29 @@ ALTER TABLE linklake_fleet_generations
     ALTER COLUMN owner_incarnation_id DROP DEFAULT;
 "#;
 
+const MIGRATION_V3_NAME: &str = "resource_lease_identity";
+const MIGRATION_V3_SQL: &str = r#"
+ALTER TABLE linklake_public_port_ownership
+    ADD COLUMN lease_id TEXT;
+UPDATE linklake_public_port_ownership
+SET lease_id = md5(
+    protocol || ':' || public_port::text || ':' || ctid::text || ':' ||
+    random()::text || ':' || clock_timestamp()::text
+)::uuid::text;
+ALTER TABLE linklake_public_port_ownership
+    ALTER COLUMN lease_id SET NOT NULL;
+
+ALTER TABLE linklake_job_leases
+    ADD COLUMN lease_id TEXT;
+UPDATE linklake_job_leases
+SET lease_id = md5(
+    job_key || ':' || ctid::text || ':' || random()::text || ':' ||
+    clock_timestamp()::text
+)::uuid::text;
+ALTER TABLE linklake_job_leases
+    ALTER COLUMN lease_id SET NOT NULL;
+"#;
+
 struct Migration {
     version: i64,
     name: &'static str,
@@ -152,6 +175,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 2,
         name: MIGRATION_V2_NAME,
         sql: MIGRATION_V2_SQL,
+    },
+    Migration {
+        version: 3,
+        name: MIGRATION_V3_NAME,
+        sql: MIGRATION_V3_SQL,
     },
 ];
 
@@ -272,6 +300,7 @@ async fn verify_schema_structure(transaction: &Transaction<'_>) -> anyhow::Resul
             &[
                 "protocol",
                 "public_port",
+                "lease_id",
                 "owner_instance_id",
                 "owner_incarnation_id",
                 "fencing_token",
@@ -283,6 +312,7 @@ async fn verify_schema_structure(transaction: &Transaction<'_>) -> anyhow::Resul
             &[
                 "job_key",
                 "job_kind",
+                "lease_id",
                 "owner_instance_id",
                 "owner_incarnation_id",
                 "fencing_token",

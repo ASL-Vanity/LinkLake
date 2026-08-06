@@ -530,7 +530,7 @@ impl HaCoordinator {
         Ok(())
     }
 
-    /// 锁定 leader 行并验证当前进程身份；调用方必须在同一 PostgreSQL 事务完成写入。
+    /// 共享锁定 leader/member 行并验证当前进程身份；调用方必须在同一事务完成写入。
     pub(crate) async fn assert_postgres_transaction_fence(
         &self,
         transaction: &PostgresTransaction<'_>,
@@ -542,7 +542,7 @@ impl HaCoordinator {
             .query_opt(
                 "SELECT instance_id, incarnation_id, fencing_token,
                     lease_until > clock_timestamp()
-                 FROM linklake_ha_leader WHERE singleton_id = 1 FOR UPDATE",
+                 FROM linklake_ha_leader WHERE singleton_id = 1 FOR SHARE",
                 &[],
             )
             .await?;
@@ -553,7 +553,15 @@ impl HaCoordinator {
                 && row.get::<_, bool>(3)
         });
         let member_active = if current {
-            postgres_member_is_active(transaction, &self.instance_id, &self.incarnation_id).await?
+            transaction
+                .query_opt(
+                    "SELECT lease_until > clock_timestamp()
+                     FROM linklake_ha_members
+                     WHERE instance_id = $1 AND incarnation_id = $2 FOR SHARE",
+                    &[&self.instance_id, &self.incarnation_id],
+                )
+                .await?
+                .is_some_and(|row| row.get(0))
         } else {
             false
         };

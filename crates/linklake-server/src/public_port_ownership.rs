@@ -11,6 +11,7 @@ const SQLITE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS public_port_ownership (
     protocol TEXT NOT NULL CHECK(protocol IN ('tcp', 'udp')),
     public_port INTEGER NOT NULL CHECK(public_port BETWEEN 1 AND 65535),
+    lease_id TEXT NOT NULL,
     owner_instance_id TEXT NOT NULL,
     owner_incarnation_id TEXT NOT NULL,
     fencing_token INTEGER NOT NULL CHECK(fencing_token > 0),
@@ -71,6 +72,7 @@ impl FromStr for PublicPortProtocol {
 pub(crate) struct PublicPortLease {
     pub(crate) protocol: PublicPortProtocol,
     pub(crate) public_port: u16,
+    pub(crate) lease_id: Uuid,
     pub(crate) owner_instance_id: String,
     pub(crate) owner_incarnation_id: String,
     pub(crate) fencing_token: u64,
@@ -90,10 +92,7 @@ impl PublicPortOwnership {
     pub(crate) fn open(coordinator: HaCoordinator, lease: Duration) -> anyhow::Result<Self> {
         let lease_seconds = lease_seconds(lease)?;
         if let CoordinationStorage::Sqlite(database) = coordinator.storage() {
-            database.with_connection(|connection| {
-                connection.execute_batch(SQLITE_SCHEMA)?;
-                Ok(())
-            })?;
+            database.with_transaction(ensure_sqlite_schema)?;
         }
         Ok(Self {
             coordinator,
@@ -101,7 +100,7 @@ impl PublicPortOwnership {
         })
     }
 
-    pub(crate) async fn acquire_or_renew(
+    pub(crate) async fn acquire(
         &self,
         protocol: PublicPortProtocol,
         public_port: u16,
@@ -120,47 +119,22 @@ impl PublicPortOwnership {
                     self.coordinator.instance_id(),
                     self.coordinator.incarnation_id(),
                     fencing_token,
-                    policy_id,
                     now,
                 )?;
                 match mode {
                     ClaimMode::Conflict => Ok(None),
-                    ClaimMode::Renew => {
-                        let lease_until = now.saturating_add(self.lease_seconds);
-                        let changed = transaction.execute(
-                            "UPDATE public_port_ownership
-                             SET renewed_unix_seconds = ?7, lease_until_unix_seconds = ?8
-                             WHERE protocol = ?1 AND public_port = ?2
-                               AND owner_instance_id = ?3 AND owner_incarnation_id = ?4
-                               AND fencing_token = ?5 AND policy_id = ?6
-                               AND lease_until_unix_seconds > ?7",
-                            params![
-                                protocol.as_str(),
-                                i64::from(public_port),
-                                self.coordinator.instance_id(),
-                                self.coordinator.incarnation_id(),
-                                as_i64(fencing_token)?,
-                                policy_id.to_string(),
-                                as_i64(now)?,
-                                as_i64(lease_until)?,
-                            ],
-                        )?;
-                        anyhow::ensure!(changed == 1, "public port lease changed during renewal");
-                        read_sqlite_lease(transaction, protocol, public_port)?
-                            .ok_or_else(|| {
-                                anyhow::anyhow!("public port lease disappeared after renewal")
-                            })
-                            .map(Some)
-                    }
                     ClaimMode::Fresh => {
+                        let lease_id = Uuid::new_v4();
                         let lease_until = now.saturating_add(self.lease_seconds);
                         let changed = transaction.execute(
                             "INSERT INTO public_port_ownership(
-                                 protocol, public_port, owner_instance_id, owner_incarnation_id,
-                                 fencing_token, policy_id, acquired_unix_seconds,
-                                 renewed_unix_seconds, lease_until_unix_seconds
-                             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)
+                                 protocol, public_port, lease_id, owner_instance_id,
+                                 owner_incarnation_id, fencing_token, policy_id,
+                                 acquired_unix_seconds, renewed_unix_seconds,
+                                 lease_until_unix_seconds
+                             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9)
                              ON CONFLICT(protocol, public_port) DO UPDATE SET
+                                 lease_id = excluded.lease_id,
                                  owner_instance_id = excluded.owner_instance_id,
                                  owner_incarnation_id = excluded.owner_incarnation_id,
                                  fencing_token = excluded.fencing_token,
@@ -171,6 +145,7 @@ impl PublicPortOwnership {
                             params![
                                 protocol.as_str(),
                                 i64::from(public_port),
+                                lease_id.to_string(),
                                 self.coordinator.instance_id(),
                                 self.coordinator.incarnation_id(),
                                 as_i64(fencing_token)?,
@@ -203,40 +178,98 @@ impl PublicPortOwnership {
                     self.coordinator.instance_id(),
                     self.coordinator.incarnation_id(),
                     fencing_token,
-                    policy_id,
                     now,
                 )?;
                 let lease = match mode {
                     ClaimMode::Conflict => None,
-                    ClaimMode::Renew => Some(
-                        renew_postgres_lease(
-                            &transaction,
-                            protocol,
-                            public_port,
-                            self.coordinator.instance_id(),
-                            self.coordinator.incarnation_id(),
-                            fencing_token,
-                            policy_id,
-                            now,
-                            now.saturating_add(self.lease_seconds),
+                    ClaimMode::Fresh => {
+                        let lease_id = Uuid::new_v4();
+                        Some(
+                            replace_postgres_lease(
+                                &transaction,
+                                protocol,
+                                public_port,
+                                lease_id,
+                                self.coordinator.instance_id(),
+                                self.coordinator.incarnation_id(),
+                                fencing_token,
+                                policy_id,
+                                now,
+                                now.saturating_add(self.lease_seconds),
+                            )
+                            .await?,
                         )
-                        .await?,
-                    ),
-                    ClaimMode::Fresh => Some(
-                        replace_postgres_lease(
-                            &transaction,
-                            protocol,
-                            public_port,
-                            self.coordinator.instance_id(),
-                            self.coordinator.incarnation_id(),
-                            fencing_token,
-                            policy_id,
-                            now,
-                            now.saturating_add(self.lease_seconds),
-                        )
-                        .await?,
-                    ),
+                    }
                 };
+                transaction.commit().await?;
+                Ok(lease)
+            }
+        }
+    }
+
+    pub(crate) async fn renew(
+        &self,
+        protocol: PublicPortProtocol,
+        public_port: u16,
+        policy_id: Uuid,
+        lease_id: Uuid,
+        fencing_token: u64,
+    ) -> anyhow::Result<Option<PublicPortLease>> {
+        validate_port_and_fence(public_port, fencing_token)?;
+        match self.coordinator.storage() {
+            CoordinationStorage::Sqlite(database) => database.with_transaction(|transaction| {
+                self.coordinator
+                    .assert_sqlite_transaction_fence(transaction, fencing_token)?;
+                let now = sqlite_now(transaction)?;
+                let lease_until = now.saturating_add(self.lease_seconds);
+                let changed = transaction.execute(
+                    "UPDATE public_port_ownership
+                     SET renewed_unix_seconds = ?8, lease_until_unix_seconds = ?9
+                     WHERE protocol = ?1 AND public_port = ?2 AND lease_id = ?3
+                       AND owner_instance_id = ?4 AND owner_incarnation_id = ?5
+                       AND fencing_token = ?6 AND policy_id = ?7
+                       AND lease_until_unix_seconds > ?8",
+                    params![
+                        protocol.as_str(),
+                        i64::from(public_port),
+                        lease_id.to_string(),
+                        self.coordinator.instance_id(),
+                        self.coordinator.incarnation_id(),
+                        as_i64(fencing_token)?,
+                        policy_id.to_string(),
+                        as_i64(now)?,
+                        as_i64(lease_until)?,
+                    ],
+                )?;
+                anyhow::ensure!(changed <= 1, "multiple public port leases were renewed");
+                if changed == 0 {
+                    return Ok(None);
+                }
+                read_sqlite_lease(transaction, protocol, public_port)?
+                    .map(Some)
+                    .ok_or_else(|| anyhow::anyhow!("public port lease disappeared after renewal"))
+            }),
+            CoordinationStorage::Postgres(_) => {
+                let mut client = self.coordinator.storage().postgres_client().await?;
+                let transaction = client.transaction().await?;
+                self.coordinator
+                    .assert_postgres_transaction_fence(&transaction, fencing_token)
+                    .await?;
+                lock_postgres_port(&transaction, protocol, public_port).await?;
+                let now = postgres_now(&transaction).await?;
+                let lease = renew_postgres_lease(
+                    &transaction,
+                    protocol,
+                    public_port,
+                    lease_id,
+                    self.coordinator.instance_id(),
+                    self.coordinator.incarnation_id(),
+                    fencing_token,
+                    policy_id,
+                    now,
+                    now.saturating_add(self.lease_seconds),
+                )
+                .await?;
                 transaction.commit().await?;
                 Ok(lease)
             }
@@ -248,6 +281,7 @@ impl PublicPortOwnership {
         protocol: PublicPortProtocol,
         public_port: u16,
         policy_id: Uuid,
+        lease_id: Uuid,
         fencing_token: u64,
     ) -> anyhow::Result<bool> {
         validate_port_and_fence(public_port, fencing_token)?;
@@ -257,11 +291,13 @@ impl PublicPortOwnership {
                     .assert_sqlite_transaction_fence(transaction, fencing_token)?;
                 Ok(transaction.execute(
                     "DELETE FROM public_port_ownership
-                     WHERE protocol = ?1 AND public_port = ?2 AND owner_instance_id = ?3
-                       AND owner_incarnation_id = ?4 AND fencing_token = ?5 AND policy_id = ?6",
+                     WHERE protocol = ?1 AND public_port = ?2 AND lease_id = ?3
+                       AND owner_instance_id = ?4 AND owner_incarnation_id = ?5
+                       AND fencing_token = ?6 AND policy_id = ?7",
                     params![
                         protocol.as_str(),
                         i64::from(public_port),
+                        lease_id.to_string(),
                         self.coordinator.instance_id(),
                         self.coordinator.incarnation_id(),
                         as_i64(fencing_token)?,
@@ -279,11 +315,13 @@ impl PublicPortOwnership {
                 let changed = transaction
                     .execute(
                         "DELETE FROM linklake_public_port_ownership
-                         WHERE protocol = $1 AND public_port = $2 AND owner_instance_id = $3
-                           AND owner_incarnation_id = $4 AND fencing_token = $5 AND policy_id = $6",
+                         WHERE protocol = $1 AND public_port = $2 AND lease_id = $3
+                           AND owner_instance_id = $4 AND owner_incarnation_id = $5
+                           AND fencing_token = $6 AND policy_id = $7",
                         &[
                             &protocol.as_str(),
                             &i32::from(public_port),
+                            &lease_id.to_string(),
                             &self.coordinator.instance_id(),
                             &self.coordinator.incarnation_id(),
                             &as_i64(fencing_token)?,
@@ -301,12 +339,23 @@ impl PublicPortOwnership {
         match self.coordinator.storage() {
             CoordinationStorage::Sqlite(database) => database.with_connection(|connection| {
                 let mut statement = connection.prepare(
-                    "SELECT protocol, public_port, owner_instance_id, owner_incarnation_id,
-                            fencing_token, policy_id,
-                            acquired_unix_seconds, renewed_unix_seconds, lease_until_unix_seconds
-                     FROM public_port_ownership
-                     WHERE lease_until_unix_seconds > CAST(unixepoch('now') AS INTEGER)
-                     ORDER BY protocol, public_port",
+                    "SELECT ownership.protocol, ownership.public_port, ownership.lease_id,
+                            ownership.owner_instance_id, ownership.owner_incarnation_id,
+                            ownership.fencing_token, ownership.policy_id,
+                            ownership.acquired_unix_seconds, ownership.renewed_unix_seconds,
+                            ownership.lease_until_unix_seconds
+                     FROM public_port_ownership AS ownership
+                     JOIN ha_leader AS leader
+                       ON leader.instance_id = ownership.owner_instance_id
+                      AND leader.incarnation_id = ownership.owner_incarnation_id
+                      AND leader.fencing_token = ownership.fencing_token
+                     JOIN ha_members AS member
+                       ON member.instance_id = ownership.owner_instance_id
+                      AND member.incarnation_id = ownership.owner_incarnation_id
+                     WHERE ownership.lease_until_unix_seconds > CAST(unixepoch('now') AS INTEGER)
+                       AND leader.lease_until_unix_seconds > CAST(unixepoch('now') AS INTEGER)
+                       AND member.lease_until_unix_seconds > CAST(unixepoch('now') AS INTEGER)
+                     ORDER BY ownership.protocol, ownership.public_port",
                 )?;
                 let rows = statement.query_map([], sqlite_lease_row)?;
                 rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -315,14 +364,24 @@ impl PublicPortOwnership {
                 let client = self.coordinator.storage().postgres_client().await?;
                 client
                     .query(
-                        "SELECT protocol, public_port, owner_instance_id, owner_incarnation_id,
-                            fencing_token, policy_id,
-                            CAST(EXTRACT(EPOCH FROM acquired_at) AS BIGINT),
-                            CAST(EXTRACT(EPOCH FROM renewed_at) AS BIGINT),
-                            CAST(EXTRACT(EPOCH FROM lease_until) AS BIGINT)
-                         FROM linklake_public_port_ownership
-                         WHERE lease_until > clock_timestamp()
-                         ORDER BY protocol, public_port",
+                        "SELECT ownership.protocol, ownership.public_port, ownership.lease_id,
+                            ownership.owner_instance_id, ownership.owner_incarnation_id,
+                            ownership.fencing_token, ownership.policy_id,
+                            CAST(EXTRACT(EPOCH FROM ownership.acquired_at) AS BIGINT),
+                            CAST(EXTRACT(EPOCH FROM ownership.renewed_at) AS BIGINT),
+                            CAST(EXTRACT(EPOCH FROM ownership.lease_until) AS BIGINT)
+                         FROM linklake_public_port_ownership AS ownership
+                         JOIN linklake_ha_leader AS leader
+                           ON leader.instance_id = ownership.owner_instance_id
+                          AND leader.incarnation_id = ownership.owner_incarnation_id
+                          AND leader.fencing_token = ownership.fencing_token
+                         JOIN linklake_ha_members AS member
+                           ON member.instance_id = ownership.owner_instance_id
+                          AND member.incarnation_id = ownership.owner_incarnation_id
+                         WHERE ownership.lease_until > clock_timestamp()
+                           AND leader.lease_until > clock_timestamp()
+                           AND member.lease_until > clock_timestamp()
+                         ORDER BY ownership.protocol, ownership.public_port",
                         &[],
                     )
                     .await?
@@ -356,10 +415,68 @@ impl PublicPortOwnership {
     }
 }
 
+fn ensure_sqlite_schema(transaction: &SqliteTransaction<'_>) -> anyhow::Result<()> {
+    transaction.execute_batch(SQLITE_SCHEMA)?;
+    if sqlite_column_is_required(transaction, "public_port_ownership", "lease_id")? {
+        return Ok(());
+    }
+
+    // 旧开发构建可能已经创建过不含租约身份的表。DDL 与数据复制必须处于同一事务，
+    // 新身份会主动使重启前遗留的 worker 失效，避免它们误操作升级后的租约。
+    anyhow::ensure!(
+        !sqlite_table_exists(transaction, "public_port_ownership_lease_upgrade")?,
+        "unfinished public port lease schema upgrade was detected"
+    );
+    transaction.execute_batch(
+        "ALTER TABLE public_port_ownership
+             RENAME TO public_port_ownership_lease_upgrade;
+         DROP INDEX IF EXISTS public_port_ownership_owner;",
+    )?;
+    transaction.execute_batch(SQLITE_SCHEMA)?;
+    transaction.execute(
+        "INSERT INTO public_port_ownership(
+             protocol, public_port, lease_id, owner_instance_id, owner_incarnation_id,
+             fencing_token, policy_id, acquired_unix_seconds, renewed_unix_seconds,
+             lease_until_unix_seconds
+         )
+         SELECT protocol, public_port, lower(hex(randomblob(16))), owner_instance_id,
+                owner_incarnation_id, fencing_token, policy_id, acquired_unix_seconds,
+                renewed_unix_seconds, lease_until_unix_seconds
+         FROM public_port_ownership_lease_upgrade",
+        [],
+    )?;
+    transaction.execute_batch("DROP TABLE public_port_ownership_lease_upgrade;")?;
+    Ok(())
+}
+
+fn sqlite_column_is_required(
+    transaction: &SqliteTransaction<'_>,
+    table: &str,
+    column: &str,
+) -> anyhow::Result<bool> {
+    let mut statement = transaction.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, String>(1)? == column {
+            return Ok(row.get::<_, i64>(3)? == 1);
+        }
+    }
+    Ok(false)
+}
+
+fn sqlite_table_exists(transaction: &SqliteTransaction<'_>, table: &str) -> anyhow::Result<bool> {
+    Ok(transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1
+         )",
+        [table],
+        |row| row.get(0),
+    )?)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ClaimMode {
     Conflict,
-    Renew,
     Fresh,
 }
 
@@ -368,7 +485,6 @@ fn claim_mode(
     owner_instance_id: &str,
     owner_incarnation_id: &str,
     fencing_token: u64,
-    policy_id: Uuid,
     now: u64,
 ) -> anyhow::Result<ClaimMode> {
     let Some(current) = current else {
@@ -388,10 +504,7 @@ fn claim_mode(
     if current.lease_until_unix_seconds <= now {
         return Ok(ClaimMode::Fresh);
     }
-    if current.policy_id != policy_id {
-        return Ok(ClaimMode::Conflict);
-    }
-    Ok(ClaimMode::Renew)
+    Ok(ClaimMode::Conflict)
 }
 
 fn read_sqlite_lease(
@@ -401,7 +514,7 @@ fn read_sqlite_lease(
 ) -> anyhow::Result<Option<PublicPortLease>> {
     transaction
         .query_row(
-            "SELECT protocol, public_port, owner_instance_id, owner_incarnation_id,
+            "SELECT protocol, public_port, lease_id, owner_instance_id, owner_incarnation_id,
                     fencing_token, policy_id,
                     acquired_unix_seconds, renewed_unix_seconds, lease_until_unix_seconds
              FROM public_port_ownership WHERE protocol = ?1 AND public_port = ?2",
@@ -426,21 +539,25 @@ fn sqlite_lease_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PublicPortLease
     if public_port == 0 {
         return Err(rusqlite::Error::IntegralValueOutOfRange(1, 0));
     }
-    let policy_id = Uuid::parse_str(&row.get::<_, String>(5)?).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(error))
+    let lease_id = Uuid::parse_str(&row.get::<_, String>(2)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let policy_id = Uuid::parse_str(&row.get::<_, String>(6)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(error))
     })?;
     Ok(PublicPortLease {
         protocol,
         public_port,
-        owner_instance_id: row.get(2)?,
-        owner_incarnation_id: row.get(3)?,
-        fencing_token: positive(row.get(4)?, "public port fencing token").map_err(sqlite_error)?,
+        lease_id,
+        owner_instance_id: row.get(3)?,
+        owner_incarnation_id: row.get(4)?,
+        fencing_token: positive(row.get(5)?, "public port fencing token").map_err(sqlite_error)?,
         policy_id,
-        acquired_unix_seconds: nonnegative(row.get(6)?, "public port acquired time")
+        acquired_unix_seconds: nonnegative(row.get(7)?, "public port acquired time")
             .map_err(sqlite_error)?,
-        renewed_unix_seconds: nonnegative(row.get(7)?, "public port renewed time")
+        renewed_unix_seconds: nonnegative(row.get(8)?, "public port renewed time")
             .map_err(sqlite_error)?,
-        lease_until_unix_seconds: nonnegative(row.get(8)?, "public port lease time")
+        lease_until_unix_seconds: nonnegative(row.get(9)?, "public port lease time")
             .map_err(sqlite_error)?,
     })
 }
@@ -452,7 +569,7 @@ async fn read_postgres_lease_for_update(
 ) -> anyhow::Result<Option<PublicPortLease>> {
     transaction
         .query_opt(
-            "SELECT protocol, public_port, owner_instance_id, owner_incarnation_id,
+            "SELECT protocol, public_port, lease_id, owner_instance_id, owner_incarnation_id,
                 fencing_token, policy_id,
                 CAST(EXTRACT(EPOCH FROM acquired_at) AS BIGINT),
                 CAST(EXTRACT(EPOCH FROM renewed_at) AS BIGINT),
@@ -470,28 +587,31 @@ async fn renew_postgres_lease(
     transaction: &PostgresTransaction<'_>,
     protocol: PublicPortProtocol,
     public_port: u16,
+    lease_id: Uuid,
     owner_instance_id: &str,
     owner_incarnation_id: &str,
     fencing_token: u64,
     policy_id: Uuid,
     now: u64,
     lease_until: u64,
-) -> anyhow::Result<PublicPortLease> {
-    let row = transaction
+) -> anyhow::Result<Option<PublicPortLease>> {
+    transaction
         .query_opt(
             "UPDATE linklake_public_port_ownership
-             SET renewed_at = to_timestamp($7), lease_until = to_timestamp($8)
-             WHERE protocol = $1 AND public_port = $2 AND owner_instance_id = $3
-               AND owner_incarnation_id = $4 AND fencing_token = $5 AND policy_id = $6
-               AND lease_until > to_timestamp($7)
-             RETURNING protocol, public_port, owner_instance_id, owner_incarnation_id,
-                 fencing_token, policy_id,
+             SET renewed_at = to_timestamp($8), lease_until = to_timestamp($9)
+             WHERE protocol = $1 AND public_port = $2 AND lease_id = $3
+               AND owner_instance_id = $4 AND owner_incarnation_id = $5
+               AND fencing_token = $6 AND policy_id = $7
+               AND lease_until > to_timestamp($8)
+             RETURNING protocol, public_port, lease_id, owner_instance_id,
+                 owner_incarnation_id, fencing_token, policy_id,
                  CAST(EXTRACT(EPOCH FROM acquired_at) AS BIGINT),
                  CAST(EXTRACT(EPOCH FROM renewed_at) AS BIGINT),
                  CAST(EXTRACT(EPOCH FROM lease_until) AS BIGINT)",
             &[
                 &protocol.as_str(),
                 &i32::from(public_port),
+                &lease_id.to_string(),
                 &owner_instance_id,
                 &owner_incarnation_id,
                 &as_i64(fencing_token)?,
@@ -501,14 +621,15 @@ async fn renew_postgres_lease(
             ],
         )
         .await?
-        .ok_or_else(|| anyhow::anyhow!("public port lease changed during renewal"))?;
-    postgres_lease(&row)
+        .map(|row| postgres_lease(&row))
+        .transpose()
 }
 
 async fn replace_postgres_lease(
     transaction: &PostgresTransaction<'_>,
     protocol: PublicPortProtocol,
     public_port: u16,
+    lease_id: Uuid,
     owner_instance_id: &str,
     owner_incarnation_id: &str,
     fencing_token: u64,
@@ -519,11 +640,13 @@ async fn replace_postgres_lease(
     let row = transaction
         .query_one(
             "INSERT INTO linklake_public_port_ownership(
-                 protocol, public_port, owner_instance_id, owner_incarnation_id,
+                 protocol, public_port, lease_id, owner_instance_id, owner_incarnation_id,
                  fencing_token, policy_id,
                  acquired_at, renewed_at, lease_until
-             ) VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7), to_timestamp($7), to_timestamp($8))
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7,
+                 to_timestamp($8), to_timestamp($8), to_timestamp($9))
              ON CONFLICT(protocol, public_port) DO UPDATE SET
+                 lease_id = EXCLUDED.lease_id,
                  owner_instance_id = EXCLUDED.owner_instance_id,
                  owner_incarnation_id = EXCLUDED.owner_incarnation_id,
                  fencing_token = EXCLUDED.fencing_token,
@@ -531,14 +654,15 @@ async fn replace_postgres_lease(
                  acquired_at = EXCLUDED.acquired_at,
                  renewed_at = EXCLUDED.renewed_at,
                  lease_until = EXCLUDED.lease_until
-             RETURNING protocol, public_port, owner_instance_id, owner_incarnation_id,
-                 fencing_token, policy_id,
+             RETURNING protocol, public_port, lease_id, owner_instance_id,
+                 owner_incarnation_id, fencing_token, policy_id,
                  CAST(EXTRACT(EPOCH FROM acquired_at) AS BIGINT),
                  CAST(EXTRACT(EPOCH FROM renewed_at) AS BIGINT),
                  CAST(EXTRACT(EPOCH FROM lease_until) AS BIGINT)",
             &[
                 &protocol.as_str(),
                 &i32::from(public_port),
+                &lease_id.to_string(),
                 &owner_instance_id,
                 &owner_incarnation_id,
                 &as_i64(fencing_token)?,
@@ -558,13 +682,14 @@ fn postgres_lease(row: &tokio_postgres::Row) -> anyhow::Result<PublicPortLease> 
     Ok(PublicPortLease {
         protocol: row.get::<_, String>(0).parse()?,
         public_port,
-        owner_instance_id: row.get(2),
-        owner_incarnation_id: row.get(3),
-        fencing_token: positive(row.get(4), "public port fencing token")?,
-        policy_id: Uuid::parse_str(&row.get::<_, String>(5))?,
-        acquired_unix_seconds: nonnegative(row.get(6), "public port acquired time")?,
-        renewed_unix_seconds: nonnegative(row.get(7), "public port renewed time")?,
-        lease_until_unix_seconds: nonnegative(row.get(8), "public port lease time")?,
+        lease_id: Uuid::parse_str(&row.get::<_, String>(2))?,
+        owner_instance_id: row.get(3),
+        owner_incarnation_id: row.get(4),
+        fencing_token: positive(row.get(5), "public port fencing token")?,
+        policy_id: Uuid::parse_str(&row.get::<_, String>(6))?,
+        acquired_unix_seconds: nonnegative(row.get(7), "public port acquired time")?,
+        renewed_unix_seconds: nonnegative(row.get(8), "public port renewed time")?,
+        lease_until_unix_seconds: nonnegative(row.get(9), "public port lease time")?,
     })
 }
 
