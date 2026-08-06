@@ -63,6 +63,27 @@ void main() {
     expect(loaded.closeToTray, isTrue);
   });
 
+  test('legacy material names migrate without losing appearance intent', () {
+    expect(
+      ManagerSettings.fromJson(const {'theme_style': 'lake'}).themeStyle,
+      ManagerThemeStyle.aurora,
+    );
+    expect(
+      ManagerSettings.fromJson(const {'theme_style': 'graphite'}).themeStyle,
+      ManagerThemeStyle.highContrast,
+    );
+    expect(
+      ManagerSettings.fromJson(const {'theme_style': 'paper'}).themeStyle,
+      ManagerThemeStyle.paper,
+    );
+    for (final style in ManagerThemeStyle.values) {
+      expect(
+        ManagerSettings.fromJson({'theme_style': style.name}).themeStyle,
+        style,
+      );
+    }
+  });
+
   test(
     'corrupt primary preferences fall back to the last valid backup',
     () async {

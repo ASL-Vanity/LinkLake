@@ -85,7 +85,7 @@ class ManagerSettings {
   const ManagerSettings({
     this.chinese = true,
     this.themeMode = ThemeMode.system,
-    this.themeStyle = ManagerThemeStyle.lake,
+    this.themeStyle = ManagerThemeStyle.aurora,
     this.lastServerUrl = 'https://link.odelake.com',
     this.closeToTray = true,
     this.launchAtStartup = false,

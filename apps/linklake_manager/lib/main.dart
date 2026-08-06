@@ -827,19 +827,18 @@ class _DashboardPageState extends State<DashboardPage> {
                     ),
                   ),
                   const SizedBox(height: 8),
-                  Row(
+                  Wrap(
                     key: const Key('theme-style-picker'),
+                    spacing: 8,
+                    runSpacing: 8,
                     children: [
-                      for (final style in ManagerThemeStyle.values) ...[
+                      for (final style in ManagerThemeStyle.values)
                         ThemeStylePreview(
                           style: style,
                           selected: themeStyle == style,
                           chinese: language,
                           onTap: () => setDialogState(() => themeStyle = style),
                         ),
-                        if (style != ManagerThemeStyle.values.last)
-                          const SizedBox(width: 8),
-                      ],
                     ],
                   ),
                   const SizedBox(height: 12),
@@ -3246,13 +3245,18 @@ class _LakeBackground extends StatelessWidget {
   const _LakeBackground();
 
   @override
-  Widget build(BuildContext context) => DecoratedBox(
-    decoration: const BoxDecoration(
-      gradient: LinearGradient(
-        colors: [Color(0xFFE0F2FE), Color(0xFFF0FDFA), Color(0xFFF8FAFC)],
-        begin: Alignment.topLeft,
-        end: Alignment.bottomRight,
+  Widget build(BuildContext context) {
+    final material = Theme.of(context).extension<ManagerMaterialTheme>();
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          colors:
+              material?.backgroundColors ??
+              const [Color(0xFFE0F2FE), Color(0xFFF0FDFA), Color(0xFFF8FAFC)],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
       ),
-    ),
-  );
+    );
+  }
 }
