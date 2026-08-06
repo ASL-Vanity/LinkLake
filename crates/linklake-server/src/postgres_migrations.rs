@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use tokio_postgres::{Client, Transaction};
 
-pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 1;
+pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 2;
 const ADVISORY_LOCK_ID: i64 = 0x4c4c_4841_4d49_4752;
 
 const MIGRATION_V1_NAME: &str = "ha_coordination_foundation";
@@ -108,17 +108,52 @@ CREATE INDEX IF NOT EXISTS linklake_fleet_conflicts_source_state
     ON linklake_fleet_conflicts(source_instance_id, state, detected_at DESC);
 "#;
 
+const MIGRATION_V2_NAME: &str = "ha_incarnation_fencing";
+const MIGRATION_V2_SQL: &str = r#"
+ALTER TABLE linklake_ha_members
+    ADD COLUMN incarnation_id TEXT NOT NULL DEFAULT 'legacy';
+ALTER TABLE linklake_ha_members
+    ALTER COLUMN incarnation_id DROP DEFAULT;
+
+ALTER TABLE linklake_ha_leader
+    ADD COLUMN incarnation_id TEXT NOT NULL DEFAULT 'legacy';
+ALTER TABLE linklake_ha_leader
+    ALTER COLUMN incarnation_id DROP DEFAULT;
+
+ALTER TABLE linklake_public_port_ownership
+    ADD COLUMN owner_incarnation_id TEXT NOT NULL DEFAULT 'legacy';
+ALTER TABLE linklake_public_port_ownership
+    ALTER COLUMN owner_incarnation_id DROP DEFAULT;
+
+ALTER TABLE linklake_job_leases
+    ADD COLUMN owner_incarnation_id TEXT NOT NULL DEFAULT 'legacy';
+ALTER TABLE linklake_job_leases
+    ALTER COLUMN owner_incarnation_id DROP DEFAULT;
+
+ALTER TABLE linklake_fleet_generations
+    ADD COLUMN owner_incarnation_id TEXT NOT NULL DEFAULT 'legacy';
+ALTER TABLE linklake_fleet_generations
+    ALTER COLUMN owner_incarnation_id DROP DEFAULT;
+"#;
+
 struct Migration {
     version: i64,
     name: &'static str,
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: MIGRATION_V1_NAME,
-    sql: MIGRATION_V1_SQL,
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: MIGRATION_V1_NAME,
+        sql: MIGRATION_V1_SQL,
+    },
+    Migration {
+        version: 2,
+        name: MIGRATION_V2_NAME,
+        sql: MIGRATION_V2_SQL,
+    },
+];
 
 pub(crate) async fn apply(client: &mut Client) -> anyhow::Result<()> {
     let transaction = client.transaction().await?;
@@ -213,6 +248,7 @@ async fn verify_schema_structure(transaction: &Transaction<'_>) -> anyhow::Resul
             "linklake_ha_members",
             &[
                 "instance_id",
+                "incarnation_id",
                 "last_seen_at",
                 "lease_until",
                 "metadata_json",
@@ -224,7 +260,12 @@ async fn verify_schema_structure(transaction: &Transaction<'_>) -> anyhow::Resul
         ),
         (
             "linklake_ha_leader",
-            &["instance_id", "fencing_token", "lease_until"],
+            &[
+                "instance_id",
+                "incarnation_id",
+                "fencing_token",
+                "lease_until",
+            ],
         ),
         (
             "linklake_public_port_ownership",
@@ -232,6 +273,7 @@ async fn verify_schema_structure(transaction: &Transaction<'_>) -> anyhow::Resul
                 "protocol",
                 "public_port",
                 "owner_instance_id",
+                "owner_incarnation_id",
                 "fencing_token",
                 "lease_until",
             ],
@@ -242,6 +284,7 @@ async fn verify_schema_structure(transaction: &Transaction<'_>) -> anyhow::Resul
                 "job_key",
                 "job_kind",
                 "owner_instance_id",
+                "owner_incarnation_id",
                 "fencing_token",
                 "lease_until",
             ],
@@ -263,6 +306,7 @@ async fn verify_schema_structure(transaction: &Transaction<'_>) -> anyhow::Resul
                 "source_instance_id",
                 "generation",
                 "owner_instance_id",
+                "owner_incarnation_id",
                 "fencing_token",
                 "sync_progress",
             ],

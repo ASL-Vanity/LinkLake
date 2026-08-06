@@ -7,10 +7,17 @@ use rusqlite::{
 use serde::Serialize;
 use std::{io, time::Duration};
 use tokio_postgres::{Row as PostgresRow, Transaction as PostgresTransaction};
+use uuid::Uuid;
+
+const MAX_INSTANCE_ID_BYTES: usize = 128;
+const MAX_METADATA_JSON_BYTES: usize = 16 * 1024;
+const MAX_LEASE_SECONDS: u64 = 24 * 60 * 60;
+const POSTGRES_INSTANCE_LOCK_SEED: i64 = 0x4c4c_4841_494e_5354;
 
 const SQLITE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS ha_members (
     instance_id TEXT PRIMARY KEY NOT NULL,
+    incarnation_id TEXT NOT NULL,
     started_unix_seconds INTEGER NOT NULL,
     last_seen_unix_seconds INTEGER NOT NULL,
     lease_until_unix_seconds INTEGER NOT NULL,
@@ -25,6 +32,7 @@ INSERT OR IGNORE INTO ha_fencing_sequence(singleton_id, next_token) VALUES (1, 1
 CREATE TABLE IF NOT EXISTS ha_leader (
     singleton_id INTEGER PRIMARY KEY NOT NULL CHECK(singleton_id = 1),
     instance_id TEXT NOT NULL,
+    incarnation_id TEXT NOT NULL,
     fencing_token INTEGER NOT NULL CHECK(fencing_token > 0),
     acquired_unix_seconds INTEGER NOT NULL,
     renewed_unix_seconds INTEGER NOT NULL,
@@ -35,6 +43,7 @@ CREATE TABLE IF NOT EXISTS ha_leader (
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct HaMember {
     pub(crate) instance_id: String,
+    pub(crate) incarnation_id: String,
     pub(crate) started_unix_seconds: u64,
     pub(crate) last_seen_unix_seconds: u64,
     pub(crate) lease_until_unix_seconds: u64,
@@ -44,6 +53,7 @@ pub(crate) struct HaMember {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct LeadershipLease {
     pub(crate) instance_id: String,
+    pub(crate) incarnation_id: String,
     pub(crate) fencing_token: u64,
     pub(crate) acquired_unix_seconds: u64,
     pub(crate) renewed_unix_seconds: u64,
@@ -54,6 +64,7 @@ pub(crate) struct LeadershipLease {
 pub(crate) struct HaCoordinator {
     storage: CoordinationStorage,
     instance_id: String,
+    incarnation_id: String,
     metadata_json: String,
     member_lease_seconds: u64,
     leader_lease_seconds: u64,
@@ -67,11 +78,10 @@ impl HaCoordinator {
         member_lease: Duration,
         leader_lease: Duration,
     ) -> anyhow::Result<Self> {
-        let instance_id = instance_id.into();
-        anyhow::ensure!(!instance_id.trim().is_empty(), "HA instance ID is required");
-        let metadata_json = metadata_json.into();
-        serde_json::from_str::<serde_json::Value>(&metadata_json)
-            .map_err(|error| anyhow::anyhow!("HA member metadata must be valid JSON: {error}"))?;
+        let instance_id = instance_id.into().trim().to_owned();
+        validate_instance_id(&instance_id)?;
+        let metadata_json = normalize_metadata_json(metadata_json.into())?;
+        let incarnation_id = Uuid::new_v4().to_string();
         let member_lease_seconds = lease_seconds(member_lease, "member")?;
         let leader_lease_seconds = lease_seconds(leader_lease, "leader")?;
         if let CoordinationStorage::Sqlite(database) = &storage {
@@ -83,6 +93,7 @@ impl HaCoordinator {
         Ok(Self {
             storage,
             instance_id,
+            incarnation_id,
             metadata_json,
             member_lease_seconds,
             leader_lease_seconds,
@@ -97,57 +108,152 @@ impl HaCoordinator {
         &self.instance_id
     }
 
+    pub(crate) fn incarnation_id(&self) -> &str {
+        &self.incarnation_id
+    }
+
     pub(crate) async fn register_or_renew_member(&self) -> anyhow::Result<HaMember> {
         match &self.storage {
             CoordinationStorage::Sqlite(database) => database.with_transaction(|transaction| {
                 let now = sqlite_now(transaction)?;
                 let lease_until = now.saturating_add(self.member_lease_seconds);
-                transaction.execute(
-                    "INSERT INTO ha_members(
-                         instance_id, started_unix_seconds, last_seen_unix_seconds,
-                         lease_until_unix_seconds, metadata_json
-                     ) VALUES (?1, ?2, ?2, ?3, ?4)
-                     ON CONFLICT(instance_id) DO UPDATE SET
-                         last_seen_unix_seconds = excluded.last_seen_unix_seconds,
-                         lease_until_unix_seconds = excluded.lease_until_unix_seconds,
-                         metadata_json = excluded.metadata_json",
-                    params![
-                        self.instance_id,
-                        as_i64(now)?,
-                        as_i64(lease_until)?,
-                        self.metadata_json,
-                    ],
-                )?;
+                match read_sqlite_member(transaction, &self.instance_id)? {
+                    Some(current) if current.incarnation_id == self.incarnation_id => {
+                        transaction.execute(
+                            "UPDATE ha_members
+                             SET last_seen_unix_seconds = ?3,
+                                 lease_until_unix_seconds = ?4, metadata_json = ?5
+                             WHERE instance_id = ?1 AND incarnation_id = ?2",
+                            params![
+                                self.instance_id,
+                                self.incarnation_id,
+                                as_i64(now)?,
+                                as_i64(lease_until)?,
+                                self.metadata_json,
+                            ],
+                        )?;
+                    }
+                    Some(current) if current.lease_until_unix_seconds > now => {
+                        anyhow::bail!("another incarnation is active for this HA instance ID");
+                    }
+                    Some(_) => {
+                        transaction.execute(
+                            "UPDATE ha_members
+                             SET incarnation_id = ?2, started_unix_seconds = ?3,
+                                 last_seen_unix_seconds = ?3, lease_until_unix_seconds = ?4,
+                                 metadata_json = ?5
+                             WHERE instance_id = ?1",
+                            params![
+                                self.instance_id,
+                                self.incarnation_id,
+                                as_i64(now)?,
+                                as_i64(lease_until)?,
+                                self.metadata_json,
+                            ],
+                        )?;
+                    }
+                    None => {
+                        transaction.execute(
+                            "INSERT INTO ha_members(
+                                 instance_id, incarnation_id, started_unix_seconds,
+                                 last_seen_unix_seconds, lease_until_unix_seconds, metadata_json
+                             ) VALUES (?1, ?2, ?3, ?3, ?4, ?5)",
+                            params![
+                                self.instance_id,
+                                self.incarnation_id,
+                                as_i64(now)?,
+                                as_i64(lease_until)?,
+                                self.metadata_json,
+                            ],
+                        )?;
+                    }
+                }
                 read_sqlite_member(transaction, &self.instance_id)?
                     .ok_or_else(|| anyhow::anyhow!("HA member disappeared after registration"))
             }),
             CoordinationStorage::Postgres(_) => {
                 let mut client = self.storage.postgres_client().await?;
                 let transaction = client.transaction().await?;
+                lock_postgres_instance(&transaction, &self.instance_id).await?;
+                let current =
+                    read_postgres_member_for_update(&transaction, &self.instance_id).await?;
                 let now = postgres_now(&transaction).await?;
                 let lease_until = now.saturating_add(self.member_lease_seconds);
-                let row = transaction
-                    .query_one(
-                        "INSERT INTO linklake_ha_members(
-                             instance_id, started_at, last_seen_at, lease_until, metadata_json
-                         ) VALUES ($1, to_timestamp($2), to_timestamp($2), to_timestamp($3), $4::jsonb)
-                         ON CONFLICT(instance_id) DO UPDATE SET
-                             last_seen_at = EXCLUDED.last_seen_at,
-                             lease_until = EXCLUDED.lease_until,
-                             metadata_json = EXCLUDED.metadata_json
-                         RETURNING instance_id,
-                             CAST(EXTRACT(EPOCH FROM started_at) AS BIGINT),
-                             CAST(EXTRACT(EPOCH FROM last_seen_at) AS BIGINT),
-                             CAST(EXTRACT(EPOCH FROM lease_until) AS BIGINT),
-                             metadata_json::text",
-                        &[
-                            &self.instance_id,
-                            &as_i64(now)?,
-                            &as_i64(lease_until)?,
-                            &self.metadata_json,
-                        ],
-                    )
-                    .await?;
+                let row = match current {
+                    Some(current) if current.incarnation_id == self.incarnation_id => {
+                        transaction
+                            .query_one(
+                                "UPDATE linklake_ha_members
+                                 SET last_seen_at = to_timestamp($3), lease_until = to_timestamp($4),
+                                     metadata_json = $5::jsonb
+                                 WHERE instance_id = $1 AND incarnation_id = $2
+                                 RETURNING instance_id, incarnation_id,
+                                     CAST(EXTRACT(EPOCH FROM started_at) AS BIGINT),
+                                     CAST(EXTRACT(EPOCH FROM last_seen_at) AS BIGINT),
+                                     CAST(EXTRACT(EPOCH FROM lease_until) AS BIGINT),
+                                     metadata_json::text",
+                                &[
+                                    &self.instance_id,
+                                    &self.incarnation_id,
+                                    &as_i64(now)?,
+                                    &as_i64(lease_until)?,
+                                    &self.metadata_json,
+                                ],
+                            )
+                            .await?
+                    }
+                    Some(current) if current.lease_until_unix_seconds > now => {
+                        anyhow::bail!(
+                            "another incarnation is active for this HA instance ID"
+                        );
+                    }
+                    Some(_) => {
+                        transaction
+                            .query_one(
+                                "UPDATE linklake_ha_members
+                                 SET incarnation_id = $2, started_at = to_timestamp($3),
+                                     last_seen_at = to_timestamp($3), lease_until = to_timestamp($4),
+                                     metadata_json = $5::jsonb
+                                 WHERE instance_id = $1
+                                 RETURNING instance_id, incarnation_id,
+                                     CAST(EXTRACT(EPOCH FROM started_at) AS BIGINT),
+                                     CAST(EXTRACT(EPOCH FROM last_seen_at) AS BIGINT),
+                                     CAST(EXTRACT(EPOCH FROM lease_until) AS BIGINT),
+                                     metadata_json::text",
+                                &[
+                                    &self.instance_id,
+                                    &self.incarnation_id,
+                                    &as_i64(now)?,
+                                    &as_i64(lease_until)?,
+                                    &self.metadata_json,
+                                ],
+                            )
+                            .await?
+                    }
+                    None => {
+                        transaction
+                            .query_one(
+                                "INSERT INTO linklake_ha_members(
+                                     instance_id, incarnation_id, started_at, last_seen_at,
+                                     lease_until, metadata_json
+                                 ) VALUES ($1, $2, to_timestamp($3), to_timestamp($3),
+                                     to_timestamp($4), $5::jsonb)
+                                 RETURNING instance_id, incarnation_id,
+                                     CAST(EXTRACT(EPOCH FROM started_at) AS BIGINT),
+                                     CAST(EXTRACT(EPOCH FROM last_seen_at) AS BIGINT),
+                                     CAST(EXTRACT(EPOCH FROM lease_until) AS BIGINT),
+                                     metadata_json::text",
+                                &[
+                                    &self.instance_id,
+                                    &self.incarnation_id,
+                                    &as_i64(now)?,
+                                    &as_i64(lease_until)?,
+                                    &self.metadata_json,
+                                ],
+                            )
+                            .await?
+                    }
+                };
                 let member = postgres_member(&row)?;
                 transaction.commit().await?;
                 Ok(member)
@@ -164,7 +270,7 @@ impl HaCoordinator {
                     |row| row.get(0),
                 )?;
                 let mut statement = connection.prepare(
-                    "SELECT instance_id, started_unix_seconds, last_seen_unix_seconds,
+                    "SELECT instance_id, incarnation_id, started_unix_seconds, last_seen_unix_seconds,
                             lease_until_unix_seconds, metadata_json
                      FROM ha_members WHERE lease_until_unix_seconds > ?1
                      ORDER BY instance_id",
@@ -177,6 +283,7 @@ impl HaCoordinator {
                 client
                     .query(
                         "SELECT instance_id,
+                            incarnation_id,
                             CAST(EXTRACT(EPOCH FROM started_at) AS BIGINT),
                             CAST(EXTRACT(EPOCH FROM last_seen_at) AS BIGINT),
                             CAST(EXTRACT(EPOCH FROM lease_until) AS BIGINT),
@@ -222,6 +329,7 @@ impl HaCoordinator {
                 let current = read_sqlite_leader(transaction)?;
                 if let Some(current) = current {
                     if current.instance_id == self.instance_id
+                        && current.incarnation_id == self.incarnation_id
                         && current.lease_until_unix_seconds > now
                     {
                         return self.renew_sqlite_leader(transaction, current.fencing_token, now);
@@ -240,17 +348,19 @@ impl HaCoordinator {
                 let lease_until = now.saturating_add(self.leader_lease_seconds);
                 transaction.execute(
                     "INSERT INTO ha_leader(
-                         singleton_id, instance_id, fencing_token, acquired_unix_seconds,
-                         renewed_unix_seconds, lease_until_unix_seconds
-                     ) VALUES (1, ?1, ?2, ?3, ?3, ?4)
+                         singleton_id, instance_id, incarnation_id, fencing_token,
+                         acquired_unix_seconds, renewed_unix_seconds, lease_until_unix_seconds
+                     ) VALUES (1, ?1, ?2, ?3, ?4, ?4, ?5)
                      ON CONFLICT(singleton_id) DO UPDATE SET
                          instance_id = excluded.instance_id,
+                         incarnation_id = excluded.incarnation_id,
                          fencing_token = excluded.fencing_token,
                          acquired_unix_seconds = excluded.acquired_unix_seconds,
                          renewed_unix_seconds = excluded.renewed_unix_seconds,
                          lease_until_unix_seconds = excluded.lease_until_unix_seconds",
                     params![
                         self.instance_id,
+                        self.incarnation_id,
                         as_i64(token)?,
                         as_i64(now)?,
                         as_i64(lease_until)?,
@@ -258,6 +368,7 @@ impl HaCoordinator {
                 )?;
                 Ok(Some(LeadershipLease {
                     instance_id: self.instance_id.clone(),
+                    incarnation_id: self.incarnation_id.clone(),
                     fencing_token: token,
                     acquired_unix_seconds: now,
                     renewed_unix_seconds: now,
@@ -280,6 +391,7 @@ impl HaCoordinator {
                 let now = postgres_now(&transaction).await?;
                 let lease = if let Some(current) = current {
                     if current.instance_id == self.instance_id
+                        && current.incarnation_id == self.incarnation_id
                         && current.lease_until_unix_seconds > now
                     {
                         self.renew_postgres_leader(&transaction, current.fencing_token, now)
@@ -320,14 +432,54 @@ impl HaCoordinator {
         }
     }
 
-    pub(crate) async fn assert_current_fence(&self, fencing_token: u64) -> anyhow::Result<()> {
-        let current = self.current_leader().await?;
-        anyhow::ensure!(
-            current.as_ref().is_some_and(|leader| {
-                leader.instance_id == self.instance_id && leader.fencing_token == fencing_token
-            }),
-            "leadership fencing token is stale; refusing write"
-        );
+    /// 必须从 `Database::with_transaction` 创建的 IMMEDIATE 事务内调用，并在同一事务写入。
+    pub(crate) fn assert_sqlite_transaction_fence(
+        &self,
+        transaction: &SqliteTransaction<'_>,
+        fencing_token: u64,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(fencing_token > 0, "fencing token must be positive");
+        let current: bool = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM ha_leader
+                 WHERE singleton_id = 1 AND instance_id = ?1 AND incarnation_id = ?2
+                   AND fencing_token = ?3
+                   AND lease_until_unix_seconds > CAST(unixepoch('now') AS INTEGER)
+             )",
+            params![
+                self.instance_id,
+                self.incarnation_id,
+                as_i64(fencing_token)?,
+            ],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(current, "leadership fencing token is stale; refusing write");
+        Ok(())
+    }
+
+    /// 锁定 leader 行并验证当前进程身份；调用方必须在同一 PostgreSQL 事务完成写入。
+    pub(crate) async fn assert_postgres_transaction_fence(
+        &self,
+        transaction: &PostgresTransaction<'_>,
+        fencing_token: u64,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(fencing_token > 0, "fencing token must be positive");
+        let expected_token = as_i64(fencing_token)?;
+        let row = transaction
+            .query_opt(
+                "SELECT instance_id, incarnation_id, fencing_token,
+                    lease_until > clock_timestamp()
+                 FROM linklake_ha_leader WHERE singleton_id = 1 FOR UPDATE",
+                &[],
+            )
+            .await?;
+        let current = row.is_some_and(|row| {
+            row.get::<_, String>(0) == self.instance_id
+                && row.get::<_, String>(1) == self.incarnation_id
+                && row.get::<_, i64>(2) == expected_token
+                && row.get::<_, bool>(3)
+        });
+        anyhow::ensure!(current, "leadership fencing token is stale; refusing write");
         Ok(())
     }
 
@@ -336,7 +488,7 @@ impl HaCoordinator {
             CoordinationStorage::Sqlite(database) => database.with_connection(|connection| {
                 connection
                     .query_row(
-                        "SELECT instance_id, fencing_token, acquired_unix_seconds,
+                        "SELECT instance_id, incarnation_id, fencing_token, acquired_unix_seconds,
                                 renewed_unix_seconds, lease_until_unix_seconds
                          FROM ha_leader
                          WHERE singleton_id = 1
@@ -351,7 +503,7 @@ impl HaCoordinator {
                 let client = self.storage.postgres_client().await?;
                 client
                     .query_opt(
-                        "SELECT instance_id, fencing_token,
+                        "SELECT instance_id, incarnation_id, fencing_token,
                             CAST(EXTRACT(EPOCH FROM acquired_at) AS BIGINT),
                             CAST(EXTRACT(EPOCH FROM renewed_at) AS BIGINT),
                             CAST(EXTRACT(EPOCH FROM lease_until) AS BIGINT)
@@ -374,11 +526,12 @@ impl HaCoordinator {
     ) -> anyhow::Result<Option<LeadershipLease>> {
         let lease_until = now.saturating_add(self.leader_lease_seconds);
         let changed = transaction.execute(
-            "UPDATE ha_leader SET renewed_unix_seconds = ?3, lease_until_unix_seconds = ?4
-             WHERE singleton_id = 1 AND instance_id = ?1 AND fencing_token = ?2
-               AND lease_until_unix_seconds > ?3",
+            "UPDATE ha_leader SET renewed_unix_seconds = ?4, lease_until_unix_seconds = ?5
+             WHERE singleton_id = 1 AND instance_id = ?1 AND incarnation_id = ?2
+               AND fencing_token = ?3 AND lease_until_unix_seconds > ?4",
             params![
                 self.instance_id,
+                self.incarnation_id,
                 as_i64(fencing_token)?,
                 as_i64(now)?,
                 as_i64(lease_until)?,
@@ -403,15 +556,16 @@ impl HaCoordinator {
         transaction
             .query_opt(
                 "UPDATE linklake_ha_leader
-                 SET renewed_at = to_timestamp($3), lease_until = to_timestamp($4)
-                 WHERE singleton_id = 1 AND instance_id = $1 AND fencing_token = $2
-                   AND lease_until > to_timestamp($3)
-                 RETURNING instance_id, fencing_token,
+                 SET renewed_at = to_timestamp($4), lease_until = to_timestamp($5)
+                 WHERE singleton_id = 1 AND instance_id = $1 AND incarnation_id = $2
+                   AND fencing_token = $3 AND lease_until > to_timestamp($4)
+                 RETURNING instance_id, incarnation_id, fencing_token,
                      CAST(EXTRACT(EPOCH FROM acquired_at) AS BIGINT),
                      CAST(EXTRACT(EPOCH FROM renewed_at) AS BIGINT),
                      CAST(EXTRACT(EPOCH FROM lease_until) AS BIGINT)",
                 &[
                     &self.instance_id,
+                    &self.incarnation_id,
                     &as_i64(fencing_token)?,
                     &as_i64(now)?,
                     &as_i64(lease_until)?,
@@ -439,16 +593,19 @@ impl HaCoordinator {
         transaction
             .execute(
                 "INSERT INTO linklake_ha_leader(
-                     singleton_id, instance_id, fencing_token, acquired_at, renewed_at, lease_until
-                 ) VALUES (1, $1, $2, to_timestamp($3), to_timestamp($3), to_timestamp($4))
+                     singleton_id, instance_id, incarnation_id, fencing_token,
+                     acquired_at, renewed_at, lease_until
+                 ) VALUES (1, $1, $2, $3, to_timestamp($4), to_timestamp($4), to_timestamp($5))
                  ON CONFLICT(singleton_id) DO UPDATE SET
                      instance_id = EXCLUDED.instance_id,
+                     incarnation_id = EXCLUDED.incarnation_id,
                      fencing_token = EXCLUDED.fencing_token,
                      acquired_at = EXCLUDED.acquired_at,
                      renewed_at = EXCLUDED.renewed_at,
                      lease_until = EXCLUDED.lease_until",
                 &[
                     &self.instance_id,
+                    &self.incarnation_id,
                     &as_i64(token)?,
                     &as_i64(now)?,
                     &as_i64(lease_until)?,
@@ -457,6 +614,7 @@ impl HaCoordinator {
             .await?;
         Ok(LeadershipLease {
             instance_id: self.instance_id.clone(),
+            incarnation_id: self.incarnation_id.clone(),
             fencing_token: token,
             acquired_unix_seconds: now,
             renewed_unix_seconds: now,
@@ -471,7 +629,7 @@ fn read_sqlite_member(
 ) -> anyhow::Result<Option<HaMember>> {
     transaction
         .query_row(
-            "SELECT instance_id, started_unix_seconds, last_seen_unix_seconds,
+            "SELECT instance_id, incarnation_id, started_unix_seconds, last_seen_unix_seconds,
                     lease_until_unix_seconds, metadata_json
              FROM ha_members WHERE instance_id = ?1",
             [instance_id],
@@ -482,23 +640,48 @@ fn read_sqlite_member(
 }
 
 fn sqlite_member_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HaMember> {
+    let metadata_json: String = row.get(5)?;
+    validate_metadata_json(&metadata_json).map_err(|error| sqlite_text_error(5, error))?;
     Ok(HaMember {
         instance_id: row.get(0)?,
-        started_unix_seconds: sqlite_nonnegative(row.get(1)?, 1, "member start time")?,
-        last_seen_unix_seconds: sqlite_nonnegative(row.get(2)?, 2, "member last seen time")?,
-        lease_until_unix_seconds: sqlite_nonnegative(row.get(3)?, 3, "member lease time")?,
-        metadata_json: row.get(4)?,
+        incarnation_id: row.get(1)?,
+        started_unix_seconds: sqlite_nonnegative(row.get(2)?, 2, "member start time")?,
+        last_seen_unix_seconds: sqlite_nonnegative(row.get(3)?, 3, "member last seen time")?,
+        lease_until_unix_seconds: sqlite_nonnegative(row.get(4)?, 4, "member lease time")?,
+        metadata_json,
     })
 }
 
 fn postgres_member(row: &PostgresRow) -> anyhow::Result<HaMember> {
+    let metadata_json: String = row.get(5);
+    validate_metadata_json(&metadata_json)?;
     Ok(HaMember {
         instance_id: row.get(0),
-        started_unix_seconds: positive_or_zero(row.get(1), "member start time")?,
-        last_seen_unix_seconds: positive_or_zero(row.get(2), "member last seen time")?,
-        lease_until_unix_seconds: positive_or_zero(row.get(3), "member lease time")?,
-        metadata_json: row.get(4),
+        incarnation_id: row.get(1),
+        started_unix_seconds: positive_or_zero(row.get(2), "member start time")?,
+        last_seen_unix_seconds: positive_or_zero(row.get(3), "member last seen time")?,
+        lease_until_unix_seconds: positive_or_zero(row.get(4), "member lease time")?,
+        metadata_json,
     })
+}
+
+async fn read_postgres_member_for_update(
+    transaction: &PostgresTransaction<'_>,
+    instance_id: &str,
+) -> anyhow::Result<Option<HaMember>> {
+    transaction
+        .query_opt(
+            "SELECT instance_id, incarnation_id,
+                CAST(EXTRACT(EPOCH FROM started_at) AS BIGINT),
+                CAST(EXTRACT(EPOCH FROM last_seen_at) AS BIGINT),
+                CAST(EXTRACT(EPOCH FROM lease_until) AS BIGINT),
+                metadata_json::text
+             FROM linklake_ha_members WHERE instance_id = $1 FOR UPDATE",
+            &[&instance_id],
+        )
+        .await?
+        .map(|row| postgres_member(&row))
+        .transpose()
 }
 
 fn read_sqlite_leader(
@@ -506,7 +689,7 @@ fn read_sqlite_leader(
 ) -> anyhow::Result<Option<LeadershipLease>> {
     transaction
         .query_row(
-            "SELECT instance_id, fencing_token, acquired_unix_seconds,
+            "SELECT instance_id, incarnation_id, fencing_token, acquired_unix_seconds,
                     renewed_unix_seconds, lease_until_unix_seconds
              FROM ha_leader WHERE singleton_id = 1",
             [],
@@ -519,10 +702,11 @@ fn read_sqlite_leader(
 fn sqlite_leader_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LeadershipLease> {
     Ok(LeadershipLease {
         instance_id: row.get(0)?,
-        fencing_token: sqlite_positive(row.get(1)?, 1, "fencing token")?,
-        acquired_unix_seconds: sqlite_nonnegative(row.get(2)?, 2, "leader acquired time")?,
-        renewed_unix_seconds: sqlite_nonnegative(row.get(3)?, 3, "leader renewed time")?,
-        lease_until_unix_seconds: sqlite_nonnegative(row.get(4)?, 4, "leader lease time")?,
+        incarnation_id: row.get(1)?,
+        fencing_token: sqlite_positive(row.get(2)?, 2, "fencing token")?,
+        acquired_unix_seconds: sqlite_nonnegative(row.get(3)?, 3, "leader acquired time")?,
+        renewed_unix_seconds: sqlite_nonnegative(row.get(4)?, 4, "leader renewed time")?,
+        lease_until_unix_seconds: sqlite_nonnegative(row.get(5)?, 5, "leader lease time")?,
     })
 }
 
@@ -531,7 +715,7 @@ async fn read_postgres_leader_for_update(
 ) -> anyhow::Result<Option<LeadershipLease>> {
     transaction
         .query_opt(
-            "SELECT instance_id, fencing_token,
+            "SELECT instance_id, incarnation_id, fencing_token,
                 CAST(EXTRACT(EPOCH FROM acquired_at) AS BIGINT),
                 CAST(EXTRACT(EPOCH FROM renewed_at) AS BIGINT),
                 CAST(EXTRACT(EPOCH FROM lease_until) AS BIGINT)
@@ -546,10 +730,11 @@ async fn read_postgres_leader_for_update(
 fn postgres_leader(row: &PostgresRow) -> anyhow::Result<LeadershipLease> {
     Ok(LeadershipLease {
         instance_id: row.get(0),
-        fencing_token: positive(row.get(1), "fencing token")?,
-        acquired_unix_seconds: positive_or_zero(row.get(2), "leader acquired time")?,
-        renewed_unix_seconds: positive_or_zero(row.get(3), "leader renewed time")?,
-        lease_until_unix_seconds: positive_or_zero(row.get(4), "leader lease time")?,
+        incarnation_id: row.get(1),
+        fencing_token: positive(row.get(2), "fencing token")?,
+        acquired_unix_seconds: positive_or_zero(row.get(3), "leader acquired time")?,
+        renewed_unix_seconds: positive_or_zero(row.get(4), "leader renewed time")?,
+        lease_until_unix_seconds: positive_or_zero(row.get(5), "leader lease time")?,
     })
 }
 
@@ -572,9 +757,64 @@ async fn postgres_now(transaction: &PostgresTransaction<'_>) -> anyhow::Result<u
     positive_or_zero(now, "PostgreSQL clock")
 }
 
+async fn lock_postgres_instance(
+    transaction: &PostgresTransaction<'_>,
+    instance_id: &str,
+) -> anyhow::Result<()> {
+    transaction
+        .query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, $2))",
+            &[&instance_id, &POSTGRES_INSTANCE_LOCK_SEED],
+        )
+        .await?;
+    Ok(())
+}
+
+fn validate_instance_id(instance_id: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(!instance_id.is_empty(), "HA instance ID is required");
+    anyhow::ensure!(
+        instance_id.len() <= MAX_INSTANCE_ID_BYTES,
+        "HA instance ID exceeds {MAX_INSTANCE_ID_BYTES} bytes"
+    );
+    anyhow::ensure!(
+        !instance_id.chars().any(char::is_control),
+        "HA instance ID must not contain control characters"
+    );
+    Ok(())
+}
+
+fn normalize_metadata_json(metadata_json: String) -> anyhow::Result<String> {
+    validate_metadata_json(&metadata_json)?;
+    let value = serde_json::from_str::<serde_json::Value>(&metadata_json)?;
+    let normalized = serde_json::to_string(&value)?;
+    anyhow::ensure!(
+        normalized.len() <= MAX_METADATA_JSON_BYTES,
+        "HA member metadata exceeds {MAX_METADATA_JSON_BYTES} bytes"
+    );
+    Ok(normalized)
+}
+
+fn validate_metadata_json(metadata_json: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        metadata_json.len() <= MAX_METADATA_JSON_BYTES,
+        "HA member metadata exceeds {MAX_METADATA_JSON_BYTES} bytes"
+    );
+    let value = serde_json::from_str::<serde_json::Value>(metadata_json)
+        .map_err(|error| anyhow::anyhow!("HA member metadata must be valid JSON: {error}"))?;
+    anyhow::ensure!(
+        value.is_object(),
+        "HA member metadata must be a JSON object"
+    );
+    Ok(())
+}
+
 fn lease_seconds(duration: Duration, name: &str) -> anyhow::Result<u64> {
     let seconds = duration.as_secs();
     anyhow::ensure!(seconds >= 2, "{name} lease must be at least two seconds");
+    anyhow::ensure!(
+        seconds <= MAX_LEASE_SECONDS,
+        "{name} lease must not exceed {MAX_LEASE_SECONDS} seconds"
+    );
     Ok(seconds)
 }
 
@@ -610,6 +850,17 @@ fn sqlite_integer_error(column: usize, label: &str, requirement: &str) -> rusqli
         Box::new(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("{label} {requirement}"),
+        )),
+    )
+}
+
+fn sqlite_text_error(column: usize, error: anyhow::Error) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        column,
+        SqliteType::Text,
+        Box::new(io::Error::new(
+            io::ErrorKind::InvalidData,
+            error.to_string(),
         )),
     )
 }
