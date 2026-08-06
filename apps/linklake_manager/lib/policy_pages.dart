@@ -3,6 +3,7 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 
 import 'api_client.dart';
+import 'metric_charts.dart';
 import 'rbac.dart';
 
 enum PolicyKind { tcp, udp, group, http, sni, secret, socks5, proxy }
@@ -509,6 +510,20 @@ class _PolicyPageState extends State<PolicyPage> {
             )
           else
             for (final policy in values) _policyCard(policy),
+          const SizedBox(height: 8),
+          MetricsHistoryPanel(
+            key: Key('protocol-history-${widget.kind.key}'),
+            api: widget.api,
+            protocol: historyProtocolForPolicyKey(widget.kind.key),
+            chinese: widget.chinese,
+            compact: true,
+            initiallyExpanded: false,
+            title: t('协议历史趋势', 'Protocol history'),
+            subtitle: t(
+              '展示该协议类别的流量、连接和错误变化',
+              'Traffic, connection, and error trends for this protocol category',
+            ),
+          ),
         ],
       ),
     );

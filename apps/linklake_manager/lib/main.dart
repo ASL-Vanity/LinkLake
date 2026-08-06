@@ -10,6 +10,7 @@ import 'desktop_lifecycle.dart';
 import 'manager_settings.dart';
 import 'manager_identity.dart';
 import 'manager_theme.dart';
+import 'metric_charts.dart';
 import 'policy_pages.dart';
 import 'rbac.dart';
 import 'server_profiles.dart';
@@ -1265,6 +1266,18 @@ class _DashboardPageState extends State<DashboardPage> {
             },
           ),
           const SizedBox(height: 20),
+          MetricsHistoryPanel(
+            key: const Key('overview-history'),
+            api: widget.api,
+            protocol: 'total',
+            chinese: zh,
+            title: t('流量与连接趋势', 'Traffic and connection trends'),
+            subtitle: t(
+              '保留当前图表并快速切换 1h、12h、1d、7d 和 30d',
+              'Switch between 1h, 12h, 1d, 7d, and 30d while retaining the current chart',
+            ),
+          ),
+          const SizedBox(height: 20),
           _jsonPanel(t('完整指标', 'Full metrics'), _metrics),
         ],
       ),
@@ -1278,6 +1291,8 @@ class _DashboardPageState extends State<DashboardPage> {
           t('已注册客户端', 'Enrolled clients'),
           t('配置模式、同步状态和最近心跳', 'Configuration mode, sync status, and heartbeat'),
         ),
+        const SizedBox(height: 16),
+        ClientInsightsPanel(clients: _clients, chinese: zh),
         const SizedBox(height: 16),
         for (final raw in _clients)
           _recordCard(
