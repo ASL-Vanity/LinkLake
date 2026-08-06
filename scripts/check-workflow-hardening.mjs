@@ -27,6 +27,215 @@ function workflowJob(text, jobId) {
   return lines.slice(start, end).join('\n');
 }
 
+function stripYamlComment(line) {
+  let quote = null;
+  for (let index = 0; index < line.length; index += 1) {
+    const character = line[index];
+    if (quote === "'") {
+      if (character === "'" && line[index + 1] === "'") {
+        index += 1;
+      } else if (character === "'") {
+        quote = null;
+      }
+      continue;
+    }
+    if (quote === '"') {
+      if (character === '\\') {
+        index += 1;
+      } else if (character === '"') {
+        quote = null;
+      }
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+    } else if (character === '#' && (index === 0 || /\s/.test(line[index - 1]))) {
+      return line.slice(0, index);
+    }
+  }
+  return line;
+}
+
+function yamlScalar(value, context) {
+  const scalar = value.trim();
+  if (!scalar) fail(`${context} must not be empty`);
+  if (scalar.startsWith("'")) {
+    if (!scalar.endsWith("'") || scalar.length < 2) fail(`${context} has an invalid quoted scalar`);
+    return scalar.slice(1, -1).replaceAll("''", "'");
+  }
+  if (scalar.startsWith('"')) {
+    try {
+      const parsed = JSON.parse(scalar);
+      if (typeof parsed !== 'string') fail(`${context} must be a string`);
+      return parsed;
+    } catch {
+      fail(`${context} has an invalid quoted scalar`);
+    }
+  }
+  if (/[[\]{},&*!|>]/.test(scalar)) {
+    fail(`${context} uses unsupported YAML syntax`);
+  }
+  return scalar;
+}
+
+function yamlMappingEntry(node, context) {
+  let quote = null;
+  for (let index = 0; index < node.content.length; index += 1) {
+    const character = node.content[index];
+    if (quote === "'") {
+      if (character === "'" && node.content[index + 1] === "'") {
+        index += 1;
+      } else if (character === "'") {
+        quote = null;
+      }
+      continue;
+    }
+    if (quote === '"') {
+      if (character === '\\') {
+        index += 1;
+      } else if (character === '"') {
+        quote = null;
+      }
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+    } else if (character === ':') {
+      return {
+        key: yamlScalar(node.content.slice(0, index), `${context}:${node.line} key`),
+        value: node.content.slice(index + 1).trim(),
+      };
+    }
+  }
+  fail(`${context}:${node.line} must be a YAML mapping entry`);
+}
+
+function yamlNodes(text, context) {
+  const nodes = [];
+  text.split(/\r?\n/).forEach((rawLine, index) => {
+    if (/^ *\t/.test(rawLine)) fail(`${context}:${index + 1} must use spaces for indentation`);
+    const line = stripYamlComment(rawLine).trimEnd();
+    if (!line.trim()) return;
+    const indent = line.length - line.trimStart().length;
+    nodes.push({ content: line.trimStart(), indent, line: index + 1 });
+  });
+  return nodes;
+}
+
+function nestedEntries(nodes, start, end, parentIndent, context) {
+  const nested = nodes.slice(start, end).filter((node) => node.indent > parentIndent);
+  if (nested.length === 0) fail(`${context} must be a YAML mapping`);
+  const childIndent = Math.min(...nested.map((node) => node.indent));
+  const entries = new Map();
+  for (let index = start; index < end; index += 1) {
+    const node = nodes[index];
+    if (node.indent !== childIndent) continue;
+    const entry = yamlMappingEntry(node, context);
+    if (entries.has(entry.key)) fail(`${context} contains duplicate key ${entry.key}`);
+    let entryEnd = end;
+    for (let cursor = index + 1; cursor < end; cursor += 1) {
+      if (nodes[cursor].indent <= childIndent) {
+        entryEnd = cursor;
+        break;
+      }
+    }
+    entries.set(entry.key, { ...entry, end: entryEnd, index, node });
+  }
+  return entries;
+}
+
+function inlineYamlSequence(value, context) {
+  const sequence = value.trim();
+  if (!sequence.startsWith('[') || !sequence.endsWith(']')) {
+    fail(`${context} must be a YAML sequence`);
+  }
+  const body = sequence.slice(1, -1).trim();
+  if (!body) return [];
+  const values = [];
+  let quote = null;
+  let start = 0;
+  for (let index = 0; index <= body.length; index += 1) {
+    const character = body[index];
+    if (quote === "'") {
+      if (character === "'" && body[index + 1] === "'") {
+        index += 1;
+      } else if (character === "'") {
+        quote = null;
+      }
+      continue;
+    }
+    if (quote === '"') {
+      if (character === '\\') {
+        index += 1;
+      } else if (character === '"') {
+        quote = null;
+      }
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+    } else if (character === ',' || index === body.length) {
+      values.push(yamlScalar(body.slice(start, index), `${context} item`));
+      start = index + 1;
+    }
+  }
+  if (quote !== null) fail(`${context} has an unterminated quoted scalar`);
+  return values;
+}
+
+function workflowTriggerPolicy(text, workflowName) {
+  const nodes = yamlNodes(text, workflowName);
+  const onEntries = nodes
+    .map((node, index) => ({ entry: node.indent === 0 ? yamlMappingEntry(node, workflowName) : null, index, node }))
+    .filter(({ entry }) => entry?.key === 'on');
+  if (onEntries.length !== 1) fail(`${workflowName} must contain exactly one top-level on mapping`);
+  const on = onEntries[0];
+  if (on.entry.value) fail(`${workflowName} on must use a block mapping`);
+  let onEnd = nodes.length;
+  for (let index = on.index + 1; index < nodes.length; index += 1) {
+    if (nodes[index].indent <= on.node.indent) {
+      onEnd = index;
+      break;
+    }
+  }
+  const events = nestedEntries(nodes, on.index + 1, onEnd, on.node.indent, `${workflowName} on`);
+  for (const eventName of ['push', 'pull_request', 'workflow_call']) {
+    if (!events.has(eventName)) fail(`${workflowName} on must include ${eventName}`);
+  }
+
+  const push = events.get('push');
+  if (push.value) fail(`${workflowName} push must use a block mapping`);
+  const pushEntries = nestedEntries(
+    nodes,
+    push.index + 1,
+    push.end,
+    push.node.indent,
+    `${workflowName} push`,
+  );
+  const branches = pushEntries.get('branches');
+  if (!branches) fail(`${workflowName} push must define branches`);
+
+  let branchNames;
+  if (branches.value) {
+    branchNames = inlineYamlSequence(branches.value, `${workflowName} push.branches`);
+  } else {
+    const branchNodes = nodes
+      .slice(branches.index + 1, branches.end)
+      .filter((node) => node.indent > branches.node.indent);
+    if (branchNodes.length === 0) fail(`${workflowName} push.branches must not be empty`);
+    const itemIndent = Math.min(...branchNodes.map((node) => node.indent));
+    if (branchNodes.some((node) => node.indent !== itemIndent || !node.content.startsWith('- '))) {
+      fail(`${workflowName} push.branches must contain only scalar sequence items`);
+    }
+    branchNames = branchNodes.map((node) =>
+      yamlScalar(node.content.slice(2), `${workflowName}:${node.line} push.branches item`),
+    );
+  }
+  if (branchNames.length !== 1 || branchNames[0] !== 'main') {
+    fail(`${workflowName} push.branches must equal exactly [main]`);
+  }
+}
+
 const workflowFiles = fs
   .readdirSync(workflowDirectory)
   .filter((name) => name.endsWith('.yml') || name.endsWith('.yaml'))
@@ -92,18 +301,8 @@ const nativeLinuxRpmDockerfile = fs.readFileSync(
 );
 const packageJson = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
 const packageLock = JSON.parse(fs.readFileSync(path.join(root, 'package-lock.json'), 'utf8'));
-if (!/^\s*workflow_call:\s*$/m.test(ci) || !/^\s*workflow_call:\s*$/m.test(security)) {
-  fail('CI and security workflows must remain reusable by the release workflow');
-}
-if (!/^  push:\s*\n    branches:\s*\n      - main\s*$/m.test(ci)) {
-  fail('CI push events must be limited to main so pull requests do not create duplicate required checks');
-}
-if (/^      - ['"]?\*\*['"]?\s*$/m.test(ci)) {
-  fail('CI must not run duplicate push checks for every pull request branch');
-}
-if (!/^  push:\s*\n    branches:\s*\n      - main\s*$/m.test(security)) {
-  fail('security push events must remain limited to main');
-}
+workflowTriggerPolicy(ci, 'ci.yml');
+workflowTriggerPolicy(security, 'security.yml');
 for (const reusable of ['./.github/workflows/ci.yml', './.github/workflows/security.yml']) {
   if (!release.includes(`uses: ${reusable}`)) {
     fail(`release workflow does not reuse ${reusable}`);
