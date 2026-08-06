@@ -32,7 +32,7 @@ The formal updater manifest intentionally contains only `windows-x86_64` and `li
 - Rotation first adds a new public key with a future `not_before_version`, ships an updater that trusts old and new keys, then changes CI secrets, and finally assigns the old key a `not_after_version`.
 - Emergency revocation requires another trusted production key. Without one, a new trust root must be distributed through a separate authenticated channel.
 
-The production public key `linklake-production-2026-08-a` signed the verified `v1.0.0` updater manifest and remains registered for the `1.0.x` release line. Every later tagged Release fails closed unless `LINKLAKE_RELEASE_SIGNING_KEY_ID` selects a registered production key valid for that version and `LINKLAKE_RELEASE_SIGNING_KEY_B64` contains the matching private seed. Using the development fixture to bypass this check is prohibited.
+The production public key `linklake-production-2026-08-a` signed the verified `v1.0.0` updater manifest and is currently registered through version `1.99.99`. That validity ceiling is an emergency compatibility boundary, not a commitment to reuse one key for the entire `1.x` line: normal rotation should introduce and ship trust for a replacement key well before the ceiling is reached. Every later tagged Release fails closed unless `LINKLAKE_RELEASE_SIGNING_KEY_ID` selects a registered production key valid for that version and `LINKLAKE_RELEASE_SIGNING_KEY_B64` contains the matching private seed. Using the development fixture to bypass this check is prohibited.
 
 ## Replacement invariants
 

@@ -95,6 +95,15 @@ const packageLock = JSON.parse(fs.readFileSync(path.join(root, 'package-lock.jso
 if (!/^\s*workflow_call:\s*$/m.test(ci) || !/^\s*workflow_call:\s*$/m.test(security)) {
   fail('CI and security workflows must remain reusable by the release workflow');
 }
+if (!/^  push:\s*\n    branches:\s*\n      - main\s*$/m.test(ci)) {
+  fail('CI push events must be limited to main so pull requests do not create duplicate required checks');
+}
+if (/^      - ['"]?\*\*['"]?\s*$/m.test(ci)) {
+  fail('CI must not run duplicate push checks for every pull request branch');
+}
+if (!/^  push:\s*\n    branches:\s*\n      - main\s*$/m.test(security)) {
+  fail('security push events must remain limited to main');
+}
 for (const reusable of ['./.github/workflows/ci.yml', './.github/workflows/security.yml']) {
   if (!release.includes(`uses: ${reusable}`)) {
     fail(`release workflow does not reuse ${reusable}`);
