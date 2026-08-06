@@ -616,7 +616,7 @@ try {
         LINKLAKE_ADMIN_USERNAME = 'admin'
         LINKLAKE_ADMIN_PASSWORD = $adminPassword
         LINKLAKE_ACME_ROOT_CA_PATH = $rootCaPath
-        LINKLAKE_CERTIFICATE_OPERATION_COOLDOWN_SECONDS = '1'
+        LINKLAKE_CERTIFICATE_OPERATION_COOLDOWN_SECONDS = '3600'
         LINKLAKE_CLOUDFLARE_API_TOKEN_FILE = $tokenPath
         LINKLAKE_CLOUDFLARE_API_BASE_URL = "$mockBaseUrl/client/v4/"
         LINKLAKE_ACME_DNS_LOOKUP_URL = "$mockBaseUrl/dns-query"
@@ -800,6 +800,10 @@ try {
     }
     $null = Invoke-CurlRequest -Port $httpsPort `
         -ServerName 'nested.alternate.deep.sub.example.test' -ExpectFailure
+    # Pebble 测试证书寿命很短，继续保持路由启用会在一分钟维护周期触发自动续期，
+    # 并可能抢先恢复后续故障注入场景故意留下的 DNS-01 journal。
+    Set-TestHttpRouteEnabled -BaseUrl $baseUrl -Session $webSession `
+        -RouteId $routes['dns01-wildcard'].id -Enabled $false
 
     # 错误的权威 TXT 会令 Pebble 拒绝授权，但 LinkLake 仍必须删除自己创建的记录.
     $null = Set-MockConfig -MockBaseUrl $mockBaseUrl -Config @{ publish_mode = 'wrong' }
@@ -821,6 +825,8 @@ try {
     if (@($stateAfterInvalid.records).Count -ne 0) {
         throw 'The failed ACME authorization left its TXT record behind.'
     }
+    Set-TestHttpRouteEnabled -BaseUrl $baseUrl -Session $webSession `
+        -RouteId $routes['dns01-invalid'].id -Enabled $false
 
     # Cloudflare success=false envelope 必须被视为失败，不能继续创建记录.
     $null = Set-MockConfig -MockBaseUrl $mockBaseUrl -Config @{
@@ -841,6 +847,8 @@ try {
     if (@($zoneErrorEvents | Where-Object { $_.kind -eq 'txt_created' }).Count -ne 0) {
         throw 'LinkLake created a TXT record after a failed Cloudflare zone envelope.'
     }
+    Set-TestHttpRouteEnabled -BaseUrl $baseUrl -Session $webSession `
+        -RouteId $routes['dns01-zone-error'].id -Enabled $false
 
     $null = Set-MockConfig -MockBaseUrl $mockBaseUrl -Config @{ create_error_count = 1 }
     $stateBeforeCreateError = Get-MockState -MockBaseUrl $mockBaseUrl
@@ -858,9 +866,13 @@ try {
         @((Get-MockState -MockBaseUrl $mockBaseUrl).records).Count -ne 0) {
         throw 'A rejected Cloudflare TXT create mutated Mock DNS state.'
     }
+    Set-TestHttpRouteEnabled -BaseUrl $baseUrl -Session $webSession `
+        -RouteId $routes['dns01-create-error'].id -Enabled $false
 
     # 删除 envelope 失败时保留私密 journal；下一次订单必须先恢复并清除孤儿记录.
     $null = Set-MockConfig -MockBaseUrl $mockBaseUrl -Config @{ delete_error_count = 1 }
+    $stateBeforeDeleteFailure = Get-MockState -MockBaseUrl $mockBaseUrl
+    $deleteFailureOffset = @($stateBeforeDeleteFailure.events).Count
     Set-TestHttpRouteEnabled -BaseUrl $baseUrl -Session $webSession `
         -RouteId $routes['dns01-delete-retry'].id -Enabled $true
     $null = Wait-HttpRouteOnline -BaseUrl $baseUrl -Session $webSession `
@@ -870,14 +882,38 @@ try {
     $null = Wait-RouteTlsStatus -BaseUrl $baseUrl -Session $webSession `
         -RouteId $routes['dns01-delete-retry'].id -ExpectedStatus 'active' -ExpectedOnline $true
     $deleteFailureState = Get-MockState -MockBaseUrl $mockBaseUrl
+    $deleteFailureEvents = @($deleteFailureState.events | Select-Object -Skip $deleteFailureOffset)
+    $deleteFailureRecords = @($deleteFailureState.records | Where-Object {
+        $_.name -eq '_acme-challenge.delete-retry.example.test'
+    })
+    $deleteFailureCreated = @($deleteFailureEvents | Where-Object {
+        $_.kind -eq 'txt_created' -and
+        $_.name -eq '_acme-challenge.delete-retry.example.test'
+    } | Select-Object -Last 1)
+    $deleteFailureRejected = @($deleteFailureEvents | Where-Object {
+        $_.kind -eq 'txt_delete_rejected' -and
+        $deleteFailureCreated.Count -eq 1 -and
+        $_.record_id -eq $deleteFailureCreated[0].record_id
+    })
     if (@($deleteFailureState.records).Count -ne 1 -or
-        @($deleteFailureState.events | Where-Object { $_.kind -eq 'txt_delete_rejected' }).Count -lt 1) {
+        $deleteFailureRecords.Count -ne 1 -or
+        $deleteFailureCreated.Count -ne 1 -or
+        $deleteFailureRejected.Count -lt 1 -or
+        $deleteFailureRecords[0].id -ne $deleteFailureCreated[0].record_id) {
         throw 'Injected Cloudflare delete failure was not observed.'
     }
     $journalDirectory = Join-Path $dataDirectory 'acme/dns01-records'
-    if (@(Get-ChildItem -LiteralPath $journalDirectory -Filter '*.json' -File -ErrorAction SilentlyContinue).Count -ne 1) {
+    $journalFiles = @(Get-ChildItem -LiteralPath $journalDirectory -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    if ($journalFiles.Count -ne 1) {
         throw 'DNS-01 cleanup journal was not retained after delete failure.'
     }
+    $deleteFailureJournal = Get-Content -LiteralPath $journalFiles[0].FullName -Raw | ConvertFrom-Json
+    if ($deleteFailureJournal.zone_id -ne $deleteFailureRecords[0].zone_id -or
+        $deleteFailureJournal.record_id -ne $deleteFailureRecords[0].id) {
+        throw 'DNS-01 cleanup journal does not identify the rejected TXT deletion.'
+    }
+    Set-TestHttpRouteEnabled -BaseUrl $baseUrl -Session $webSession `
+        -RouteId $routes['dns01-delete-retry'].id -Enabled $false
 
     $null = Set-MockConfig -MockBaseUrl $mockBaseUrl -Config @{ delete_error_count = 0 }
     Set-TestHttpRouteEnabled -BaseUrl $baseUrl -Session $webSession `
