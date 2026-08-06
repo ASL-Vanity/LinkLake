@@ -4,3 +4,5 @@ RUN dnf --setopt=install_weak_deps=False --setopt=retries=3 --setopt=timeout=20 
       --setopt=max_parallel_downloads=4 -y install ca-certificates rpm-build shadow-utils systemd \
  && dnf clean all \
  && rm -rf /var/cache/dnf
+
+USER 65534:65534

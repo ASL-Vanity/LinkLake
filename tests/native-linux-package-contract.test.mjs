@@ -68,6 +68,7 @@ test('native Linux DEB and RPM release contracts are isolated, pinned, and befor
     const dockerfile = read(relative);
     assert.match(dockerfile, /^FROM\s+[^\s]+@sha256:[a-f0-9]{64}$/m);
     assert.doesNotMatch(dockerfile, /^\s*(?:ADD|COPY)\s+/m);
+    assert.match(dockerfile, /^USER\s+65534:65534$/m);
   }
   assert.match(read('tests/native-linux-package-contract-deb.Dockerfile'), /apt-get .*Acquire::Retries=3/);
   assert.match(read('tests/native-linux-package-contract-rpm.Dockerfile'), /dnf .*--setopt=retries=3/);

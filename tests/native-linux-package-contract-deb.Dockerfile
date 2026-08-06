@@ -6,3 +6,5 @@ RUN apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https
  && apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 \
       install --no-install-recommends -y adduser ca-certificates systemd \
  && rm -rf /var/lib/apt/lists/*
+
+USER 65534:65534
