@@ -2894,6 +2894,19 @@
         elements.user_form.reset();
       }
 
+      async function refreshUsers() {
+        const response = await apiFetch('/api/v1/users', { headers: { Accept: 'application/json' }, scope: 'user-management' });
+        if (!response.ok) {
+          showToast(await responseError(response, 'requestFailed'), true);
+          return false;
+        }
+        const users = await response.json();
+        state.dashboard ||= emptyDashboard();
+        state.dashboard.users = Array.isArray(users) ? users : [];
+        if (state.route.view === 'users') renderUsers();
+        return true;
+      }
+
       async function submitUser(event) {
         event.preventDefault();
         const submit = event.submitter;
@@ -2911,7 +2924,7 @@
           }
           closeUserModal();
           showToast(t(editing ? 'userUpdated' : 'userCreated'));
-          await loadManagementData({ forceHistory: false });
+          await refreshUsers();
         } catch (_) { showToast(t('requestFailed'), true); }
         finally { setBusy(submit, false); }
       }
@@ -2924,7 +2937,7 @@
           return showToast(payload.error || t('requestFailed'), true);
         }
         showToast(t('userDeleted'));
-        await loadManagementData({ forceHistory: false });
+        await refreshUsers();
       }
 
       function openResetPassword(user) {
@@ -2953,7 +2966,7 @@
           }
           closeResetPassword();
           showToast(t('passwordReset'));
-          await loadManagementData({ forceHistory: false });
+          await refreshUsers();
         } catch (_) { showToast(t('requestFailed'), true); }
         finally { setBusy(submit, false); }
       }
@@ -2967,7 +2980,7 @@
         }
         showToast(t('sessionsRevoked'));
         if (user.username === state.identity.username) return resetForExpiredSession();
-        await loadManagementData({ forceHistory: false });
+        await refreshUsers();
       }
 
       function renderUsers() {
