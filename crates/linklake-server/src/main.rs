@@ -141,7 +141,20 @@ use tunnel_catalog::{
 use udp_data_plane::{UdpDataPlane, UdpDataPlaneConfig};
 use uuid::Uuid;
 
-const MANAGEMENT_UI: &str = include_str!("../web/index.html");
+const MANAGEMENT_UI_DOCUMENT: &str = include_str!("../web/index.html");
+const MANAGEMENT_UI_STYLES: &str = include_str!("../web/linklake.css");
+const MANAGEMENT_UI_SCRIPT: &str = include_str!("../web/linklake.js");
+const MANAGEMENT_UI_THEME_BOOTSTRAP: &str = include_str!("../web/theme-bootstrap.js");
+#[cfg(test)]
+static MANAGEMENT_UI: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    [
+        MANAGEMENT_UI_DOCUMENT,
+        MANAGEMENT_UI_STYLES,
+        MANAGEMENT_UI_THEME_BOOTSTRAP,
+        MANAGEMENT_UI_SCRIPT,
+    ]
+    .join("\n")
+});
 const GLOBAL_CONNECTION_LIMIT: usize = 1024;
 const PENDING_CONNECTION_LIMIT: usize = 256;
 const NOTIFICATION_DELIVERY_INTERVAL_SECONDS: u64 = 1;
@@ -3915,6 +3928,12 @@ async fn run_server(
     restore_managed_certificates(&state)?;
     let app = Router::new()
         .route("/", get(management_ui))
+        .route("/assets/linklake.css", get(management_ui_styles))
+        .route("/assets/linklake.js", get(management_ui_script))
+        .route(
+            "/assets/theme-bootstrap.js",
+            get(management_ui_theme_bootstrap),
+        )
         .route("/api/v1/health", get(health))
         .route("/livez", get(live_probe))
         .route("/readyz", get(ready_probe))
@@ -4530,7 +4549,7 @@ async fn security_headers(request: Request, next: Next) -> Response {
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
         axum::http::HeaderValue::from_static(
-            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
         ),
     );
     headers.insert(
@@ -4555,7 +4574,7 @@ async fn security_headers(request: Request, next: Next) -> Response {
 fn apply_cache_control(path: &str, headers: &mut HeaderMap) {
     let value = if path == "/api/v1" || path.starts_with("/api/v1/") {
         Some("no-store, private")
-    } else if path == "/" {
+    } else if path == "/" || path.starts_with("/assets/") {
         Some("no-cache")
     } else {
         None
@@ -4571,7 +4590,28 @@ fn apply_cache_control(path: &str, headers: &mut HeaderMap) {
 async fn management_ui() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        Html(MANAGEMENT_UI),
+        Html(MANAGEMENT_UI_DOCUMENT),
+    )
+}
+
+async fn management_ui_styles() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        MANAGEMENT_UI_STYLES,
+    )
+}
+
+async fn management_ui_script() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        MANAGEMENT_UI_SCRIPT,
+    )
+}
+
+async fn management_ui_theme_bootstrap() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        MANAGEMENT_UI_THEME_BOOTSTRAP,
     )
 }
 
@@ -14109,7 +14149,8 @@ mod tests {
         HistoryCounters, HttpTransportCapabilitiesView, ListenerStartupProbe, LoginResponse,
         LoginThrottle, ManagementPrincipal, MetricsHistory, MetricsHistoryProtocol,
         MetricsHistorySample, Socks5CapabilitiesView, UserRole, LOGIN_THROTTLE_MAX_IDENTITIES,
-        MANAGEMENT_UI, METRICS_HISTORY_ARCHIVE_CAPACITY,
+        MANAGEMENT_UI, MANAGEMENT_UI_DOCUMENT, MANAGEMENT_UI_SCRIPT, MANAGEMENT_UI_STYLES,
+        MANAGEMENT_UI_THEME_BOOTSTRAP, METRICS_HISTORY_ARCHIVE_CAPACITY,
         METRICS_HISTORY_ARCHIVE_SAMPLE_INTERVAL_SECONDS, METRICS_HISTORY_CAPACITY,
         METRICS_HISTORY_RECENT_RETENTION_SECONDS, METRICS_HISTORY_RETENTION_SECONDS,
         METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS, SLO_DEFAULT_AVAILABILITY_TARGET,
@@ -14326,6 +14367,21 @@ mod tests {
         );
 
         for path in [
+            "/assets/linklake.css",
+            "/assets/linklake.js",
+            "/assets/theme-bootstrap.js",
+        ] {
+            let mut headers = HeaderMap::new();
+            apply_cache_control(path, &mut headers);
+            assert_eq!(
+                headers
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-cache")
+            );
+        }
+
+        for path in [
             "/api/v1/auth/login",
             "/api/v1/auth/me",
             "/api/v1/metrics/history",
@@ -14339,6 +14395,27 @@ mod tests {
                     .and_then(|value| value.to_str().ok()),
                 Some("no-store, private")
             );
+        }
+    }
+
+    #[test]
+    fn management_ui_is_split_into_embedded_same_origin_assets() {
+        assert!(MANAGEMENT_UI_DOCUMENT.contains("/assets/theme-bootstrap.js"));
+        assert!(MANAGEMENT_UI_DOCUMENT.contains("/assets/linklake.css"));
+        assert!(MANAGEMENT_UI_DOCUMENT.contains("/assets/linklake.js"));
+        assert!(!MANAGEMENT_UI_DOCUMENT.contains("<style>"));
+        assert!(!MANAGEMENT_UI_DOCUMENT.contains("<script>"));
+        assert!(!MANAGEMENT_UI_STYLES.trim().is_empty());
+        assert!(!MANAGEMENT_UI_SCRIPT.trim().is_empty());
+        assert!(!MANAGEMENT_UI_THEME_BOOTSTRAP.trim().is_empty());
+        for asset in [
+            MANAGEMENT_UI_DOCUMENT,
+            MANAGEMENT_UI_STYLES,
+            MANAGEMENT_UI_SCRIPT,
+            MANAGEMENT_UI_THEME_BOOTSTRAP,
+        ] {
+            assert!(!asset.contains("https://cdn."));
+            assert!(!asset.contains("https://unpkg."));
         }
     }
 
