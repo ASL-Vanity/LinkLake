@@ -40,13 +40,30 @@ pub enum BackendProtocol {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum BackendSecurity {
     Plaintext,
-    Tls { server_name: Box<str> },
+    Tls {
+        server_name: Box<str>,
+        trust: BackendTrustKey,
+    },
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum BackendTrustKey {
+    System,
+    Profile(Box<str>),
 }
 
 impl BackendSecurity {
     pub fn tls(server_name: &str) -> Result<Self, OriginKeyError> {
+        Self::tls_with_trust(server_name, BackendTrustKey::System)
+    }
+
+    pub fn tls_with_trust(
+        server_name: &str,
+        trust: BackendTrustKey,
+    ) -> Result<Self, OriginKeyError> {
         Ok(Self::Tls {
             server_name: normalize_server_name(server_name)?.into_boxed_str(),
+            trust,
         })
     }
 }
@@ -620,7 +637,8 @@ mod tests {
         assert_eq!(
             tls.security(),
             &BackendSecurity::Tls {
-                server_name: "example.com".into()
+                server_name: "example.com".into(),
+                trust: BackendTrustKey::System,
             }
         );
         assert!(OriginKey::new(

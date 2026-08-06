@@ -7,6 +7,7 @@ use uuid::Uuid;
 use crate::database::Database;
 
 const DEFAULT_MAX_CONNECTIONS: u16 = 64;
+type RuntimePolicyRow = (String, i64, String, Option<String>, Option<String>);
 
 #[derive(Deserialize)]
 pub(crate) struct CreateHttpRoutePolicy {
@@ -15,6 +16,12 @@ pub(crate) struct CreateHttpRoutePolicy {
     pub(crate) hostname: String,
     pub(crate) target_addr: String,
     pub(crate) max_connections: Option<u16>,
+    #[serde(default)]
+    pub(crate) grpc_backend_transport: GrpcBackendTransport,
+    #[serde(default)]
+    pub(crate) grpc_backend_server_name: Option<String>,
+    #[serde(default)]
+    pub(crate) grpc_backend_trust_profile: Option<String>,
 }
 
 // 更新接口采用完整替换语义，字段格式与创建接口一致。
@@ -28,13 +35,43 @@ pub(crate) struct HttpRoutePolicy {
     pub(crate) hostname: String,
     pub(crate) target_addr: String,
     pub(crate) max_connections: u16,
+    pub(crate) grpc_backend_transport: GrpcBackendTransport,
+    pub(crate) grpc_backend_server_name: Option<String>,
+    pub(crate) grpc_backend_trust_profile: Option<String>,
     pub(crate) enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GrpcBackendTransport {
+    #[default]
+    H2c,
+    Tls,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum GrpcBackendTrust {
+    System,
+    Profile(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GrpcBackendTlsPolicy {
+    pub(crate) server_name: String,
+    pub(crate) trust: GrpcBackendTrust,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum GrpcBackendRuntimeTransport {
+    H2c,
+    Tls(GrpcBackendTlsPolicy),
 }
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct HttpRouteRuntimePolicy {
     pub(crate) policy_id: Uuid,
     pub(crate) max_connections: usize,
+    pub(crate) grpc_backend: GrpcBackendRuntimeTransport,
 }
 
 #[derive(Debug)]
@@ -44,6 +81,7 @@ pub(crate) enum CreateHttpRouteError {
     DuplicateHostname,
     InvalidTarget,
     InvalidConnectionLimit,
+    InvalidGrpcBackend,
     Database(rusqlite::Error),
 }
 
@@ -55,6 +93,7 @@ impl fmt::Display for CreateHttpRouteError {
             Self::DuplicateHostname => "hostname is already assigned to another route",
             Self::InvalidTarget => "target address is invalid",
             Self::InvalidConnectionLimit => "connection limit is invalid",
+            Self::InvalidGrpcBackend => "gRPC backend TLS policy is invalid",
             Self::Database(_) => "HTTP route database operation failed",
         };
         formatter.write_str(message)
@@ -98,10 +137,20 @@ impl HttpRouteCatalog {
                 hostname TEXT NOT NULL UNIQUE,
                 target_addr TEXT NOT NULL,
                 max_connections INTEGER NOT NULL DEFAULT 64,
+                grpc_backend_transport TEXT NOT NULL DEFAULT 'h2c',
+                grpc_backend_server_name TEXT,
+                grpc_backend_trust_profile TEXT,
                 enabled INTEGER NOT NULL DEFAULT 1
             );
             ",
         )?;
+        ensure_column(
+            &database,
+            "grpc_backend_transport",
+            "TEXT NOT NULL DEFAULT 'h2c'",
+        )?;
+        ensure_column(&database, "grpc_backend_server_name", "TEXT")?;
+        ensure_column(&database, "grpc_backend_trust_profile", "TEXT")?;
         Ok(Self { database })
     }
 
@@ -120,6 +169,8 @@ impl HttpRouteCatalog {
         if duplicate_count != 0 {
             return Err(CreateHttpRouteError::DuplicateHostname);
         }
+        let (grpc_backend_server_name, grpc_backend_trust_profile) =
+            normalize_grpc_backend(&request)?;
         let policy = HttpRoutePolicy {
             id: Uuid::new_v4(),
             client_id: request.client_id,
@@ -127,33 +178,23 @@ impl HttpRouteCatalog {
             hostname,
             target_addr: request.target_addr.trim().to_owned(),
             max_connections: request.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
+            grpc_backend_transport: request.grpc_backend_transport,
+            grpc_backend_server_name,
+            grpc_backend_trust_profile,
             enabled: true,
         };
         self.database.execute(
-            "INSERT INTO http_route_policies (id, client_id, name, hostname, target_addr, max_connections, enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
-            params![policy.id.to_string(), policy.client_id.to_string(), policy.name, policy.hostname, policy.target_addr, policy.max_connections],
+            "INSERT INTO http_route_policies (id, client_id, name, hostname, target_addr, max_connections, grpc_backend_transport, grpc_backend_server_name, grpc_backend_trust_profile, enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)",
+            params![policy.id.to_string(), policy.client_id.to_string(), policy.name, policy.hostname, policy.target_addr, policy.max_connections, grpc_backend_transport_name(policy.grpc_backend_transport), policy.grpc_backend_server_name, policy.grpc_backend_trust_profile],
         )?;
         Ok(policy)
     }
 
     pub(crate) fn list(&self) -> anyhow::Result<Vec<HttpRoutePolicy>> {
         let mut statement = self.database.prepare(
-            "SELECT id, client_id, name, hostname, target_addr, max_connections, enabled FROM http_route_policies ORDER BY hostname",
+            "SELECT id, client_id, name, hostname, target_addr, max_connections, grpc_backend_transport, grpc_backend_server_name, grpc_backend_trust_profile, enabled FROM http_route_policies ORDER BY hostname",
         )?;
-        let rows = statement.query_map([], |row| {
-            let id: String = row.get(0)?;
-            let client_id: String = row.get(1)?;
-            Ok(HttpRoutePolicy {
-                id: Uuid::parse_str(&id).map_err(|_| rusqlite::Error::InvalidQuery)?,
-                client_id: Uuid::parse_str(&client_id)
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                name: row.get(2)?,
-                hostname: row.get(3)?,
-                target_addr: row.get(4)?,
-                max_connections: row.get(5)?,
-                enabled: row.get::<_, i64>(6)? != 0,
-            })
-        })?;
+        let rows = statement.query_map([], read_http_route_policy)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -163,22 +204,9 @@ impl HttpRouteCatalog {
     ) -> Result<Option<HttpRoutePolicy>, CreateHttpRouteError> {
         self.database
             .query_row(
-                "SELECT id, client_id, name, hostname, target_addr, max_connections, enabled FROM http_route_policies WHERE id = ?1",
+                "SELECT id, client_id, name, hostname, target_addr, max_connections, grpc_backend_transport, grpc_backend_server_name, grpc_backend_trust_profile, enabled FROM http_route_policies WHERE id = ?1",
                 [id.to_string()],
-                |row| {
-                    let id: String = row.get(0)?;
-                    let client_id: String = row.get(1)?;
-                    Ok(HttpRoutePolicy {
-                        id: Uuid::parse_str(&id).map_err(|_| rusqlite::Error::InvalidQuery)?,
-                        client_id: Uuid::parse_str(&client_id)
-                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                        name: row.get(2)?,
-                        hostname: row.get(3)?,
-                        target_addr: row.get(4)?,
-                        max_connections: row.get(5)?,
-                        enabled: row.get::<_, i64>(6)? != 0,
-                    })
-                },
+                read_http_route_policy,
             )
             .optional()
             .map_err(Into::into)
@@ -203,6 +231,8 @@ impl HttpRouteCatalog {
         if duplicate_count != 0 {
             return Err(CreateHttpRouteError::DuplicateHostname);
         }
+        let (grpc_backend_server_name, grpc_backend_trust_profile) =
+            normalize_grpc_backend(&request)?;
         let policy = HttpRoutePolicy {
             id,
             client_id: request.client_id,
@@ -210,17 +240,23 @@ impl HttpRouteCatalog {
             hostname,
             target_addr: request.target_addr.trim().to_owned(),
             max_connections: request.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
+            grpc_backend_transport: request.grpc_backend_transport,
+            grpc_backend_server_name,
+            grpc_backend_trust_profile,
             enabled: current.enabled,
         };
         self.database.execute(
-            "UPDATE http_route_policies SET client_id = ?1, name = ?2, hostname = ?3, target_addr = ?4, max_connections = ?5 WHERE id = ?6",
+            "UPDATE http_route_policies SET client_id = ?1, name = ?2, hostname = ?3, target_addr = ?4, max_connections = ?5, grpc_backend_transport = ?6, grpc_backend_server_name = ?7, grpc_backend_trust_profile = ?8 WHERE id = ?9",
             params![
                 policy.client_id.to_string(),
                 policy.name,
                 policy.hostname,
                 policy.target_addr,
                 policy.max_connections,
-                policy.id.to_string(),
+                grpc_backend_transport_name(policy.grpc_backend_transport),
+                policy.grpc_backend_server_name,
+                policy.grpc_backend_trust_profile,
+                policy.id.to_string()
             ],
         )?;
         Ok(Some(policy))
@@ -258,23 +294,171 @@ impl HttpRouteCatalog {
         target_addr: &str,
     ) -> anyhow::Result<Option<HttpRouteRuntimePolicy>> {
         let hostname = normalize_hostname(hostname)?;
-        let value: Option<(String, i64)> = self
+        let value: Option<RuntimePolicyRow> = self
             .database
             .query_row(
-                "SELECT id, max_connections FROM http_route_policies WHERE client_id = ?1 AND name = ?2 AND hostname = ?3 AND target_addr = ?4 AND enabled = 1",
+                "SELECT id, max_connections, grpc_backend_transport, grpc_backend_server_name, grpc_backend_trust_profile FROM http_route_policies WHERE client_id = ?1 AND name = ?2 AND hostname = ?3 AND target_addr = ?4 AND enabled = 1",
                 params![client_id.to_string(), name, hostname, target_addr],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .optional()?;
         value
-            .map(|(policy_id, max_connections)| {
-                Ok(HttpRouteRuntimePolicy {
-                    policy_id: Uuid::parse_str(&policy_id)?,
-                    max_connections: max_connections as usize,
-                })
-            })
+            .map(
+                |(policy_id, max_connections, transport, server_name, trust_profile)| {
+                    Ok(HttpRouteRuntimePolicy {
+                        policy_id: Uuid::parse_str(&policy_id)?,
+                        max_connections: max_connections as usize,
+                        grpc_backend: grpc_backend_runtime(&transport, server_name, trust_profile)?,
+                    })
+                },
+            )
             .transpose()
     }
+}
+
+fn read_http_route_policy(row: &rusqlite::Row<'_>) -> rusqlite::Result<HttpRoutePolicy> {
+    let id: String = row.get(0)?;
+    let client_id: String = row.get(1)?;
+    let transport: String = row.get(6)?;
+    Ok(HttpRoutePolicy {
+        id: Uuid::parse_str(&id).map_err(|_| rusqlite::Error::InvalidQuery)?,
+        client_id: Uuid::parse_str(&client_id).map_err(|_| rusqlite::Error::InvalidQuery)?,
+        name: row.get(2)?,
+        hostname: row.get(3)?,
+        target_addr: row.get(4)?,
+        max_connections: row.get(5)?,
+        grpc_backend_transport: parse_grpc_backend_transport(&transport)
+            .ok_or(rusqlite::Error::InvalidQuery)?,
+        grpc_backend_server_name: row.get(7)?,
+        grpc_backend_trust_profile: row.get(8)?,
+        enabled: row.get::<_, i64>(9)? != 0,
+    })
+}
+
+fn ensure_column(database: &Connection, name: &str, definition: &str) -> anyhow::Result<()> {
+    let count: i64 = database.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('http_route_policies') WHERE name = ?1",
+        [name],
+        |row| row.get(0),
+    )?;
+    if count == 0 {
+        database.execute(
+            &format!("ALTER TABLE http_route_policies ADD COLUMN {name} {definition}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn grpc_backend_transport_name(transport: GrpcBackendTransport) -> &'static str {
+    match transport {
+        GrpcBackendTransport::H2c => "h2c",
+        GrpcBackendTransport::Tls => "tls",
+    }
+}
+
+fn parse_grpc_backend_transport(value: &str) -> Option<GrpcBackendTransport> {
+    match value {
+        "h2c" => Some(GrpcBackendTransport::H2c),
+        "tls" => Some(GrpcBackendTransport::Tls),
+        _ => None,
+    }
+}
+
+fn normalize_grpc_backend(
+    request: &CreateHttpRoutePolicy,
+) -> Result<(Option<String>, Option<String>), CreateHttpRouteError> {
+    let server_name = request
+        .grpc_backend_server_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let trust_profile = request
+        .grpc_backend_trust_profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match request.grpc_backend_transport {
+        GrpcBackendTransport::H2c => {
+            if server_name.is_some() || trust_profile.is_some() {
+                return Err(CreateHttpRouteError::InvalidGrpcBackend);
+            }
+            Ok((None, None))
+        }
+        GrpcBackendTransport::Tls => {
+            let server_name = server_name
+                .filter(|value| valid_tls_server_name(value))
+                .ok_or(CreateHttpRouteError::InvalidGrpcBackend)?
+                .to_ascii_lowercase();
+            let trust_profile = trust_profile
+                .map(|value| {
+                    valid_trust_profile(value)
+                        .then(|| value.to_owned())
+                        .ok_or(CreateHttpRouteError::InvalidGrpcBackend)
+                })
+                .transpose()?;
+            Ok((Some(server_name), trust_profile))
+        }
+    }
+}
+
+fn grpc_backend_runtime(
+    transport: &str,
+    server_name: Option<String>,
+    trust_profile: Option<String>,
+) -> anyhow::Result<GrpcBackendRuntimeTransport> {
+    match parse_grpc_backend_transport(transport) {
+        Some(GrpcBackendTransport::H2c) => {
+            anyhow::ensure!(
+                server_name.is_none() && trust_profile.is_none(),
+                "h2c backend cannot carry TLS identity"
+            );
+            Ok(GrpcBackendRuntimeTransport::H2c)
+        }
+        Some(GrpcBackendTransport::Tls) => {
+            let server_name = server_name
+                .filter(|value| valid_tls_server_name(value))
+                .ok_or_else(|| anyhow::anyhow!("gRPC TLS backend server name is invalid"))?;
+            let trust = match trust_profile {
+                Some(profile) if valid_trust_profile(&profile) => {
+                    GrpcBackendTrust::Profile(profile)
+                }
+                Some(_) => anyhow::bail!("gRPC TLS backend trust profile is invalid"),
+                None => GrpcBackendTrust::System,
+            };
+            Ok(GrpcBackendRuntimeTransport::Tls(GrpcBackendTlsPolicy {
+                server_name,
+                trust,
+            }))
+        }
+        None => anyhow::bail!("gRPC backend transport is invalid"),
+    }
+}
+
+fn valid_tls_server_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 253
+        && value.is_ascii()
+        && value.parse::<IpAddr>().is_err()
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+}
+
+fn valid_trust_profile(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 pub(crate) fn normalize_hostname(value: &str) -> anyhow::Result<String> {
@@ -331,13 +515,15 @@ fn validate_policy(
     if !(1..=1024).contains(&request.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS)) {
         return Err(CreateHttpRouteError::InvalidConnectionLimit);
     }
+    normalize_grpc_backend(request)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_hostname, CreateHttpRouteError, CreateHttpRoutePolicy, HttpRouteCatalog,
+        normalize_hostname, CreateHttpRouteError, CreateHttpRoutePolicy,
+        GrpcBackendRuntimeTransport, GrpcBackendTransport, GrpcBackendTrust, HttpRouteCatalog,
     };
     use uuid::Uuid;
 
@@ -363,6 +549,9 @@ mod tests {
                 hostname: "Site.Example.com".to_owned(),
                 target_addr: "127.0.0.1:8080".to_owned(),
                 max_connections: Some(12),
+                grpc_backend_transport: GrpcBackendTransport::H2c,
+                grpc_backend_server_name: None,
+                grpc_backend_trust_profile: None,
             })
             .expect("route should be created");
         assert_eq!(policy.hostname, "site.example.com");
@@ -373,6 +562,7 @@ mod tests {
             Some(super::HttpRouteRuntimePolicy {
                 policy_id: policy.id,
                 max_connections: 12,
+                grpc_backend: GrpcBackendRuntimeTransport::H2c,
             })
         );
         catalog
@@ -397,6 +587,9 @@ mod tests {
                 hostname: hostname.to_owned(),
                 target_addr: target_addr.to_owned(),
                 max_connections,
+                grpc_backend_transport: GrpcBackendTransport::H2c,
+                grpc_backend_server_name: None,
+                grpc_backend_trust_profile: None,
             }
         };
 
@@ -433,6 +626,9 @@ mod tests {
             hostname: hostname.to_owned(),
             target_addr: "127.0.0.1:8080".to_owned(),
             max_connections: Some(64),
+            grpc_backend_transport: GrpcBackendTransport::H2c,
+            grpc_backend_server_name: None,
+            grpc_backend_trust_profile: None,
         };
         catalog
             .create(request("site.example.com"))
@@ -454,6 +650,9 @@ mod tests {
                 hostname: "old.example.com".to_owned(),
                 target_addr: "127.0.0.1:8080".to_owned(),
                 max_connections: Some(8),
+                grpc_backend_transport: GrpcBackendTransport::H2c,
+                grpc_backend_server_name: None,
+                grpc_backend_trust_profile: None,
             })
             .expect("route should create");
         catalog
@@ -468,6 +667,9 @@ mod tests {
                     hostname: "New.Example.com.".to_owned(),
                     target_addr: "127.0.0.1:9090".to_owned(),
                     max_connections: Some(16),
+                    grpc_backend_transport: GrpcBackendTransport::H2c,
+                    grpc_backend_server_name: None,
+                    grpc_backend_trust_profile: None,
                 },
             )
             .expect("route should update")
@@ -477,5 +679,52 @@ mod tests {
         assert_eq!(updated.hostname, "new.example.com");
         assert_eq!(updated.target_addr, "127.0.0.1:9090");
         assert_eq!(updated.max_connections, 16);
+    }
+
+    #[test]
+    fn grpc_tls_policy_requires_sni_and_preserves_explicit_trust_profile() {
+        let client_id = Uuid::new_v4();
+        let mut catalog = HttpRouteCatalog::open(None).unwrap();
+        let policy = catalog
+            .create(CreateHttpRoutePolicy {
+                client_id,
+                name: "grpc".to_owned(),
+                hostname: "api.example.com".to_owned(),
+                target_addr: "127.0.0.1:8443".to_owned(),
+                max_connections: Some(8),
+                grpc_backend_transport: GrpcBackendTransport::Tls,
+                grpc_backend_server_name: Some("Grpc.Internal.Example".to_owned()),
+                grpc_backend_trust_profile: Some("private_ca".to_owned()),
+            })
+            .unwrap();
+        assert_eq!(
+            policy.grpc_backend_server_name.as_deref(),
+            Some("grpc.internal.example")
+        );
+        let runtime = catalog
+            .runtime_policy(client_id, "grpc", "api.example.com", "127.0.0.1:8443")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            runtime.grpc_backend,
+            GrpcBackendRuntimeTransport::Tls(super::GrpcBackendTlsPolicy {
+                trust: GrpcBackendTrust::Profile(ref profile),
+                ..
+            }) if profile == "private_ca"
+        ));
+
+        assert!(matches!(
+            catalog.create(CreateHttpRoutePolicy {
+                client_id,
+                name: "bad-grpc".to_owned(),
+                hostname: "bad.example.com".to_owned(),
+                target_addr: "127.0.0.1:8080".to_owned(),
+                max_connections: Some(8),
+                grpc_backend_transport: GrpcBackendTransport::H2c,
+                grpc_backend_server_name: Some("unexpected.example".to_owned()),
+                grpc_backend_trust_profile: None,
+            }),
+            Err(CreateHttpRouteError::InvalidGrpcBackend)
+        ));
     }
 }

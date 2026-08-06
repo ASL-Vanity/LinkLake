@@ -12,7 +12,7 @@ use http_body_util::combinators::UnsyncBoxBody;
 use hyper::{
     body::Incoming,
     client::conn::http2::{self as client_http2, SendRequest},
-    Request, Response,
+    Method, Request, Response,
 };
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use linklake_core::BoxedIo;
@@ -52,6 +52,32 @@ pub(crate) struct Http2BackendCounters {
     pub(crate) goaway_total: AtomicU64,
     pub(crate) failures_total: AtomicU64,
     pub(crate) pool_exhausted_total: AtomicU64,
+    pub(crate) non_idempotent_replay_suppressed_total: AtomicU64,
+}
+
+/// 该策略是未来重连逻辑的硬边界：已经交给 Hyper 的非幂等请求永远不能重放。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RequestReplayPolicy {
+    BeforeDispatchOnly,
+    NeverAfterDispatch,
+}
+
+impl RequestReplayPolicy {
+    pub(crate) fn for_method(method: &Method) -> Self {
+        if matches!(
+            *method,
+            Method::GET
+                | Method::HEAD
+                | Method::PUT
+                | Method::DELETE
+                | Method::OPTIONS
+                | Method::TRACE
+        ) {
+            Self::BeforeDispatchOnly
+        } else {
+            Self::NeverAfterDispatch
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -414,12 +440,23 @@ impl Http2BackendLease {
     pub(crate) async fn send_request(
         &mut self,
         request: Request<ProxyBody>,
+        replay_policy: RequestReplayPolicy,
     ) -> Result<Response<Incoming>, hyper::Error> {
+        let mut dispatched = false;
         let result = match self.sender.ready().await {
-            Ok(()) => self.sender.send_request(request).await,
+            Ok(()) => {
+                dispatched = true;
+                self.sender.send_request(request).await
+            }
             Err(error) => Err(error),
         };
         if result.is_err() {
+            if dispatched && replay_policy == RequestReplayPolicy::NeverAfterDispatch {
+                self.pool
+                    .counters
+                    .non_idempotent_replay_suppressed_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             if let Some(runtime) = self
                 .pool
                 .connections
@@ -590,7 +627,10 @@ mod tests {
             .map_err(|never| -> BoxError { match never {} })
             .boxed_unsync();
         let mut first_response = first
-            .send_request(request(request_body))
+            .send_request(
+                request(request_body),
+                RequestReplayPolicy::NeverAfterDispatch,
+            )
             .await
             .expect("streaming request should receive response headers");
 
@@ -615,7 +655,10 @@ mod tests {
             .expect("second HTTP/2 stream should reuse the connection");
         assert_eq!(second.connection_id(), first_connection_id);
         let second_response = second
-            .send_request(request(full_body("two")))
+            .send_request(
+                request(full_body("two")),
+                RequestReplayPolicy::NeverAfterDispatch,
+            )
             .await
             .expect("second request should succeed");
         let second_collected = second_response
@@ -673,7 +716,10 @@ mod tests {
             .expect("first connection should open");
         let first_id = first.connection_id();
         let first_response = first
-            .send_request(request(full_body("before-goaway")))
+            .send_request(
+                request(full_body("before-goaway")),
+                RequestReplayPolicy::NeverAfterDispatch,
+            )
             .await
             .expect("request before GOAWAY should succeed");
         let first_collected = first_response
@@ -695,7 +741,10 @@ mod tests {
             .expect("request after GOAWAY should reconnect");
         assert_ne!(second.connection_id(), first_id);
         let second_response = second
-            .send_request(request(full_body("after-goaway")))
+            .send_request(
+                request(full_body("after-goaway")),
+                RequestReplayPolicy::NeverAfterDispatch,
+            )
             .await
             .expect("request after GOAWAY should succeed");
         assert_eq!(
@@ -712,5 +761,21 @@ mod tests {
         assert_eq!(counters.reconnects_total.load(Ordering::Relaxed), 1);
         drop(second);
         pool.invalidate();
+    }
+
+    #[test]
+    fn replay_policy_never_replays_non_idempotent_methods_after_dispatch() {
+        for method in [Method::POST, Method::PATCH, Method::CONNECT] {
+            assert_eq!(
+                RequestReplayPolicy::for_method(&method),
+                RequestReplayPolicy::NeverAfterDispatch
+            );
+        }
+        for method in [Method::GET, Method::HEAD, Method::PUT, Method::DELETE] {
+            assert_eq!(
+                RequestReplayPolicy::for_method(&method),
+                RequestReplayPolicy::BeforeDispatchOnly
+            );
+        }
     }
 }

@@ -1,14 +1,20 @@
+#[path = "grpc_backend_tls.rs"]
+mod grpc_backend_tls;
+
 use crate::traffic_control::{TrafficDecision, TrafficPolicyKind};
 use crate::{
     client_registry::Authentication,
     http2_backend::{
         BoxError, Http2BackendCounters, Http2BackendLease, Http2BackendPool, ProxyBody,
+        RequestReplayPolicy,
     },
-    http_backend_pool::{BackendProtocol, BackendSecurity, OriginKey},
+    http_backend_pool::{BackendProtocol, OriginKey},
     http_route_catalog::normalize_hostname,
     record_audit, AppState,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use bytes::Bytes;
+use grpc_backend_tls::{GrpcBackendConnector, GrpcBackendTlsCounters};
 use http_body_util::{BodyExt, Full};
 use hyper::{
     body::{Body, Frame, Incoming, SizeHint},
@@ -49,6 +55,10 @@ const CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(35);
 const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const BACKEND_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const H2C_UPGRADE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const H2C_UPGRADE_MAX_LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
+const MAX_H2C_UPGRADES: usize = 128;
+const MAX_H2C_SETTINGS_BYTES: usize = 1024;
 const MAX_HTTP_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_PUBLIC_HTTP_CONNECTIONS: usize = 2048;
 const MAX_PUBLIC_HTTP2_STREAMS: u32 = 256;
@@ -58,6 +68,8 @@ pub(crate) const HTTP_REQUEST_LATENCY_BUCKETS_MILLIS: [u64; 12] = [
 
 static PUBLIC_HTTP_CONNECTION_PERMITS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(MAX_PUBLIC_HTTP_CONNECTIONS)));
+static H2C_UPGRADE_PERMITS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_H2C_UPGRADES)));
 
 struct PublicHttpConnectionActivity {
     state: Arc<AppState>,
@@ -124,7 +136,14 @@ pub(crate) struct HttpRouteStatistics {
     pub(crate) grpc_trailers_total: AtomicU64,
     pub(crate) grpc_failures_total: AtomicU64,
     pub(crate) grpc_cancellations_total: AtomicU64,
+    pub(crate) h2c_upgrade_attempts_total: AtomicU64,
+    pub(crate) h2c_upgrade_active: AtomicUsize,
+    pub(crate) h2c_upgrade_completed_total: AtomicU64,
+    pub(crate) h2c_upgrade_rejected_total: AtomicU64,
+    pub(crate) h2c_upgrade_timeouts_total: AtomicU64,
+    pub(crate) h2c_upgrade_failures_total: AtomicU64,
     pub(crate) http2_backend: Arc<Http2BackendCounters>,
+    pub(crate) grpc_backend_tls: Arc<GrpcBackendTlsCounters>,
     request_latency: HttpRequestLatencyHistogram,
 }
 
@@ -144,7 +163,14 @@ impl Default for HttpRouteStatistics {
             grpc_trailers_total: AtomicU64::new(0),
             grpc_failures_total: AtomicU64::new(0),
             grpc_cancellations_total: AtomicU64::new(0),
+            h2c_upgrade_attempts_total: AtomicU64::new(0),
+            h2c_upgrade_active: AtomicUsize::new(0),
+            h2c_upgrade_completed_total: AtomicU64::new(0),
+            h2c_upgrade_rejected_total: AtomicU64::new(0),
+            h2c_upgrade_timeouts_total: AtomicU64::new(0),
+            h2c_upgrade_failures_total: AtomicU64::new(0),
             http2_backend: Arc::new(Http2BackendCounters::default()),
+            grpc_backend_tls: Arc::new(GrpcBackendTlsCounters::default()),
             request_latency: HttpRequestLatencyHistogram::default(),
         }
     }
@@ -264,6 +290,7 @@ struct HttpRouteContext {
     permits: Arc<Semaphore>,
     statistics: Arc<HttpRouteStatistics>,
     http2_backend: Arc<Http2BackendPool>,
+    grpc_backend: GrpcBackendConnector,
 }
 
 struct TrackedBody {
@@ -301,6 +328,27 @@ struct RequestProtocols {
 struct PendingConnectionGuard {
     state: Arc<AppState>,
     connection_id: Uuid,
+}
+
+struct H2cUpgradeActivity {
+    statistics: Arc<HttpRouteStatistics>,
+}
+
+impl H2cUpgradeActivity {
+    fn begin(statistics: Arc<HttpRouteStatistics>) -> Self {
+        statistics
+            .h2c_upgrade_active
+            .fetch_add(1, Ordering::Relaxed);
+        Self { statistics }
+    }
+}
+
+impl Drop for H2cUpgradeActivity {
+    fn drop(&mut self) {
+        self.statistics
+            .h2c_upgrade_active
+            .fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl TrackedBody {
@@ -858,6 +906,7 @@ async fn proxy_request(
         return TrackedBody::plain(StatusCode::BAD_REQUEST, "invalid request target");
     }
     let native_grpc = is_native_grpc_request(&request);
+    let grpc_replay_policy = RequestReplayPolicy::for_method(request.method());
     if native_grpc && !public_http2 {
         return TrackedBody::plain(
             StatusCode::HTTP_VERSION_NOT_SUPPORTED,
@@ -916,6 +965,37 @@ async fn proxy_request(
             "HTTP traffic control rejected request",
         );
     }
+    let h2c_settings = match h2c_upgrade_settings(&request) {
+        Ok(settings) => settings,
+        Err(message) => {
+            context
+                .statistics
+                .h2c_upgrade_rejected_total
+                .fetch_add(1, Ordering::Relaxed);
+            return TrackedBody::plain(StatusCode::BAD_REQUEST, message);
+        }
+    };
+    let mut h2c_permit = if h2c_settings.is_some() {
+        context
+            .statistics
+            .h2c_upgrade_attempts_total
+            .fetch_add(1, Ordering::Relaxed);
+        match H2C_UPGRADE_PERMITS.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                context
+                    .statistics
+                    .h2c_upgrade_rejected_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return TrackedBody::plain(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "h2c upgrade capacity is exhausted",
+                );
+            }
+        }
+    } else {
+        None
+    };
     let Ok(route_permit) = context.permits.clone().try_acquire_owned() else {
         return TrackedBody::plain(StatusCode::SERVICE_UNAVAILABLE, "HTTP route is busy");
     };
@@ -968,6 +1048,16 @@ async fn proxy_request(
     let client_upgrade =
         (!public_http2 && is_upgrade_request(&request)).then(|| hyper::upgrade::on(&mut request));
     prepare_forward_headers(&mut request, peer, &original_host, scheme, native_grpc);
+    if let Some(settings) = h2c_settings {
+        request.headers_mut().insert("http2-settings", settings);
+        request.headers_mut().insert(
+            header::CONNECTION,
+            HeaderValue::from_static("Upgrade, HTTP2-Settings"),
+        );
+        request
+            .headers_mut()
+            .insert(header::UPGRADE, HeaderValue::from_static("h2c"));
+    }
     if !request.headers().contains_key(header::HOST) {
         let Ok(host) = HeaderValue::from_str(&original_host) else {
             return TrackedBody::plain(StatusCode::BAD_REQUEST, "invalid Host header");
@@ -979,7 +1069,11 @@ async fn proxy_request(
     };
     let backend_uri = if native_grpc {
         hyper::Uri::builder()
-            .scheme("http")
+            .scheme(if context.grpc_backend.is_tls() {
+                "https"
+            } else {
+                "http"
+            })
             .authority(original_host.as_str())
             .path_and_query(path_and_query)
             .build()
@@ -1014,10 +1108,14 @@ async fn proxy_request(
     let (mut response, backend_lease) = if native_grpc {
         let statistics = context.statistics.clone();
         let pool = context.http2_backend.clone();
+        let grpc_backend = context.grpc_backend.clone();
         let acquire = pool
             .acquire_or_connect(|| async {
                 match request_client_stream(&state, &context).await {
-                    Ok(stream) => Ok(stream),
+                    Ok(stream) => grpc_backend
+                        .connect(stream)
+                        .await
+                        .map_err(|error| Box::new(error) as BoxError),
                     Err(pairing_timeout) => {
                         if pairing_timeout {
                             statistics.pairing_timeouts.fetch_add(1, Ordering::Relaxed);
@@ -1058,7 +1156,12 @@ async fn proxy_request(
             }
         };
         let connection_id = lease.connection_id();
-        let response = match timeout(BACKEND_RESPONSE_TIMEOUT, lease.send_request(request)).await {
+        let response = match timeout(
+            BACKEND_RESPONSE_TIMEOUT,
+            lease.send_request(request, grpc_replay_policy),
+        )
+        .await
+        {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => {
                 tracing::warn!(
@@ -1173,23 +1276,101 @@ async fn proxy_request(
         if let Some(client_upgrade) = client_upgrade {
             let backend_upgrade = hyper::upgrade::on(&mut response);
             let mut stop = context.stop.clone();
+            let h2c = h2c_permit.is_some();
+            let h2c_permit = h2c_permit.take();
+            let h2c_statistics = context.statistics.clone();
+            let h2c_state = state.clone();
+            let h2c_policy_id = context.policy_id;
             let upgrade_activity = activity
                 .take()
                 .expect("HTTP upgrade should own the connection activity");
             tokio::spawn(async move {
                 let _activity = upgrade_activity;
+                let _h2c_permit = h2c_permit;
+                let _h2c_activity = h2c.then(|| H2cUpgradeActivity::begin(h2c_statistics.clone()));
                 let upgraded = tokio::select! {
                     _ = stop.changed() => return,
-                    upgraded = async { tokio::join!(client_upgrade, backend_upgrade) } => upgraded,
+                    upgraded = timeout(H2C_UPGRADE_HANDSHAKE_TIMEOUT, async {
+                        let client = client_upgrade.await?;
+                        let backend = backend_upgrade.await?;
+                        Ok::<_, hyper::Error>((client, backend))
+                    }) => upgraded,
                 };
-                let (Ok(client), Ok(backend)) = upgraded else {
-                    return;
+                let (client, backend) = match upgraded {
+                    Ok(Ok(upgraded)) => upgraded,
+                    Ok(Err(_)) => {
+                        if h2c {
+                            h2c_statistics
+                                .h2c_upgrade_failures_total
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        return;
+                    }
+                    Err(_) => {
+                        if h2c {
+                            h2c_statistics
+                                .h2c_upgrade_timeouts_total
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        return;
+                    }
                 };
+                // Hyper 的 Upgraded 持有协议解析器已经预读的缓冲区；TokioIo 接管后
+                // 缓冲字节与底层连接由同一个任务独占，不会遗漏 HTTP/2 preface。
                 let mut client = TokioIo::new(client);
                 let mut backend = TokioIo::new(backend);
-                tokio::select! {
-                    _ = stop.changed() => {}
-                    _ = copy_bidirectional(&mut client, &mut backend) => {}
+                let transfer = tokio::select! {
+                    _ = stop.changed() => None,
+                    result = async {
+                        if h2c {
+                            timeout(
+                                H2C_UPGRADE_MAX_LIFETIME,
+                                copy_bidirectional(&mut client, &mut backend),
+                            )
+                            .await
+                            .map_err(|_| ())
+                            .and_then(|result| result.map_err(|_| ()))
+                        } else {
+                            copy_bidirectional(&mut client, &mut backend)
+                                .await
+                                .map_err(|_| ())
+                        }
+                    } => Some(result),
+                };
+                if !h2c {
+                    return;
+                }
+                match transfer {
+                    Some(Ok((from_public, to_public))) => {
+                        h2c_statistics
+                            .h2c_upgrade_completed_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        h2c_statistics
+                            .bytes_from_public
+                            .fetch_add(from_public, Ordering::Relaxed);
+                        h2c_statistics
+                            .bytes_to_public
+                            .fetch_add(to_public, Ordering::Relaxed);
+                        if let Err(error) = h2c_state
+                            .traffic_controls
+                            .lock()
+                            .expect("traffic control catalog lock poisoned")
+                            .record_bytes(
+                                TrafficPolicyKind::Http,
+                                h2c_policy_id,
+                                from_public.saturating_add(to_public),
+                                crate::unix_seconds(),
+                            )
+                        {
+                            tracing::warn!("Could not persist h2c upgrade traffic usage: {error}");
+                        }
+                    }
+                    Some(Err(())) => {
+                        h2c_statistics
+                            .h2c_upgrade_timeouts_total
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    None => {}
                 }
             });
         } else {
@@ -1320,11 +1501,30 @@ pub(crate) async fn register_route(
             .or_insert_with(|| Arc::new(HttpRouteStatistics::default()))
             .clone()
     };
+    let grpc_backend = match GrpcBackendConnector::from_policy(
+        &runtime_policy.grpc_backend,
+        statistics.grpc_backend_tls.clone(),
+    ) {
+        Ok(connector) => connector,
+        Err(error) => {
+            tracing::warn!(
+                "gRPC backend transport configuration is unavailable for {hostname}: {error}"
+            );
+            send_error(
+                &mut stream,
+                "gRPC backend TLS or trust profile configuration is unavailable",
+            )
+            .await;
+            return;
+        }
+    };
+    let backend_port = if grpc_backend.is_tls() { 443 } else { 80 };
+    let grpc_backend_transport = grpc_backend.transport_name();
     let origin = OriginKey::new(
         runtime_policy.policy_id,
-        &format!("{hostname}:80"),
+        &format!("{hostname}:{backend_port}"),
         BackendProtocol::Http2,
-        BackendSecurity::Plaintext,
+        grpc_backend.security(),
     )
     .expect("validated HTTP hostname must form a backend origin");
     let http2_backend = Http2BackendPool::new(
@@ -1340,6 +1540,7 @@ pub(crate) async fn register_route(
         permits: Arc::new(Semaphore::new(runtime_policy.max_connections)),
         statistics,
         http2_backend,
+        grpc_backend,
     });
     if let Some(previous) = state
         .http_routes
@@ -1376,7 +1577,10 @@ pub(crate) async fn register_route(
         &state,
         "http_route.registered",
         &client_id.to_string(),
-        &format!("name={name}; hostname={hostname}; target={target_addr}"),
+        &format!(
+            "name={name}; hostname={hostname}; target={target_addr}; grpc_backend={}",
+            grpc_backend_transport
+        ),
     );
     let (reader, mut writer) = split(stream);
     if write_control_frame(
@@ -1694,6 +1898,83 @@ fn is_upgrade_request<B>(request: &Request<B>) -> bool {
             .any(|value| value.trim().eq_ignore_ascii_case("upgrade"))
 }
 
+fn h2c_upgrade_settings<B>(request: &Request<B>) -> Result<Option<HeaderValue>, &'static str> {
+    let upgrade_values = request
+        .headers()
+        .get_all(header::UPGRADE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if !upgrade_values
+        .iter()
+        .any(|value| value.eq_ignore_ascii_case("h2c"))
+    {
+        return Ok(None);
+    }
+    if request.version() != Version::HTTP_11
+        || upgrade_values.len() != 1
+        || !upgrade_values[0].eq_ignore_ascii_case("h2c")
+    {
+        return Err("invalid h2c Upgrade header");
+    }
+    let connection_tokens = request
+        .headers()
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    if !connection_tokens
+        .iter()
+        .any(|value| value.eq_ignore_ascii_case("upgrade"))
+        || !connection_tokens
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case("http2-settings"))
+    {
+        return Err("h2c requires Connection: Upgrade, HTTP2-Settings");
+    }
+    if request.headers().contains_key(header::TRANSFER_ENCODING) {
+        return Err("h2c upgrade request bodies are not supported");
+    }
+    let content_lengths = request.headers().get_all(header::CONTENT_LENGTH);
+    if content_lengths.iter().count() > 1
+        || content_lengths.iter().any(|value| value.as_bytes() != b"0")
+    {
+        return Err("h2c upgrade request bodies are not supported");
+    }
+    let mut settings = request.headers().get_all("http2-settings").iter();
+    let Some(settings_value) = settings.next().cloned() else {
+        return Err("h2c requires exactly one HTTP2-Settings header");
+    };
+    if settings.next().is_some() {
+        return Err("h2c requires exactly one HTTP2-Settings header");
+    }
+    let encoded = settings_value
+        .to_str()
+        .map_err(|_| "HTTP2-Settings is not valid base64url")?;
+    if encoded.len() > MAX_H2C_SETTINGS_BYTES.saturating_mul(2) {
+        return Err("HTTP2-Settings exceeds the h2c budget");
+    }
+    let decoded = URL_SAFE_NO_PAD
+        .decode(encoded.as_bytes())
+        .map_err(|_| "HTTP2-Settings is not valid base64url")?;
+    if decoded.len() > MAX_H2C_SETTINGS_BYTES || decoded.len() % 6 != 0 {
+        return Err("HTTP2-Settings payload is malformed");
+    }
+    let mut identifiers = HashSet::new();
+    for setting in decoded.chunks_exact(6) {
+        let identifier = u16::from_be_bytes([setting[0], setting[1]]);
+        if !identifiers.insert(identifier) {
+            return Err("HTTP2-Settings contains a duplicate setting");
+        }
+    }
+    Ok(Some(settings_value))
+}
+
 async fn send_error(stream: &mut BoxedIo, message: &str) {
     let _ = write_control_frame(
         stream,
@@ -1738,6 +2019,41 @@ mod tests {
                 .expect("test request should build");
             assert!(!is_native_grpc_request(&request));
         }
+    }
+
+    #[test]
+    fn h2c_upgrade_requires_strict_settings_and_connection_tokens() {
+        let settings = URL_SAFE_NO_PAD.encode([0_u8, 1, 0, 0, 0, 100]);
+        let request = Request::builder()
+            .version(Version::HTTP_11)
+            .header(header::UPGRADE, "h2c")
+            .header(header::CONNECTION, "Upgrade, HTTP2-Settings")
+            .header("http2-settings", settings)
+            .body(())
+            .unwrap();
+        assert!(h2c_upgrade_settings(&request).unwrap().is_some());
+
+        let duplicate = URL_SAFE_NO_PAD.encode([0_u8, 1, 0, 0, 0, 100, 0, 1, 0, 0, 0, 200]);
+        let duplicate = Request::builder()
+            .version(Version::HTTP_11)
+            .header(header::UPGRADE, "h2c")
+            .header(header::CONNECTION, "Upgrade, HTTP2-Settings")
+            .header("http2-settings", duplicate)
+            .body(())
+            .unwrap();
+        assert_eq!(
+            h2c_upgrade_settings(&duplicate),
+            Err("HTTP2-Settings contains a duplicate setting")
+        );
+
+        let missing_token = Request::builder()
+            .version(Version::HTTP_11)
+            .header(header::UPGRADE, "h2c")
+            .header(header::CONNECTION, "Upgrade")
+            .header("http2-settings", "")
+            .body(())
+            .unwrap();
+        assert!(h2c_upgrade_settings(&missing_token).is_err());
     }
 
     #[test]
