@@ -3,6 +3,8 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 
+import 'manager_theme.dart';
+
 class WindowPreferences {
   const WindowPreferences({
     this.x,
@@ -83,6 +85,7 @@ class ManagerSettings {
   const ManagerSettings({
     this.chinese = true,
     this.themeMode = ThemeMode.system,
+    this.themeStyle = ManagerThemeStyle.lake,
     this.lastServerUrl = 'https://link.odelake.com',
     this.closeToTray = true,
     this.launchAtStartup = false,
@@ -93,6 +96,7 @@ class ManagerSettings {
 
   final bool chinese;
   final ThemeMode themeMode;
+  final ManagerThemeStyle themeStyle;
   final String lastServerUrl;
   final bool closeToTray;
   final bool launchAtStartup;
@@ -103,6 +107,7 @@ class ManagerSettings {
   ManagerSettings copyWith({
     bool? chinese,
     ThemeMode? themeMode,
+    ManagerThemeStyle? themeStyle,
     String? lastServerUrl,
     bool? closeToTray,
     bool? launchAtStartup,
@@ -112,6 +117,7 @@ class ManagerSettings {
   }) => ManagerSettings(
     chinese: chinese ?? this.chinese,
     themeMode: themeMode ?? this.themeMode,
+    themeStyle: themeStyle ?? this.themeStyle,
     lastServerUrl: lastServerUrl ?? this.lastServerUrl,
     closeToTray: closeToTray ?? this.closeToTray,
     launchAtStartup: launchAtStartup ?? this.launchAtStartup,
@@ -123,6 +129,7 @@ class ManagerSettings {
   Map<String, dynamic> toJson() => {
     'language': chinese ? 'zh' : 'en',
     'theme': themeMode.name,
+    'theme_style': themeStyle.name,
     'last_server_url': lastServerUrl,
     'close_to_tray': closeToTray,
     'launch_at_startup': launchAtStartup,
@@ -143,6 +150,7 @@ class ManagerSettings {
     return ManagerSettings(
       chinese: map['language'] != 'en',
       themeMode: theme,
+      themeStyle: ManagerThemeStyle.parse(map['theme_style']),
       lastServerUrl: server.startsWith('http')
           ? server
           : 'https://link.odelake.com',

@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:linklake_manager/desktop_lifecycle.dart';
 import 'package:linklake_manager/manager_settings.dart';
+import 'package:linklake_manager/manager_theme.dart';
 
 import 'fakes.dart';
 
@@ -21,6 +22,7 @@ void main() {
       const settings = ManagerSettings(
         chinese: false,
         themeMode: ThemeMode.dark,
+        themeStyle: ManagerThemeStyle.paper,
         lastServerUrl: 'https://manager.example.com',
         closeToTray: false,
         launchAtStartup: true,
@@ -38,6 +40,7 @@ void main() {
 
       expect(loaded.chinese, isFalse);
       expect(loaded.themeMode, ThemeMode.dark);
+      expect(loaded.themeStyle, ManagerThemeStyle.paper);
       expect(loaded.lastServerUrl, 'https://manager.example.com');
       expect(loaded.closeToTray, isFalse);
       expect(loaded.launchAtStartup, isTrue);

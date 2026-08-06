@@ -8,6 +8,8 @@ import 'package:flutter/material.dart';
 import 'api_client.dart';
 import 'desktop_lifecycle.dart';
 import 'manager_settings.dart';
+import 'manager_identity.dart';
+import 'manager_theme.dart';
 import 'policy_pages.dart';
 import 'rbac.dart';
 import 'server_profiles.dart';
@@ -85,26 +87,11 @@ class _LinkLakeManagerAppState extends State<LinkLakeManagerApp> {
 
   @override
   Widget build(BuildContext context) {
-    final scheme = ColorScheme.fromSeed(seedColor: const Color(0xFF168AAD));
-    final darkScheme = ColorScheme.fromSeed(
-      seedColor: const Color(0xFF38BDF8),
-      brightness: Brightness.dark,
-    );
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'LinkLake Manager',
-      theme: ThemeData(
-        colorScheme: scheme,
-        useMaterial3: true,
-        scaffoldBackgroundColor: const Color(0xFFF3F8FA),
-        cardTheme: const CardThemeData(elevation: 0, margin: EdgeInsets.zero),
-      ),
-      darkTheme: ThemeData(
-        colorScheme: darkScheme,
-        useMaterial3: true,
-        scaffoldBackgroundColor: const Color(0xFF06131D),
-        cardTheme: const CardThemeData(elevation: 0, margin: EdgeInsets.zero),
-      ),
+      theme: buildManagerTheme(_settings.themeStyle, Brightness.light),
+      darkTheme: buildManagerTheme(_settings.themeStyle, Brightness.dark),
       themeMode: _settings.themeMode,
       home: LoginPage(
         chinese: _settings.chinese,
@@ -781,6 +768,7 @@ class _DashboardPageState extends State<DashboardPage> {
         const DesktopCapabilities.none();
     var language = _settings.chinese;
     var theme = _settings.themeMode;
+    var themeStyle = _settings.themeStyle;
     var closeToTray = desktopCapabilities.tray && _settings.closeToTray;
     var launchAtStartup =
         desktopCapabilities.launchAtStartup && _settings.launchAtStartup;
@@ -827,6 +815,30 @@ class _DashboardPageState extends State<DashboardPage> {
                     ],
                     onChanged: (value) =>
                         setDialogState(() => theme = value ?? ThemeMode.system),
+                  ),
+                  const SizedBox(height: 12),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      t('外观材质', 'Visual material'),
+                      style: Theme.of(context).textTheme.labelLarge,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    key: const Key('theme-style-picker'),
+                    children: [
+                      for (final style in ManagerThemeStyle.values) ...[
+                        ThemeStylePreview(
+                          style: style,
+                          selected: themeStyle == style,
+                          chinese: language,
+                          onTap: () => setDialogState(() => themeStyle = style),
+                        ),
+                        if (style != ManagerThemeStyle.values.last)
+                          const SizedBox(width: 8),
+                      ],
+                    ],
                   ),
                   const SizedBox(height: 12),
                   SwitchListTile(
@@ -919,6 +931,7 @@ class _DashboardPageState extends State<DashboardPage> {
                 _settings.copyWith(
                   chinese: language,
                   themeMode: theme,
+                  themeStyle: themeStyle,
                   closeToTray: closeToTray,
                   launchAtStartup: launchAtStartup,
                   rememberWindow: rememberWindow,
@@ -939,6 +952,7 @@ class _DashboardPageState extends State<DashboardPage> {
     return LayoutBuilder(
       builder: (context, constraints) {
         final narrow = constraints.maxWidth < 900;
+        final identity = ManagerIdentity.fromJson(_identity);
         final destinations = _dashboardDestinations();
         final selectedIndex = math.max(
           0,
@@ -1041,6 +1055,14 @@ class _DashboardPageState extends State<DashboardPage> {
                   ],
                   icon: const Icon(Icons.palette_outlined),
                 ),
+              if (!narrow) ...[
+                const SizedBox(width: 6),
+                ManagerIdentityBadge(
+                  identity: identity,
+                  chinese: zh,
+                  compact: constraints.maxWidth < 1180,
+                ),
+              ],
               IconButton(
                 key: const Key('manager-settings'),
                 onPressed: _showManagerSettings,
@@ -1061,6 +1083,18 @@ class _DashboardPageState extends State<DashboardPage> {
                     if (value == 'logout') _logout();
                   },
                   itemBuilder: (_) => [
+                    PopupMenuItem(
+                      enabled: false,
+                      child: ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        leading: const Icon(Icons.account_circle_outlined),
+                        title: Text(identity.primaryName),
+                        subtitle: Text(
+                          '${identity.roleLabel(zh)} · '
+                          '${identity.authenticationLabel(zh)}',
+                        ),
+                      ),
+                    ),
                     PopupMenuItem(
                       value: 'language',
                       child: Text(zh ? 'English' : '中文'),
