@@ -789,7 +789,7 @@ class _PolicyPageState extends State<PolicyPage> {
         try {
           await _showCreatedCredentials(response);
         } on LinkLakeApiException catch (error) {
-          if (error.code == 'invalid_response') {
+          if (error.code == 'invalid_response' && mounted) {
             await widget.onRefresh();
           }
           rethrow;

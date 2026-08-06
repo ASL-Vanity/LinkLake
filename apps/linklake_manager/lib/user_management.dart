@@ -1201,11 +1201,12 @@ class _UserManagementPageState extends State<UserManagementPage> {
       ),
     );
     await _disposeControllers([name, days]);
+    if (!mounted) return;
     if (invalidOneTimeCredential) {
       await _recoverFromInvalidApiTokenCredential();
       return;
     }
-    if (created == null || !mounted) return;
+    if (created == null) return;
     final token = created['token']!.toString();
     await showDialog<void>(
       context: context,
@@ -1224,6 +1225,7 @@ class _UserManagementPageState extends State<UserManagementPage> {
   }
 
   Future<void> _recoverFromInvalidApiTokenCredential() async {
+    if (!mounted) return;
     Object? refreshFailure;
     try {
       await widget.onRefresh();
