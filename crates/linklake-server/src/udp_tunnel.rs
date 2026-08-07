@@ -4,6 +4,8 @@ use crate::traffic_control::TrafficDecision;
 use crate::{
     client_registry::Authentication,
     dual_stack_udp::{bind_public_socket, DualStackUdpSocket, PublicUdpEndpoint},
+    public_port_lease::HaPublicPortLease,
+    public_port_ownership::PublicPortProtocol,
     record_audit,
     udp_data_plane::AuthenticatedUdpConnection,
     AppState,
@@ -414,14 +416,6 @@ pub(crate) async fn register_tunnel(
         .await;
         return;
     };
-    let public_socket = match bind_public_socket(&state, public_port, "udp_tunnel").await {
-        Ok(socket) => socket,
-        Err(_) => {
-            reject_registration(&state, &mut stream, "public UDP port is unavailable").await;
-            return;
-        }
-    };
-
     let registration_id = Uuid::new_v4();
     let attachment = data_plane.reserve_attachment(client_id, registration_id);
     let offer = attachment.offer().clone();
@@ -480,6 +474,56 @@ pub(crate) async fn register_tunnel(
         return;
     }
 
+    let port_lease = match HaPublicPortLease::acquire(
+        &state.ha_runtime,
+        PublicPortProtocol::Udp,
+        public_port,
+        runtime_policy.policy_id,
+    )
+    .await
+    {
+        Ok(Some(lease)) => lease,
+        Ok(None) => {
+            authenticated
+                .connection
+                .close(8_u8.into(), b"UDP public port owned by another instance");
+            reject_registration(
+                &state,
+                &mut stream,
+                "public UDP port is owned by another HA instance",
+            )
+            .await;
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(
+                public_port,
+                "Could not acquire UDP public port ownership: {error}"
+            );
+            authenticated
+                .connection
+                .close(8_u8.into(), b"UDP public port ownership unavailable");
+            reject_registration(
+                &state,
+                &mut stream,
+                "public UDP port ownership is unavailable",
+            )
+            .await;
+            return;
+        }
+    };
+    let public_socket = match bind_public_socket(&state, public_port, "udp_tunnel").await {
+        Ok(socket) => socket,
+        Err(_) => {
+            port_lease.release().await;
+            authenticated
+                .connection
+                .close(8_u8.into(), b"UDP public port unavailable");
+            reject_registration(&state, &mut stream, "public UDP port is unavailable").await;
+            return;
+        }
+    };
+
     let negotiated_max_datagram_size = authenticated
         .connection
         .max_datagram_size()
@@ -493,6 +537,7 @@ pub(crate) async fn register_tunnel(
     .await
     .is_err()
     {
+        port_lease.release().await;
         authenticated
             .connection
             .close(6_u8.into(), b"could not send UDP ready frame");
@@ -508,6 +553,7 @@ pub(crate) async fn register_tunnel(
     .await
     .is_err()
     {
+        port_lease.release().await;
         authenticated
             .connection
             .close(7_u8.into(), b"UDP registration control connection closed");
@@ -516,6 +562,7 @@ pub(crate) async fn register_tunnel(
 
     let statistics = statistics_for(&state, runtime_policy.policy_id);
     let (stop_tx, stop_rx) = watch::channel(());
+    port_lease.spawn_supervisor(stop_rx.clone(), stop_tx.clone());
     {
         let mut tunnels = state
             .udp_tunnels
@@ -747,7 +794,7 @@ async fn run_tunnel_loop(
                         session.last_activity = now;
                         (session.session_id, false)
                     } else {
-                        if !state.lifecycle.accepts_new_work() {
+                        if !state.accepts_public_work() {
                             statistics.dropped_packets.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }

@@ -1,3 +1,7 @@
+use crate::{
+    ha_runtime::HaRuntime,
+    public_port_ownership::{PublicPortLease, PublicPortProtocol},
+};
 use linklake_core::public_ports::PortRanges;
 use serde::Serialize;
 use std::{
@@ -8,10 +12,12 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc, Mutex,
     },
+    time::Duration,
 };
+use uuid::Uuid;
 
 const DEFAULT_PUBLIC_PORTS: &str = "32000-32999";
 const DEFAULT_RESERVED_TCP_PORTS: &str = "22";
@@ -42,6 +48,7 @@ pub(crate) trait DynamicPortLease: Send + Sync {
     fn protocol(&self) -> DynamicPortProtocol;
     fn port(&self) -> u16;
     fn lease_id(&self) -> &str;
+    fn renewal_interval(&self) -> Duration;
     fn renew<'a>(&'a self) -> DynamicPortLeaseOperationFuture<'a>;
     fn release(self: Box<Self>) -> DynamicPortLeaseReleaseFuture;
 }
@@ -55,18 +62,27 @@ pub(crate) type DynamicPortLeaseReleaseFuture =
     Pin<Box<dyn Future<Output = Result<(), DynamicPortLeaseError>> + Send + 'static>>;
 
 pub(crate) trait DynamicPortLeaseProvider: Send + Sync {
-    fn acquire_tcp<'a>(&'a self, policy: &'a PublicPortPolicy)
-        -> DynamicPortLeaseAcquireFuture<'a>;
+    fn acquire_tcp<'a>(
+        &'a self,
+        policy: &'a PublicPortPolicy,
+        policy_id: Uuid,
+    ) -> DynamicPortLeaseAcquireFuture<'a>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DynamicPortLeaseError {
     Exhausted,
+    Unavailable,
 }
 
 impl fmt::Display for DynamicPortLeaseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("no dynamic TCP public port is available")
+        match self {
+            Self::Exhausted => formatter.write_str("no dynamic TCP public port is available"),
+            Self::Unavailable => {
+                formatter.write_str("dynamic TCP public port leasing is unavailable")
+            }
+        }
     }
 }
 
@@ -104,6 +120,10 @@ impl DynamicPortLease for LocalDynamicPortLease {
         &self.lease_id
     }
 
+    fn renewal_interval(&self) -> Duration {
+        Duration::from_secs(30)
+    }
+
     fn renew<'a>(&'a self) -> DynamicPortLeaseOperationFuture<'a> {
         Box::pin(async { Ok(()) })
     }
@@ -138,6 +158,7 @@ impl DynamicPortLeaseProvider for LocalDynamicPortLeaseProvider {
     fn acquire_tcp<'a>(
         &'a self,
         policy: &'a PublicPortPolicy,
+        _policy_id: Uuid,
     ) -> DynamicPortLeaseAcquireFuture<'a> {
         let state = self.state.clone();
         Box::pin(async move {
@@ -158,6 +179,129 @@ impl DynamicPortLeaseProvider for LocalDynamicPortLeaseProvider {
                 lease_id,
                 released: AtomicBool::new(false),
             }) as Box<dyn DynamicPortLease>)
+        })
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct HaDynamicPortLeaseProvider {
+    runtime: Arc<HaRuntime>,
+    next_tcp: Arc<AtomicU32>,
+}
+
+impl HaDynamicPortLeaseProvider {
+    pub(crate) fn new(runtime: Arc<HaRuntime>) -> Self {
+        Self {
+            runtime,
+            next_tcp: Arc::new(AtomicU32::new(1)),
+        }
+    }
+}
+
+struct HaDynamicPortLease {
+    ownership: crate::public_port_ownership::PublicPortOwnership,
+    lease: PublicPortLease,
+    renewal_interval: Duration,
+    lease_id: String,
+    released: AtomicBool,
+}
+
+impl DynamicPortLease for HaDynamicPortLease {
+    fn protocol(&self) -> DynamicPortProtocol {
+        DynamicPortProtocol::Tcp
+    }
+
+    fn port(&self) -> u16 {
+        self.lease.public_port
+    }
+
+    fn lease_id(&self) -> &str {
+        &self.lease_id
+    }
+
+    fn renewal_interval(&self) -> Duration {
+        self.renewal_interval
+    }
+
+    fn renew<'a>(&'a self) -> DynamicPortLeaseOperationFuture<'a> {
+        Box::pin(async move {
+            if self.released.load(Ordering::Acquire) {
+                return Err(DynamicPortLeaseError::Unavailable);
+            }
+            self.ownership
+                .renew(
+                    self.lease.protocol,
+                    self.lease.public_port,
+                    self.lease.policy_id,
+                    self.lease.lease_id,
+                    self.lease.fencing_token,
+                )
+                .await
+                .map_err(|_| DynamicPortLeaseError::Unavailable)?
+                .ok_or(DynamicPortLeaseError::Unavailable)
+                .map(|_| ())
+        })
+    }
+
+    fn release(self: Box<Self>) -> DynamicPortLeaseReleaseFuture {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return Box::pin(async { Ok(()) });
+        }
+        let ownership = self.ownership.clone();
+        let lease = self.lease.clone();
+        Box::pin(async move {
+            ownership
+                .release(
+                    lease.protocol,
+                    lease.public_port,
+                    lease.policy_id,
+                    lease.lease_id,
+                    lease.fencing_token,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|_| DynamicPortLeaseError::Unavailable)
+        })
+    }
+}
+
+impl DynamicPortLeaseProvider for HaDynamicPortLeaseProvider {
+    fn acquire_tcp<'a>(
+        &'a self,
+        policy: &'a PublicPortPolicy,
+        policy_id: Uuid,
+    ) -> DynamicPortLeaseAcquireFuture<'a> {
+        Box::pin(async move {
+            let fencing_token = self
+                .runtime
+                .fencing_token()
+                .map_err(|_| DynamicPortLeaseError::Unavailable)?;
+            let cursor = self.next_tcp.fetch_add(1, Ordering::Relaxed).max(1);
+            for offset in 0..u16::MAX as u32 {
+                let port = ((cursor - 1 + offset) % u16::MAX as u32 + 1) as u16;
+                if !policy.allows_tcp(port) {
+                    continue;
+                }
+                let lease = self
+                    .runtime
+                    .public_ports()
+                    .acquire(PublicPortProtocol::Tcp, port, policy_id, fencing_token)
+                    .await
+                    .map_err(|_| DynamicPortLeaseError::Unavailable)?;
+                let Some(lease) = lease else {
+                    continue;
+                };
+                self.next_tcp
+                    .store(u32::from(port.wrapping_add(1).max(1)), Ordering::Relaxed);
+                return Ok(Box::new(HaDynamicPortLease {
+                    ownership: self.runtime.public_ports().clone(),
+                    renewal_interval: self.runtime.heartbeat(),
+                    lease_id: lease.lease_id.to_string(),
+                    lease,
+                    released: AtomicBool::new(false),
+                }) as Box<dyn DynamicPortLease>);
+            }
+            Err(DynamicPortLeaseError::Exhausted)
         })
     }
 }
@@ -280,6 +424,7 @@ fn has_available_port(allowed: &PortRanges, reserved: &PortRanges) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{DynamicPortLeaseProvider, LocalDynamicPortLeaseProvider, PublicPortPolicy};
+    use uuid::Uuid;
 
     #[test]
     fn development_policy_keeps_previous_defaults() {
@@ -305,14 +450,19 @@ mod tests {
     async fn local_dynamic_leases_are_unique_rotating_and_released_on_drop() {
         let policy = PublicPortPolicy::for_test("32000-32001", "32000", "", "");
         let provider = LocalDynamicPortLeaseProvider::default();
-        let first = provider.acquire_tcp(&policy).await.unwrap();
-        let second = provider.acquire_tcp(&policy).await.unwrap();
+        let policy_id = Uuid::new_v4();
+        let first = provider.acquire_tcp(&policy, policy_id).await.unwrap();
+        let second = provider.acquire_tcp(&policy, policy_id).await.unwrap();
         assert_ne!(first.port(), second.port());
-        assert!(provider.acquire_tcp(&policy).await.is_err());
+        assert!(provider.acquire_tcp(&policy, policy_id).await.is_err());
         let released = first.port();
         drop(first);
         assert_eq!(
-            provider.acquire_tcp(&policy).await.unwrap().port(),
+            provider
+                .acquire_tcp(&policy, policy_id)
+                .await
+                .unwrap()
+                .port(),
             released
         );
     }

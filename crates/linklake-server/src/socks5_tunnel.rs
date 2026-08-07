@@ -2,6 +2,8 @@ use crate::traffic_control::{TrafficDecision, TrafficPolicyKind};
 use crate::{
     client_registry::Authentication,
     dual_stack_udp::{bind_public_socket, DualStackUdpSocket, PublicUdpEndpoint},
+    public_port_lease::HaPublicPortLease,
+    public_port_ownership::PublicPortProtocol,
     public_port_policy::{DynamicPortLease, DynamicPortProtocol},
     record_audit,
     tcp_tunnel::{copy_bidirectional_with_limit, BandwidthLimiter},
@@ -218,9 +220,42 @@ pub(crate) async fn register_proxy(
         .await;
         return;
     };
+    let tcp_port_lease = match HaPublicPortLease::acquire(
+        &state.ha_runtime,
+        PublicPortProtocol::Tcp,
+        public_port,
+        runtime_policy.policy_id,
+    )
+    .await
+    {
+        Ok(Some(lease)) => lease,
+        Ok(None) => {
+            reject(
+                &state,
+                &mut stream,
+                "SOCKS5 TCP port is owned by another HA instance",
+            )
+            .await;
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(
+                public_port,
+                "Could not acquire SOCKS5 TCP port ownership: {error}"
+            );
+            reject(
+                &state,
+                &mut stream,
+                "SOCKS5 TCP port ownership is unavailable",
+            )
+            .await;
+            return;
+        }
+    };
     let listener = match TcpListener::bind(("0.0.0.0", public_port)).await {
         Ok(listener) => listener,
         Err(_) => {
+            tcp_port_lease.release().await;
             reject(&state, &mut stream, "SOCKS5 public port is unavailable").await;
             return;
         }
@@ -239,7 +274,40 @@ pub(crate) async fn register_proxy(
         .bandwidth_limit_bps
         .map(BandwidthLimiter::new)
         .map(Arc::new);
+    let mut udp_port_lease = None;
     let udp_runtime = if let Some(data_plane) = state.udp_data_plane.clone() {
+        let lease = match HaPublicPortLease::acquire(
+            &state.ha_runtime,
+            PublicPortProtocol::Udp,
+            public_port,
+            runtime_policy.policy_id,
+        )
+        .await
+        {
+            Ok(Some(lease)) => lease,
+            Ok(None) => {
+                reject(
+                    &state,
+                    &mut stream,
+                    "SOCKS5 UDP port is owned by another HA instance",
+                )
+                .await;
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    public_port,
+                    "Could not acquire SOCKS5 UDP port ownership: {error}"
+                );
+                reject(
+                    &state,
+                    &mut stream,
+                    "SOCKS5 UDP port ownership is unavailable",
+                )
+                .await;
+                return;
+            }
+        };
         let socket = match bind_public_socket(&state, public_port, "socks5_udp_associate").await {
             Ok(socket) => socket,
             Err(_) => {
@@ -247,6 +315,7 @@ pub(crate) async fn register_proxy(
                 return;
             }
         };
+        udp_port_lease = Some(lease);
         let attachment = data_plane.reserve_attachment(client_id, registration_id);
         let offer = attachment.offer().clone();
         if write_control_frame(
@@ -340,6 +409,10 @@ pub(crate) async fn register_proxy(
         &runtime_policy.policy_id.to_string(),
         &format!("client={client_id}; name={name}; public_port={public_port}"),
     );
+    tcp_port_lease.spawn_supervisor(stop_rx.clone(), stop_tx.clone());
+    if let Some(lease) = udp_port_lease {
+        lease.spawn_supervisor(stop_rx.clone(), stop_tx.clone());
+    }
     let context = PublicConnectionContext {
         state: state.clone(),
         policy_id: runtime_policy.policy_id,
@@ -529,7 +602,7 @@ async fn run_udp_runtime(
                 let Some(session_id) = association_for_source(
                     &context.associations,
                     source,
-                    context.state.lifecycle.accepts_new_work(),
+                    context.state.accepts_public_work(),
                 ) else {
                     statistics.udp_dropped_datagrams.fetch_add(1, Ordering::Relaxed);
                     if fragmented {
@@ -820,7 +893,7 @@ async fn accept_public_connections(
             _ = stop.changed() => break,
             accepted = listener.accept() => match accepted {
                 Ok((stream, source)) => {
-                    if !context.state.lifecycle.accepts_new_work() {
+                    if !context.state.accepts_public_work() {
                         context.statistics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                         drop(stream);
                         continue;
@@ -1202,7 +1275,12 @@ async fn serve_bound_listener(
         .fetch_add(1, Ordering::Relaxed);
 
     let deadline = Instant::now() + BIND_ACCEPT_TIMEOUT;
-    let mut renewal = interval(Duration::from_secs(30));
+    let renewal_interval = bound
+        .lease
+        .as_ref()
+        .map(|lease| lease.renewal_interval())
+        .unwrap_or(Duration::from_secs(1));
+    let mut renewal = interval(renewal_interval);
     renewal.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut rejected = 0_usize;
     let mut peek = [0_u8; 1];
@@ -1386,7 +1464,7 @@ async fn bind_dynamic_listener(
         let lease = context
             .state
             .dynamic_port_leases
-            .acquire_tcp(&context.state.public_port_policy)
+            .acquire_tcp(&context.state.public_port_policy, context.policy_id)
             .await
             .map_err(|_| ())?;
         debug_assert_eq!(lease.protocol(), DynamicPortProtocol::Tcp);

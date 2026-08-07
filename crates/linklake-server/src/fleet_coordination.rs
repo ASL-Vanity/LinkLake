@@ -935,13 +935,19 @@ fn sqlite_generation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FleetGener
         owner_incarnation_id: row.get(4)?,
         fencing_token: sqlite_positive_u64(row.get(5)?, 5, "Fleet fencing token")?,
         resource_count: sqlite_u64(row.get(6)?, 6, "Fleet resource count")?,
-        sync_state: row.get::<_, String>(7)?.parse().map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                7,
-                rusqlite::types::Type::Text,
-                Box::new(error),
-            )
-        })?,
+        sync_state: row
+            .get::<_, String>(7)?
+            .parse::<FleetSyncState>()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    7,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        error.to_string(),
+                    )),
+                )
+            })?,
         sync_progress: sqlite_progress(row.get(8)?, 8)?,
         updated_unix_seconds: sqlite_u64(row.get(9)?, 9, "Fleet update time")?,
     })
@@ -960,13 +966,19 @@ fn sqlite_conflict_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FleetConflic
         owner_instance_id: row.get(5)?,
         conflict_code: row.get(6)?,
         detail_summary: row.get(7)?,
-        state: row.get::<_, String>(8)?.parse().map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                8,
-                rusqlite::types::Type::Text,
-                Box::new(error),
-            )
-        })?,
+        state: row
+            .get::<_, String>(8)?
+            .parse::<FleetConflictState>()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    8,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        error.to_string(),
+                    )),
+                )
+            })?,
         detected_unix_seconds: sqlite_u64(row.get(9)?, 9, "Fleet conflict time")?,
         resolved_unix_seconds: row
             .get::<_, Option<i64>>(10)?

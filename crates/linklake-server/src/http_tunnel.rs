@@ -624,7 +624,7 @@ pub(crate) async fn run_http_listener(
         };
         match accepted {
             Ok((stream, peer)) => {
-                if !state.lifecycle.accepts_new_work() {
+                if !state.accepts_public_work() {
                     drop(stream);
                     continue;
                 }
@@ -668,7 +668,7 @@ pub(crate) async fn run_https_listener(
         };
         match accepted {
             Ok((stream, peer)) => {
-                if !state.lifecycle.accepts_new_work() {
+                if !state.accepts_public_work() {
                     drop(stream);
                     continue;
                 }

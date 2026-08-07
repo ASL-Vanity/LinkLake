@@ -526,9 +526,19 @@ fn read_sqlite_lease(
 }
 
 fn sqlite_lease_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PublicPortLease> {
-    let protocol = row.get::<_, String>(0)?.parse().map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
-    })?;
+    let protocol = row
+        .get::<_, String>(0)?
+        .parse::<PublicPortProtocol>()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    error.to_string(),
+                )),
+            )
+        })?;
     let public_port = u16::try_from(row.get::<_, i64>(1)?).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
             1,

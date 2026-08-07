@@ -12,23 +12,32 @@ mod database_tools;
 mod disaster_recovery;
 mod dual_stack_udp;
 mod fleet;
+mod fleet_coordination;
 mod fleet_health;
+mod ha_coordination;
+mod ha_runtime;
 mod http2_backend;
 pub mod http_backend_pool;
 mod http_proxy_tunnel;
 mod http_route_catalog;
 mod http_tunnel;
+mod job_leases;
 mod lifecycle;
 mod notifications;
 mod p2p_control;
 mod p2p_node_catalog;
 mod policy_service;
+mod postgres_migrations;
+mod public_port_lease;
+mod public_port_ownership;
 mod public_port_policy;
 mod secret_tunnel;
 mod secret_tunnel_catalog;
 mod sni_route_catalog;
 mod sni_tunnel;
 mod socks5_tunnel;
+mod storage;
+mod target_health;
 mod tcp_tunnel;
 mod traffic_control;
 mod tunnel_catalog;
@@ -77,6 +86,7 @@ use fleet_health::{
     FleetHealthConfig, FleetHealthMetrics, FleetHealthSnapshot, FleetHealthState, FleetPeerHealth,
     FleetProbeObservation, FreezeFleetDnsFailover, UpdateFleetHealthConfig, UpsertFleetDnsFailover,
 };
+use ha_runtime::{HaRuntime, HaRuntimeConfig};
 use http_route_catalog::{
     CreateHttpRouteError, CreateHttpRoutePolicy, HttpRouteCatalog, HttpRoutePolicy,
     UpdateHttpRoutePolicy,
@@ -96,7 +106,7 @@ use policy_service::{
     FleetReconcileResult, FleetRuntimeInvalidation, FleetSourceStatus, PolicyService,
 };
 use public_port_policy::{
-    DynamicPortLeaseProvider, LocalDynamicPortLeaseProvider, PublicPortPolicy, PublicPortPolicyView,
+    DynamicPortLeaseProvider, HaDynamicPortLeaseProvider, PublicPortPolicy, PublicPortPolicyView,
 };
 use rusqlite::{params, Connection};
 use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
@@ -128,6 +138,7 @@ use std::{
     task::Poll,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use storage::{CoordinationStorage, StorageConfig};
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch, Mutex as AsyncMutex, Semaphore};
 use tokio_rustls::{
@@ -547,6 +558,7 @@ struct AppState {
     started_at: Instant,
     instance_id: String,
     lifecycle: LifecycleController,
+    ha_runtime: Arc<HaRuntime>,
     enrollment_token: String,
     management_token: Option<String>,
     admin_auth: Mutex<AdminAuth>,
@@ -605,6 +617,12 @@ struct AppState {
     global_udp_session_permits: Arc<Semaphore>,
     metrics: ServerCounters,
     metrics_history: Mutex<MetricsHistory>,
+}
+
+impl AppState {
+    fn accepts_public_work(&self) -> bool {
+        self.lifecycle.accepts_new_work() && self.ha_runtime.is_leader()
+    }
 }
 
 #[derive(Default)]
@@ -3967,6 +3985,16 @@ fn stop_udp_data_plane(state: &AppState) {
     }
 }
 
+fn stop_all_public_work(state: &AppState) {
+    tcp_tunnel::stop_all(state);
+    udp_tunnel::stop_all(state);
+    http_tunnel::stop_all(state);
+    sni_tunnel::stop_all(state);
+    secret_tunnel::stop_all(state);
+    socks5_tunnel::stop_all(state);
+    http_proxy_tunnel::stop_all(state);
+}
+
 async fn run_server(
     service_shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> anyhow::Result<()> {
@@ -4158,6 +4186,29 @@ async fn run_server(
     let management_cookies_secure = management_tls.is_some();
     let policy_service = PolicyService::open_with_database(&database, public_port_policy.clone())?;
     let instance_id = policy_service.local_instance_id()?.to_string();
+    let storage_config = StorageConfig::from_environment()?;
+    let coordination_storage = CoordinationStorage::open(&storage_config, &database).await?;
+    let ha_runtime = Arc::new(HaRuntime::open(
+        coordination_storage,
+        HaRuntimeConfig::from_environment(&instance_id)?,
+    )?);
+    let bootstrap_timeout = ha_runtime
+        .heartbeat()
+        .saturating_mul(2)
+        .max(Duration::from_secs(10));
+    let (ha_member, leadership_transition) =
+        tokio::time::timeout(bootstrap_timeout, ha_runtime.bootstrap())
+            .await
+            .map_err(|_| anyhow::anyhow!("HA bootstrap timed out"))??;
+    tracing::info!(
+        backend = storage_config.backend().as_str(),
+        instance_id = %ha_member.instance_id,
+        incarnation_id = %ha_member.incarnation_id,
+        ?leadership_transition,
+        "HA coordination runtime initialized"
+    );
+    let dynamic_port_leases: Arc<dyn DynamicPortLeaseProvider> =
+        Arc::new(HaDynamicPortLeaseProvider::new(ha_runtime.clone()));
     let socks5_fragment_config = Socks5FragmentConfig::default();
     let socks5_fragment_budget = Arc::new(Socks5FragmentGlobalBudget::from_config(
         socks5_fragment_config,
@@ -4174,6 +4225,7 @@ async fn run_server(
         started_at: Instant::now(),
         instance_id,
         lifecycle: LifecycleController::new(unix_seconds()),
+        ha_runtime,
         enrollment_token,
         management_token: configured_management_token,
         admin_auth: Mutex::new(AdminAuth::open_with_database(&database, bootstrap_admin)?),
@@ -4195,7 +4247,7 @@ async fn run_server(
         traffic_controls: Mutex::new(TrafficControlCatalog::open_with_database(&database)?),
         management_cookies_secure,
         public_port_policy: public_port_policy.clone(),
-        dynamic_port_leases: Arc::new(LocalDynamicPortLeaseProvider::default()),
+        dynamic_port_leases,
         socks5_fragment_config,
         socks5_fragment_budget,
         udp_public_bind_mode,
@@ -4600,6 +4652,37 @@ async fn run_server(
     };
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let ha_supervisor = state.ha_runtime.clone();
+    let ha_shutdown = shutdown_rx.clone();
+    tokio::spawn(async move {
+        ha_supervisor.supervise(ha_shutdown).await;
+    });
+    let leadership_state = state.clone();
+    let mut leadership = state.ha_runtime.subscribe_leadership();
+    let mut leadership_shutdown = shutdown_rx.clone();
+    tokio::spawn(async move {
+        let mut was_leader = leadership_state.ha_runtime.is_leader();
+        loop {
+            tokio::select! {
+                changed = leadership_shutdown.changed() => {
+                    if changed.is_err() || *leadership_shutdown.borrow() {
+                        break;
+                    }
+                }
+                changed = leadership.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let is_leader = leadership.borrow().is_some();
+                    if was_leader && !is_leader {
+                        tracing::warn!("HA leadership was lost; stopping all public protocol runtimes");
+                        stop_all_public_work(&leadership_state);
+                    }
+                    was_leader = is_leader;
+                }
+            }
+        }
+    });
     let shutdown_state = state.clone();
     let shutdown_signal_tx = shutdown_tx.clone();
     tokio::spawn(async move {
@@ -4614,13 +4697,7 @@ async fn run_server(
             "LinkLake received a shutdown signal; closing tunnels and draining requests."
         );
         stop_udp_data_plane(&shutdown_state);
-        tcp_tunnel::stop_all(&shutdown_state);
-        udp_tunnel::stop_all(&shutdown_state);
-        http_tunnel::stop_all(&shutdown_state);
-        sni_tunnel::stop_all(&shutdown_state);
-        secret_tunnel::stop_all(&shutdown_state);
-        socks5_tunnel::stop_all(&shutdown_state);
-        http_proxy_tunnel::stop_all(&shutdown_state);
+        stop_all_public_work(&shutdown_state);
         let _ = shutdown_signal_tx.send(true);
     });
 
@@ -5174,7 +5251,7 @@ async fn lifecycle_response(state: &AppState) -> LifecycleResponse {
     let now = unix_seconds();
     LifecycleResponse {
         lifecycle,
-        accepting_new_work: state.lifecycle.accepts_new_work(),
+        accepting_new_work: state.accepts_public_work(),
         active_tcp_connections,
         pending_connection_pairings,
         active_udp_sessions,
@@ -13471,7 +13548,7 @@ async fn enroll_client(
     headers: HeaderMap,
     Json(request): Json<ClientEnrollmentRequest>,
 ) -> Result<Json<ClientEnrollmentResponse>, ApiError> {
-    if !state.lifecycle.accepts_new_work() {
+    if !state.accepts_public_work() {
         return Err(ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
             "server is not accepting new client enrollments",

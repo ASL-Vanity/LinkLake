@@ -5,6 +5,8 @@ use crate::traffic_control::{TrafficDecision, TrafficPolicyKind};
 use crate::{
     client_registry::Authentication,
     http_backend_pool::{BackendPoolLimits, BackendProtocol, BackendSecurity, OriginKey},
+    public_port_lease::HaPublicPortLease,
+    public_port_ownership::PublicPortProtocol,
     record_audit,
     tcp_tunnel::BandwidthLimiter,
     tunnel_catalog::http_proxy_password_matches,
@@ -194,15 +196,49 @@ pub(crate) async fn register_proxy(
         .await;
         return;
     };
+    let port_lease = match HaPublicPortLease::acquire(
+        &state.ha_runtime,
+        PublicPortProtocol::Tcp,
+        public_port,
+        runtime_policy.policy_id,
+    )
+    .await
+    {
+        Ok(Some(lease)) => lease,
+        Ok(None) => {
+            reject(
+                &state,
+                &mut stream,
+                "HTTP proxy port is owned by another HA instance",
+            )
+            .await;
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(
+                public_port,
+                "Could not acquire HTTP proxy port ownership: {error}"
+            );
+            reject(
+                &state,
+                &mut stream,
+                "HTTP proxy port ownership is unavailable",
+            )
+            .await;
+            return;
+        }
+    };
     let listener = match TcpListener::bind(("0.0.0.0", public_port)).await {
         Ok(listener) => listener,
         Err(_) => {
+            port_lease.release().await;
             reject(&state, &mut stream, "HTTP proxy public port is unavailable").await;
             return;
         }
     };
     let (command_tx, command_rx) = mpsc::channel(64);
     let (stop_tx, stop_rx) = watch::channel(());
+    port_lease.spawn_supervisor(stop_rx.clone(), stop_tx.clone());
     let registration_id = Uuid::new_v4();
     let statistics = state
         .http_proxy_statistics
@@ -351,7 +387,7 @@ async fn accept_public_connections(
             _ = stop.changed() => break,
             accepted = listener.accept() => match accepted {
                 Ok((stream, source)) => {
-                    if !context.state.lifecycle.accepts_new_work() {
+                    if !context.state.accepts_public_work() {
                         context.statistics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                         drop(stream);
                         continue;

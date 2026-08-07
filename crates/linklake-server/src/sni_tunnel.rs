@@ -108,7 +108,7 @@ pub(crate) async fn run_listener(
         };
         match accepted {
             Ok((stream, peer)) => {
-                if !state.lifecycle.accepts_new_work() {
+                if !state.accepts_public_work() {
                     drop(stream);
                     continue;
                 }

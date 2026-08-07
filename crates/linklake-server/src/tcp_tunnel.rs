@@ -1,5 +1,8 @@
 use crate::traffic_control::{TrafficDecision, TrafficPolicyKind};
-use crate::{client_registry::Authentication, record_audit, AppState};
+use crate::{
+    client_registry::Authentication, public_port_lease::HaPublicPortLease,
+    public_port_ownership::PublicPortProtocol, record_audit, AppState,
+};
 use linklake_core::{
     read_control_frame, write_control_frame, write_control_frame_and_shutdown, BoxedIo,
     ControlFrame, ManagedConfigMode, ManagedConfigStatus,
@@ -179,7 +182,7 @@ pub(crate) async fn handle_connection(
             return;
         }
     };
-    if starts_new_work(&frame) && !state.lifecycle.accepts_new_work() {
+    if starts_new_work(&frame) && !state.accepts_public_work() {
         state
             .metrics
             .registration_rejections_total
@@ -551,9 +554,40 @@ async fn register_tunnel(
         .await;
         return;
     };
+    let port_lease = match HaPublicPortLease::acquire(
+        &state.ha_runtime,
+        PublicPortProtocol::Tcp,
+        public_port,
+        runtime_policy.policy_id,
+    )
+    .await
+    {
+        Ok(Some(lease)) => lease,
+        Ok(None) => {
+            state
+                .metrics
+                .registration_rejections_total
+                .fetch_add(1, Ordering::Relaxed);
+            send_error(&mut stream, "public port is owned by another HA instance").await;
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(
+                public_port,
+                "Could not acquire TCP public port ownership: {error}"
+            );
+            state
+                .metrics
+                .registration_rejections_total
+                .fetch_add(1, Ordering::Relaxed);
+            send_error(&mut stream, "public port ownership is unavailable").await;
+            return;
+        }
+    };
     let listener = match TcpListener::bind(("0.0.0.0", public_port)).await {
         Ok(listener) => listener,
         Err(_) => {
+            port_lease.release().await;
             state
                 .metrics
                 .registration_rejections_total
@@ -564,6 +598,7 @@ async fn register_tunnel(
     };
     let (command_tx, command_rx) = mpsc::channel(64);
     let (stop_tx, stop_rx) = watch::channel(());
+    port_lease.spawn_supervisor(stop_rx.clone(), stop_tx.clone());
     let control_stop = stop_rx.clone();
     let registration_id = Uuid::new_v4();
     let statistics = {
@@ -723,7 +758,7 @@ async fn accept_public_connections(
             accepted = listener.accept() => match accepted {
                 Ok((external, source)) => {
                     context.statistics.connections_total.fetch_add(1, Ordering::Relaxed);
-                    if !context.state.lifecycle.accepts_new_work() {
+                    if !context.state.accepts_public_work() {
                         context.statistics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                         drop(external);
                         continue;

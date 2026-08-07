@@ -3,6 +3,7 @@
 use crate::{ha_coordination::HaCoordinator, storage::CoordinationStorage};
 use rusqlite::{params, OptionalExtension, Transaction as SqliteTransaction};
 use serde::Serialize;
+use std::time::Duration;
 use tokio_postgres::Transaction as PostgresTransaction;
 
 const SQLITE_SCHEMA: &str = r#"
@@ -70,6 +71,7 @@ pub(crate) struct TargetHealthCatalog {
     coordinator: HaCoordinator,
     success_threshold: u32,
     failure_threshold: u32,
+    stale_after_seconds: u64,
 }
 
 impl TargetHealthCatalog {
@@ -77,6 +79,7 @@ impl TargetHealthCatalog {
         coordinator: HaCoordinator,
         success_threshold: u32,
         failure_threshold: u32,
+        stale_after: Duration,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             (1..=1_000).contains(&success_threshold),
@@ -85,6 +88,11 @@ impl TargetHealthCatalog {
         anyhow::ensure!(
             (1..=1_000).contains(&failure_threshold),
             "target health failure threshold must be between 1 and 1000"
+        );
+        let stale_after_seconds = stale_after.as_secs();
+        anyhow::ensure!(
+            (1..=86_400).contains(&stale_after_seconds),
+            "target health stale timeout must be between 1 and 86400 seconds"
         );
         if let CoordinationStorage::Sqlite(database) = coordinator.storage() {
             database.with_transaction(|transaction| {
@@ -96,6 +104,7 @@ impl TargetHealthCatalog {
             coordinator,
             success_threshold,
             failure_threshold,
+            stale_after_seconds,
         })
     }
 
@@ -111,7 +120,10 @@ impl TargetHealthCatalog {
                 self.coordinator
                     .assert_sqlite_transaction_fence(transaction, fencing_token)?;
                 let now = sqlite_now(transaction)?;
-                let current = read_sqlite(transaction, &observation.target_key)?;
+                let mut current = read_sqlite(transaction, &observation.target_key)?;
+                if let Some(current) = current.as_mut() {
+                    apply_staleness(current, now, self.stale_after_seconds);
+                }
                 let update = calculate_update(
                     current.as_ref(),
                     &observation,
@@ -132,8 +144,11 @@ impl TargetHealthCatalog {
                     .await?;
                 lock_postgres_target(&transaction, &observation.target_key).await?;
                 let now = postgres_now(&transaction).await?;
-                let current =
+                let mut current =
                     read_postgres_for_update(&transaction, &observation.target_key).await?;
+                if let Some(current) = current.as_mut() {
+                    apply_staleness(current, now, self.stale_after_seconds);
+                }
                 let update = calculate_update(
                     current.as_ref(),
                     &observation,
@@ -152,7 +167,7 @@ impl TargetHealthCatalog {
 
     pub(crate) async fn get(&self, target_key: &str) -> anyhow::Result<Option<TargetHealth>> {
         let target_key = normalize_target_key(target_key)?;
-        match self.coordinator.storage() {
+        let mut health = match self.coordinator.storage() {
             CoordinationStorage::Sqlite(database) => database.with_connection(|connection| {
                 let mut statement = connection.prepare(
                     "SELECT target_key, member_alive, control_channel_healthy,
@@ -183,11 +198,16 @@ impl TargetHealthCatalog {
                     .map(|row| postgres_row(&row))
                     .transpose()
             }
+        }?;
+        if let Some(health) = health.as_mut() {
+            let now = self.coordinator.storage().database_unix_seconds().await?;
+            apply_staleness(health, now, self.stale_after_seconds);
         }
+        Ok(health)
     }
 
     pub(crate) async fn list(&self) -> anyhow::Result<Vec<TargetHealth>> {
-        match self.coordinator.storage() {
+        let mut health = match self.coordinator.storage() {
             CoordinationStorage::Sqlite(database) => database.with_connection(|connection| {
                 let mut statement = connection.prepare(
                     "SELECT target_key, member_alive, control_channel_healthy,
@@ -217,7 +237,12 @@ impl TargetHealthCatalog {
                     .map(postgres_row)
                     .collect()
             }
+        }?;
+        let now = self.coordinator.storage().database_unix_seconds().await?;
+        for health in &mut health {
+            apply_staleness(health, now, self.stale_after_seconds);
         }
+        Ok(health)
     }
 
     pub(crate) async fn healthy(&self) -> anyhow::Result<Vec<TargetHealth>> {
@@ -227,6 +252,15 @@ impl TargetHealthCatalog {
             .into_iter()
             .filter(|health| health.effective_healthy && health.weight > 0)
             .collect())
+    }
+}
+
+fn apply_staleness(health: &mut TargetHealth, now: u64, stale_after_seconds: u64) {
+    let stale = health
+        .last_probe_unix_seconds
+        .is_none_or(|last_probe| now.saturating_sub(last_probe) >= stale_after_seconds);
+    if stale {
+        health.effective_healthy = false;
     }
 }
 
