@@ -4,8 +4,13 @@ use std::{
     collections::HashSet,
     error::Error,
     fmt,
+    future::Future,
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 
 const DEFAULT_PUBLIC_PORTS: &str = "32000-32999";
@@ -36,13 +41,22 @@ pub(crate) enum DynamicPortProtocol {
 pub(crate) trait DynamicPortLease: Send + Sync {
     fn protocol(&self) -> DynamicPortProtocol;
     fn port(&self) -> u16;
+    fn lease_id(&self) -> &str;
+    fn renew<'a>(&'a self) -> DynamicPortLeaseOperationFuture<'a>;
+    fn release(self: Box<Self>) -> DynamicPortLeaseReleaseFuture;
 }
 
+pub(crate) type DynamicPortLeaseAcquireFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<Box<dyn DynamicPortLease>, DynamicPortLeaseError>> + Send + 'a>,
+>;
+pub(crate) type DynamicPortLeaseOperationFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), DynamicPortLeaseError>> + Send + 'a>>;
+pub(crate) type DynamicPortLeaseReleaseFuture =
+    Pin<Box<dyn Future<Output = Result<(), DynamicPortLeaseError>> + Send + 'static>>;
+
 pub(crate) trait DynamicPortLeaseProvider: Send + Sync {
-    fn acquire_tcp(
-        &self,
-        policy: &PublicPortPolicy,
-    ) -> Result<Box<dyn DynamicPortLease>, DynamicPortLeaseError>;
+    fn acquire_tcp<'a>(&'a self, policy: &'a PublicPortPolicy)
+        -> DynamicPortLeaseAcquireFuture<'a>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,11 +81,14 @@ pub(crate) struct LocalDynamicPortLeaseProvider {
 struct LocalDynamicPortLeaseState {
     tcp: HashSet<u16>,
     next_tcp: u16,
+    next_lease_id: u64,
 }
 
 struct LocalDynamicPortLease {
     state: Arc<Mutex<LocalDynamicPortLeaseState>>,
     port: u16,
+    lease_id: String,
+    released: AtomicBool,
 }
 
 impl DynamicPortLease for LocalDynamicPortLease {
@@ -82,10 +99,33 @@ impl DynamicPortLease for LocalDynamicPortLease {
     fn port(&self) -> u16 {
         self.port
     }
+
+    fn lease_id(&self) -> &str {
+        &self.lease_id
+    }
+
+    fn renew<'a>(&'a self) -> DynamicPortLeaseOperationFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn release(self: Box<Self>) -> DynamicPortLeaseReleaseFuture {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return Box::pin(async { Ok(()) });
+        }
+        self.state
+            .lock()
+            .expect("dynamic port lease lock poisoned")
+            .tcp
+            .remove(&self.port);
+        Box::pin(async { Ok(()) })
+    }
 }
 
 impl Drop for LocalDynamicPortLease {
     fn drop(&mut self) {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return;
+        }
         self.state
             .lock()
             .expect("dynamic port lease lock poisoned")
@@ -95,22 +135,30 @@ impl Drop for LocalDynamicPortLease {
 }
 
 impl DynamicPortLeaseProvider for LocalDynamicPortLeaseProvider {
-    fn acquire_tcp(
-        &self,
-        policy: &PublicPortPolicy,
-    ) -> Result<Box<dyn DynamicPortLease>, DynamicPortLeaseError> {
-        let mut state = self.state.lock().expect("dynamic port lease lock poisoned");
-        let cursor = state.next_tcp.max(1) as u32;
-        let port = (0..u16::MAX as u32)
-            .map(|offset| ((cursor - 1 + offset) % u16::MAX as u32 + 1) as u16)
-            .find(|port| policy.allows_tcp(*port) && !state.tcp.contains(port))
-            .ok_or(DynamicPortLeaseError::Exhausted)?;
-        state.tcp.insert(port);
-        state.next_tcp = port.wrapping_add(1).max(1);
-        Ok(Box::new(LocalDynamicPortLease {
-            state: self.state.clone(),
-            port,
-        }))
+    fn acquire_tcp<'a>(
+        &'a self,
+        policy: &'a PublicPortPolicy,
+    ) -> DynamicPortLeaseAcquireFuture<'a> {
+        let state = self.state.clone();
+        Box::pin(async move {
+            let mut locked = state.lock().expect("dynamic port lease lock poisoned");
+            let cursor = locked.next_tcp.max(1) as u32;
+            let port = (0..u16::MAX as u32)
+                .map(|offset| ((cursor - 1 + offset) % u16::MAX as u32 + 1) as u16)
+                .find(|port| policy.allows_tcp(*port) && !locked.tcp.contains(port))
+                .ok_or(DynamicPortLeaseError::Exhausted)?;
+            locked.tcp.insert(port);
+            locked.next_tcp = port.wrapping_add(1).max(1);
+            locked.next_lease_id = locked.next_lease_id.wrapping_add(1).max(1);
+            let lease_id = format!("local-tcp-{}", locked.next_lease_id);
+            drop(locked);
+            Ok(Box::new(LocalDynamicPortLease {
+                state,
+                port,
+                lease_id,
+                released: AtomicBool::new(false),
+            }) as Box<dyn DynamicPortLease>)
+        })
     }
 }
 
@@ -253,16 +301,19 @@ mod tests {
         assert!(policy.allows_udp(10_000));
     }
 
-    #[test]
-    fn local_dynamic_leases_are_unique_rotating_and_released_on_drop() {
+    #[tokio::test]
+    async fn local_dynamic_leases_are_unique_rotating_and_released_on_drop() {
         let policy = PublicPortPolicy::for_test("32000-32001", "32000", "", "");
         let provider = LocalDynamicPortLeaseProvider::default();
-        let first = provider.acquire_tcp(&policy).unwrap();
-        let second = provider.acquire_tcp(&policy).unwrap();
+        let first = provider.acquire_tcp(&policy).await.unwrap();
+        let second = provider.acquire_tcp(&policy).await.unwrap();
         assert_ne!(first.port(), second.port());
-        assert!(provider.acquire_tcp(&policy).is_err());
+        assert!(provider.acquire_tcp(&policy).await.is_err());
         let released = first.port();
         drop(first);
-        assert_eq!(provider.acquire_tcp(&policy).unwrap().port(), released);
+        assert_eq!(
+            provider.acquire_tcp(&policy).await.unwrap().port(),
+            released
+        );
     }
 }

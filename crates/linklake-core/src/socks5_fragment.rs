@@ -1,13 +1,21 @@
 //! RFC 1928 SOCKS5 UDP FRAG 的有界重组器。
 //!
-//! 为避免任意高序号分片制造稀疏状态，只有序号 1 可以创建重组；创建后允许
-//! `max_reorder_gap` 范围内乱序。相同分片可幂等重复，内容或终片标志冲突会
-//! 丢弃整个数据报。所有完成、冲突、会话关闭与超时路径都会归还预算。
+//! 默认严格按连续序号接收分片；只有显式设置 `max_reorder_gap` 才启用乱序扩展。
+//! 任何冲突都会丢弃整个数据报，完成、超时、会话关闭和析构路径都会归还预算。
 
-use crate::socks5_udp::{Socks5UdpDatagram, Socks5UdpFragment, Socks5UdpTarget};
+use crate::{
+    socks5_udp::{
+        socks5_udp_envelope_header_len, Socks5UdpDatagram, Socks5UdpFragment, Socks5UdpTarget,
+    },
+    udp_protocol::MAX_UDP_DATAGRAM_BYTES,
+};
 use std::{
     collections::{BTreeMap, HashMap},
     hash::Hash,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use thiserror::Error;
@@ -31,8 +39,9 @@ impl Default for Socks5FragmentConfig {
         Self {
             timeout: Duration::from_secs(5),
             max_fragments_per_datagram: 64,
-            max_bytes_per_datagram: u16::MAX as usize,
-            max_reorder_gap: 16,
+            max_bytes_per_datagram: MAX_UDP_DATAGRAM_BYTES,
+            // RFC 1928 的严格模式只接受连续的分片序号；乱序必须显式配置。
+            max_reorder_gap: 0,
             max_inflight_per_session: 8,
             max_fragments_per_session: 128,
             max_bytes_per_session: 256 * 1024,
@@ -43,10 +52,103 @@ impl Default for Socks5FragmentConfig {
     }
 }
 
+/// 进程级 SOCKS5 UDP FRAG 原子预算，供所有策略共享。
+#[derive(Debug)]
+pub struct Socks5FragmentGlobalBudget {
+    max_inflight_datagrams: usize,
+    max_fragments: usize,
+    max_bytes: usize,
+    inflight_datagrams: AtomicUsize,
+    buffered_fragments: AtomicUsize,
+    buffered_bytes: AtomicUsize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Socks5FragmentGlobalSnapshot {
+    pub inflight_datagrams: usize,
+    pub buffered_fragments: usize,
+    pub buffered_bytes: usize,
+}
+
+impl Socks5FragmentGlobalBudget {
+    pub fn from_config(config: Socks5FragmentConfig) -> Self {
+        Self {
+            max_inflight_datagrams: config.max_inflight_global,
+            max_fragments: config.max_fragments_global,
+            max_bytes: config.max_bytes_global,
+            inflight_datagrams: AtomicUsize::new(0),
+            buffered_fragments: AtomicUsize::new(0),
+            buffered_bytes: AtomicUsize::new(0),
+        }
+    }
+
+    fn supports(&self, config: Socks5FragmentConfig) -> bool {
+        self.max_inflight_datagrams >= config.max_inflight_global
+            && self.max_fragments >= config.max_fragments_global
+            && self.max_bytes >= config.max_bytes_global
+    }
+
+    pub fn snapshot(&self) -> Socks5FragmentGlobalSnapshot {
+        Socks5FragmentGlobalSnapshot {
+            inflight_datagrams: self.inflight_datagrams.load(Ordering::Acquire),
+            buffered_fragments: self.buffered_fragments.load(Ordering::Acquire),
+            buffered_bytes: self.buffered_bytes.load(Ordering::Acquire),
+        }
+    }
+
+    fn try_reserve_datagram(&self) -> bool {
+        reserve_counter(&self.inflight_datagrams, self.max_inflight_datagrams, 1)
+    }
+
+    fn try_reserve_bytes(&self, bytes: usize) -> bool {
+        reserve_counter(&self.buffered_bytes, self.max_bytes, bytes)
+    }
+
+    fn try_reserve_fragment(&self, bytes: usize) -> Result<(), Socks5FragmentError> {
+        if !reserve_counter(&self.buffered_fragments, self.max_fragments, 1) {
+            return Err(Socks5FragmentError::GlobalFragmentBudget);
+        }
+        if !self.try_reserve_bytes(bytes) {
+            release_counter(&self.buffered_fragments, 1);
+            return Err(Socks5FragmentError::GlobalByteBudget);
+        }
+        Ok(())
+    }
+
+    fn release_datagram(&self) {
+        release_counter(&self.inflight_datagrams, 1);
+    }
+
+    fn release_bytes(&self, bytes: usize) {
+        release_counter(&self.buffered_bytes, bytes);
+    }
+
+    fn release_fragment(&self, bytes: usize) {
+        release_counter(&self.buffered_fragments, 1);
+        self.release_bytes(bytes);
+    }
+}
+
+fn reserve_counter(counter: &AtomicUsize, limit: usize, amount: usize) -> bool {
+    counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current.checked_add(amount).filter(|next| *next <= limit)
+        })
+        .is_ok()
+}
+
+fn release_counter(counter: &AtomicUsize, amount: usize) {
+    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(current.saturating_sub(amount))
+    });
+}
+
 #[derive(Debug, Error, Clone, Copy, Eq, PartialEq)]
 pub enum Socks5FragmentConfigError {
     #[error("SOCKS5 fragment timeout must be positive")]
     ZeroTimeout,
+    #[error("SOCKS5 fragment timeout must be at least five seconds")]
+    TimeoutTooShort,
     #[error("SOCKS5 fragment limits must be positive and internally consistent")]
     InvalidLimit,
 }
@@ -106,6 +208,9 @@ pub struct Socks5FragmentSnapshot {
     pub buffered_fragments: usize,
     pub buffered_bytes: usize,
     pub sessions: usize,
+    pub global_inflight_datagrams: usize,
+    pub global_buffered_fragments: usize,
+    pub global_buffered_bytes: usize,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -121,6 +226,8 @@ struct Assembly {
     fragments: BTreeMap<u8, Vec<u8>>,
     final_sequence: Option<u8>,
     highest_contiguous: u8,
+    highest_received: u8,
+    payload_bytes: usize,
     bytes: usize,
     last_activity: Instant,
 }
@@ -136,8 +243,24 @@ pub struct Socks5FragmentReassembler<K> {
     config: Socks5FragmentConfig,
     assemblies: HashMap<FragmentKey<K>, Assembly>,
     sessions: HashMap<K, Usage>,
-    global_fragments: usize,
-    global_bytes: usize,
+    local_fragments: usize,
+    local_bytes: usize,
+    global_budget: Arc<Socks5FragmentGlobalBudget>,
+}
+
+impl<K> Drop for Socks5FragmentReassembler<K> {
+    fn drop(&mut self) {
+        // 运行时可能因控制面错误提前退出，析构时必须归还尚未完成的全局预算。
+        let budget = self.global_budget.clone();
+        for assembly in self.assemblies.values() {
+            budget.release_datagram();
+            let envelope_bytes = assembly.bytes.saturating_sub(assembly.payload_bytes);
+            budget.release_bytes(envelope_bytes);
+            for fragment in assembly.fragments.values() {
+                budget.release_fragment(fragment.len());
+            }
+        }
+    }
 }
 
 impl<K> Socks5FragmentReassembler<K>
@@ -145,13 +268,25 @@ where
     K: Clone + Eq + Hash,
 {
     pub fn new(config: Socks5FragmentConfig) -> Result<Self, Socks5FragmentConfigError> {
+        let global_budget = Arc::new(Socks5FragmentGlobalBudget::from_config(config));
+        Self::new_with_global_budget(config, global_budget)
+    }
+
+    pub fn new_with_global_budget(
+        config: Socks5FragmentConfig,
+        global_budget: Arc<Socks5FragmentGlobalBudget>,
+    ) -> Result<Self, Socks5FragmentConfigError> {
         validate_config(config)?;
+        if !global_budget.supports(config) {
+            return Err(Socks5FragmentConfigError::InvalidLimit);
+        }
         Ok(Self {
             config,
             assemblies: HashMap::new(),
             sessions: HashMap::new(),
-            global_fragments: 0,
-            global_bytes: 0,
+            local_fragments: 0,
+            local_bytes: 0,
+            global_budget,
         })
     }
 
@@ -184,7 +319,9 @@ where
             if fragment.sequence != 1 {
                 return Err(Socks5FragmentError::MissingInitialFragment);
             }
-            self.reserve_new_assembly(&session)?;
+            let envelope_bytes = socks5_udp_envelope_header_len(&fragment.target)
+                .map_err(|_| Socks5FragmentError::DatagramByteBudget)?;
+            self.reserve_new_assembly(&session, envelope_bytes)?;
             self.assemblies.insert(
                 key.clone(),
                 Assembly {
@@ -193,7 +330,9 @@ where
                     fragments: BTreeMap::new(),
                     final_sequence: None,
                     highest_contiguous: 0,
-                    bytes: 0,
+                    highest_received: 0,
+                    payload_bytes: 0,
+                    bytes: envelope_bytes,
                     last_activity: now,
                 },
             );
@@ -204,7 +343,9 @@ where
                 .assemblies
                 .get(&key)
                 .expect("SOCKS5 assembly was created above");
-            if let Some(existing) = assembly.fragments.get(&fragment.sequence) {
+            if self.config.max_reorder_gap == 0 && fragment.sequence < assembly.highest_received {
+                Some(Socks5FragmentError::ReorderGap)
+            } else if let Some(existing) = assembly.fragments.get(&fragment.sequence) {
                 let existing_final = assembly.final_sequence == Some(fragment.sequence);
                 if existing_final && fragment.final_fragment {
                     Some(Socks5FragmentError::DuplicateFinalFragment)
@@ -254,10 +395,14 @@ where
         if fragment.final_fragment {
             assembly.final_sequence = Some(fragment.sequence);
         }
+        assembly.payload_bytes = assembly
+            .payload_bytes
+            .saturating_add(fragment.payload.len());
         assembly.bytes = assembly.bytes.saturating_add(fragment.payload.len());
         assembly
             .fragments
             .insert(fragment.sequence, fragment.payload);
+        assembly.highest_received = assembly.highest_received.max(fragment.sequence);
         assembly.last_activity = now;
         while assembly
             .fragments
@@ -278,7 +423,7 @@ where
         let final_sequence = assembly
             .final_sequence
             .expect("complete SOCKS5 assembly has a final fragment");
-        let mut payload = Vec::with_capacity(assembly.bytes);
+        let mut payload = Vec::with_capacity(assembly.payload_bytes);
         for sequence in 1..=final_sequence {
             payload.extend_from_slice(
                 assembly
@@ -337,23 +482,44 @@ where
     }
 
     pub fn snapshot(&self) -> Socks5FragmentSnapshot {
+        let global = self.global_budget.snapshot();
         Socks5FragmentSnapshot {
             inflight_datagrams: self.assemblies.len(),
-            buffered_fragments: self.global_fragments,
-            buffered_bytes: self.global_bytes,
+            buffered_fragments: self.local_fragments,
+            buffered_bytes: self.local_bytes,
             sessions: self.sessions.len(),
+            global_inflight_datagrams: global.inflight_datagrams,
+            global_buffered_fragments: global.buffered_fragments,
+            global_buffered_bytes: global.buffered_bytes,
         }
     }
 
-    fn reserve_new_assembly(&mut self, session: &K) -> Result<(), Socks5FragmentError> {
-        if self.assemblies.len() >= self.config.max_inflight_global {
-            return Err(Socks5FragmentError::GlobalInflightBudget);
+    fn reserve_new_assembly(
+        &mut self,
+        session: &K,
+        envelope_bytes: usize,
+    ) -> Result<(), Socks5FragmentError> {
+        if envelope_bytes > self.config.max_bytes_per_datagram {
+            return Err(Socks5FragmentError::DatagramByteBudget);
         }
         let usage = self.sessions.get(session).copied().unwrap_or_default();
         if usage.datagrams >= self.config.max_inflight_per_session {
             return Err(Socks5FragmentError::SessionInflightBudget);
         }
-        self.sessions.entry(session.clone()).or_default().datagrams += 1;
+        if usage.bytes.saturating_add(envelope_bytes) > self.config.max_bytes_per_session {
+            return Err(Socks5FragmentError::SessionByteBudget);
+        }
+        if !self.global_budget.try_reserve_datagram() {
+            return Err(Socks5FragmentError::GlobalInflightBudget);
+        }
+        if !self.global_budget.try_reserve_bytes(envelope_bytes) {
+            self.global_budget.release_datagram();
+            return Err(Socks5FragmentError::GlobalByteBudget);
+        }
+        let usage = self.sessions.entry(session.clone()).or_default();
+        usage.datagrams = usage.datagrams.saturating_add(1);
+        usage.bytes = usage.bytes.saturating_add(envelope_bytes);
+        self.local_bytes = self.local_bytes.saturating_add(envelope_bytes);
         Ok(())
     }
 
@@ -371,7 +537,6 @@ where
             return Err(Socks5FragmentError::SequenceLimit);
         }
         if assembly.bytes.saturating_add(bytes) > self.config.max_bytes_per_datagram {
-            self.remove_assembly(key);
             return Err(Socks5FragmentError::DatagramByteBudget);
         }
         let usage = self.sessions.get(session).copied().unwrap_or_default();
@@ -381,29 +546,30 @@ where
         if usage.bytes.saturating_add(bytes) > self.config.max_bytes_per_session {
             return Err(Socks5FragmentError::SessionByteBudget);
         }
-        if self.global_fragments >= self.config.max_fragments_global {
-            return Err(Socks5FragmentError::GlobalFragmentBudget);
-        }
-        if self.global_bytes.saturating_add(bytes) > self.config.max_bytes_global {
-            return Err(Socks5FragmentError::GlobalByteBudget);
-        }
+        self.global_budget.try_reserve_fragment(bytes)?;
         let usage = self
             .sessions
             .get_mut(session)
             .expect("session usage exists");
         usage.fragments = usage.fragments.saturating_add(1);
         usage.bytes = usage.bytes.saturating_add(bytes);
-        self.global_fragments = self.global_fragments.saturating_add(1);
-        self.global_bytes = self.global_bytes.saturating_add(bytes);
+        self.local_fragments = self.local_fragments.saturating_add(1);
+        self.local_bytes = self.local_bytes.saturating_add(bytes);
         Ok(())
     }
 
     fn remove_assembly(&mut self, key: &FragmentKey<K>) -> Option<Assembly> {
         let assembly = self.assemblies.remove(key)?;
-        self.global_fragments = self
-            .global_fragments
+        self.global_budget.release_datagram();
+        let envelope_bytes = assembly.bytes.saturating_sub(assembly.payload_bytes);
+        self.global_budget.release_bytes(envelope_bytes);
+        for fragment in assembly.fragments.values() {
+            self.global_budget.release_fragment(fragment.len());
+        }
+        self.local_fragments = self
+            .local_fragments
             .saturating_sub(assembly.fragments.len());
-        self.global_bytes = self.global_bytes.saturating_sub(assembly.bytes);
+        self.local_bytes = self.local_bytes.saturating_sub(assembly.bytes);
         if let Some(usage) = self.sessions.get_mut(&key.session) {
             usage.datagrams = usage.datagrams.saturating_sub(1);
             usage.fragments = usage.fragments.saturating_sub(assembly.fragments.len());
@@ -420,10 +586,13 @@ fn validate_config(config: Socks5FragmentConfig) -> Result<(), Socks5FragmentCon
     if config.timeout.is_zero() {
         return Err(Socks5FragmentConfigError::ZeroTimeout);
     }
+    if config.timeout < Duration::from_secs(5) {
+        return Err(Socks5FragmentConfigError::TimeoutTooShort);
+    }
     if config.max_fragments_per_datagram == 0
         || config.max_fragments_per_datagram > 127
         || config.max_bytes_per_datagram == 0
-        || config.max_reorder_gap == 0
+        || config.max_bytes_per_datagram > MAX_UDP_DATAGRAM_BYTES
         || config.max_inflight_per_session == 0
         || config.max_fragments_per_session < config.max_fragments_per_datagram
         || config.max_bytes_per_session < config.max_bytes_per_datagram
@@ -454,8 +623,12 @@ mod tests {
     #[test]
     fn bounded_reordering_duplicates_completion_and_timeout_release_budgets() {
         let now = Instant::now();
-        let mut reassembler = Socks5FragmentReassembler::new(Socks5FragmentConfig::default())
-            .expect("default config is valid");
+        let config = Socks5FragmentConfig {
+            max_reorder_gap: 16,
+            ..Socks5FragmentConfig::default()
+        };
+        let mut reassembler =
+            Socks5FragmentReassembler::new(config).expect("reordering config is valid");
         assert_eq!(
             reassembler.push(1_u64, fragment(1, false, b"a"), now),
             Ok(Socks5FragmentOutcome::Pending)
@@ -518,6 +691,11 @@ mod tests {
         );
         assert_eq!(reassembler.snapshot(), Socks5FragmentSnapshot::default());
 
+        let config = Socks5FragmentConfig {
+            max_reorder_gap: 16,
+            ..Socks5FragmentConfig::default()
+        };
+        let mut reassembler = Socks5FragmentReassembler::new(config).unwrap();
         reassembler
             .push(1_u64, fragment(1, false, b"one"), now)
             .unwrap();

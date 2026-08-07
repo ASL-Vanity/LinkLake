@@ -150,9 +150,20 @@ struct BindPeerConstraint {
 }
 
 struct BoundListener {
-    _lease: Box<dyn DynamicPortLease>,
+    lease: Option<Box<dyn DynamicPortLease>>,
     listener: TcpListener,
     advertised: SocketAddr,
+}
+
+impl BoundListener {
+    async fn release(&mut self) {
+        if let Some(lease) = self.lease.take() {
+            let lease_id = lease.lease_id().to_owned();
+            if let Err(error) = lease.release().await {
+                tracing::debug!(lease_id = %lease_id, "SOCKS5 BIND lease release failed: {error}");
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1155,6 +1166,24 @@ async fn serve_bind(
         }
     };
     let lease_activity = BindLeaseActivity::begin(context.statistics.clone());
+    serve_bound_listener(context, external, constraint, allowed_ips, bound, stop).await;
+    drop(lease_activity);
+}
+
+enum BindAcceptResult {
+    Accepted(TcpStream, SocketAddr, OwnedSemaphorePermit),
+    Reply(u8),
+    Cancelled,
+}
+
+async fn serve_bound_listener(
+    context: &PublicConnectionContext,
+    external: &mut TcpStream,
+    constraint: BindPeerConstraint,
+    allowed_ips: Option<HashSet<IpAddr>>,
+    mut bound: BoundListener,
+    stop: &mut watch::Receiver<()>,
+) {
     if write_socks5_bound_reply(external, 0x00, bound.advertised)
         .await
         .is_err()
@@ -1163,6 +1192,7 @@ async fn serve_bind(
             .statistics
             .bind_cancellations_total
             .fetch_add(1, Ordering::Relaxed);
+        bound.release().await;
         return;
     }
     context
@@ -1171,39 +1201,33 @@ async fn serve_bind(
         .fetch_add(1, Ordering::Relaxed);
 
     let deadline = Instant::now() + BIND_ACCEPT_TIMEOUT;
+    let mut renewal = interval(Duration::from_secs(30));
+    renewal.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut rejected = 0_usize;
     let mut peek = [0_u8; 1];
     let accepted = loop {
         let event = tokio::select! {
-            _ = stop.changed() => {
-                context.statistics.bind_cancellations_total.fetch_add(1, Ordering::Relaxed);
-                return;
+            _ = stop.changed() => break BindAcceptResult::Cancelled,
+            _ = renewal.tick() => {
+                let failed = match bound.lease.as_ref() {
+                    Some(lease) => lease.renew().await.is_err(),
+                    None => true,
+                };
+                if failed {
+                    break BindAcceptResult::Reply(0x01);
+                }
+                continue;
             }
             result = tokio::time::timeout_at(deadline, bound.listener.accept()) => result,
             control = external.peek(&mut peek) => {
                 let _ = control;
-                context.statistics.bind_cancellations_total.fetch_add(1, Ordering::Relaxed);
-                return;
+                break BindAcceptResult::Cancelled;
             }
         };
         let (incoming, peer) = match event {
             Ok(Ok(accepted)) => accepted,
-            Ok(Err(_)) => {
-                context
-                    .statistics
-                    .bind_failures_total
-                    .fetch_add(1, Ordering::Relaxed);
-                let _ = write_socks5_reply(external, 0x01).await;
-                return;
-            }
-            Err(_) => {
-                context
-                    .statistics
-                    .bind_accept_timeouts_total
-                    .fetch_add(1, Ordering::Relaxed);
-                let _ = write_socks5_reply(external, 0x06).await;
-                return;
-            }
+            Ok(Err(_)) => break BindAcceptResult::Reply(0x01),
+            Err(_) => break BindAcceptResult::Reply(0x06),
         };
         let traffic_allowed = context
             .state
@@ -1224,7 +1248,7 @@ async fn serve_bind(
             .try_acquire_owned();
         if traffic_allowed && bind_peer_matches(&constraint, &allowed_ips, peer) {
             if let Ok(global_permit) = global_permit {
-                break (incoming, peer, global_permit);
+                break BindAcceptResult::Accepted(incoming, peer, global_permit);
             }
         }
         rejected = rejected.saturating_add(1);
@@ -1234,17 +1258,37 @@ async fn serve_bind(
             .fetch_add(1, Ordering::Relaxed);
         drop(incoming);
         if rejected >= BIND_MAX_REJECTED_PEERS {
+            break BindAcceptResult::Reply(0x02);
+        }
+    };
+    let (mut incoming, peer, _incoming_global_permit) = match accepted {
+        BindAcceptResult::Accepted(incoming, peer, permit) => (incoming, peer, permit),
+        BindAcceptResult::Reply(reply) => {
+            bound.release().await;
+            if reply == 0x06 {
+                context
+                    .statistics
+                    .bind_accept_timeouts_total
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                context
+                    .statistics
+                    .bind_failures_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            let _ = write_socks5_reply(external, reply).await;
+            return;
+        }
+        BindAcceptResult::Cancelled => {
             context
                 .statistics
-                .bind_failures_total
+                .bind_cancellations_total
                 .fetch_add(1, Ordering::Relaxed);
-            let _ = write_socks5_reply(external, 0x02).await;
+            bound.release().await;
             return;
         }
     };
-    let (mut incoming, peer, _incoming_global_permit) = accepted;
-    drop(bound);
-    drop(lease_activity);
+    bound.release().await;
     if write_socks5_bound_reply(external, 0x00, peer)
         .await
         .is_err()
@@ -1342,22 +1386,32 @@ async fn bind_dynamic_listener(
             .state
             .dynamic_port_leases
             .acquire_tcp(&context.state.public_port_policy)
+            .await
             .map_err(|_| ())?;
         debug_assert_eq!(lease.protocol(), DynamicPortProtocol::Tcp);
         let port = lease.port();
-        let listener = match TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).await {
+        let local_ip = external
+            .local_addr()
+            .map(|address| address.ip())
+            .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        let listener = match TcpListener::bind(SocketAddr::new(
+            match local_ip {
+                IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            },
+            port,
+        ))
+        .await
+        {
             Ok(listener) => listener,
             Err(_) => {
-                drop(lease);
+                let _ = lease.release().await;
                 continue;
             }
         };
-        let advertised = external
-            .local_addr()
-            .map(|address| bind_reply_address(address.ip(), port))
-            .unwrap_or_else(|_| SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)));
+        let advertised = bind_reply_address(local_ip, port);
         return Ok(BoundListener {
-            _lease: lease,
+            lease: Some(lease),
             listener,
             advertised,
         });

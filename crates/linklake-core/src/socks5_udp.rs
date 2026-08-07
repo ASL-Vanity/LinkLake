@@ -116,20 +116,9 @@ pub fn decode_socks5_udp_fragment(encoded: &[u8]) -> Result<Socks5UdpFragment, S
 }
 
 pub fn encode_socks5_udp_datagram(datagram: &Socks5UdpDatagram) -> Result<Vec<u8>, Socks5UdpError> {
-    let address_bytes = match &datagram.target {
-        Socks5UdpTarget::Ip(IpAddr::V4(_)) => 1 + 4,
-        Socks5UdpTarget::Ip(IpAddr::V6(_)) => 1 + 16,
-        Socks5UdpTarget::Domain(domain) => {
-            if !valid_domain(domain) || domain.len() > u8::MAX as usize {
-                return Err(Socks5UdpError::InvalidDomain);
-            }
-            2 + domain.len()
-        }
-    };
-    let total = 3_usize
-        .checked_add(address_bytes)
-        .and_then(|value| value.checked_add(2))
-        .and_then(|value| value.checked_add(datagram.payload.len()))
+    let header_bytes = socks5_udp_envelope_header_len(&datagram.target)?;
+    let total = header_bytes
+        .checked_add(datagram.payload.len())
         .ok_or(Socks5UdpError::TooLarge)?;
     if total > u16::MAX as usize {
         return Err(Socks5UdpError::TooLarge);
@@ -154,6 +143,33 @@ pub fn encode_socks5_udp_datagram(datagram: &Socks5UdpDatagram) -> Result<Vec<u8
     encoded.extend_from_slice(&datagram.port.to_be_bytes());
     encoded.extend_from_slice(&datagram.payload);
     Ok(encoded)
+}
+
+/// 返回 SOCKS5 UDP 包头（保留字节、FRAG、地址和端口）的长度。
+pub fn socks5_udp_envelope_header_len(target: &Socks5UdpTarget) -> Result<usize, Socks5UdpError> {
+    let address_bytes = match target {
+        Socks5UdpTarget::Ip(IpAddr::V4(_)) => 1 + 4,
+        Socks5UdpTarget::Ip(IpAddr::V6(_)) => 1 + 16,
+        Socks5UdpTarget::Domain(domain) => {
+            if !valid_domain(domain) || domain.len() > u8::MAX as usize {
+                return Err(Socks5UdpError::InvalidDomain);
+            }
+            2 + domain.len()
+        }
+    };
+    3_usize
+        .checked_add(address_bytes)
+        .and_then(|value| value.checked_add(2))
+        .ok_or(Socks5UdpError::TooLarge)
+}
+
+/// 返回一个 SOCKS5 UDP 分片完整封套的编码长度。
+pub fn socks5_udp_fragment_encoded_len(
+    fragment: &Socks5UdpFragment,
+) -> Result<usize, Socks5UdpError> {
+    socks5_udp_envelope_header_len(&fragment.target)?
+        .checked_add(fragment.payload.len())
+        .ok_or(Socks5UdpError::TooLarge)
 }
 
 pub fn encode_socks5_udp_response(
