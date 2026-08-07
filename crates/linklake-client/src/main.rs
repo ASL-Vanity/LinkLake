@@ -25,6 +25,7 @@ use std::{
     },
     time::Duration,
 };
+use tokio::sync::watch;
 use tokio::{
     io::{copy_bidirectional, split, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
     net::{lookup_host, TcpListener, TcpStream, UdpSocket},
@@ -39,6 +40,7 @@ use uuid::Uuid;
 
 mod p2p_iroh;
 mod p2p_noise;
+mod remote_update;
 mod socks5_udp_agent;
 mod udp_agent;
 use linklake_update as updater;
@@ -554,6 +556,8 @@ struct ClientIdentityConfig {
     p2p_tcp_enabled: bool,
     #[serde(default = "default_true")]
     p2p_iroh_enabled: bool,
+    #[serde(default)]
+    remote_update: remote_update::RemoteUpdateWorkerConfig,
 }
 
 #[derive(Clone)]
@@ -721,12 +725,23 @@ struct RunningAgent {
     task: JoinHandle<()>,
 }
 
+#[derive(Debug)]
+struct ClientRestartRequested;
+
+impl std::fmt::Display for ClientRestartRequested {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("remote update scheduled a client restart")
+    }
+}
+
+impl std::error::Error for ClientRestartRequested {}
+
 fn main() -> anyhow::Result<()> {
     if print_version_if_requested("LinkLake Client")? {
         return Ok(());
     }
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let _log_guard = init_logging()?;
+    let log_guard = init_logging()?;
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--windows-service")) {
         #[cfg(windows)]
         {
@@ -739,7 +754,16 @@ fn main() -> anyhow::Result<()> {
         #[cfg(not(windows))]
         anyhow::bail!("--windows-service is available only on Windows");
     }
-    tokio::runtime::Runtime::new()?.block_on(run_cli())
+    let result = tokio::runtime::Runtime::new()?.block_on(run_cli());
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(|error| error.downcast_ref::<ClientRestartRequested>().is_some())
+    {
+        drop(log_guard);
+        std::process::exit(75);
+    }
+    result
 }
 
 fn print_version_if_requested(product: &'static str) -> anyhow::Result<bool> {
@@ -1093,11 +1117,13 @@ async fn run_configured_agents(
 ) -> anyhow::Result<()> {
     let content = read_to_string(&path)?;
     let config = parse_client_config(&content)?;
+    let (restart_tx, restart_rx) = watch::channel(false);
     if !config.servers.is_empty() {
-        return run_multi_server_agents(path, config, shutdown).await;
+        return run_multi_server_agents(path, config, shutdown, restart_tx, restart_rx).await;
     }
     if let Some(identity) = config.client.clone() {
-        return run_supervised_agents(path, config, identity, shutdown).await;
+        return run_supervised_agents(path, config, identity, shutdown, restart_tx, restart_rx)
+            .await;
     }
     run_legacy_agents(config, shutdown).await
 }
@@ -1106,6 +1132,8 @@ async fn run_multi_server_agents(
     bootstrap_path: PathBuf,
     config: ClientConfigFile,
     shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
+    restart_tx: watch::Sender<bool>,
+    mut restart_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let mut tasks = JoinSet::new();
     let mut shutdown_senders = Vec::new();
@@ -1123,10 +1151,19 @@ async fn run_multi_server_agents(
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         shutdown_senders.push(shutdown_tx);
         let path = bootstrap_path.clone();
+        let supervisor_restart_tx = restart_tx.clone();
+        let supervisor_restart_rx = restart_rx.clone();
         tasks.spawn(async move {
             tracing::info!(server = %server_name, "Starting cloud entry supervisor");
-            let result =
-                run_supervised_agents(path, server_config, identity, Some(shutdown_rx)).await;
+            let result = run_supervised_agents(
+                path,
+                server_config,
+                identity,
+                Some(shutdown_rx),
+                supervisor_restart_tx,
+                supervisor_restart_rx,
+            )
+            .await;
             if let Err(error) = &result {
                 tracing::error!(server = %server_name, "Cloud entry supervisor stopped: {error}");
             }
@@ -1134,12 +1171,20 @@ async fn run_multi_server_agents(
         });
     }
 
-    match shutdown {
+    let mut restart_requested = match shutdown {
         Some(shutdown) => {
-            let _ = shutdown.await;
+            tokio::select! {
+                _ = shutdown => false,
+                changed = restart_rx.changed() => changed.is_ok() && *restart_rx.borrow(),
+            }
         }
-        None => wait_for_os_shutdown().await,
-    }
+        None => {
+            tokio::select! {
+                _ = wait_for_os_shutdown() => false,
+                changed = restart_rx.changed() => changed.is_ok() && *restart_rx.borrow(),
+            }
+        }
+    };
     for sender in shutdown_senders {
         let _ = sender.send(());
     }
@@ -1150,7 +1195,12 @@ async fn run_multi_server_agents(
             Err(error) => tracing::warn!("Cloud entry task failed: {error}"),
         }
     }
+    restart_requested |= *restart_rx.borrow();
     tracing::info!("All LinkLake cloud entry supervisors stopped.");
+    if restart_requested {
+        tracing::info!("Client restart handoff completed; exiting with code 75");
+        return Err(anyhow::Error::new(ClientRestartRequested));
+    }
     Ok(())
 }
 
@@ -1254,6 +1304,8 @@ async fn run_supervised_agents(
     config: ClientConfigFile,
     identity: ClientIdentityConfig,
     shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
+    restart_tx: watch::Sender<bool>,
+    mut restart_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let transport = ControlTransport::new(
         identity.control.clone(),
@@ -1276,6 +1328,12 @@ async fn run_supervised_agents(
         (None, None) => None,
         _ => anyhow::bail!("p2p_bind and p2p_endpoint must be configured together"),
     };
+    let remote_update_task = remote_update::spawn(
+        identity.remote_update.clone(),
+        identity.client_id,
+        identity.client_token.clone(),
+        restart_tx,
+    )?;
     let managed_path = managed_config_path(&bootstrap_path, &identity);
     let local_config = local_managed_config(&config);
     let local_secret_visitors = config.secret_visitors.clone();
@@ -1335,9 +1393,12 @@ async fn run_supervised_agents(
     tokio::pin!(shutdown_future);
     let mut poll = interval(MANAGED_CONFIG_POLL_INTERVAL);
     poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    loop {
+    let mut restart_requested = loop {
         tokio::select! {
-            _ = &mut shutdown_future => break,
+            _ = &mut shutdown_future => break false,
+            changed = restart_rx.changed() => {
+                break changed.is_ok() && *restart_rx.borrow();
+            }
             _ = poll.tick() => {
                 match request_managed_config(
                     &transport,
@@ -1393,14 +1454,25 @@ async fn run_supervised_agents(
                 }
             }
         }
-    }
+    };
     for (_, agent) in agents {
         agent.task.abort();
     }
     if let Some(task) = p2p_task {
         task.abort();
     }
+    if let Some(task) = remote_update_task {
+        if let Err(error) = task.shutdown().await {
+            tracing::error!(%error, "Remote update worker did not stop cleanly");
+            return Err(error);
+        }
+    }
+    restart_requested |= *restart_rx.borrow();
     tracing::info!("LinkLake client configuration supervisor stopped.");
+    if restart_requested {
+        tracing::info!("Client restart handoff completed; exiting with code 75");
+        return Err(anyhow::Error::new(ClientRestartRequested));
+    }
     Ok(())
 }
 
@@ -2041,6 +2113,7 @@ fn validate_client_identity(identity: &ClientIdentityConfig) -> anyhow::Result<(
             .is_none_or(|value| value.starts_with("https://") && value.len() <= 512),
         "p2p_relay_url must be an HTTPS relay URL"
     );
+    remote_update::validate_config(&identity.remote_update)?;
     Ok(())
 }
 
@@ -5008,6 +5081,14 @@ mod windows_service_host {
             (Ok(runtime), Some(config)) => {
                 match runtime.block_on(super::run_configured_agents(config, Some(shutdown_rx))) {
                     Ok(()) => 0,
+                    Err(error)
+                        if error
+                            .downcast_ref::<super::ClientRestartRequested>()
+                            .is_some() =>
+                    {
+                        tracing::info!("Windows service client restart handoff completed");
+                        75
+                    }
                     Err(error) => {
                         tracing::error!("LinkLake client stopped with an error: {error}");
                         1

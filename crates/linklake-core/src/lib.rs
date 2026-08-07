@@ -11,6 +11,7 @@ pub mod fleet_protocol;
 pub mod p2p_protocol;
 pub mod port_mapping;
 pub mod public_ports;
+pub mod remote_update;
 pub mod socks5_fragment;
 pub mod socks5_udp;
 pub mod target_pool;

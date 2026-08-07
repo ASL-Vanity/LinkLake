@@ -34,6 +34,9 @@ mod traffic_control;
 mod tunnel_catalog;
 mod udp_data_plane;
 mod udp_tunnel;
+mod update_api;
+mod update_tasks;
+mod update_worker;
 
 use admin_auth::{
     AdminAuth, BootstrapCredentials, CreateUser, LoginAttempt, SessionIdentity, SessionRecord,
@@ -142,6 +145,7 @@ use tunnel_catalog::{
     UpdateSocks5ProxyPolicy, UpdateTcpTunnelPolicy, UpdateUdpTunnelPolicy,
 };
 use udp_data_plane::{UdpDataPlane, UdpDataPlaneConfig};
+use update_tasks::{UpdateTaskCatalog, UpdateTaskCoordinationStorage};
 use uuid::Uuid;
 
 const MANAGEMENT_UI_DOCUMENT: &str = include_str!("../web/index.html");
@@ -154,7 +158,7 @@ const UPDATE_APPLY_CONFIRMATION: &str = "UPDATE";
 const UPDATE_CSRF_HEADER: &str = "x-linklake-csrf";
 const UPDATE_CSRF_VALUE: &str = "1";
 const SERVER_UPDATE_AUTH_AUDIT_WINDOW: Duration = Duration::from_secs(60);
-const SERVER_UPDATE_OPERATION_COUNT: usize = 4;
+const SERVER_UPDATE_OPERATION_COUNT: usize = 8;
 const SERVER_UPDATE_AUTH_REASON_COUNT: usize = 8;
 const SERVER_UPDATE_AUTH_AUDIT_BUCKET_COUNT: usize =
     SERVER_UPDATE_OPERATION_COUNT * SERVER_UPDATE_AUTH_REASON_COUNT;
@@ -165,6 +169,10 @@ enum ServerUpdateOperation {
     Check,
     Download,
     Apply,
+    RemoteList,
+    RemoteDetail,
+    RemoteCreate,
+    RemoteCancel,
 }
 
 impl ServerUpdateOperation {
@@ -174,6 +182,10 @@ impl ServerUpdateOperation {
             Self::Check => "check",
             Self::Download => "download",
             Self::Apply => "apply",
+            Self::RemoteList => "remote_list",
+            Self::RemoteDetail => "remote_detail",
+            Self::RemoteCreate => "remote_create",
+            Self::RemoteCancel => "remote_cancel",
         }
     }
 
@@ -183,6 +195,10 @@ impl ServerUpdateOperation {
             Self::Check => 1,
             Self::Download => 2,
             Self::Apply => 3,
+            Self::RemoteList => 4,
+            Self::RemoteDetail => 5,
+            Self::RemoteCreate => 6,
+            Self::RemoteCancel => 7,
         }
     }
 }
@@ -545,6 +561,7 @@ struct AppState {
     policy_mutation_lock: AsyncMutex<()>,
     server_update_data_directory: Option<PathBuf>,
     server_update_operation_lock: AsyncMutex<()>,
+    update_tasks: Mutex<Box<dyn UpdateTaskCoordinationStorage>>,
     fleet_health: Mutex<FleetHealthCatalog>,
     traffic_controls: Mutex<TrafficControlCatalog>,
     management_cookies_secure: bool,
@@ -4145,6 +4162,13 @@ async fn run_server(
     let socks5_fragment_budget = Arc::new(Socks5FragmentGlobalBudget::from_config(
         socks5_fragment_config,
     ));
+    // 独立部署注入 SQLite 实现；HA 接线必须在这里替换为共享 PostgreSQL/账本实现。
+    // 只有协调存储确认当前实例为 leader 时才允许驱动启动恢复与定时 sweep。
+    let update_tasks: Box<dyn UpdateTaskCoordinationStorage> =
+        Box::new(UpdateTaskCatalog::open(&database)?);
+    if update_tasks.is_maintenance_leader() {
+        update_tasks.reconcile_after_restart(unix_seconds())?;
+    }
     let state = Arc::new(AppState {
         _database: database.clone(),
         started_at: Instant::now(),
@@ -4166,6 +4190,7 @@ async fn run_server(
         policy_mutation_lock: AsyncMutex::new(()),
         server_update_data_directory: data_dir.clone(),
         server_update_operation_lock: AsyncMutex::new(()),
+        update_tasks: Mutex::new(update_tasks),
         fleet_health: Mutex::new(FleetHealthCatalog::open_with_database(&database)?),
         traffic_controls: Mutex::new(TrafficControlCatalog::open_with_database(&database)?),
         management_cookies_secure,
@@ -4218,6 +4243,7 @@ async fn run_server(
         )?),
     });
     restore_managed_certificates(&state)?;
+    let _remote_update_task_sweeper = update_worker::spawn_update_task_sweeper(state.clone());
     let app = Router::new()
         .route("/", get(management_ui))
         .route("/assets/linklake.css", get(management_ui_styles))
@@ -4277,6 +4303,18 @@ async fn run_server(
             post(download_server_update),
         )
         .route("/api/v1/updates/server/apply", post(apply_server_update))
+        .route(
+            "/api/v1/updates/clients/tasks",
+            get(update_api::list_remote_update_tasks).post(update_api::create_remote_update_task),
+        )
+        .route(
+            "/api/v1/updates/clients/tasks/:task_id",
+            get(update_api::get_remote_update_task),
+        )
+        .route(
+            "/api/v1/updates/clients/tasks/:task_id/cancel",
+            post(update_api::cancel_remote_update_task),
+        )
         .route("/api/v1/public-port-policy", get(get_public_port_policy))
         .route("/api/v1/metrics", get(metrics))
         .route("/api/v1/metrics/prometheus", get(prometheus_metrics))
@@ -4495,6 +4533,18 @@ async fn run_server(
         )
         .route("/api/v1/clients/enroll", post(enroll_client))
         .route("/api/v1/clients/:client_id/heartbeat", post(heartbeat))
+        .route(
+            "/api/v1/clients/:client_id/update-tasks/claim",
+            post(update_worker::claim_remote_update_task),
+        )
+        .route(
+            "/api/v1/clients/:client_id/update-tasks/:task_id/renew",
+            post(update_worker::renew_remote_update_task),
+        )
+        .route(
+            "/api/v1/clients/:client_id/update-tasks/:task_id/report",
+            post(update_worker::report_remote_update_task),
+        )
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -5161,7 +5211,7 @@ async fn server_update_overview(
         status: status.into(),
         operation_active,
         apply_available: state.server_update_data_directory.is_some(),
-        remote_client_update_available: false,
+        remote_client_update_available: true,
         confirmation_required: true,
     }))
 }
@@ -14652,7 +14702,8 @@ async fn enforce_management_role(
         || path == "/api/v1/auth/logout"
         || path == "/api/v1/auth/change-password"
         || path == "/api/v1/clients/enroll"
-        || (path.starts_with("/api/v1/clients/") && path.ends_with("/heartbeat"));
+        || (path.starts_with("/api/v1/clients/") && path.ends_with("/heartbeat"))
+        || update_worker::is_remote_update_worker_path(path);
     if public || !path.starts_with("/api/v1/") {
         return next.run(request).await;
     }
