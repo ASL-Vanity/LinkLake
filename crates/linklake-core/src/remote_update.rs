@@ -3,6 +3,7 @@
 //! 这里故意不提供命令、脚本、自由参数、仓库名或下载 URL 字段。服务端只能创建
 //! 六种封闭动作，客户端也只能把动作映射到内置的安全更新器。
 
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -14,6 +15,8 @@ pub const REMOTE_UPDATE_MAX_LEASE_SECONDS: u32 = 300;
 pub const REMOTE_UPDATE_DEFAULT_LEASE_SECONDS: u32 = 60;
 pub const REMOTE_UPDATE_MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
 const REMOTE_UPDATE_MIN_IDEMPOTENCY_KEY_BYTES: usize = 8;
+const REMOTE_UPDATE_MAX_VERSION_BYTES: usize = 64;
+const REMOTE_UPDATE_MAX_KEY_ID_BYTES: usize = 64;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -99,16 +102,10 @@ pub enum RemoteUpdateStage {
 }
 
 impl RemoteUpdateStage {
-    pub fn valid_for(self, action: RemoteUpdateAction) -> bool {
-        matches!(
-            self,
-            Self::Queued
-                | Self::Claimed
-                | Self::AwaitingRestart
-                | Self::Completed
-                | Self::Failed
-                | Self::Cancelled
-        ) || self == action.execution_stage()
+    pub fn valid_for_active_lease(self, action: RemoteUpdateAction) -> bool {
+        self == Self::Claimed
+            || self == action.execution_stage()
+            || (self == Self::AwaitingRestart && action.changes_installation())
     }
 }
 
@@ -300,6 +297,72 @@ impl RemoteUpdateResult {
                 )
         )
     }
+
+    pub fn validate(&self) -> Result<(), RemoteUpdateContractError> {
+        match self {
+            Self::Check {
+                current_version,
+                latest_version,
+                signature_key_id,
+                ..
+            } => {
+                validate_version(current_version)?;
+                validate_version(latest_version)?;
+                validate_key_id(signature_key_id)
+            }
+            Self::Downloaded {
+                version,
+                archive_sha256,
+                binary_sha256,
+                signature_key_id,
+            } => {
+                validate_version(version)?;
+                validate_sha256(archive_sha256)?;
+                validate_sha256(binary_sha256)?;
+                validate_key_id(signature_key_id)
+            }
+            Self::Scheduled {
+                operation_id,
+                from_version,
+                to_version,
+                ..
+            } => {
+                validate_non_nil_uuid(*operation_id)?;
+                validate_version(from_version)?;
+                validate_version(to_version)
+            }
+            Self::Status {
+                state,
+                operation,
+                from_version,
+                to_version,
+                updated_unix_seconds,
+                ..
+            } => {
+                if let Some(version) = from_version {
+                    validate_version(version)?;
+                }
+                if let Some(version) = to_version {
+                    validate_version(version)?;
+                }
+                if *updated_unix_seconds == 0 {
+                    return Err(RemoteUpdateContractError::InvalidTimestamp);
+                }
+                let operation_required = matches!(
+                    state,
+                    RemoteLocalUpdateState::Scheduled
+                        | RemoteLocalUpdateState::Installing
+                        | RemoteLocalUpdateState::Succeeded
+                        | RemoteLocalUpdateState::RolledBack
+                        | RemoteLocalUpdateState::RecoveryRequired
+                );
+                if operation_required != operation.is_some() {
+                    return Err(RemoteUpdateContractError::InvalidLocalStatus);
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -313,6 +376,7 @@ pub struct CreateRemoteUpdateTaskRequest {
 
 impl CreateRemoteUpdateTaskRequest {
     pub fn validate(&self) -> Result<(), RemoteUpdateContractError> {
+        validate_non_nil_uuid(self.target_client_id)?;
         validate_idempotency_key(&self.idempotency_key)?;
         if self.confirmation != self.action.confirmation_phrase() {
             return Err(RemoteUpdateContractError::ConfirmationMismatch);
@@ -397,6 +461,7 @@ pub struct RemoteUpdateClaimRequest {
 
 impl RemoteUpdateClaimRequest {
     pub fn validate(&self) -> Result<(), RemoteUpdateContractError> {
+        validate_non_nil_uuid(self.worker_instance_id)?;
         validate_lease_seconds(self.requested_lease_seconds)
     }
 }
@@ -426,8 +491,10 @@ pub struct RemoteUpdateLeaseRenewRequest {
 
 impl RemoteUpdateLeaseRenewRequest {
     pub fn validate(&self, action: RemoteUpdateAction) -> Result<(), RemoteUpdateContractError> {
+        validate_non_nil_uuid(self.worker_instance_id)?;
+        validate_non_nil_uuid(self.lease_token)?;
         validate_lease_seconds(self.requested_lease_seconds)?;
-        if !self.stage.valid_for(action) {
+        if !self.stage.valid_for_active_lease(action) {
             return Err(RemoteUpdateContractError::InvalidStage);
         }
         Ok(())
@@ -466,13 +533,13 @@ impl RemoteUpdateWorkerReport {
             Self::Started { .. } => Err(RemoteUpdateContractError::InvalidStage),
             Self::AwaitingRestart if action.changes_installation() => Ok(()),
             Self::AwaitingRestart => Err(RemoteUpdateContractError::InvalidTransition),
-            Self::Succeeded { result } if result.matches_action(action) => Ok(()),
+            Self::Succeeded { result } if result.matches_action(action) => result.validate(),
             Self::Succeeded { .. } => Err(RemoteUpdateContractError::ResultActionMismatch),
             Self::Failed {
-                recovery_state: RemoteUpdateRecoveryState::Recovered,
-                ..
-            } => Err(RemoteUpdateContractError::InvalidRecoveryState),
-            Self::Failed { .. } | Self::Cancelled => Ok(()),
+                error_code,
+                recovery_state,
+            } => validate_failure_report(action, *error_code, *recovery_state),
+            Self::Cancelled => Ok(()),
         }
     }
 }
@@ -483,6 +550,14 @@ pub struct RemoteUpdateReportRequest {
     pub worker_instance_id: Uuid,
     pub lease_token: Uuid,
     pub report: RemoteUpdateWorkerReport,
+}
+
+impl RemoteUpdateReportRequest {
+    pub fn validate(&self, action: RemoteUpdateAction) -> Result<(), RemoteUpdateContractError> {
+        validate_non_nil_uuid(self.worker_instance_id)?;
+        validate_non_nil_uuid(self.lease_token)?;
+        self.report.validate(action)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -509,6 +584,18 @@ pub enum RemoteUpdateContractError {
     InvalidRecoveryState,
     #[error("the update transition is invalid")]
     InvalidTransition,
+    #[error("a required UUID is nil")]
+    NilUuid,
+    #[error("a reported version is not a bounded semantic version")]
+    InvalidVersion,
+    #[error("a reported signing key ID is invalid")]
+    InvalidKeyId,
+    #[error("a reported SHA-256 digest is invalid")]
+    InvalidSha256,
+    #[error("a reported timestamp is invalid")]
+    InvalidTimestamp,
+    #[error("the local update status fields are inconsistent")]
+    InvalidLocalStatus,
 }
 
 pub fn validate_idempotency_key(value: &str) -> Result<(), RemoteUpdateContractError> {
@@ -531,6 +618,87 @@ pub fn validate_lease_seconds(value: u32) -> Result<(), RemoteUpdateContractErro
         Ok(())
     } else {
         Err(RemoteUpdateContractError::InvalidLeaseDuration)
+    }
+}
+
+pub fn validate_non_nil_uuid(value: Uuid) -> Result<(), RemoteUpdateContractError> {
+    if value.is_nil() {
+        Err(RemoteUpdateContractError::NilUuid)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_version(value: &str) -> Result<(), RemoteUpdateContractError> {
+    if value.is_empty() || value.len() > REMOTE_UPDATE_MAX_VERSION_BYTES {
+        return Err(RemoteUpdateContractError::InvalidVersion);
+    }
+    let normalized = value.strip_prefix('v').unwrap_or(value);
+    Version::parse(normalized)
+        .map(|_| ())
+        .map_err(|_| RemoteUpdateContractError::InvalidVersion)
+}
+
+fn validate_key_id(value: &str) -> Result<(), RemoteUpdateContractError> {
+    if value.is_empty()
+        || value.len() > REMOTE_UPDATE_MAX_KEY_ID_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        Err(RemoteUpdateContractError::InvalidKeyId)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_sha256(value: &str) -> Result<(), RemoteUpdateContractError> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(RemoteUpdateContractError::InvalidSha256)
+    }
+}
+
+fn validate_failure_report(
+    action: RemoteUpdateAction,
+    error_code: RemoteUpdateErrorCode,
+    recovery_state: RemoteUpdateRecoveryState,
+) -> Result<(), RemoteUpdateContractError> {
+    if error_code == RemoteUpdateErrorCode::Cancelled
+        || matches!(
+            recovery_state,
+            RemoteUpdateRecoveryState::None | RemoteUpdateRecoveryState::Recovered
+        )
+    {
+        return Err(RemoteUpdateContractError::InvalidRecoveryState);
+    }
+    if error_code == RemoteUpdateErrorCode::FailedClosed
+        && recovery_state != RemoteUpdateRecoveryState::FailedClosed
+    {
+        return Err(RemoteUpdateContractError::InvalidRecoveryState);
+    }
+    let valid = if action.changes_installation() {
+        matches!(
+            recovery_state,
+            RemoteUpdateRecoveryState::StatusRequired
+                | RemoteUpdateRecoveryState::RollbackRequired
+                | RemoteUpdateRecoveryState::FailedClosed
+        )
+    } else {
+        matches!(
+            recovery_state,
+            RemoteUpdateRecoveryState::Retryable | RemoteUpdateRecoveryState::FailedClosed
+        )
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(RemoteUpdateContractError::InvalidRecoveryState)
     }
 }
 
@@ -562,7 +730,7 @@ mod tests {
     #[test]
     fn exact_confirmation_is_action_specific() {
         let mut request = CreateRemoteUpdateTaskRequest {
-            target_client_id: Uuid::nil(),
+            target_client_id: Uuid::from_u128(1),
             action: RemoteUpdateAction::Rollback,
             idempotency_key: "rollback-client-a".to_owned(),
             confirmation: "ROLLBACK".to_owned(),
@@ -591,5 +759,65 @@ mod tests {
         ] {
             assert!(!action.safe_to_requeue_after_lease_loss());
         }
+    }
+
+    #[test]
+    fn active_lease_rejects_terminal_and_impossible_stages() {
+        for stage in [
+            RemoteUpdateStage::AwaitingRestart,
+            RemoteUpdateStage::Completed,
+            RemoteUpdateStage::Failed,
+            RemoteUpdateStage::Cancelled,
+        ] {
+            assert!(!stage.valid_for_active_lease(RemoteUpdateAction::Check));
+        }
+        assert!(
+            RemoteUpdateStage::AwaitingRestart.valid_for_active_lease(RemoteUpdateAction::Apply)
+        );
+    }
+
+    #[test]
+    fn request_identifiers_must_not_be_nil() {
+        let claim = RemoteUpdateClaimRequest {
+            worker_instance_id: Uuid::nil(),
+            requested_lease_seconds: REMOTE_UPDATE_DEFAULT_LEASE_SECONDS,
+        };
+        assert_eq!(claim.validate(), Err(RemoteUpdateContractError::NilUuid));
+    }
+
+    #[test]
+    fn worker_results_are_bounded_and_typed() {
+        let invalid = RemoteUpdateResult::Downloaded {
+            version: "not-semver".to_owned(),
+            archive_sha256: "a".repeat(64),
+            binary_sha256: "b".repeat(64),
+            signature_key_id: "production-2026".to_owned(),
+        };
+        assert_eq!(
+            invalid.validate(),
+            Err(RemoteUpdateContractError::InvalidVersion)
+        );
+        let invalid_digest = RemoteUpdateResult::Downloaded {
+            version: "1.1.0".to_owned(),
+            archive_sha256: "A".repeat(64),
+            binary_sha256: "b".repeat(64),
+            signature_key_id: "production-2026".to_owned(),
+        };
+        assert_eq!(
+            invalid_digest.validate(),
+            Err(RemoteUpdateContractError::InvalidSha256)
+        );
+    }
+
+    #[test]
+    fn failed_reports_require_a_fail_closed_recovery_state() {
+        let invalid = RemoteUpdateWorkerReport::Failed {
+            error_code: RemoteUpdateErrorCode::ApplyFailed,
+            recovery_state: RemoteUpdateRecoveryState::None,
+        };
+        assert_eq!(
+            invalid.validate(RemoteUpdateAction::Apply),
+            Err(RemoteUpdateContractError::InvalidRecoveryState)
+        );
     }
 }
