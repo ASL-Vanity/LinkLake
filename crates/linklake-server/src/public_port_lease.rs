@@ -1,6 +1,7 @@
 //! 将公网端口所有权租约绑定到具体协议运行时，并在续租失败时立即停止监听。
 
 use crate::{
+    ha_coordination::LeadershipLease,
     ha_runtime::HaRuntime,
     public_port_ownership::{PublicPortLease, PublicPortOwnership, PublicPortProtocol},
 };
@@ -16,6 +17,8 @@ pub(crate) struct HaPublicPortLease {
     ownership: PublicPortOwnership,
     lease: Option<PublicPortLease>,
     heartbeat: Duration,
+    leadership: watch::Receiver<Option<LeadershipLease>>,
+    expected_fencing_token: u64,
 }
 
 impl HaPublicPortLease {
@@ -32,8 +35,10 @@ impl HaPublicPortLease {
             .await?;
         Ok(lease.map(|lease| Self {
             ownership,
+            expected_fencing_token: fencing_token,
             lease: Some(lease),
             heartbeat: runtime.heartbeat(),
+            leadership: runtime.subscribe_leadership(),
         }))
     }
 
@@ -43,11 +48,23 @@ impl HaPublicPortLease {
         stop_tx: watch::Sender<()>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
+            if !self.leadership_matches() {
+                let _ = stop_tx.send(());
+                self.release_inner().await;
+                return;
+            }
             let mut heartbeat = interval_at(Instant::now() + self.heartbeat, self.heartbeat);
             heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     _ = stop.changed() => break,
+                    changed = self.leadership.changed() => {
+                        if changed.is_err() || !self.leadership_matches() {
+                            tracing::warn!("HA leadership changed; stopping public port listener");
+                            let _ = stop_tx.send(());
+                            break;
+                        }
+                    }
                     _ = heartbeat.tick() => {
                         match timeout(self.heartbeat, self.renew()).await {
                             Ok(Ok(true)) => {}
@@ -79,6 +96,9 @@ impl HaPublicPortLease {
     }
 
     async fn renew(&self) -> anyhow::Result<bool> {
+        if !self.leadership_matches() {
+            return Ok(false);
+        }
         let Some(lease) = self.lease.as_ref() else {
             return Ok(false);
         };
@@ -93,6 +113,13 @@ impl HaPublicPortLease {
             )
             .await?
             .is_some())
+    }
+
+    fn leadership_matches(&self) -> bool {
+        self.leadership
+            .borrow()
+            .as_ref()
+            .is_some_and(|lease| lease.fencing_token == self.expected_fencing_token)
     }
 
     async fn release_inner(&mut self) {

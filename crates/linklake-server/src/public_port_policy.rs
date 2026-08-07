@@ -199,6 +199,7 @@ impl HaDynamicPortLeaseProvider {
 }
 
 struct HaDynamicPortLease {
+    runtime: Arc<HaRuntime>,
     ownership: crate::public_port_ownership::PublicPortOwnership,
     lease: PublicPortLease,
     renewal_interval: Duration,
@@ -226,6 +227,9 @@ impl DynamicPortLease for HaDynamicPortLease {
     fn renew<'a>(&'a self) -> DynamicPortLeaseOperationFuture<'a> {
         Box::pin(async move {
             if self.released.load(Ordering::Acquire) {
+                return Err(DynamicPortLeaseError::Unavailable);
+            }
+            if self.runtime.fencing_token().ok() != Some(self.lease.fencing_token) {
                 return Err(DynamicPortLeaseError::Unavailable);
             }
             self.ownership
@@ -294,6 +298,7 @@ impl DynamicPortLeaseProvider for HaDynamicPortLeaseProvider {
                 self.next_tcp
                     .store(u32::from(port.wrapping_add(1).max(1)), Ordering::Relaxed);
                 return Ok(Box::new(HaDynamicPortLease {
+                    runtime: self.runtime.clone(),
                     ownership: self.runtime.public_ports().clone(),
                     renewal_interval: self.runtime.heartbeat(),
                     lease_id: lease.lease_id.to_string(),
