@@ -29,8 +29,10 @@ mod manager;
 mod server_database;
 use durable::{
     read_limited_bytes, read_limited_json as read_durable_json, remove_durable_file,
-    update_operation_active as durable_update_operation_active, write_durable_bytes,
-    write_durable_json, write_journal_json, UpdateLock,
+    remove_durable_file_if_exists, update_operation_active as durable_update_operation_active,
+    validate_existing_directory as validate_durable_directory, validate_private_file,
+    write_durable_bytes, write_durable_bytes_create_new, write_durable_json, write_journal_json,
+    UpdateLock,
 };
 pub use manager::{
     manager_apply, manager_download, manager_rollback, manager_status, run_manager_helper,
@@ -61,6 +63,8 @@ const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const SERVER_READY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const SERVER_READY_STABLE_POLLS: usize = 6;
 const MAX_UPDATE_STATE_BYTES: u64 = 128 * 1024;
+const MAX_REMOTE_UPDATE_RESUME_BYTES: u64 = 16 * 1024;
+const REMOTE_UPDATE_RESUME_DIRECTORY: &str = "remote-resume";
 const UPDATE_JOURNAL_SCHEMA_VERSION: u32 = 1;
 const SERVER_STATE_AUTH_SCHEMA_VERSION: u32 = 1;
 const SERVER_STATE_AUTH_KEY_NAME: &str = ".linklake-server-update-auth.key";
@@ -405,6 +409,18 @@ pub struct UpdateSchedule {
     pub helper_process_id: u32,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct CompletedUpdateVerification {
+    pub operation_id: Uuid,
+    pub operation: String,
+    pub from_version: String,
+    pub to_version: String,
+    pub installed_sha256: String,
+    pub backup_sha256: String,
+    pub backup_directory: PathBuf,
+    pub verified_unix_seconds: u64,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct GithubRelease {
     tag_name: String,
@@ -572,6 +588,322 @@ pub fn default_state_directory(product: UpdateProduct) -> PathBuf {
     }
 }
 
+/// 返回远程更新续跑凭据的受保护路径。
+///
+/// 路径始终位于更新器自己的 state directory 下，文件名由客户端 UUID 与服务端
+/// origin 摘要确定，调用方不能传入任意路径。目录和文件都会拒绝符号链接/重解析点。
+pub fn remote_update_resume_path(
+    product: UpdateProduct,
+    state_directory: &Path,
+    client_id: Uuid,
+    api_origin_sha256: &str,
+) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(!client_id.is_nil(), "remote update resume client ID is nil");
+    anyhow::ensure!(
+        api_origin_sha256.len() == 64
+            && api_origin_sha256
+                .bytes()
+                .all(|value| value.is_ascii_digit() || (b'a'..=b'f').contains(&value)),
+        "remote update resume origin digest is malformed"
+    );
+    let resume_directory = remote_update_resume_directory(product, state_directory)?;
+    anyhow::ensure!(
+        resume_directory.file_name() == Some(OsStr::new(REMOTE_UPDATE_RESUME_DIRECTORY)),
+        "remote update resume directory has an invalid managed name"
+    );
+    let path = resume_directory.join(format!(
+        "remote-resume-{client_id}-{}.json",
+        &api_origin_sha256[..16]
+    ));
+    anyhow::ensure!(
+        path.parent() == Some(resume_directory.as_path()),
+        "remote update resume file escaped its managed directory"
+    );
+    recover_remote_resume_temporaries(&resume_directory, &path)?;
+    Ok(path)
+}
+
+fn remote_update_resume_directory(
+    product: UpdateProduct,
+    state_directory: &Path,
+) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(
+        product != UpdateProduct::Server,
+        "server resume state is unsupported"
+    );
+    let state_directory = prepare_state_directory(state_directory)?;
+    let resume_directory = state_directory.join(REMOTE_UPDATE_RESUME_DIRECTORY);
+    match fs::symlink_metadata(&resume_directory) {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.file_type().is_dir(),
+                "remote update resume path is not a directory"
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&resume_directory)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let resume_directory = validate_durable_directory(&resume_directory)?;
+    secure_directory(&resume_directory)?;
+    let resume_directory = canonicalize_update_path(&resume_directory)?;
+    anyhow::ensure!(
+        resume_directory.parent() == Some(state_directory.as_path())
+            && resume_directory.file_name() == Some(OsStr::new(REMOTE_UPDATE_RESUME_DIRECTORY)),
+        "remote update resume directory escaped the updater state directory"
+    );
+    validate_remote_resume_directory(&resume_directory)?;
+    Ok(resume_directory)
+}
+
+/// 创建一次性远程更新续跑凭据；已有凭据绝不覆盖。
+pub fn write_remote_update_resume_receipt(
+    product: UpdateProduct,
+    state_directory: &Path,
+    client_id: Uuid,
+    api_origin_sha256: &str,
+    bytes: &[u8],
+) -> anyhow::Result<PathBuf> {
+    let path = remote_update_resume_path(product, state_directory, client_id, api_origin_sha256)?;
+    write_durable_bytes_create_new(&path, bytes, MAX_REMOTE_UPDATE_RESUME_BYTES)?;
+    validate_remote_resume_file(&path)?;
+    Ok(path)
+}
+
+/// 读取远程更新续跑凭据；任何权限、链接或大小异常都直接失败关闭。
+pub fn read_remote_update_resume_receipt(
+    product: UpdateProduct,
+    state_directory: &Path,
+    client_id: Uuid,
+    api_origin_sha256: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let path = remote_update_resume_path(product, state_directory, client_id, api_origin_sha256)?;
+    validate_remote_resume_file(&path)?;
+    read_limited_bytes(&path, MAX_REMOTE_UPDATE_RESUME_BYTES)
+}
+
+/// 安全判断某个云身份是否已有可续跑凭据。
+pub fn remote_update_resume_receipt_exists(
+    product: UpdateProduct,
+    state_directory: &Path,
+    client_id: Uuid,
+    api_origin_sha256: &str,
+) -> anyhow::Result<bool> {
+    let path = remote_update_resume_path(product, state_directory, client_id, api_origin_sha256)?;
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            validate_remote_resume_file(&path)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "cannot inspect remote update resume receipt {}",
+                path.display()
+            )
+        }),
+    }
+}
+
+/// 判断安装级状态目录中是否存在任意身份的凭据或中断的 create-new 临时文件。
+///
+/// 未知文件名、链接、重解析点或权限异常都会失败关闭，避免另一个云入口绕过尚未完成
+/// 的重启验证并 claim 新任务。
+pub fn any_remote_update_resume_receipt_exists(
+    product: UpdateProduct,
+    state_directory: &Path,
+) -> anyhow::Result<bool> {
+    let directory = remote_update_resume_directory(product, state_directory)?;
+    let mut pending = false;
+    for entry in fs::read_dir(&directory)? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("remote update resume entry name is not UTF-8"))?;
+        let path = entry.path();
+        if is_remote_resume_receipt_name(&name) {
+            validate_remote_resume_file(&path)?;
+            pending = true;
+        } else if is_remote_resume_temporary_name(&name) {
+            validate_remote_resume_temporary(&path)?;
+            pending = true;
+        } else {
+            anyhow::bail!(
+                "remote update resume directory contains an unmanaged entry: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(pending)
+}
+
+/// 删除远程更新续跑凭据并同步目录项。
+pub fn remove_remote_update_resume_receipt(
+    product: UpdateProduct,
+    state_directory: &Path,
+    client_id: Uuid,
+    api_origin_sha256: &str,
+) -> anyhow::Result<bool> {
+    let path = remote_update_resume_path(product, state_directory, client_id, api_origin_sha256)?;
+    remove_durable_file_if_exists(&path)
+}
+
+fn validate_remote_resume_directory(path: &Path) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        metadata.file_type().is_dir(),
+        "remote update resume directory is not a regular directory"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        anyhow::ensure!(
+            metadata.mode() & 0o7777 == 0o700,
+            "remote update resume directory permissions are not restricted to the owner"
+        );
+    }
+    #[cfg(windows)]
+    {
+        if windows_process_is_elevated()? {
+            validate_windows_server_security_descriptor(
+                path,
+                WINDOWS_SERVER_AUTHENTICATION_KEY_SECURITY_DESCRIPTOR,
+                "remote update resume directory",
+            )?;
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    anyhow::bail!("remote update resume permissions cannot be verified on this platform");
+    Ok(())
+}
+
+fn validate_remote_resume_file(path: &Path) -> anyhow::Result<()> {
+    validate_private_file(path)?;
+    #[cfg(windows)]
+    {
+        if windows_process_is_elevated()? {
+            validate_windows_server_security_descriptor(
+                path,
+                WINDOWS_SERVER_AUTHENTICATION_KEY_SECURITY_DESCRIPTOR,
+                "remote update resume file",
+            )?;
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    anyhow::bail!("remote update resume permissions cannot be verified on this platform");
+    Ok(())
+}
+
+fn validate_remote_resume_temporary(path: &Path) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "remote update resume temporary is not a regular file"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        anyhow::ensure!(
+            (1..=2).contains(&metadata.nlink()) && metadata.mode() & 0o7777 == 0o600,
+            "remote update resume temporary permissions or link count are unsafe"
+        );
+    }
+    #[cfg(windows)]
+    {
+        validate_private_file(path)?;
+        if windows_process_is_elevated()? {
+            validate_windows_server_security_descriptor(
+                path,
+                WINDOWS_SERVER_AUTHENTICATION_KEY_SECURITY_DESCRIPTOR,
+                "remote update resume temporary",
+            )?;
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    anyhow::bail!("remote update resume permissions cannot be verified on this platform");
+    Ok(())
+}
+
+fn is_remote_resume_receipt_name(name: &str) -> bool {
+    let Some(value) = name
+        .strip_prefix("remote-resume-")
+        .and_then(|value| value.strip_suffix(".json"))
+    else {
+        return false;
+    };
+    let Some((client_id, origin_prefix)) = value.rsplit_once('-') else {
+        return false;
+    };
+    Uuid::parse_str(client_id).is_ok()
+        && origin_prefix.len() == 16
+        && origin_prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_remote_resume_temporary_name(name: &str) -> bool {
+    let Some(value) = name.strip_prefix('.') else {
+        return false;
+    };
+    let Some((target, temporary_identity)) = value.split_once(".json.tmp-") else {
+        return false;
+    };
+    let target = format!("{target}.json");
+    let Some((pid, nonce)) = temporary_identity.split_once('-') else {
+        return false;
+    };
+    is_remote_resume_receipt_name(&target)
+        && !pid.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && nonce.len() == 32
+        && nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn recover_remote_resume_temporaries(directory: &Path, target: &Path) -> anyhow::Result<()> {
+    let target_name = target
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("remote update resume file has no name"))?
+        .to_string_lossy();
+    let prefix = format!(".{target_name}.tmp-");
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let temporary = entry.path();
+        let metadata = fs::symlink_metadata(&temporary)?;
+        validate_remote_resume_temporary(&temporary)?;
+        if metadata.modified()?.elapsed().unwrap_or_default() < Duration::from_secs(5) {
+            continue;
+        }
+        let temporary_bytes = read_limited_bytes(&temporary, MAX_REMOTE_UPDATE_RESUME_BYTES)?;
+        match fs::symlink_metadata(target) {
+            Ok(_) => {
+                let target_bytes = read_limited_bytes(target, MAX_REMOTE_UPDATE_RESUME_BYTES)?;
+                anyhow::ensure!(
+                    target_bytes == temporary_bytes,
+                    "remote update resume target conflicts with an interrupted create-new write"
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::hard_link(&temporary, target).with_context(|| {
+                    format!(
+                        "cannot recover interrupted remote update resume receipt {}",
+                        target.display()
+                    )
+                })?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        remove_durable_file(&temporary)?;
+    }
+    Ok(())
+}
+
 pub async fn check(
     product: UpdateProduct,
     repository: &str,
@@ -729,6 +1061,36 @@ pub async fn apply(
         UpdateOperation::Apply,
         staged,
         None,
+        None,
+    )
+}
+
+/// 使用调用方已经校验过的下载产物调度替换，并固定操作 UUID。
+///
+/// 远程更新 worker 必须先把该 UUID 写入受保护续跑凭据，再调用本函数；helper
+/// 启动后即使当前进程马上退出，重启流程仍能用同一 operation_id 做独立核验。
+pub fn apply_staged_with_operation_id(
+    product: UpdateProduct,
+    state_directory: &Path,
+    staged: StagedUpdate,
+    operation_id: Uuid,
+    confirmed: bool,
+) -> anyhow::Result<UpdateSchedule> {
+    anyhow::ensure!(
+        product != UpdateProduct::Server,
+        "server updates require the server-specific update command"
+    );
+    anyhow::ensure!(
+        confirmed,
+        "pass --yes to confirm the LinkLake executable replacement"
+    );
+    schedule_update(
+        product,
+        state_directory,
+        UpdateOperation::Apply,
+        staged,
+        None,
+        Some(operation_id),
     )
 }
 
@@ -770,11 +1132,61 @@ pub fn rollback(
     );
     anyhow::ensure!(confirmed, "pass --yes to confirm rollback");
     let state_directory = prepare_state_directory(state_directory)?;
+    let staged = rollback_staged(product, &state_directory)?;
+    schedule_update(
+        product,
+        &state_directory,
+        UpdateOperation::Rollback,
+        staged,
+        None,
+        None,
+    )
+}
+
+/// 只读准备一次客户端回滚，不启动 helper，也不改变当前安装。
+pub fn prepare_rollback(
+    product: UpdateProduct,
+    state_directory: &Path,
+    confirmed: bool,
+) -> anyhow::Result<StagedUpdate> {
+    anyhow::ensure!(
+        product != UpdateProduct::Server,
+        "server rollback requires the server-specific rollback command"
+    );
+    anyhow::ensure!(confirmed, "pass --yes to confirm rollback");
+    let state_directory = prepare_state_directory(state_directory)?;
+    rollback_staged(product, &state_directory)
+}
+
+/// 使用预先选择的回滚产物和固定 operation UUID 调度回滚。
+pub fn rollback_staged_with_operation_id(
+    product: UpdateProduct,
+    state_directory: &Path,
+    staged: StagedUpdate,
+    operation_id: Uuid,
+    confirmed: bool,
+) -> anyhow::Result<UpdateSchedule> {
+    anyhow::ensure!(
+        product != UpdateProduct::Server,
+        "server rollback requires the server-specific rollback command"
+    );
+    anyhow::ensure!(confirmed, "pass --yes to confirm rollback");
+    schedule_update(
+        product,
+        state_directory,
+        UpdateOperation::Rollback,
+        staged,
+        None,
+        Some(operation_id),
+    )
+}
+
+fn rollback_staged(product: UpdateProduct, state_directory: &Path) -> anyhow::Result<StagedUpdate> {
     let target = current_installation(product)?.target;
     validate_target_executable(product, &target)?;
     let current_hash = sha256_file(&target)?;
-    let (metadata, executable) = latest_rollback_backup(&state_directory, &target, &current_hash)?;
-    let staged = StagedUpdate {
+    let (metadata, executable) = latest_rollback_backup(state_directory, &target, &current_hash)?;
+    Ok(StagedUpdate {
         schema_version: UPDATE_SCHEMA_VERSION,
         product,
         current_version: executable_version(&target)
@@ -790,14 +1202,7 @@ pub fn rollback(
         staged_manifest: PathBuf::new(),
         signature_key_id: "local-backup".to_owned(),
         downloaded_unix_seconds: metadata.created_unix_seconds,
-    };
-    schedule_update(
-        product,
-        &state_directory,
-        UpdateOperation::Rollback,
-        staged,
-        None,
-    )
+    })
 }
 
 /// 调度带数据库兼容性约束的服务端人工回滚。跨 schema/账本回滚默认拒绝，只有
@@ -890,6 +1295,7 @@ pub fn server_rollback(
         UpdateOperation::Rollback,
         staged,
         Some(transaction),
+        None,
     )
 }
 
@@ -1336,6 +1742,111 @@ pub fn status(product: UpdateProduct, state_directory: &Path) -> anyhow::Result<
         });
     }
     read_durable_json(&path, MAX_UPDATE_STATE_BYTES)
+}
+
+/// 在组件重启后独立核验一次已完成的自替换。
+///
+/// 成功不仅依赖 status.json，还同时校验 operation plan、journal、当前目标摘要与
+/// 版本，以及回滚备份的真实摘要和版本。该函数取得更新锁；helper 尚未完成时会
+/// 返回锁冲突，调用方应续租后重试，不能提前把远程任务标记成功。
+pub fn verify_completed_update(
+    product: UpdateProduct,
+    state_directory: &Path,
+    expected_operation_id: Uuid,
+) -> anyhow::Result<CompletedUpdateVerification> {
+    anyhow::ensure!(
+        product != UpdateProduct::Server,
+        "server completion verification requires the server-specific readiness protocol"
+    );
+    anyhow::ensure!(
+        !expected_operation_id.is_nil(),
+        "completed update operation ID is nil"
+    );
+    let state_directory = prepare_state_directory(state_directory)?;
+    let _update_lock = UpdateLock::acquire(&state_directory)?;
+    anyhow::ensure!(
+        !state_directory.join("active.json").exists(),
+        "update helper has not completed its active transaction"
+    );
+    let operation_directory = state_directory
+        .join("operations")
+        .join(expected_operation_id.to_string());
+    let operation_directory = canonicalize_update_path(&operation_directory)?;
+    anyhow::ensure!(
+        operation_directory.parent() == Some(state_directory.join("operations").as_path()),
+        "completed update operation directory is invalid"
+    );
+    let plan_path = operation_directory.join("plan.json");
+    let plan_bytes = read_limited_bytes(&plan_path, MAX_UPDATE_STATE_BYTES)?;
+    let plan: HelperPlan = read_durable_json(&plan_path, MAX_UPDATE_STATE_BYTES)?;
+    anyhow::ensure!(
+        plan.schema_version == UPDATE_SCHEMA_VERSION
+            && plan.operation_id == expected_operation_id
+            && plan.product == product
+            && plan.product != UpdateProduct::Server
+            && plan.server_database.is_none()
+            && canonicalize_update_path(&plan.state_directory)? == state_directory
+            && canonicalize_update_path(&plan.operation_directory)? == operation_directory,
+        "completed update plan is not bound to the requested operation"
+    );
+    let journal: UpdateJournal = read_durable_json(
+        &operation_directory.join("journal.json"),
+        MAX_UPDATE_STATE_BYTES,
+    )?;
+    let plan_sha256 = sha256_bytes(&plan_bytes);
+    anyhow::ensure!(
+        journal.schema_version == UPDATE_JOURNAL_SCHEMA_VERSION
+            && journal.operation_id == expected_operation_id
+            && journal.product == product
+            && journal.operation == plan.operation
+            && journal.plan_sha256 == plan_sha256
+            && journal.stage == "completed",
+        "completed update journal is not bound to a successful operation"
+    );
+    let status = status(product, &state_directory)?;
+    let expected_state = if plan.operation == UpdateOperation::Rollback {
+        "rolled_back"
+    } else {
+        "succeeded"
+    };
+    anyhow::ensure!(
+        status.schema_version == UPDATE_SCHEMA_VERSION
+            && status.state == expected_state
+            && status.operation.as_deref() == Some(operation_name(plan.operation))
+            && status.from_version.as_deref() == Some(plan.from_version.as_str())
+            && status.to_version.as_deref() == Some(plan.to_version.as_str())
+            && status.error.is_none(),
+        "completed update status is inconsistent with its operation plan"
+    );
+    validate_target_executable(product, &plan.target_executable)?;
+    let installed_sha256 = sha256_file(&plan.target_executable)?;
+    anyhow::ensure!(
+        installed_sha256 == plan.staged_sha256,
+        "completed update target digest does not match the staged executable"
+    );
+    verify_installed_version(&plan.target_executable, &plan.to_version)?;
+
+    let backup_directory = journal
+        .backup_directory
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("completed update journal has no rollback backup"))?;
+    let backup_directory =
+        validate_non_server_recovery_backup(&state_directory, &plan, backup_directory)?;
+    anyhow::ensure!(
+        status.backup.as_deref() == Some(backup_directory.as_path()),
+        "completed update status references a different rollback backup"
+    );
+    let backup_sha256 = plan.expected_target_sha256.clone();
+    Ok(CompletedUpdateVerification {
+        operation_id: expected_operation_id,
+        operation: operation_name(plan.operation).to_owned(),
+        from_version: plan.from_version,
+        to_version: plan.to_version,
+        installed_sha256,
+        backup_sha256,
+        backup_directory,
+        verified_unix_seconds: unix_seconds(),
+    })
 }
 
 /// 只读、非阻塞地汇总跨进程更新锁与可恢复活动标记。
@@ -2103,6 +2614,7 @@ fn schedule_server_apply(
         UpdateOperation::Apply,
         staged,
         Some(ServerDatabaseTransaction::Apply { context }),
+        None,
     )
 }
 
@@ -2112,6 +2624,7 @@ fn schedule_update(
     operation: UpdateOperation,
     staged: StagedUpdate,
     server_database: Option<ServerDatabaseTransaction>,
+    requested_operation_id: Option<Uuid>,
 ) -> anyhow::Result<UpdateSchedule> {
     let state_directory = prepare_state_directory(state_directory)?;
     let _schedule_lock = UpdateLock::acquire(&state_directory)?;
@@ -2132,6 +2645,12 @@ fn schedule_update(
     let installation = current_installation(product)?;
     let target = installation.target;
     validate_target_executable(product, &target)?;
+    if let Some(current_version) = installation.version.as_ref() {
+        anyhow::ensure!(
+            staged.current_version == current_version.to_string(),
+            "installed component changed after the remote update artifact was prepared"
+        );
+    }
     ensure_within(&staged.staged_executable, &state_directory)?;
     anyhow::ensure!(
         sha256_file(&staged.staged_executable)? == staged.binary_sha256,
@@ -2147,7 +2666,8 @@ fn schedule_update(
         ),
         ServiceRuntime::NotInstalled | ServiceRuntime::Stopped | ServiceRuntime::Running => {}
     }
-    let operation_id = Uuid::new_v4();
+    let operation_id = requested_operation_id.unwrap_or_else(Uuid::new_v4);
+    anyhow::ensure!(!operation_id.is_nil(), "update operation ID is nil");
     let operations = state_directory.join("operations");
     fs::create_dir_all(&operations)?;
     secure_directory(&operations)?;
@@ -4702,6 +5222,7 @@ fn prepare_state_directory(path: &Path) -> anyhow::Result<PathBuf> {
     let path = absolute_path(path)?;
     reject_windows_remote_update_path(&path)?;
     fs::create_dir_all(&path)?;
+    let path = validate_durable_directory(&path)?;
     secure_directory(&path)?;
     canonicalize_update_path(&path)
 }

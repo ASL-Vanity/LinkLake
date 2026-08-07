@@ -156,6 +156,7 @@ pub(crate) fn write_durable_bytes(path: &Path, bytes: &[u8], max_bytes: u64) -> 
         .open(&temporary)
         .with_context(|| format!("cannot create durable temporary {}", temporary.display()))?;
     validate_open_regular_file(&temporary, &file)?;
+    secure_new_private_file(&temporary)?;
     file.write_all(bytes)?;
     file.flush()?;
     file.sync_all()?;
@@ -165,6 +166,70 @@ pub(crate) fn write_durable_bytes(path: &Path, bytes: &[u8], max_bytes: u64) -> 
     validate_existing_directory(parent)?;
     validate_managed_file_path(&target, true)?;
     atomic_replace(&temporary, &target)?;
+    cleanup.disarm();
+    sync_parent_directory(parent)?;
+    Ok(())
+}
+
+/// 以“只创建一次”的语义持久化字节。
+///
+/// 远程更新续跑凭据不能被后来的任务覆盖；先同步临时文件，再用同目录硬链接
+/// 把它发布为目标文件，目标已存在时由文件系统原子拒绝，最后同步目录项。
+pub(crate) fn write_durable_bytes_create_new(
+    path: &Path,
+    bytes: &[u8],
+    max_bytes: u64,
+) -> Result<()> {
+    ensure_length_within_limit(bytes.len(), max_bytes, "durable payload")?;
+    let target = validate_managed_file_path(path, true)?;
+    anyhow::ensure!(
+        !target.exists(),
+        "durable create-new target already exists: {}",
+        target.display()
+    );
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("durable target has no parent directory"))?;
+    let file_name = target
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("durable target has no file name"))?
+        .to_string_lossy();
+    let temporary = parent.join(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        Uuid::new_v4().simple()
+    ));
+    let mut cleanup = TemporaryFileGuard::new(temporary.clone());
+    let mut options = OpenOptions::new();
+    options.write(true).read(true).create_new(true);
+    configure_new_file_open_options(&mut options);
+    let mut file = options
+        .open(&temporary)
+        .with_context(|| format!("cannot create durable temporary {}", temporary.display()))?;
+    validate_open_regular_file(&temporary, &file)?;
+    secure_new_private_file(&temporary)?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    file.sync_all()?;
+    drop(file);
+    validate_existing_directory(parent)?;
+    anyhow::ensure!(
+        !target.exists(),
+        "durable create-new target appeared before publication: {}",
+        target.display()
+    );
+    fs::hard_link(&temporary, &target).with_context(|| {
+        format!(
+            "cannot publish durable create-new target {}",
+            target.display()
+        )
+    })?;
+    fs::remove_file(&temporary).with_context(|| {
+        format!(
+            "cannot remove durable create-new temporary {}",
+            temporary.display()
+        )
+    })?;
     cleanup.disarm();
     sync_parent_directory(parent)?;
     Ok(())
@@ -218,6 +283,52 @@ pub(crate) fn remove_durable_file(path: &Path) -> Result<()> {
     fs::remove_file(&path)
         .with_context(|| format!("cannot remove durable file {}", path.display()))?;
     sync_parent_directory(parent)?;
+    Ok(())
+}
+
+/// 删除可选的受管文件；文件不存在视为已经删除，并同步父目录。
+pub(crate) fn remove_durable_file_if_exists(path: &Path) -> Result<bool> {
+    let path = validate_managed_file_path(path, true)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("durable target has no parent directory"))?;
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            reject_link_like_path(&path, &metadata)?;
+            anyhow::ensure!(
+                metadata.is_file(),
+                "managed path is not a regular file: {}",
+                path.display()
+            );
+            fs::remove_file(&path)
+                .with_context(|| format!("cannot remove durable file {}", path.display()))?;
+            sync_parent_directory(parent)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("cannot inspect durable file {}", path.display()))
+        }
+    }
+}
+
+/// 验证受管私有文件的普通文件与最小权限边界。
+pub(crate) fn validate_private_file(path: &Path) -> Result<()> {
+    let path = validate_managed_file_path(path, false)?;
+    let file = open_regular_file_no_follow(&path)?;
+    let metadata = file.metadata()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        anyhow::ensure!(
+            metadata.nlink() == 1 && metadata.mode() & 0o7777 == 0o600,
+            "durable private file permissions are not restricted to the owner"
+        );
+    }
+    #[cfg(windows)]
+    {
+        reject_reparse_point(&path, &metadata)?;
+    }
     Ok(())
 }
 
@@ -441,7 +552,7 @@ fn validate_platform_component(_value: &std::ffi::OsStr, _full_path: &Path) -> R
     Ok(())
 }
 
-fn validate_existing_directory(path: &Path) -> Result<PathBuf> {
+pub(crate) fn validate_existing_directory(path: &Path) -> Result<PathBuf> {
     let path = normalize_absolute_path(path)?;
     validate_existing_components(&path, false)?;
     let metadata = safe_symlink_metadata(&path)?;
@@ -599,6 +710,23 @@ fn configure_new_file_open_options(options: &mut OpenOptions) {
 
 #[cfg(not(any(unix, windows)))]
 fn configure_new_file_open_options(_options: &mut OpenOptions) {}
+
+#[cfg(unix)]
+fn secure_new_private_file(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("cannot restrict durable file {}", path.display()))
+}
+
+#[cfg(windows)]
+fn secure_new_private_file(path: &Path) -> Result<()> {
+    super::apply_windows_update_dacl(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn secure_new_private_file(_path: &Path) -> Result<()> {
+    anyhow::bail!("durable private file permissions are unsupported on this platform")
+}
 
 #[cfg(unix)]
 fn configure_lock_open_options(options: &mut OpenOptions) {

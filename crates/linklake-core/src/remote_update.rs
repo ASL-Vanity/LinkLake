@@ -13,8 +13,14 @@ pub const REMOTE_UPDATE_CANCEL_CONFIRMATION: &str = "CANCEL";
 pub const REMOTE_UPDATE_MIN_LEASE_SECONDS: u32 = 15;
 pub const REMOTE_UPDATE_MAX_LEASE_SECONDS: u32 = 300;
 pub const REMOTE_UPDATE_DEFAULT_LEASE_SECONDS: u32 = 60;
+/// 安装替换进入等待重启后，服务端只在这个固定窗口内保留原租约身份。
+/// 该窗口不能由客户端请求延长，过期后必须关闭任务，避免未知安装结果被重试。
+pub const REMOTE_UPDATE_RESTART_RESUME_SECONDS: u64 = 30 * 60;
+pub const REMOTE_UPDATE_MAX_CLAIM_ATTEMPTS: u32 = 16;
+pub const REMOTE_UPDATE_MAX_EVENTS_PER_TASK: usize = 128;
 pub const REMOTE_UPDATE_MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
 const REMOTE_UPDATE_MIN_IDEMPOTENCY_KEY_BYTES: usize = 8;
+const REMOTE_UPDATE_MAX_REQUESTED_BY_BYTES: usize = 128;
 const REMOTE_UPDATE_MAX_VERSION_BYTES: usize = 64;
 const REMOTE_UPDATE_MAX_KEY_ID_BYTES: usize = 64;
 
@@ -59,6 +65,10 @@ impl RemoteUpdateAction {
 
     pub const fn changes_installation(self) -> bool {
         matches!(self, Self::Apply | Self::Recover | Self::Rollback)
+    }
+
+    pub const fn requires_restart(self) -> bool {
+        matches!(self, Self::Apply | Self::Rollback)
     }
 }
 
@@ -105,7 +115,7 @@ impl RemoteUpdateStage {
     pub fn valid_for_active_lease(self, action: RemoteUpdateAction) -> bool {
         self == Self::Claimed
             || self == action.execution_stage()
-            || (self == Self::AwaitingRestart && action.changes_installation())
+            || (self == Self::AwaitingRestart && action.requires_restart())
     }
 }
 
@@ -255,11 +265,14 @@ pub enum RemoteUpdateResult {
         binary_sha256: String,
         signature_key_id: String,
     },
-    Scheduled {
+    Installed {
         operation_id: Uuid,
         operation: RemoteLocalUpdateOperation,
         from_version: String,
         to_version: String,
+        installed_sha256: String,
+        backup_sha256: String,
+        verified_unix_seconds: u64,
     },
     Status {
         state: RemoteLocalUpdateState,
@@ -278,7 +291,7 @@ impl RemoteUpdateResult {
             (Self::Check { .. }, RemoteUpdateAction::Check)
                 | (Self::Downloaded { .. }, RemoteUpdateAction::Download)
                 | (
-                    Self::Scheduled {
+                    Self::Installed {
                         operation: RemoteLocalUpdateOperation::Apply,
                         ..
                     },
@@ -289,7 +302,7 @@ impl RemoteUpdateResult {
                     RemoteUpdateAction::Status | RemoteUpdateAction::Recover
                 )
                 | (
-                    Self::Scheduled {
+                    Self::Installed {
                         operation: RemoteLocalUpdateOperation::Rollback,
                         ..
                     },
@@ -321,15 +334,24 @@ impl RemoteUpdateResult {
                 validate_sha256(binary_sha256)?;
                 validate_key_id(signature_key_id)
             }
-            Self::Scheduled {
+            Self::Installed {
                 operation_id,
                 from_version,
                 to_version,
+                installed_sha256,
+                backup_sha256,
+                verified_unix_seconds,
                 ..
             } => {
                 validate_non_nil_uuid(*operation_id)?;
                 validate_version(from_version)?;
-                validate_version(to_version)
+                validate_version(to_version)?;
+                validate_sha256(installed_sha256)?;
+                validate_sha256(backup_sha256)?;
+                if *verified_unix_seconds == 0 {
+                    return Err(RemoteUpdateContractError::InvalidTimestamp);
+                }
+                Ok(())
             }
             Self::Status {
                 state,
@@ -429,11 +451,210 @@ pub struct RemoteUpdateTask {
     pub cancel_requested: bool,
     pub lease_owner: Option<Uuid>,
     pub lease_deadline_unix_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart: Option<RemoteUpdateRestartBinding>,
     pub result: Option<RemoteUpdateResult>,
     pub error_code: Option<RemoteUpdateErrorCode>,
     pub created_unix_seconds: u64,
     pub updated_unix_seconds: u64,
     pub completed_unix_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteUpdateRestartPlan {
+    pub operation_id: Uuid,
+    pub operation: RemoteLocalUpdateOperation,
+    pub from_version: String,
+    pub to_version: String,
+}
+
+impl RemoteUpdateRestartPlan {
+    pub fn validate(&self, action: RemoteUpdateAction) -> Result<(), RemoteUpdateContractError> {
+        validate_non_nil_uuid(self.operation_id)?;
+        let expected = match action {
+            RemoteUpdateAction::Apply => RemoteLocalUpdateOperation::Apply,
+            RemoteUpdateAction::Rollback => RemoteLocalUpdateOperation::Rollback,
+            _ => return Err(RemoteUpdateContractError::InvalidTransition),
+        };
+        if self.operation != expected {
+            return Err(RemoteUpdateContractError::ResultActionMismatch);
+        }
+        validate_version(&self.from_version)?;
+        validate_version(&self.to_version)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteUpdateRestartBinding {
+    pub operation_id: Uuid,
+    pub operation: RemoteLocalUpdateOperation,
+    pub from_version: String,
+    pub to_version: String,
+    pub prepared_unix_seconds: u64,
+    pub resume_deadline_unix_seconds: u64,
+}
+
+impl RemoteUpdateRestartBinding {
+    pub fn validate(
+        &self,
+        action: RemoteUpdateAction,
+        lease_deadline_unix_seconds: Option<u64>,
+        now: Option<u64>,
+    ) -> Result<(), RemoteUpdateContractError> {
+        let plan = RemoteUpdateRestartPlan {
+            operation_id: self.operation_id,
+            operation: self.operation,
+            from_version: self.from_version.clone(),
+            to_version: self.to_version.clone(),
+        };
+        plan.validate(action)?;
+        if self.resume_deadline_unix_seconds == 0
+            || self.prepared_unix_seconds == 0
+            || self.resume_deadline_unix_seconds <= self.prepared_unix_seconds
+            || self
+                .resume_deadline_unix_seconds
+                .saturating_sub(self.prepared_unix_seconds)
+                > REMOTE_UPDATE_RESTART_RESUME_SECONDS
+            || lease_deadline_unix_seconds != Some(self.resume_deadline_unix_seconds)
+            || now.is_some_and(|value| self.resume_deadline_unix_seconds <= value)
+        {
+            return Err(RemoteUpdateContractError::InvalidTimestamp);
+        }
+        Ok(())
+    }
+}
+
+impl RemoteUpdateTask {
+    pub fn validate(&self) -> Result<(), RemoteUpdateContractError> {
+        if self.schema_version != REMOTE_UPDATE_CONTRACT_VERSION {
+            return Err(RemoteUpdateContractError::UnsupportedSchema);
+        }
+        validate_non_nil_uuid(self.task_id)?;
+        validate_non_nil_uuid(self.target_client_id)?;
+        validate_idempotency_key(&self.idempotency_key)?;
+        if self.attempt > REMOTE_UPDATE_MAX_CLAIM_ATTEMPTS {
+            return Err(RemoteUpdateContractError::InvalidTaskSnapshot);
+        }
+        if self.requested_by.is_empty()
+            || self.requested_by.len() > REMOTE_UPDATE_MAX_REQUESTED_BY_BYTES
+            || self.requested_by.chars().any(char::is_control)
+        {
+            return Err(RemoteUpdateContractError::InvalidRequester);
+        }
+        if self.created_unix_seconds == 0
+            || self.updated_unix_seconds < self.created_unix_seconds
+            || self
+                .completed_unix_seconds
+                .is_some_and(|completed| completed < self.updated_unix_seconds)
+        {
+            return Err(RemoteUpdateContractError::InvalidTimestamp);
+        }
+        let lease_present =
+            self.lease_owner.is_some() && self.lease_deadline_unix_seconds.is_some();
+        if let Some(owner) = self.lease_owner {
+            validate_non_nil_uuid(owner)?;
+        }
+        if self.lease_deadline_unix_seconds == Some(0) {
+            return Err(RemoteUpdateContractError::InvalidTimestamp);
+        }
+        let restart_required = self.stage == RemoteUpdateStage::AwaitingRestart;
+        if let Some(restart) = self.restart.as_ref() {
+            restart.validate(
+                self.action,
+                self.lease_deadline_unix_seconds,
+                Some(self.updated_unix_seconds),
+            )?;
+        }
+        if restart_required != self.restart.is_some() {
+            return Err(RemoteUpdateContractError::InvalidTaskSnapshot);
+        }
+        let active_payload_empty = self.result.is_none()
+            && self.error_code.is_none()
+            && self.completed_unix_seconds.is_none();
+        let valid = match self.state {
+            RemoteUpdateTaskState::Queued => {
+                self.stage == RemoteUpdateStage::Queued
+                    && !lease_present
+                    && self.restart.is_none()
+                    && !self.cancel_requested
+                    && active_payload_empty
+            }
+            RemoteUpdateTaskState::Claimed => {
+                self.stage == RemoteUpdateStage::Claimed
+                    && lease_present
+                    && self.restart.is_none()
+                    && !self.cancel_requested
+                    && active_payload_empty
+            }
+            RemoteUpdateTaskState::Running => {
+                (self.stage == self.action.execution_stage()
+                    || (self.stage == RemoteUpdateStage::AwaitingRestart
+                        && self.action.requires_restart()))
+                    && lease_present
+                    && (self.stage == RemoteUpdateStage::AwaitingRestart || self.restart.is_none())
+                    && !self.cancel_requested
+                    && active_payload_empty
+            }
+            RemoteUpdateTaskState::CancelRequested => {
+                (self.stage == RemoteUpdateStage::Claimed
+                    || self.stage == self.action.execution_stage()
+                    || (self.stage == RemoteUpdateStage::AwaitingRestart
+                        && self.action.requires_restart()))
+                    && lease_present
+                    && (self.stage == RemoteUpdateStage::AwaitingRestart || self.restart.is_none())
+                    && self.cancel_requested
+                    && active_payload_empty
+            }
+            RemoteUpdateTaskState::Succeeded => {
+                self.stage == RemoteUpdateStage::Completed
+                    && !lease_present
+                    && self.restart.is_none()
+                    && self.completed_unix_seconds.is_some()
+                    && self.error_code.is_none()
+                    && self.result.as_ref().is_some_and(|result| {
+                        result.matches_action(self.action) && result.validate().is_ok()
+                    })
+                    && self.recovery_state
+                        == if self.action == RemoteUpdateAction::Recover {
+                            RemoteUpdateRecoveryState::Recovered
+                        } else {
+                            RemoteUpdateRecoveryState::None
+                        }
+            }
+            RemoteUpdateTaskState::Failed => {
+                self.stage == RemoteUpdateStage::Failed
+                    && !lease_present
+                    && self.restart.is_none()
+                    && self.completed_unix_seconds.is_some()
+                    && self.result.is_none()
+                    && self.error_code.is_some_and(|error_code| {
+                        RemoteUpdateWorkerReport::Failed {
+                            error_code,
+                            recovery_state: self.recovery_state,
+                        }
+                        .validate(self.action)
+                        .is_ok()
+                    })
+            }
+            RemoteUpdateTaskState::Cancelled => {
+                self.stage == RemoteUpdateStage::Cancelled
+                    && !lease_present
+                    && self.restart.is_none()
+                    && self.cancel_requested
+                    && self.completed_unix_seconds.is_some()
+                    && self.result.is_none()
+                    && self.error_code == Some(RemoteUpdateErrorCode::Cancelled)
+                    && self.recovery_state == RemoteUpdateRecoveryState::None
+            }
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(RemoteUpdateContractError::InvalidTaskSnapshot)
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -451,11 +672,90 @@ pub struct RemoteUpdateTaskEvent {
     pub created_unix_seconds: u64,
 }
 
+impl RemoteUpdateTaskEvent {
+    pub fn validate(&self, expected_task_id: Uuid) -> Result<(), RemoteUpdateContractError> {
+        if self.schema_version != REMOTE_UPDATE_CONTRACT_VERSION {
+            return Err(RemoteUpdateContractError::UnsupportedSchema);
+        }
+        validate_non_nil_uuid(self.event_id)?;
+        validate_non_nil_uuid(self.task_id)?;
+        if self.task_id != expected_task_id || self.sequence == 0 || self.created_unix_seconds == 0
+        {
+            return Err(RemoteUpdateContractError::InvalidTaskEvent);
+        }
+        let stage_valid = match self.state {
+            RemoteUpdateTaskState::Queued => self.stage == RemoteUpdateStage::Queued,
+            RemoteUpdateTaskState::Claimed => self.stage == RemoteUpdateStage::Claimed,
+            RemoteUpdateTaskState::Running => matches!(
+                self.stage,
+                RemoteUpdateStage::Checking
+                    | RemoteUpdateStage::Downloading
+                    | RemoteUpdateStage::Applying
+                    | RemoteUpdateStage::Inspecting
+                    | RemoteUpdateStage::Recovering
+                    | RemoteUpdateStage::RollingBack
+                    | RemoteUpdateStage::AwaitingRestart
+            ),
+            RemoteUpdateTaskState::CancelRequested => matches!(
+                self.stage,
+                RemoteUpdateStage::Claimed
+                    | RemoteUpdateStage::Checking
+                    | RemoteUpdateStage::Downloading
+                    | RemoteUpdateStage::Applying
+                    | RemoteUpdateStage::Inspecting
+                    | RemoteUpdateStage::Recovering
+                    | RemoteUpdateStage::RollingBack
+                    | RemoteUpdateStage::AwaitingRestart
+            ),
+            RemoteUpdateTaskState::Succeeded => self.stage == RemoteUpdateStage::Completed,
+            RemoteUpdateTaskState::Failed => self.stage == RemoteUpdateStage::Failed,
+            RemoteUpdateTaskState::Cancelled => self.stage == RemoteUpdateStage::Cancelled,
+        };
+        if stage_valid {
+            Ok(())
+        } else {
+            Err(RemoteUpdateContractError::InvalidTaskEvent)
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteUpdateTaskDetail {
     pub task: RemoteUpdateTask,
     pub events: Vec<RemoteUpdateTaskEvent>,
+}
+
+impl RemoteUpdateTaskDetail {
+    pub fn validate(&self, expected_task_id: Uuid) -> Result<(), RemoteUpdateContractError> {
+        self.task.validate()?;
+        if self.task.task_id != expected_task_id
+            || self.events.is_empty()
+            || self.events.len() > REMOTE_UPDATE_MAX_EVENTS_PER_TASK
+        {
+            return Err(RemoteUpdateContractError::InvalidTaskEvent);
+        }
+        let mut previous_sequence = 0;
+        for event in &self.events {
+            event.validate(expected_task_id)?;
+            if event.sequence <= previous_sequence {
+                return Err(RemoteUpdateContractError::InvalidTaskEvent);
+            }
+            previous_sequence = event.sequence;
+        }
+        let last = self
+            .events
+            .last()
+            .ok_or(RemoteUpdateContractError::InvalidTaskEvent)?;
+        if last.state != self.task.state
+            || last.stage != self.task.stage
+            || last.recovery_state != self.task.recovery_state
+            || last.error_code != self.task.error_code
+        {
+            return Err(RemoteUpdateContractError::InvalidTaskEvent);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -484,6 +784,28 @@ pub struct RemoteUpdateClaim {
     pub task: RemoteUpdateTask,
     pub lease_token: Uuid,
     pub lease_deadline_unix_seconds: u64,
+}
+
+impl RemoteUpdateClaim {
+    pub fn validate(
+        &self,
+        expected_client_id: Uuid,
+        expected_worker_instance_id: Uuid,
+        now: u64,
+    ) -> Result<(), RemoteUpdateContractError> {
+        self.task.validate()?;
+        validate_non_nil_uuid(self.lease_token)?;
+        if self.task.target_client_id != expected_client_id
+            || self.task.lease_owner != Some(expected_worker_instance_id)
+            || self.task.state != RemoteUpdateTaskState::Claimed
+            || self.task.stage != RemoteUpdateStage::Claimed
+            || self.task.lease_deadline_unix_seconds != Some(self.lease_deadline_unix_seconds)
+            || self.lease_deadline_unix_seconds <= now
+        {
+            return Err(RemoteUpdateContractError::InvalidClaim);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -521,13 +843,33 @@ pub struct RemoteUpdateLeaseRenewResponse {
     pub cancel_requested: bool,
 }
 
+impl RemoteUpdateLeaseRenewResponse {
+    pub fn validate(
+        &self,
+        expected_task_id: Uuid,
+        now: u64,
+        maximum_deadline: Option<u64>,
+    ) -> Result<(), RemoteUpdateContractError> {
+        validate_non_nil_uuid(self.task_id)?;
+        if self.task_id != expected_task_id
+            || self.lease_deadline_unix_seconds <= now
+            || maximum_deadline.is_some_and(|maximum| self.lease_deadline_unix_seconds > maximum)
+        {
+            return Err(RemoteUpdateContractError::InvalidClaim);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RemoteUpdateWorkerReport {
     Started {
         stage: RemoteUpdateStage,
     },
-    AwaitingRestart,
+    AwaitingRestart {
+        plan: RemoteUpdateRestartPlan,
+    },
     Succeeded {
         result: RemoteUpdateResult,
     },
@@ -543,8 +885,8 @@ impl RemoteUpdateWorkerReport {
         match self {
             Self::Started { stage } if *stage == action.execution_stage() => Ok(()),
             Self::Started { .. } => Err(RemoteUpdateContractError::InvalidStage),
-            Self::AwaitingRestart if action.changes_installation() => Ok(()),
-            Self::AwaitingRestart => Err(RemoteUpdateContractError::InvalidTransition),
+            Self::AwaitingRestart { plan } if action.requires_restart() => plan.validate(action),
+            Self::AwaitingRestart { .. } => Err(RemoteUpdateContractError::InvalidTransition),
             Self::Succeeded { result } if result.matches_action(action) => result.validate(),
             Self::Succeeded { .. } => Err(RemoteUpdateContractError::ResultActionMismatch),
             Self::Failed {
@@ -597,6 +939,61 @@ pub struct RemoteUpdateReportResponse {
     pub task: RemoteUpdateTask,
 }
 
+impl RemoteUpdateReportResponse {
+    pub fn validate(
+        &self,
+        expected_task_id: Uuid,
+        expected_client_id: Uuid,
+        expected_action: RemoteUpdateAction,
+        expected_report: &RemoteUpdateWorkerReport,
+    ) -> Result<(), RemoteUpdateContractError> {
+        self.task.validate()?;
+        validate_non_nil_uuid(expected_client_id)?;
+        if self.task.task_id != expected_task_id
+            || self.task.target_client_id != expected_client_id
+            || self.task.action != expected_action
+        {
+            return Err(RemoteUpdateContractError::InvalidTaskSnapshot);
+        }
+        let response_matches = match expected_report {
+            RemoteUpdateWorkerReport::Started { stage } => {
+                self.task.state == RemoteUpdateTaskState::Running && self.task.stage == *stage
+            }
+            RemoteUpdateWorkerReport::AwaitingRestart { plan } => {
+                matches!(
+                    self.task.state,
+                    RemoteUpdateTaskState::Running | RemoteUpdateTaskState::CancelRequested
+                ) && self.task.stage == RemoteUpdateStage::AwaitingRestart
+                    && self.task.restart.as_ref().is_some_and(|binding| {
+                        binding.operation_id == plan.operation_id
+                            && binding.operation == plan.operation
+                            && binding.from_version == plan.from_version
+                            && binding.to_version == plan.to_version
+                    })
+            }
+            RemoteUpdateWorkerReport::Succeeded { result } => {
+                self.task.state == RemoteUpdateTaskState::Succeeded
+                    && self.task.result.as_ref() == Some(result)
+            }
+            RemoteUpdateWorkerReport::Failed {
+                error_code,
+                recovery_state,
+            } => {
+                self.task.state == RemoteUpdateTaskState::Failed
+                    && self.task.error_code == Some(*error_code)
+                    && self.task.recovery_state == *recovery_state
+            }
+            RemoteUpdateWorkerReport::Cancelled => {
+                self.task.state == RemoteUpdateTaskState::Cancelled
+            }
+        };
+        if !response_matches {
+            return Err(RemoteUpdateContractError::InvalidTaskSnapshot);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum RemoteUpdateContractError {
     #[error("idempotency key length is invalid")]
@@ -627,6 +1024,16 @@ pub enum RemoteUpdateContractError {
     InvalidTimestamp,
     #[error("the local update status fields are inconsistent")]
     InvalidLocalStatus,
+    #[error("the remote update contract schema is unsupported")]
+    UnsupportedSchema,
+    #[error("the remote update requester is invalid")]
+    InvalidRequester,
+    #[error("the remote update task snapshot is inconsistent")]
+    InvalidTaskSnapshot,
+    #[error("the remote update claim is inconsistent")]
+    InvalidClaim,
+    #[error("the remote update task event stream is inconsistent")]
+    InvalidTaskEvent,
 }
 
 pub fn validate_idempotency_key(value: &str) -> Result<(), RemoteUpdateContractError> {
