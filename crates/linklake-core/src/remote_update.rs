@@ -336,8 +336,8 @@ impl RemoteUpdateResult {
                 operation,
                 from_version,
                 to_version,
+                has_error,
                 updated_unix_seconds,
-                ..
             } => {
                 if let Some(version) = from_version {
                     validate_version(version)?;
@@ -348,15 +348,27 @@ impl RemoteUpdateResult {
                 if *updated_unix_seconds == 0 {
                     return Err(RemoteUpdateContractError::InvalidTimestamp);
                 }
-                let operation_required = matches!(
-                    state,
+                let fields_valid = match state {
+                    RemoteLocalUpdateState::Idle => {
+                        operation.is_none() && to_version.is_none() && !has_error
+                    }
                     RemoteLocalUpdateState::Scheduled
-                        | RemoteLocalUpdateState::Installing
-                        | RemoteLocalUpdateState::Succeeded
-                        | RemoteLocalUpdateState::RolledBack
-                        | RemoteLocalUpdateState::RecoveryRequired
-                );
-                if operation_required != operation.is_some() {
+                    | RemoteLocalUpdateState::Installing
+                    | RemoteLocalUpdateState::Succeeded
+                    | RemoteLocalUpdateState::RolledBack => {
+                        operation.is_some()
+                            && from_version.is_some()
+                            && to_version.is_some()
+                            && !has_error
+                    }
+                    RemoteLocalUpdateState::Failed | RemoteLocalUpdateState::RecoveryRequired => {
+                        operation.is_some()
+                            && from_version.is_some()
+                            && to_version.is_some()
+                            && *has_error
+                    }
+                };
+                if !fields_valid {
                     return Err(RemoteUpdateContractError::InvalidLocalStatus);
                 }
                 Ok(())
@@ -818,6 +830,31 @@ mod tests {
         assert_eq!(
             invalid.validate(RemoteUpdateAction::Apply),
             Err(RemoteUpdateContractError::InvalidRecoveryState)
+        );
+    }
+
+    #[test]
+    fn failed_local_status_requires_bound_versions_operation_and_error() {
+        let valid = RemoteUpdateResult::Status {
+            state: RemoteLocalUpdateState::Failed,
+            operation: Some(RemoteLocalUpdateOperation::Apply),
+            from_version: Some("1.0.0".to_owned()),
+            to_version: Some("1.1.0".to_owned()),
+            has_error: true,
+            updated_unix_seconds: 1,
+        };
+        assert!(valid.validate().is_ok());
+        let contradictory = RemoteUpdateResult::Status {
+            state: RemoteLocalUpdateState::Failed,
+            operation: Some(RemoteLocalUpdateOperation::Apply),
+            from_version: Some("1.0.0".to_owned()),
+            to_version: Some("1.1.0".to_owned()),
+            has_error: false,
+            updated_unix_seconds: 1,
+        };
+        assert_eq!(
+            contradictory.validate(),
+            Err(RemoteUpdateContractError::InvalidLocalStatus)
         );
     }
 }
