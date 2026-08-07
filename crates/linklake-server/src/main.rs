@@ -16126,11 +16126,11 @@ mod tests {
     }
 
     #[test]
-    fn web_ui_explains_socks5_capabilities_without_unsupported_controls() {
+    fn web_ui_explains_socks5_capabilities_without_configuration_controls() {
         assert!(MANAGEMENT_UI.contains("socks5CapabilityText"));
         assert!(MANAGEMENT_UI.contains("socks5CapabilitiesWithUdp"));
         assert!(MANAGEMENT_UI.contains("socks5CapabilitiesTcpOnly"));
-        assert!(MANAGEMENT_UI.contains("BIND and UDP FRAG are intentionally unsupported"));
+        assert!(MANAGEMENT_UI.contains("BIND and UDP FRAG are also available"));
         assert!(!MANAGEMENT_UI.contains("{ name: 'bind'"));
         assert!(!MANAGEMENT_UI.contains("{ name: 'udp_fragmentation'"));
     }
