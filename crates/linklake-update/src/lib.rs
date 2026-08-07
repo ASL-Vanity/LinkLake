@@ -940,9 +940,9 @@ pub fn recover(
         "update recovery journal is not bound to its plan"
     );
 
-    let current_hash = sha256_file(&plan.target_executable)?;
     match journal.stage.as_str() {
         "completed" => {
+            let current_hash = sha256_file(&plan.target_executable)?;
             anyhow::ensure!(
                 current_hash == plan.staged_sha256,
                 "completed update marker does not match the installed component"
@@ -952,6 +952,7 @@ pub fn recover(
             status(product, &state_directory)
         }
         "rolled_back" | "failed_before_replacement" | "recovered" => {
+            let current_hash = sha256_file(&plan.target_executable)?;
             anyhow::ensure!(
                 current_hash == plan.expected_target_sha256,
                 "terminal recovery marker does not match the previous component"
@@ -961,6 +962,7 @@ pub fn recover(
             status(product, &state_directory)
         }
         "scheduled" | "helper_started" | "service_stopped" if journal.backup_directory.is_none() => {
+            let current_hash = sha256_file(&plan.target_executable)?;
             anyhow::ensure!(
                 current_hash == plan.expected_target_sha256,
                 "interrupted update changed the installed component but has no trusted backup"
@@ -1060,7 +1062,7 @@ fn validate_non_server_recovery_plan(
         canonicalize_update_path(&active.plan_path)? == operation_directory.join("plan.json"),
         "active update marker does not reference the bound recovery plan"
     );
-    validate_target_executable(plan.product, &plan.target_executable)?;
+    validate_recovery_target_path(plan.product, &plan.target_executable)?;
     ensure_within(&plan.staged_executable, state_directory)?;
     Ok(())
 }
@@ -1083,13 +1085,49 @@ fn validate_non_server_recovery_backup(
     anyhow::ensure!(
         metadata.schema_version == UPDATE_SCHEMA_VERSION
             && metadata.operation_id == Some(plan.operation_id)
+            && metadata.version == plan.from_version
             && metadata.sha256 == plan.expected_target_sha256
-            && canonicalize_update_path(&metadata.target_executable)?
-                == canonicalize_update_path(&plan.target_executable)?
+            && metadata.target_executable == plan.target_executable
             && metadata.database_snapshot_metadata.is_none(),
         "update recovery backup metadata is not bound to the interrupted operation"
     );
+    let backup_name = plan
+        .target_executable
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("recovery target has no executable name"))?;
+    let backup_executable = backup_directory.join(backup_name);
+    anyhow::ensure!(
+        backup_executable.is_file(),
+        "update recovery backup executable is missing"
+    );
+    anyhow::ensure!(
+        sha256_file(&backup_executable)? == plan.expected_target_sha256,
+        "update recovery backup executable digest mismatch"
+    );
+    verify_installed_version(&backup_executable, &plan.from_version)?;
     Ok(backup_directory)
+}
+
+fn validate_recovery_target_path(product: UpdateProduct, path: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(path.is_absolute(), "recovery target path is not absolute");
+    anyhow::ensure!(
+        path.file_name() == Some(OsStr::new(product.executable_name())),
+        "recovery target is not the selected LinkLake executable"
+    );
+    anyhow::ensure!(
+        path.components()
+            .all(|component| !matches!(component, Component::ParentDir | Component::CurDir)),
+        "recovery target path contains an ambiguous component"
+    );
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("recovery target has no parent directory"))?;
+    anyhow::ensure!(
+        parent.is_dir(),
+        "recovery target parent directory is missing"
+    );
+    let _ = canonicalize_update_path(parent)?;
+    Ok(())
 }
 
 /// 恢复因断电、崩溃或被终止而遗留的服务端更新事务。只有带有经过认证的
@@ -5091,6 +5129,75 @@ mod tests {
     // 签名与清单单元测试必须独立于当前构建平台。macOS 未使用 Developer ID
     // 签名时，生产代码会明确拒绝官方自动更新；测试夹具不能绕开或改变该门禁。
     const FIXTURE_TARGET: &str = "windows-x86_64";
+
+    #[test]
+    fn recovery_target_validation_allows_the_power_loss_missing_target_window() {
+        let root =
+            std::env::temp_dir().join(format!("linklake-recovery-target-{}", Uuid::new_v4()));
+        let install = root.join("install");
+        fs::create_dir_all(&install).unwrap();
+        let target = install.join(UpdateProduct::Client.executable_name());
+        assert!(!target.exists());
+        validate_recovery_target_path(UpdateProduct::Client, &target).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_rejects_a_tampered_backup_before_touching_a_missing_target() {
+        let root =
+            std::env::temp_dir().join(format!("linklake-recovery-backup-{}", Uuid::new_v4()));
+        let state = root.join("state");
+        let install = root.join("install");
+        let operation_id = Uuid::new_v4();
+        let operation_directory = state.join("operations").join(operation_id.to_string());
+        let backup_directory = state.join("backups").join("bound-backup");
+        fs::create_dir_all(&operation_directory).unwrap();
+        fs::create_dir_all(&backup_directory).unwrap();
+        fs::create_dir_all(&install).unwrap();
+        let state = canonicalize_update_path(&state).unwrap();
+        let operation_directory = canonicalize_update_path(&operation_directory).unwrap();
+        let target = install.join(UpdateProduct::Client.executable_name());
+        let backup_executable = backup_directory.join(UpdateProduct::Client.executable_name());
+        fs::write(&backup_executable, b"tampered-backup").unwrap();
+        let expected_sha256 = "a".repeat(64);
+        write_durable_json(
+            &backup_directory.join("metadata.json"),
+            &BackupMetadata {
+                schema_version: UPDATE_SCHEMA_VERSION,
+                operation_id: Some(operation_id),
+                version: "1.0.0".to_owned(),
+                sha256: expected_sha256.clone(),
+                target_executable: target.clone(),
+                database_snapshot_metadata: None,
+                created_unix_seconds: 1,
+            },
+            MAX_UPDATE_STATE_BYTES,
+        )
+        .unwrap();
+        let plan = HelperPlan {
+            schema_version: UPDATE_SCHEMA_VERSION,
+            operation_id,
+            operation_directory,
+            operation: UpdateOperation::Apply,
+            product: UpdateProduct::Client,
+            state_directory: state.clone(),
+            target_executable: target.clone(),
+            staged_executable: state.join("staging").join("candidate"),
+            expected_target_sha256: expected_sha256,
+            staged_sha256: "b".repeat(64),
+            from_version: "1.0.0".to_owned(),
+            to_version: "1.1.0".to_owned(),
+            service_installed: false,
+            service_was_running: false,
+            server_database: None,
+            created_unix_seconds: 1,
+        };
+        let error = validate_non_server_recovery_backup(&state, &plan, &backup_directory)
+            .expect_err("tampered backup must fail before replacement");
+        assert!(error.to_string().contains("digest mismatch"));
+        assert!(!target.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn signing_fixture(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
