@@ -893,6 +893,205 @@ pub fn server_rollback(
     )
 }
 
+/// 恢复客户端或 Manager 因断电、进程终止而遗留的更新事务。
+///
+/// 恢复入口只接受当前 state directory 内相互绑定的 active marker、plan、journal
+/// 和备份。任何缺失、路径越界、摘要不一致或未知阶段都会保留 active marker 并
+/// 失败关闭，调用方不能借此指定任意文件。
+pub fn recover(
+    product: UpdateProduct,
+    state_directory: &Path,
+    confirmed: bool,
+) -> anyhow::Result<UpdateStatus> {
+    anyhow::ensure!(
+        product != UpdateProduct::Server,
+        "server recovery requires the server-specific recovery command with an explicit data directory"
+    );
+    anyhow::ensure!(confirmed, "pass --yes to confirm update recovery");
+    let state_directory = prepare_state_directory(state_directory)?;
+    let _update_lock = UpdateLock::acquire(&state_directory)?;
+    let active_path = state_directory.join("active.json");
+    if !active_path.exists() {
+        return status(product, &state_directory);
+    }
+    let active: ActiveUpdate = read_durable_json(&active_path, MAX_UPDATE_STATE_BYTES)?;
+    anyhow::ensure!(
+        active.schema_version == UPDATE_SCHEMA_VERSION && active.product == product,
+        "active update marker is not a supported update for this component"
+    );
+    ensure_within(&active.plan_path, &state_directory)?;
+    let plan_bytes = read_limited_bytes(&active.plan_path, MAX_UPDATE_STATE_BYTES)?;
+    anyhow::ensure!(
+        sha256_bytes(&plan_bytes) == normalize_sha256(&active.plan_sha256)?,
+        "active update plan digest mismatch"
+    );
+    let plan: HelperPlan = read_durable_json(&active.plan_path, MAX_UPDATE_STATE_BYTES)?;
+    validate_non_server_recovery_plan(&state_directory, &active, &plan)?;
+    let journal: UpdateJournal = read_durable_json(
+        &plan.operation_directory.join("journal.json"),
+        MAX_UPDATE_STATE_BYTES,
+    )?;
+    anyhow::ensure!(
+        journal.schema_version == UPDATE_JOURNAL_SCHEMA_VERSION
+            && journal.operation_id == plan.operation_id
+            && journal.plan_sha256 == active.plan_sha256
+            && journal.product == product
+            && journal.operation == plan.operation,
+        "update recovery journal is not bound to its plan"
+    );
+
+    let current_hash = sha256_file(&plan.target_executable)?;
+    match journal.stage.as_str() {
+        "completed" => {
+            anyhow::ensure!(
+                current_hash == plan.staged_sha256,
+                "completed update marker does not match the installed component"
+            );
+            verify_installed_version(&plan.target_executable, &plan.to_version)?;
+            clear_active_marker(&state_directory, plan.operation_id, None)?;
+            status(product, &state_directory)
+        }
+        "rolled_back" | "failed_before_replacement" | "recovered" => {
+            anyhow::ensure!(
+                current_hash == plan.expected_target_sha256,
+                "terminal recovery marker does not match the previous component"
+            );
+            verify_installed_version(&plan.target_executable, &plan.from_version)?;
+            clear_active_marker(&state_directory, plan.operation_id, None)?;
+            status(product, &state_directory)
+        }
+        "scheduled" | "helper_started" | "service_stopped" if journal.backup_directory.is_none() => {
+            anyhow::ensure!(
+                current_hash == plan.expected_target_sha256,
+                "interrupted update changed the installed component but has no trusted backup"
+            );
+            restart_service_after_update(&plan)?;
+            write_status(
+                &state_directory,
+                UpdateStatus {
+                    schema_version: UPDATE_SCHEMA_VERSION,
+                    state: "rolled_back".to_owned(),
+                    operation: Some(operation_name(plan.operation).to_owned()),
+                    from_version: Some(plan.from_version.clone()),
+                    to_version: Some(plan.to_version.clone()),
+                    message: "interrupted update was recovered before component replacement"
+                        .to_owned(),
+                    error: None,
+                    backup: None,
+                    updated_unix_seconds: unix_seconds(),
+                },
+            )?;
+            write_operation_journal(
+                &plan,
+                &active.plan_sha256,
+                "recovered",
+                None,
+                None,
+            )?;
+            clear_active_marker(&state_directory, plan.operation_id, None)?;
+            status(product, &state_directory)
+        }
+        "backup_created" | "recovery_required" | "service_stopped" | "helper_started" => {
+            let backup_directory = journal.backup_directory.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "interrupted update may have replaced the component but has no trusted backup"
+                )
+            })?;
+            let backup_directory =
+                validate_non_server_recovery_backup(&state_directory, &plan, backup_directory)?;
+            restore_after_failure(&plan, &backup_directory, &active.plan_sha256, None)?;
+            write_status(
+                &state_directory,
+                UpdateStatus {
+                    schema_version: UPDATE_SCHEMA_VERSION,
+                    state: "rolled_back".to_owned(),
+                    operation: Some(operation_name(plan.operation).to_owned()),
+                    from_version: Some(plan.from_version.clone()),
+                    to_version: Some(plan.to_version.clone()),
+                    message: "interrupted update was restored from its bound backup".to_owned(),
+                    error: None,
+                    backup: Some(backup_directory.clone()),
+                    updated_unix_seconds: unix_seconds(),
+                },
+            )?;
+            write_operation_journal(
+                &plan,
+                &active.plan_sha256,
+                "recovered",
+                Some(&backup_directory),
+                None,
+            )?;
+            clear_active_marker(&state_directory, plan.operation_id, None)?;
+            status(product, &state_directory)
+        }
+        _ => anyhow::bail!(
+            "interrupted update is in an unknown stage; active marker was retained for manual recovery"
+        ),
+    }
+}
+
+fn validate_non_server_recovery_plan(
+    state_directory: &Path,
+    active: &ActiveUpdate,
+    plan: &HelperPlan,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        plan.schema_version == UPDATE_SCHEMA_VERSION
+            && plan.operation_id == active.operation_id
+            && plan.product == active.product
+            && plan.product != UpdateProduct::Server
+            && plan.server_database.is_none(),
+        "update recovery plan identity is invalid"
+    );
+    anyhow::ensure!(
+        canonicalize_update_path(&plan.state_directory)? == state_directory,
+        "update recovery plan state directory mismatch"
+    );
+    let operation_directory = canonicalize_update_path(&plan.operation_directory)?;
+    ensure_within(&operation_directory, state_directory)?;
+    anyhow::ensure!(
+        operation_directory.parent() == Some(state_directory.join("operations").as_path())
+            && operation_directory
+                .file_name()
+                .is_some_and(|value| value == OsStr::new(&plan.operation_id.to_string())),
+        "update recovery operation directory is invalid"
+    );
+    anyhow::ensure!(
+        canonicalize_update_path(&active.plan_path)? == operation_directory.join("plan.json"),
+        "active update marker does not reference the bound recovery plan"
+    );
+    validate_target_executable(plan.product, &plan.target_executable)?;
+    ensure_within(&plan.staged_executable, state_directory)?;
+    Ok(())
+}
+
+fn validate_non_server_recovery_backup(
+    state_directory: &Path,
+    plan: &HelperPlan,
+    backup_directory: &Path,
+) -> anyhow::Result<PathBuf> {
+    let backup_directory = canonicalize_update_path(backup_directory)?;
+    ensure_within(&backup_directory, state_directory)?;
+    anyhow::ensure!(
+        backup_directory.parent() == Some(state_directory.join("backups").as_path()),
+        "update recovery backup is not a direct child of the managed backup directory"
+    );
+    let metadata: BackupMetadata = read_durable_json(
+        &backup_directory.join("metadata.json"),
+        MAX_UPDATE_STATE_BYTES,
+    )?;
+    anyhow::ensure!(
+        metadata.schema_version == UPDATE_SCHEMA_VERSION
+            && metadata.operation_id == Some(plan.operation_id)
+            && metadata.sha256 == plan.expected_target_sha256
+            && canonicalize_update_path(&metadata.target_executable)?
+                == canonicalize_update_path(&plan.target_executable)?
+            && metadata.database_snapshot_metadata.is_none(),
+        "update recovery backup metadata is not bound to the interrupted operation"
+    );
+    Ok(backup_directory)
+}
+
 /// 恢复因断电、崩溃或被终止而遗留的服务端更新事务。只有带有经过认证的
 /// active marker、plan 和 journal 的事务才会被处理；任何缺失或不一致都会
 /// 失败关闭并保留 marker，避免在未知状态下覆盖数据库。
