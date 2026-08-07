@@ -47,6 +47,9 @@ CREATE TABLE IF NOT EXISTS update_tasks (
     lease_token_sha256 TEXT,
     lease_deadline_unix_seconds INTEGER,
     restart_binding_json TEXT,
+    terminal_worker_instance_id TEXT,
+    terminal_lease_token_sha256 TEXT,
+    terminal_report_sha256 TEXT,
     result_json TEXT,
     error_code TEXT CHECK(error_code IS NULL OR error_code IN (
         'client_disabled', 'invalid_request', 'confirmation_required', 'task_not_found',
@@ -71,6 +74,18 @@ CREATE TABLE IF NOT EXISTS update_tasks (
     CHECK(
         (stage = 'awaiting_restart' AND restart_binding_json IS NOT NULL)
         OR (stage != 'awaiting_restart' AND restart_binding_json IS NULL)
+    ),
+    CHECK(
+        (terminal_worker_instance_id IS NULL AND terminal_lease_token_sha256 IS NULL AND terminal_report_sha256 IS NULL)
+        OR
+        (state IN ('succeeded', 'failed', 'cancelled')
+         AND terminal_worker_instance_id IS NOT NULL
+         AND terminal_lease_token_sha256 IS NOT NULL
+         AND LENGTH(terminal_lease_token_sha256) = 64
+         AND terminal_lease_token_sha256 NOT GLOB '*[^0-9a-f]*'
+         AND terminal_report_sha256 IS NOT NULL
+         AND LENGTH(terminal_report_sha256) = 64
+         AND terminal_report_sha256 NOT GLOB '*[^0-9a-f]*')
     ),
     CHECK(
         (state = 'queued' AND stage = 'queued')
@@ -140,7 +155,7 @@ BEGIN
 END;
 "#;
 
-fn ensure_restart_binding_column(connection: &rusqlite::Connection) -> anyhow::Result<()> {
+fn ensure_update_task_replay_columns(connection: &rusqlite::Connection) -> anyhow::Result<()> {
     let table_sql: Option<String> = connection
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'update_tasks'",
@@ -159,7 +174,11 @@ fn ensure_restart_binding_column(connection: &rusqlite::Connection) -> anyhow::R
     }
     drop(rows);
     drop(statement);
-    if table_sql.contains("restart_binding_json IS NOT NULL") {
+    if table_sql.contains("restart_binding_json IS NOT NULL")
+        && columns.contains("terminal_worker_instance_id")
+        && columns.contains("terminal_lease_token_sha256")
+        && columns.contains("terminal_report_sha256")
+    {
         return Ok(());
     }
     anyhow::ensure!(
@@ -189,8 +208,36 @@ fn ensure_restart_binding_column(connection: &rusqlite::Connection) -> anyhow::R
     } else {
         "NULL"
     };
-    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let terminal_worker_expression = if columns.contains("terminal_worker_instance_id") {
+        "terminal_worker_instance_id"
+    } else {
+        "NULL"
+    };
+    let terminal_lease_expression = if columns.contains("terminal_lease_token_sha256") {
+        "terminal_lease_token_sha256"
+    } else {
+        "NULL"
+    };
+    let terminal_report_expression = if columns.contains("terminal_report_sha256") {
+        "terminal_report_sha256"
+    } else {
+        "NULL"
+    };
+    let foreign_keys: i64 = connection.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+    let legacy_alter_table: i64 =
+        connection.query_row("PRAGMA legacy_alter_table", [], |row| row.get(0))?;
+    // PRAGMA foreign_keys 不能在事务中切换。迁移连接在 BEGIN IMMEDIATE 前暂时关闭
+    // 自动约束执行，复制完数据后仍会用 foreign_key_check 做全量验证，并恢复原设置。
+    connection.pragma_update(None, "foreign_keys", false)?;
+    // SQLite 3.26+ 会在重命名父表时同步改写子表的外键目标。这里必须暂时启用旧式
+    // ALTER TABLE 语义，让 update_task_events 始终指向即将创建的新 update_tasks，
+    // 否则已有事件的数据库会把外键改到 update_tasks_legacy，导致旧表无法删除。
+    if let Err(error) = connection.pragma_update(None, "legacy_alter_table", true) {
+        let _ = connection.pragma_update(None, "foreign_keys", foreign_keys != 0);
+        return Err(error.into());
+    }
     let result = (|| -> anyhow::Result<()> {
+        connection.execute_batch("BEGIN IMMEDIATE")?;
         connection.execute_batch(
             "DROP INDEX IF EXISTS update_tasks_one_active_target;
              DROP INDEX IF EXISTS update_tasks_target_created;
@@ -205,25 +252,59 @@ fn ensure_restart_binding_column(connection: &rusqlite::Connection) -> anyhow::R
                     task_id, target_client_id, action, state, stage, recovery_state,
                     requested_by, idempotency_key, request_fingerprint, attempt,
                     cancel_requested, lease_owner, lease_token_sha256,
-                    lease_deadline_unix_seconds, restart_binding_json, result_json,
-                    error_code, created_unix_seconds, updated_unix_seconds, completed_unix_seconds
+                    lease_deadline_unix_seconds, restart_binding_json,
+                    terminal_worker_instance_id, terminal_lease_token_sha256,
+                    terminal_report_sha256, result_json, error_code,
+                    created_unix_seconds, updated_unix_seconds, completed_unix_seconds
                  ) SELECT task_id, target_client_id, action, state, stage, recovery_state,
                     requested_by, idempotency_key, request_fingerprint, attempt,
                     cancel_requested, lease_owner, lease_token_sha256,
-                    lease_deadline_unix_seconds, {restart_expression}, result_json,
-                    error_code, created_unix_seconds, updated_unix_seconds, completed_unix_seconds
+                    lease_deadline_unix_seconds, {restart_expression},
+                    {terminal_worker_expression}, {terminal_lease_expression},
+                    {terminal_report_expression}, result_json, error_code,
+                    created_unix_seconds, updated_unix_seconds, completed_unix_seconds
                  FROM update_tasks_legacy"
             ),
             [],
         )?;
         connection.execute_batch("DROP TABLE update_tasks_legacy")?;
+        let event_parent: Option<String> = connection
+            .query_row(
+                "SELECT \"table\" FROM pragma_foreign_key_list('update_task_events')
+                 WHERE \"from\" = 'task_id' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        anyhow::ensure!(
+            event_parent.as_deref() == Some("update_tasks"),
+            "remote update event foreign key does not reference the rebuilt task table"
+        );
+        let foreign_key_violation: Option<String> = connection
+            .query_row(
+                "SELECT \"table\" FROM pragma_foreign_key_check LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        anyhow::ensure!(
+            foreign_key_violation.is_none(),
+            "remote update task migration left a foreign key violation"
+        );
         connection.execute_batch("COMMIT")?;
         Ok(())
     })();
     if result.is_err() {
         let _ = connection.execute_batch("ROLLBACK");
     }
-    result
+    let restore_result =
+        connection.pragma_update(None, "legacy_alter_table", legacy_alter_table != 0);
+    let restore_foreign_keys = connection.pragma_update(None, "foreign_keys", foreign_keys != 0);
+    match (result, restore_result, restore_foreign_keys) {
+        (Err(error), _, _) => Err(error),
+        (Ok(()), Err(error), _) | (Ok(()), Ok(()), Err(error)) => Err(error.into()),
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 #[derive(Clone)]
@@ -244,6 +325,23 @@ pub(crate) enum UpdateTaskError {
     InvalidTransition,
     CapacityExceeded,
     Storage(anyhow::Error),
+}
+
+#[derive(Clone, Debug)]
+struct TerminalReportReplay {
+    worker_instance_id: Uuid,
+    lease_token_sha256: String,
+    report_sha256: String,
+}
+
+impl TerminalReportReplay {
+    fn from_request(request: &RemoteUpdateReportRequest) -> anyhow::Result<Self> {
+        Ok(Self {
+            worker_instance_id: request.worker_instance_id,
+            lease_token_sha256: lease_token_sha256(request.lease_token),
+            report_sha256: worker_report_sha256(&request.report)?,
+        })
+    }
 }
 
 /// 远程更新 API 与 worker 使用的协调存储边界。
@@ -364,7 +462,7 @@ impl UpdateTaskCatalog {
         database
             .with_connection(|connection| {
                 connection.execute_batch(UPDATE_TASK_SCHEMA)?;
-                ensure_restart_binding_column(connection)?;
+                ensure_update_task_replay_columns(connection)?;
                 Ok(())
             })
             .map_err(UpdateTaskError::Storage)?;
@@ -617,7 +715,7 @@ impl UpdateTaskCatalog {
                 task.error_code = Some(RemoteUpdateErrorCode::FailedClosed);
                 task.updated_unix_seconds = now;
                 task.completed_unix_seconds = Some(now);
-                persist_task_after_report(transaction, &task)?;
+                persist_task_after_report(transaction, &task, None)?;
                 append_event(transaction, &task, RemoteUpdateEventKind::Failed, now)?;
                 return Ok(None);
             }
@@ -756,6 +854,9 @@ impl UpdateTaskCatalog {
             request
                 .validate(task.action)
                 .map_err(|error| domain_error(UpdateTaskError::Contract(error)))?;
+            if task.state.is_terminal() {
+                return replay_terminal_report(transaction, &task, &request, now);
+            }
             request
                 .report
                 .validate_for_task(task.action, task.stage, task.cancel_requested)
@@ -768,7 +869,12 @@ impl UpdateTaskCatalog {
                 now,
             )?;
             let event_kind = apply_worker_report(&mut task, &request.report, now)?;
-            persist_task_after_report(transaction, &task)?;
+            let terminal_replay = task
+                .state
+                .is_terminal()
+                .then(|| TerminalReportReplay::from_request(&request))
+                .transpose()?;
+            persist_task_after_report(transaction, &task, terminal_replay.as_ref())?;
             append_event(transaction, &task, event_kind, now)?;
             Ok(task)
         }))
@@ -805,7 +911,7 @@ impl UpdateTaskCatalog {
                 task.state = RemoteUpdateTaskState::CancelRequested;
                 RemoteUpdateEventKind::CancelRequested
             };
-            persist_task_after_report(transaction, &task)?;
+            persist_task_after_report(transaction, &task, None)?;
             append_event(transaction, &task, event_kind, now)?;
             Ok(task)
         }))
@@ -1175,8 +1281,75 @@ fn reconcile_lost_lease(
     task.updated_unix_seconds = now;
     task.restart = None;
     clear_task_lease(&mut task);
-    persist_task_after_report(transaction, &task)?;
+    persist_task_after_report(transaction, &task, None)?;
     append_event(transaction, &task, event_kind, now)
+}
+
+fn replay_terminal_report(
+    transaction: &Transaction<'_>,
+    task: &RemoteUpdateTask,
+    request: &RemoteUpdateReportRequest,
+    now: u64,
+) -> anyhow::Result<RemoteUpdateTask> {
+    let stored = terminal_report_replay(transaction, task.task_id)?
+        .ok_or_else(|| domain_error(UpdateTaskError::InvalidTransition))?;
+    let presented_lease = lease_token_sha256(request.lease_token);
+    if stored.worker_instance_id != request.worker_instance_id
+        || !constant_time_equal(
+            stored.lease_token_sha256.as_bytes(),
+            presented_lease.as_bytes(),
+        )
+    {
+        return Err(domain_error(UpdateTaskError::LeaseConflict));
+    }
+    let presented_report = worker_report_sha256(&request.report)?;
+    if !constant_time_equal(stored.report_sha256.as_bytes(), presented_report.as_bytes()) {
+        return Err(domain_error(UpdateTaskError::InvalidTransition));
+    }
+    append_event(
+        transaction,
+        task,
+        RemoteUpdateEventKind::IdempotentReplay,
+        now,
+    )?;
+    Ok(task.clone())
+}
+
+fn terminal_report_replay(
+    transaction: &Transaction<'_>,
+    task_id: Uuid,
+) -> anyhow::Result<Option<TerminalReportReplay>> {
+    let stored = transaction
+        .query_row(
+            "SELECT terminal_worker_instance_id, terminal_lease_token_sha256, terminal_report_sha256
+             FROM update_tasks WHERE task_id = ?1",
+            [task_id.to_string()],
+            |row| {
+                let worker = row.get::<_, Option<String>>(0)?;
+                let lease = row.get::<_, Option<String>>(1)?;
+                let report = row.get::<_, Option<String>>(2)?;
+                match (worker, lease, report) {
+                    (None, None, None) => Ok(None),
+                    (Some(worker), Some(lease_token_sha256), Some(report_sha256)) => {
+                        Ok(Some(TerminalReportReplay {
+                            worker_instance_id: parse_non_nil_uuid(worker, 0)?,
+                            lease_token_sha256,
+                            report_sha256,
+                        }))
+                    }
+                    _ => Err(rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "remote update terminal replay proof is incomplete",
+                        )),
+                    )),
+                }
+            },
+        )
+        .optional()?;
+    Ok(stored.flatten())
 }
 
 fn authorize_lease(
@@ -1359,13 +1532,16 @@ fn apply_worker_report(
 fn persist_task_after_report(
     transaction: &Transaction<'_>,
     task: &RemoteUpdateTask,
+    terminal_replay: Option<&TerminalReportReplay>,
 ) -> anyhow::Result<()> {
     let affected = transaction.execute(
         "UPDATE update_tasks SET state = ?1, stage = ?2, recovery_state = ?3,
             cancel_requested = ?4, lease_owner = ?5, lease_token_sha256 = CASE WHEN ?5 IS NULL THEN NULL ELSE lease_token_sha256 END,
-            lease_deadline_unix_seconds = ?6, restart_binding_json = ?7, result_json = ?8, error_code = ?9,
-            updated_unix_seconds = ?10, completed_unix_seconds = ?11
-         WHERE task_id = ?12",
+            lease_deadline_unix_seconds = ?6, restart_binding_json = ?7,
+            terminal_worker_instance_id = ?8, terminal_lease_token_sha256 = ?9,
+            terminal_report_sha256 = ?10, result_json = ?11, error_code = ?12,
+            updated_unix_seconds = ?13, completed_unix_seconds = ?14
+         WHERE task_id = ?15",
         params![
             enum_text(task.state)?,
             enum_text(task.stage)?,
@@ -1377,6 +1553,9 @@ fn persist_task_after_report(
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?,
+            terminal_replay.map(|replay| replay.worker_instance_id.to_string()),
+            terminal_replay.map(|replay| replay.lease_token_sha256.as_str()),
+            terminal_replay.map(|replay| replay.report_sha256.as_str()),
             task.result.as_ref().map(serde_json::to_string).transpose()?,
             task.error_code.map(enum_text).transpose()?,
             now_i64(task.updated_unix_seconds)?,
@@ -1420,6 +1599,14 @@ fn lease_token_sha256(token: Uuid) -> String {
     digest.update(b"linklake-remote-update-lease-v1\0");
     digest.update(token.as_bytes());
     hex_lower(&digest.finalize())
+}
+
+fn worker_report_sha256(report: &RemoteUpdateWorkerReport) -> anyhow::Result<String> {
+    let encoded = serde_json::to_vec(report)?;
+    let mut digest = Sha256::new();
+    digest.update(b"linklake-remote-update-terminal-report-v1\0");
+    digest.update(encoded);
+    Ok(hex_lower(&digest.finalize()))
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -1552,8 +1739,8 @@ fn map_database_result<T>(result: anyhow::Result<T>) -> Result<T, UpdateTaskErro
 mod tests {
     use super::*;
     use linklake_core::remote_update::{
-        RemoteUpdateLeaseRenewRequest, RemoteUpdateReportRequest, RemoteUpdateWorkerReport,
-        REMOTE_UPDATE_DEFAULT_LEASE_SECONDS,
+        RemoteLocalUpdateState, RemoteUpdateLeaseRenewRequest, RemoteUpdateReportRequest,
+        RemoteUpdateResult, RemoteUpdateWorkerReport, REMOTE_UPDATE_DEFAULT_LEASE_SECONDS,
     };
 
     fn catalog_with_client(client_id: Uuid) -> UpdateTaskCatalog {
@@ -1570,6 +1757,110 @@ mod tests {
             })
             .unwrap();
         UpdateTaskCatalog::open(&database).unwrap()
+    }
+
+    #[test]
+    fn replay_column_migration_preserves_existing_event_foreign_keys() {
+        let database = Database::memory().unwrap();
+        let client_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let event_id = Uuid::new_v4();
+        database
+            .with_connection(|connection| {
+                connection.execute_batch(
+                    "CREATE TABLE clients(client_id TEXT PRIMARY KEY NOT NULL);
+                     CREATE TABLE update_tasks (
+                         task_id TEXT PRIMARY KEY NOT NULL,
+                         target_client_id TEXT NOT NULL,
+                         action TEXT NOT NULL,
+                         state TEXT NOT NULL,
+                         stage TEXT NOT NULL,
+                         recovery_state TEXT NOT NULL,
+                         requested_by TEXT NOT NULL,
+                         idempotency_key TEXT NOT NULL,
+                         request_fingerprint TEXT NOT NULL,
+                         attempt INTEGER NOT NULL,
+                         cancel_requested INTEGER NOT NULL,
+                         lease_owner TEXT,
+                         lease_token_sha256 TEXT,
+                         lease_deadline_unix_seconds INTEGER,
+                         restart_binding_json TEXT,
+                         result_json TEXT,
+                         error_code TEXT,
+                         created_unix_seconds INTEGER NOT NULL,
+                         updated_unix_seconds INTEGER NOT NULL,
+                         completed_unix_seconds INTEGER,
+                         FOREIGN KEY(target_client_id) REFERENCES clients(client_id) ON DELETE RESTRICT,
+                         UNIQUE(requested_by, idempotency_key)
+                     );
+                     CREATE TABLE update_task_events (
+                         event_id TEXT PRIMARY KEY NOT NULL,
+                         task_id TEXT NOT NULL,
+                         sequence INTEGER NOT NULL,
+                         kind TEXT NOT NULL,
+                         state TEXT NOT NULL,
+                         stage TEXT NOT NULL,
+                         recovery_state TEXT NOT NULL,
+                         error_code TEXT,
+                         created_unix_seconds INTEGER NOT NULL,
+                         FOREIGN KEY(task_id) REFERENCES update_tasks(task_id) ON DELETE RESTRICT,
+                         UNIQUE(task_id, sequence)
+                     );",
+                )?;
+                connection.execute(
+                    "INSERT INTO clients(client_id) VALUES (?1)",
+                    [client_id.to_string()],
+                )?;
+                connection.execute(
+                    "INSERT INTO update_tasks (
+                        task_id, target_client_id, action, state, stage, recovery_state,
+                        requested_by, idempotency_key, request_fingerprint, attempt,
+                        cancel_requested, lease_owner, lease_token_sha256,
+                        lease_deadline_unix_seconds, restart_binding_json, result_json,
+                        error_code, created_unix_seconds, updated_unix_seconds,
+                        completed_unix_seconds
+                     ) VALUES (?1, ?2, 'check', 'queued', 'queued', 'none',
+                        'admin', 'legacy-task-1', 'fingerprint', 0, 0, NULL, NULL,
+                        NULL, NULL, NULL, NULL, 1, 1, NULL)",
+                    params![task_id.to_string(), client_id.to_string()],
+                )?;
+                connection.execute(
+                    "INSERT INTO update_task_events (
+                        event_id, task_id, sequence, kind, state, stage,
+                        recovery_state, error_code, created_unix_seconds
+                     ) VALUES (?1, ?2, 1, 'created', 'queued', 'queued',
+                        'none', NULL, 1)",
+                    params![event_id.to_string(), task_id.to_string()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        UpdateTaskCatalog::open(&database).unwrap();
+        database
+            .with_connection(|connection| {
+                let parent: String = connection.query_row(
+                    "SELECT \"table\" FROM pragma_foreign_key_list('update_task_events')
+                     WHERE \"from\" = 'task_id'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let event_count: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM update_task_events WHERE task_id = ?1",
+                    [task_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                let violations: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM pragma_foreign_key_check",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(parent, "update_tasks");
+                assert_eq!(event_count, 1);
+                assert_eq!(violations, 0);
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]
@@ -1712,6 +2003,152 @@ mod tests {
             catalog.renew(client_id, task.task_id, &renew, 12),
             Err(UpdateTaskError::Contract(_))
         ));
+    }
+
+    #[test]
+    fn terminal_worker_reports_are_idempotent_only_for_the_original_lease_and_digest() {
+        let client_id = Uuid::new_v4();
+        let catalog = catalog_with_client(client_id);
+        let worker = Uuid::new_v4();
+        let task = catalog
+            .create(
+                &CreateRemoteUpdateTaskRequest {
+                    target_client_id: client_id,
+                    action: RemoteUpdateAction::Status,
+                    idempotency_key: "terminal-report-replay-success".to_owned(),
+                    confirmation: "STATUS".to_owned(),
+                },
+                "admin",
+                1,
+            )
+            .unwrap();
+        let claim = catalog
+            .claim(
+                client_id,
+                &RemoteUpdateClaimRequest {
+                    worker_instance_id: worker,
+                    requested_lease_seconds: REMOTE_UPDATE_DEFAULT_LEASE_SECONDS,
+                },
+                2,
+            )
+            .unwrap()
+            .unwrap();
+        catalog
+            .report(
+                client_id,
+                task.task_id,
+                &RemoteUpdateReportRequest {
+                    worker_instance_id: worker,
+                    lease_token: claim.lease_token,
+                    report: RemoteUpdateWorkerReport::Started {
+                        stage: RemoteUpdateStage::Inspecting,
+                    },
+                },
+                3,
+            )
+            .unwrap();
+        let success = RemoteUpdateReportRequest {
+            worker_instance_id: worker,
+            lease_token: claim.lease_token,
+            report: RemoteUpdateWorkerReport::Succeeded {
+                result: RemoteUpdateResult::Status {
+                    state: RemoteLocalUpdateState::Idle,
+                    operation: None,
+                    from_version: None,
+                    to_version: None,
+                    has_error: false,
+                    updated_unix_seconds: 4,
+                },
+            },
+        };
+        let completed = catalog
+            .report(client_id, task.task_id, &success, 4)
+            .unwrap();
+        assert_eq!(completed.state, RemoteUpdateTaskState::Succeeded);
+        assert_eq!(
+            catalog
+                .report(client_id, task.task_id, &success, 5)
+                .unwrap(),
+            completed
+        );
+
+        let mut changed = success.clone();
+        changed.report = RemoteUpdateWorkerReport::Succeeded {
+            result: RemoteUpdateResult::Status {
+                state: RemoteLocalUpdateState::Idle,
+                operation: None,
+                from_version: None,
+                to_version: None,
+                has_error: false,
+                updated_unix_seconds: 6,
+            },
+        };
+        assert!(matches!(
+            catalog.report(client_id, task.task_id, &changed, 6),
+            Err(UpdateTaskError::InvalidTransition)
+        ));
+        let mut wrong_lease = success.clone();
+        wrong_lease.lease_token = Uuid::new_v4();
+        assert!(matches!(
+            catalog.report(client_id, task.task_id, &wrong_lease, 6),
+            Err(UpdateTaskError::LeaseConflict)
+        ));
+
+        let failed_task = catalog
+            .create(
+                &CreateRemoteUpdateTaskRequest {
+                    target_client_id: client_id,
+                    action: RemoteUpdateAction::Check,
+                    idempotency_key: "terminal-report-replay-failure".to_owned(),
+                    confirmation: "CHECK".to_owned(),
+                },
+                "admin",
+                7,
+            )
+            .unwrap();
+        let failed_claim = catalog
+            .claim(
+                client_id,
+                &RemoteUpdateClaimRequest {
+                    worker_instance_id: worker,
+                    requested_lease_seconds: REMOTE_UPDATE_DEFAULT_LEASE_SECONDS,
+                },
+                8,
+            )
+            .unwrap()
+            .unwrap();
+        catalog
+            .report(
+                client_id,
+                failed_task.task_id,
+                &RemoteUpdateReportRequest {
+                    worker_instance_id: worker,
+                    lease_token: failed_claim.lease_token,
+                    report: RemoteUpdateWorkerReport::Started {
+                        stage: RemoteUpdateStage::Checking,
+                    },
+                },
+                9,
+            )
+            .unwrap();
+        let failure = RemoteUpdateReportRequest {
+            worker_instance_id: worker,
+            lease_token: failed_claim.lease_token,
+            report: RemoteUpdateWorkerReport::Failed {
+                error_code: RemoteUpdateErrorCode::CheckFailed,
+                recovery_state: RemoteUpdateRecoveryState::Retryable,
+            },
+        };
+        let failed = catalog
+            .report(client_id, failed_task.task_id, &failure, 10)
+            .unwrap();
+        assert_eq!(failed.state, RemoteUpdateTaskState::Failed);
+        assert_eq!(
+            catalog
+                .report(client_id, failed_task.task_id, &failure, 11)
+                .unwrap(),
+            failed
+        );
     }
 
     #[test]

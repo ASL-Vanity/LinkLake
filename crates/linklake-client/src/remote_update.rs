@@ -634,13 +634,6 @@ impl RemoteUpdateWorker {
                 let _ = self.restart_tx.send(true);
                 return Ok(true);
             }
-            self.renew_as(RenewContext {
-                identity: lease_identity,
-                stage: RemoteUpdateStage::AwaitingRestart,
-                lease_seconds: REMOTE_UPDATE_MAX_LEASE_SECONDS,
-                maximum_deadline: Some(receipt.resume_not_after_unix_seconds),
-            })
-            .await?;
             if status.state == expected_terminal {
                 let verified = updater::verify_completed_update(
                     UpdateProduct::Client,
