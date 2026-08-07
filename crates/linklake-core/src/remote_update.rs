@@ -554,6 +554,25 @@ impl RemoteUpdateWorkerReport {
             Self::Cancelled => Ok(()),
         }
     }
+
+    /// 结合服务端持久阶段验证取消语义。安装变更一旦进入执行阶段，就不能再把
+    /// 未知完成状态报告为“已取消”；worker 必须上报成功或带恢复状态的失败。
+    pub fn validate_for_task(
+        &self,
+        action: RemoteUpdateAction,
+        current_stage: RemoteUpdateStage,
+        cancel_requested: bool,
+    ) -> Result<(), RemoteUpdateContractError> {
+        self.validate(action)?;
+        if matches!(self, Self::Cancelled)
+            && (!cancel_requested
+                || (current_stage != RemoteUpdateStage::Claimed
+                    && !action.safe_to_requeue_after_lease_loss()))
+        {
+            return Err(RemoteUpdateContractError::InvalidTransition);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -856,5 +875,28 @@ mod tests {
             contradictory.validate(),
             Err(RemoteUpdateContractError::InvalidLocalStatus)
         );
+    }
+
+    #[test]
+    fn mutating_task_cannot_claim_cancellation_after_execution_started() {
+        let cancelled = RemoteUpdateWorkerReport::Cancelled;
+        assert!(cancelled
+            .validate_for_task(RemoteUpdateAction::Apply, RemoteUpdateStage::Claimed, true,)
+            .is_ok());
+        assert_eq!(
+            cancelled.validate_for_task(
+                RemoteUpdateAction::Apply,
+                RemoteUpdateStage::Applying,
+                true,
+            ),
+            Err(RemoteUpdateContractError::InvalidTransition)
+        );
+        assert!(cancelled
+            .validate_for_task(
+                RemoteUpdateAction::Download,
+                RemoteUpdateStage::Downloading,
+                true,
+            )
+            .is_ok());
     }
 }

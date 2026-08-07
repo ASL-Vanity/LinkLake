@@ -21,7 +21,12 @@ use uuid::Uuid;
 
 const MAX_REQUESTED_BY_BYTES: usize = 128;
 const MAX_TASK_LIST_LIMIT: usize = 500;
-const MAX_TASK_EVENT_LIMIT: usize = 2_000;
+const MAX_RETAINED_TASKS: i64 = 100_000;
+const MAX_EVENTS_PER_TASK: i64 = 128;
+const MAX_CLAIM_ATTEMPTS: u32 = 16;
+const MAX_LEASE_EVENTS_PER_TASK: i64 = 8;
+const MAX_REPLAY_EVENTS_PER_TASK: i64 = 4;
+const MAX_RESTART_EVENTS_PER_TASK: i64 = 4;
 
 const UPDATE_TASK_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS update_tasks (
@@ -40,12 +45,55 @@ CREATE TABLE IF NOT EXISTS update_tasks (
     lease_token_sha256 TEXT,
     lease_deadline_unix_seconds INTEGER,
     result_json TEXT,
-    error_code TEXT,
+    error_code TEXT CHECK(error_code IS NULL OR error_code IN (
+        'client_disabled', 'invalid_request', 'confirmation_required', 'task_not_found',
+        'target_busy', 'idempotency_conflict', 'lease_conflict', 'lease_expired',
+        'invalid_transition', 'insecure_control_channel', 'local_update_busy',
+        'signature_verification_failed', 'stable_channel_required', 'downgrade_forbidden',
+        'artifact_rejected', 'check_failed', 'download_failed', 'apply_failed',
+        'status_failed', 'recovery_failed', 'rollback_failed', 'cancelled',
+        'failed_closed', 'internal'
+    )),
     created_unix_seconds INTEGER NOT NULL,
     updated_unix_seconds INTEGER NOT NULL,
     completed_unix_seconds INTEGER,
     FOREIGN KEY(target_client_id) REFERENCES clients(client_id) ON DELETE RESTRICT,
-    UNIQUE(requested_by, idempotency_key)
+    UNIQUE(requested_by, idempotency_key),
+    CHECK(
+        (lease_owner IS NULL AND lease_token_sha256 IS NULL AND lease_deadline_unix_seconds IS NULL)
+        OR
+        (lease_owner IS NOT NULL AND lease_token_sha256 IS NOT NULL AND lease_deadline_unix_seconds IS NOT NULL
+         AND LENGTH(lease_token_sha256) = 64 AND lease_token_sha256 NOT GLOB '*[^0-9a-f]*')
+    ),
+    CHECK(
+        (state = 'queued' AND stage = 'queued')
+        OR (state = 'claimed' AND stage = 'claimed')
+        OR (state = 'running' AND stage IN ('checking', 'downloading', 'applying', 'inspecting', 'recovering', 'rolling_back', 'awaiting_restart'))
+        OR (state = 'cancel_requested' AND stage IN ('claimed', 'checking', 'downloading', 'applying', 'inspecting', 'recovering', 'rolling_back', 'awaiting_restart'))
+        OR (state = 'succeeded' AND stage = 'completed')
+        OR (state = 'failed' AND stage = 'failed')
+        OR (state = 'cancelled' AND stage = 'cancelled')
+    ),
+    CHECK(
+        stage IN ('queued', 'claimed', 'awaiting_restart', 'completed', 'failed', 'cancelled')
+        OR (action = 'check' AND stage = 'checking')
+        OR (action = 'download' AND stage = 'downloading')
+        OR (action = 'apply' AND stage = 'applying')
+        OR (action = 'status' AND stage = 'inspecting')
+        OR (action = 'recover' AND stage = 'recovering')
+        OR (action = 'rollback' AND stage = 'rolling_back')
+    ),
+    CHECK(
+        (state IN ('queued', 'succeeded', 'failed', 'cancelled') AND lease_owner IS NULL)
+        OR (state IN ('claimed', 'running', 'cancel_requested') AND lease_owner IS NOT NULL)
+    ),
+    CHECK(
+        (state IN ('queued', 'claimed', 'running', 'cancel_requested')
+         AND completed_unix_seconds IS NULL AND result_json IS NULL AND error_code IS NULL)
+        OR (state = 'succeeded' AND completed_unix_seconds IS NOT NULL AND result_json IS NOT NULL AND error_code IS NULL)
+        OR (state = 'failed' AND completed_unix_seconds IS NOT NULL AND result_json IS NULL AND error_code IS NOT NULL AND error_code != 'cancelled')
+        OR (state = 'cancelled' AND completed_unix_seconds IS NOT NULL AND result_json IS NULL AND error_code = 'cancelled')
+    )
 );
 CREATE UNIQUE INDEX IF NOT EXISTS update_tasks_one_active_target
     ON update_tasks(target_client_id)
@@ -54,6 +102,9 @@ CREATE INDEX IF NOT EXISTS update_tasks_target_created
     ON update_tasks(target_client_id, created_unix_seconds DESC);
 CREATE INDEX IF NOT EXISTS update_tasks_claim_queue
     ON update_tasks(target_client_id, state, created_unix_seconds ASC);
+CREATE INDEX IF NOT EXISTS update_tasks_active_lease_deadline
+    ON update_tasks(lease_deadline_unix_seconds)
+    WHERE state IN ('claimed', 'running', 'cancel_requested');
 
 CREATE TABLE IF NOT EXISTS update_task_events (
     event_id TEXT PRIMARY KEY NOT NULL,
@@ -98,6 +149,7 @@ pub(crate) enum UpdateTaskError {
     LeaseConflict,
     LeaseExpired,
     InvalidTransition,
+    CapacityExceeded,
     Storage(anyhow::Error),
 }
 
@@ -120,6 +172,9 @@ impl fmt::Display for UpdateTaskError {
             Self::LeaseExpired => formatter.write_str("remote update lease has expired"),
             Self::InvalidTransition => {
                 formatter.write_str("remote update task transition is invalid")
+            }
+            Self::CapacityExceeded => {
+                formatter.write_str("remote update task retention capacity was reached")
             }
             Self::Storage(error) => {
                 write!(formatter, "remote update task storage failed: {error:#}")
@@ -192,6 +247,13 @@ impl UpdateTaskCatalog {
                 if existing_fingerprint != fingerprint {
                     return Err(domain_error(UpdateTaskError::IdempotencyConflict));
                 }
+                reconcile_expired_leases(
+                    transaction,
+                    Some(existing.target_client_id),
+                    now,
+                )?;
+                let existing = task_by_id(transaction, existing.task_id)?
+                    .ok_or_else(|| domain_error(UpdateTaskError::TaskNotFound))?;
                 append_event(
                     transaction,
                     &existing,
@@ -201,6 +263,8 @@ impl UpdateTaskCatalog {
                 return Ok(existing);
             }
 
+            reconcile_expired_leases(transaction, Some(request.target_client_id), now)?;
+
             let active_exists: bool = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM update_tasks WHERE target_client_id = ?1 AND state IN ('queued', 'claimed', 'running', 'cancel_requested'))",
                 [request.target_client_id.to_string()],
@@ -208,6 +272,11 @@ impl UpdateTaskCatalog {
             )?;
             if active_exists {
                 return Err(domain_error(UpdateTaskError::TargetBusy));
+            }
+            let retained_tasks: i64 =
+                transaction.query_row("SELECT COUNT(*) FROM update_tasks", [], |row| row.get(0))?;
+            if retained_tasks >= MAX_RETAINED_TASKS {
+                return Err(domain_error(UpdateTaskError::CapacityExceeded));
             }
 
             let task = RemoteUpdateTask {
@@ -230,7 +299,7 @@ impl UpdateTaskCatalog {
                 updated_unix_seconds: now,
                 completed_unix_seconds: None,
             };
-            transaction.execute(
+            let affected = transaction.execute(
                 "INSERT INTO update_tasks (
                     task_id, target_client_id, action, state, stage, recovery_state,
                     requested_by, idempotency_key, request_fingerprint, attempt,
@@ -249,6 +318,7 @@ impl UpdateTaskCatalog {
                     now_i64(now)?,
                 ],
             )?;
+            ensure_one_row(affected, "create remote update task")?;
             append_event(transaction, &task, RemoteUpdateEventKind::Created, now)?;
             Ok(task)
         }))
@@ -258,16 +328,18 @@ impl UpdateTaskCatalog {
         &self,
         target_client_id: Option<Uuid>,
         requested_limit: usize,
+        now: u64,
     ) -> Result<Vec<RemoteUpdateTask>, UpdateTaskError> {
         if let Some(target_client_id) = target_client_id {
             validate_non_nil_uuid(target_client_id)?;
         }
         let limit = requested_limit.clamp(1, MAX_TASK_LIST_LIMIT) as i64;
-        map_database_result(self.database.with_connection(|connection| {
+        map_database_result(self.database.with_transaction(|transaction| {
+            reconcile_expired_leases(transaction, target_client_id, now)?;
             let mut tasks = Vec::new();
             match target_client_id {
                 Some(target_client_id) => {
-                    let mut statement = connection.prepare(&format!(
+                    let mut statement = transaction.prepare(&format!(
                         "{} WHERE target_client_id = ?1 ORDER BY created_unix_seconds DESC, task_id DESC LIMIT ?2",
                         TASK_SELECT
                     ))?;
@@ -280,7 +352,7 @@ impl UpdateTaskCatalog {
                     }
                 }
                 None => {
-                    let mut statement = connection.prepare(&format!(
+                    let mut statement = transaction.prepare(&format!(
                         "{} ORDER BY created_unix_seconds DESC, task_id DESC LIMIT ?1",
                         TASK_SELECT
                     ))?;
@@ -294,12 +366,19 @@ impl UpdateTaskCatalog {
         }))
     }
 
-    pub(crate) fn detail(&self, task_id: Uuid) -> Result<RemoteUpdateTaskDetail, UpdateTaskError> {
+    pub(crate) fn detail(
+        &self,
+        task_id: Uuid,
+        now: u64,
+    ) -> Result<RemoteUpdateTaskDetail, UpdateTaskError> {
         validate_non_nil_uuid(task_id)?;
-        map_database_result(self.database.with_connection(|connection| {
-            let task = task_by_id(connection, task_id)?
+        map_database_result(self.database.with_transaction(|transaction| {
+            let task = task_by_id(transaction, task_id)?
                 .ok_or_else(|| domain_error(UpdateTaskError::TaskNotFound))?;
-            let mut statement = connection.prepare(
+            reconcile_expired_leases(transaction, Some(task.target_client_id), now)?;
+            let task = task_by_id(transaction, task_id)?
+                .ok_or_else(|| domain_error(UpdateTaskError::TaskNotFound))?;
+            let mut statement = transaction.prepare(
                 "SELECT event_id, task_id, sequence, kind, state, stage, recovery_state, error_code, created_unix_seconds
                  FROM (
                     SELECT event_id, task_id, sequence, kind, state, stage, recovery_state, error_code, created_unix_seconds
@@ -308,7 +387,7 @@ impl UpdateTaskCatalog {
                  ) ORDER BY sequence ASC",
             )?;
             let rows = statement.query_map(
-                params![task_id.to_string(), MAX_TASK_EVENT_LIMIT as i64],
+                params![task_id.to_string(), MAX_EVENTS_PER_TASK],
                 read_event,
             )?;
             let mut events = Vec::new();
@@ -322,7 +401,7 @@ impl UpdateTaskCatalog {
     /// 服务端启动时执行一次。有效租约保持不变；缺失或过期租约按动作类型确定性处理。
     pub(crate) fn reconcile_after_restart(&self, now: u64) -> Result<(), UpdateTaskError> {
         map_database_result(self.database.with_transaction(|transaction| {
-            let tasks = active_leased_tasks(transaction)?;
+            let tasks = active_leased_tasks(transaction, None)?;
             for task in tasks {
                 let lease_valid = task
                     .lease_deadline_unix_seconds
@@ -343,6 +422,13 @@ impl UpdateTaskCatalog {
         }))
     }
 
+    pub(crate) fn sweep(&self, now: u64) -> Result<(), UpdateTaskError> {
+        map_database_result(
+            self.database
+                .with_transaction(|transaction| reconcile_expired_leases(transaction, None, now)),
+        )
+    }
+
     pub(crate) fn claim(
         &self,
         target_client_id: Uuid,
@@ -358,6 +444,17 @@ impl UpdateTaskCatalog {
             let Some(mut task) = task else {
                 return Ok(None);
             };
+            if task.attempt >= MAX_CLAIM_ATTEMPTS {
+                task.state = RemoteUpdateTaskState::Failed;
+                task.stage = RemoteUpdateStage::Failed;
+                task.recovery_state = RemoteUpdateRecoveryState::FailedClosed;
+                task.error_code = Some(RemoteUpdateErrorCode::FailedClosed);
+                task.updated_unix_seconds = now;
+                task.completed_unix_seconds = Some(now);
+                persist_task_after_report(transaction, &task)?;
+                append_event(transaction, &task, RemoteUpdateEventKind::Failed, now)?;
+                return Ok(None);
+            }
             let lease_token = Uuid::new_v4();
             let lease_deadline = checked_deadline(now, request.requested_lease_seconds)?;
             task.state = RemoteUpdateTaskState::Claimed;
@@ -370,7 +467,7 @@ impl UpdateTaskCatalog {
             task.lease_owner = Some(request.worker_instance_id);
             task.lease_deadline_unix_seconds = Some(lease_deadline);
             task.updated_unix_seconds = now;
-            transaction.execute(
+            let affected = transaction.execute(
                 "UPDATE update_tasks SET state = ?1, stage = ?2, recovery_state = ?3,
                     attempt = ?4, lease_owner = ?5, lease_token_sha256 = ?6,
                     lease_deadline_unix_seconds = ?7, updated_unix_seconds = ?8
@@ -387,6 +484,7 @@ impl UpdateTaskCatalog {
                     task.task_id.to_string(),
                 ],
             )?;
+            ensure_one_row(affected, "claim remote update task")?;
             append_event(transaction, &task, RemoteUpdateEventKind::Claimed, now)?;
             Ok(Some(RemoteUpdateClaim {
                 task,
@@ -436,7 +534,7 @@ impl UpdateTaskCatalog {
             };
             task.lease_deadline_unix_seconds = Some(deadline);
             task.updated_unix_seconds = now;
-            transaction.execute(
+            let affected = transaction.execute(
                 "UPDATE update_tasks SET state = ?1, stage = ?2,
                     lease_deadline_unix_seconds = ?3, updated_unix_seconds = ?4
                  WHERE task_id = ?5",
@@ -448,6 +546,7 @@ impl UpdateTaskCatalog {
                     task.task_id.to_string(),
                 ],
             )?;
+            ensure_one_row(affected, "renew remote update task lease")?;
             append_event(transaction, &task, RemoteUpdateEventKind::LeaseRenewed, now)?;
             Ok(RemoteUpdateLeaseRenewResponse {
                 task_id,
@@ -476,6 +575,10 @@ impl UpdateTaskCatalog {
             request
                 .validate(task.action)
                 .map_err(|error| domain_error(UpdateTaskError::Contract(error)))?;
+            request
+                .report
+                .validate_for_task(task.action, task.stage, task.cancel_requested)
+                .map_err(|error| domain_error(UpdateTaskError::Contract(error)))?;
             authorize_lease(
                 transaction,
                 &task,
@@ -499,6 +602,9 @@ impl UpdateTaskCatalog {
         validate_non_nil_uuid(task_id)?;
         request.validate()?;
         map_database_result(self.database.with_transaction(|transaction| {
+            let task = task_by_id(transaction, task_id)?
+                .ok_or_else(|| domain_error(UpdateTaskError::TaskNotFound))?;
+            reconcile_expired_leases(transaction, Some(task.target_client_id), now)?;
             let mut task = task_by_id(transaction, task_id)?
                 .ok_or_else(|| domain_error(UpdateTaskError::TaskNotFound))?;
             if task.state.is_terminal() || task.cancel_requested {
@@ -566,15 +672,60 @@ fn oldest_queued_task(
         .optional()?)
 }
 
-fn active_leased_tasks(transaction: &Transaction<'_>) -> anyhow::Result<Vec<RemoteUpdateTask>> {
-    let mut statement = transaction.prepare(&format!(
-        "{TASK_SELECT} WHERE state IN ('claimed', 'running', 'cancel_requested')
-         ORDER BY created_unix_seconds ASC, task_id ASC"
-    ))?;
-    let rows = statement.query_map([], read_task)?;
+fn active_leased_tasks(
+    transaction: &Transaction<'_>,
+    target_client_id: Option<Uuid>,
+) -> anyhow::Result<Vec<RemoteUpdateTask>> {
+    let sql = match target_client_id {
+        Some(_) => format!(
+            "{TASK_SELECT} WHERE target_client_id = ?1 AND state IN ('claimed', 'running', 'cancel_requested')
+             ORDER BY created_unix_seconds ASC, task_id ASC"
+        ),
+        None => format!(
+            "{TASK_SELECT} WHERE state IN ('claimed', 'running', 'cancel_requested')
+             ORDER BY created_unix_seconds ASC, task_id ASC"
+        ),
+    };
+    let mut statement = transaction.prepare(&sql)?;
+    let mut rows = match target_client_id {
+        Some(target_client_id) => statement.query([target_client_id.to_string()])?,
+        None => statement.query([])?,
+    };
     let mut tasks = Vec::new();
-    for row in rows {
-        tasks.push(row?);
+    while let Some(row) = rows.next()? {
+        tasks.push(read_task(row)?);
+    }
+    Ok(tasks)
+}
+
+fn expired_leased_tasks(
+    transaction: &Transaction<'_>,
+    target_client_id: Option<Uuid>,
+    now: u64,
+) -> anyhow::Result<Vec<RemoteUpdateTask>> {
+    let sql = match target_client_id {
+        Some(_) => format!(
+            "{TASK_SELECT} WHERE target_client_id = ?1
+             AND state IN ('claimed', 'running', 'cancel_requested')
+             AND (lease_deadline_unix_seconds IS NULL OR lease_deadline_unix_seconds <= ?2)
+             ORDER BY lease_deadline_unix_seconds ASC, task_id ASC"
+        ),
+        None => format!(
+            "{TASK_SELECT} WHERE state IN ('claimed', 'running', 'cancel_requested')
+             AND (lease_deadline_unix_seconds IS NULL OR lease_deadline_unix_seconds <= ?1)
+             ORDER BY lease_deadline_unix_seconds ASC, task_id ASC"
+        ),
+    };
+    let mut statement = transaction.prepare(&sql)?;
+    let mut rows = match target_client_id {
+        Some(target_client_id) => {
+            statement.query(params![target_client_id.to_string(), now_i64(now)?])?
+        }
+        None => statement.query([now_i64(now)?])?,
+    };
+    let mut tasks = Vec::new();
+    while let Some(row) = rows.next()? {
+        tasks.push(read_task(row)?);
     }
     Ok(tasks)
 }
@@ -592,7 +743,7 @@ fn read_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<RemoteUpdateTask> {
             )
         })?;
     }
-    Ok(RemoteUpdateTask {
+    let task = RemoteUpdateTask {
         schema_version: REMOTE_UPDATE_CONTRACT_VERSION,
         task_id: parse_non_nil_uuid(row.get::<_, String>(0)?, 0)?,
         target_client_id: parse_non_nil_uuid(row.get::<_, String>(1)?, 1)?,
@@ -623,7 +774,110 @@ fn read_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<RemoteUpdateTask> {
             .get::<_, Option<i64>>(16)?
             .map(|value| parse_u64(value, 16))
             .transpose()?,
-    })
+    };
+    validate_loaded_task(&task).map_err(|message| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                message,
+            )),
+        )
+    })?;
+    Ok(task)
+}
+
+fn validate_loaded_task(task: &RemoteUpdateTask) -> Result<(), &'static str> {
+    if task.attempt > MAX_CLAIM_ATTEMPTS
+        || task.created_unix_seconds > task.updated_unix_seconds
+        || task
+            .completed_unix_seconds
+            .is_some_and(|completed| completed < task.updated_unix_seconds)
+    {
+        return Err("remote update task counters or timestamps are inconsistent");
+    }
+    let lease_present = task.lease_owner.is_some() && task.lease_deadline_unix_seconds.is_some();
+    let active_payload_empty =
+        task.result.is_none() && task.error_code.is_none() && task.completed_unix_seconds.is_none();
+    let valid = match task.state {
+        RemoteUpdateTaskState::Queued => {
+            task.stage == RemoteUpdateStage::Queued
+                && !lease_present
+                && !task.cancel_requested
+                && active_payload_empty
+        }
+        RemoteUpdateTaskState::Claimed => {
+            task.stage == RemoteUpdateStage::Claimed
+                && lease_present
+                && !task.cancel_requested
+                && active_payload_empty
+        }
+        RemoteUpdateTaskState::Running => {
+            (task.stage == task.action.execution_stage()
+                || (task.stage == RemoteUpdateStage::AwaitingRestart
+                    && task.action.changes_installation()))
+                && lease_present
+                && !task.cancel_requested
+                && active_payload_empty
+        }
+        RemoteUpdateTaskState::CancelRequested => {
+            (task.stage == RemoteUpdateStage::Claimed
+                || task.stage == task.action.execution_stage()
+                || (task.stage == RemoteUpdateStage::AwaitingRestart
+                    && task.action.changes_installation()))
+                && lease_present
+                && task.cancel_requested
+                && active_payload_empty
+        }
+        RemoteUpdateTaskState::Succeeded => {
+            task.stage == RemoteUpdateStage::Completed
+                && !lease_present
+                && task.completed_unix_seconds.is_some()
+                && task.error_code.is_none()
+                && task
+                    .result
+                    .as_ref()
+                    .is_some_and(|result| result.matches_action(task.action))
+                && task.recovery_state
+                    == if task.action == RemoteUpdateAction::Recover {
+                        RemoteUpdateRecoveryState::Recovered
+                    } else {
+                        RemoteUpdateRecoveryState::None
+                    }
+        }
+        RemoteUpdateTaskState::Failed => {
+            task.stage == RemoteUpdateStage::Failed
+                && !lease_present
+                && task.completed_unix_seconds.is_some()
+                && task.result.is_none()
+                && task
+                    .error_code
+                    .is_some_and(|error| error != RemoteUpdateErrorCode::Cancelled)
+                && task.error_code.is_some_and(|error_code| {
+                    RemoteUpdateWorkerReport::Failed {
+                        error_code,
+                        recovery_state: task.recovery_state,
+                    }
+                    .validate(task.action)
+                    .is_ok()
+                })
+        }
+        RemoteUpdateTaskState::Cancelled => {
+            task.stage == RemoteUpdateStage::Cancelled
+                && !lease_present
+                && task.cancel_requested
+                && task.completed_unix_seconds.is_some()
+                && task.result.is_none()
+                && task.error_code == Some(RemoteUpdateErrorCode::Cancelled)
+                && task.recovery_state == RemoteUpdateRecoveryState::None
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err("remote update task state fields are inconsistent")
+    }
 }
 
 fn read_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<RemoteUpdateTaskEvent> {
@@ -650,12 +904,37 @@ fn append_event(
     kind: RemoteUpdateEventKind,
     now: u64,
 ) -> anyhow::Result<()> {
+    let kind_text = enum_text(kind)?;
+    let sampled_limit = match kind {
+        RemoteUpdateEventKind::LeaseRenewed => Some(MAX_LEASE_EVENTS_PER_TASK),
+        RemoteUpdateEventKind::IdempotentReplay => Some(MAX_REPLAY_EVENTS_PER_TASK),
+        RemoteUpdateEventKind::RestartReconciled => Some(MAX_RESTART_EVENTS_PER_TASK),
+        _ => None,
+    };
+    if let Some(limit) = sampled_limit {
+        let recorded: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM update_task_events WHERE task_id = ?1 AND kind = ?2",
+            params![task.task_id.to_string(), kind_text],
+            |row| row.get(0),
+        )?;
+        if recorded >= limit {
+            return Ok(());
+        }
+    }
+    let total: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM update_task_events WHERE task_id = ?1",
+        [task.task_id.to_string()],
+        |row| row.get(0),
+    )?;
+    if total >= MAX_EVENTS_PER_TASK {
+        return Err(domain_error(UpdateTaskError::CapacityExceeded));
+    }
     let sequence: i64 = transaction.query_row(
         "SELECT COALESCE(MAX(sequence), 0) + 1 FROM update_task_events WHERE task_id = ?1",
         [task.task_id.to_string()],
         |row| row.get(0),
     )?;
-    transaction.execute(
+    let affected = transaction.execute(
         "INSERT INTO update_task_events (
             event_id, task_id, sequence, kind, state, stage, recovery_state, error_code,
             created_unix_seconds
@@ -664,7 +943,7 @@ fn append_event(
             Uuid::new_v4().to_string(),
             task.task_id.to_string(),
             sequence,
-            enum_text(kind)?,
+            kind_text,
             enum_text(task.state)?,
             enum_text(task.stage)?,
             enum_text(task.recovery_state)?,
@@ -672,6 +951,7 @@ fn append_event(
             now_i64(now)?,
         ],
     )?;
+    ensure_one_row(affected, "append remote update task event")?;
     Ok(())
 }
 
@@ -680,17 +960,9 @@ fn reconcile_expired_leases(
     target_client_id: Option<Uuid>,
     now: u64,
 ) -> anyhow::Result<()> {
-    let tasks = active_leased_tasks(transaction)?;
+    let tasks = expired_leased_tasks(transaction, target_client_id, now)?;
     for task in tasks {
-        if target_client_id.is_some_and(|target| target != task.target_client_id) {
-            continue;
-        }
-        if task
-            .lease_deadline_unix_seconds
-            .is_none_or(|deadline| deadline <= now)
-        {
-            reconcile_lost_lease(transaction, task, now)?;
-        }
+        reconcile_lost_lease(transaction, task, now)?;
     }
     Ok(())
 }
@@ -700,7 +972,9 @@ fn reconcile_lost_lease(
     mut task: RemoteUpdateTask,
     now: u64,
 ) -> anyhow::Result<()> {
-    let event_kind = if task.cancel_requested {
+    let cancellation_is_known_safe =
+        task.stage == RemoteUpdateStage::Claimed || task.action.safe_to_requeue_after_lease_loss();
+    let event_kind = if task.cancel_requested && cancellation_is_known_safe {
         task.state = RemoteUpdateTaskState::Cancelled;
         task.stage = RemoteUpdateStage::Cancelled;
         task.recovery_state = RemoteUpdateRecoveryState::None;
@@ -805,18 +1079,19 @@ fn apply_worker_report(
             Ok(RemoteUpdateEventKind::StageReported)
         }
         RemoteUpdateWorkerReport::Succeeded { result }
-            if !task.cancel_requested
-                && matches!(task.state, RemoteUpdateTaskState::Running)
-                && matches!(
-                    task.stage,
-                    RemoteUpdateStage::Checking
-                        | RemoteUpdateStage::Downloading
-                        | RemoteUpdateStage::Applying
-                        | RemoteUpdateStage::Inspecting
-                        | RemoteUpdateStage::Recovering
-                        | RemoteUpdateStage::RollingBack
-                        | RemoteUpdateStage::AwaitingRestart
-                ) =>
+            if matches!(
+                task.state,
+                RemoteUpdateTaskState::Running | RemoteUpdateTaskState::CancelRequested
+            ) && matches!(
+                task.stage,
+                RemoteUpdateStage::Checking
+                    | RemoteUpdateStage::Downloading
+                    | RemoteUpdateStage::Applying
+                    | RemoteUpdateStage::Inspecting
+                    | RemoteUpdateStage::Recovering
+                    | RemoteUpdateStage::RollingBack
+                    | RemoteUpdateStage::AwaitingRestart
+            ) =>
         {
             task.state = RemoteUpdateTaskState::Succeeded;
             task.stage = RemoteUpdateStage::Completed;
@@ -835,7 +1110,11 @@ fn apply_worker_report(
         RemoteUpdateWorkerReport::Failed {
             error_code,
             recovery_state,
-        } if matches!(task.state, RemoteUpdateTaskState::Running) => {
+        } if matches!(
+            task.state,
+            RemoteUpdateTaskState::Running | RemoteUpdateTaskState::CancelRequested
+        ) =>
+        {
             task.state = RemoteUpdateTaskState::Failed;
             task.stage = RemoteUpdateStage::Failed;
             task.recovery_state = *recovery_state;
@@ -846,7 +1125,11 @@ fn apply_worker_report(
             clear_task_lease(task);
             Ok(RemoteUpdateEventKind::Failed)
         }
-        RemoteUpdateWorkerReport::Cancelled if task.cancel_requested => {
+        RemoteUpdateWorkerReport::Cancelled
+            if task.cancel_requested
+                && (task.stage == RemoteUpdateStage::Claimed
+                    || task.action.safe_to_requeue_after_lease_loss()) =>
+        {
             task.state = RemoteUpdateTaskState::Cancelled;
             task.stage = RemoteUpdateStage::Cancelled;
             task.recovery_state = RemoteUpdateRecoveryState::None;
@@ -865,7 +1148,7 @@ fn persist_task_after_report(
     transaction: &Transaction<'_>,
     task: &RemoteUpdateTask,
 ) -> anyhow::Result<()> {
-    transaction.execute(
+    let affected = transaction.execute(
         "UPDATE update_tasks SET state = ?1, stage = ?2, recovery_state = ?3,
             cancel_requested = ?4, lease_owner = ?5, lease_token_sha256 = CASE WHEN ?5 IS NULL THEN NULL ELSE lease_token_sha256 END,
             lease_deadline_unix_seconds = ?6, result_json = ?7, error_code = ?8,
@@ -885,6 +1168,7 @@ fn persist_task_after_report(
             task.task_id.to_string(),
         ],
     )?;
+    ensure_one_row(affected, "persist remote update task transition")?;
     Ok(())
 }
 
@@ -1025,6 +1309,14 @@ fn checked_deadline(now: u64, lease_seconds: u32) -> anyhow::Result<u64> {
         .ok_or_else(|| anyhow::anyhow!("remote update lease deadline overflowed"))
 }
 
+fn ensure_one_row(affected: usize, operation: &'static str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        affected == 1,
+        "{operation} affected {affected} rows instead of exactly one"
+    );
+    Ok(())
+}
+
 fn domain_error(error: UpdateTaskError) -> anyhow::Error {
     anyhow::Error::new(error)
 }
@@ -1114,7 +1406,11 @@ mod tests {
             .reconcile_after_restart(safe.lease_deadline_unix_seconds + 1)
             .unwrap();
         assert_eq!(
-            catalog.detail(safe.task.task_id).unwrap().task.state,
+            catalog
+                .detail(safe.task.task_id, safe.lease_deadline_unix_seconds + 1)
+                .unwrap()
+                .task
+                .state,
             RemoteUpdateTaskState::Queued
         );
 
@@ -1141,7 +1437,10 @@ mod tests {
         catalog
             .reconcile_after_restart(apply.lease_deadline_unix_seconds + 1)
             .unwrap();
-        let failed = catalog.detail(apply.task.task_id).unwrap().task;
+        let failed = catalog
+            .detail(apply.task.task_id, apply.lease_deadline_unix_seconds + 1)
+            .unwrap()
+            .task;
         assert_eq!(failed.state, RemoteUpdateTaskState::Failed);
         assert_eq!(
             failed.recovery_state,
@@ -1196,5 +1495,95 @@ mod tests {
             catalog.renew(client_id, task.task_id, &renew, 12),
             Err(UpdateTaskError::Contract(_))
         ));
+    }
+
+    #[test]
+    fn mutating_cancel_after_start_fails_closed_when_the_lease_is_lost() {
+        let client_id = Uuid::new_v4();
+        let catalog = catalog_with_client(client_id);
+        let task = catalog
+            .create(
+                &CreateRemoteUpdateTaskRequest {
+                    target_client_id: client_id,
+                    action: RemoteUpdateAction::Apply,
+                    idempotency_key: "apply-cancel-fail-closed".to_owned(),
+                    confirmation: "UPDATE".to_owned(),
+                },
+                "admin",
+                1,
+            )
+            .unwrap();
+        let worker = Uuid::new_v4();
+        let claim = catalog
+            .claim(
+                client_id,
+                &RemoteUpdateClaimRequest {
+                    worker_instance_id: worker,
+                    requested_lease_seconds: REMOTE_UPDATE_DEFAULT_LEASE_SECONDS,
+                },
+                2,
+            )
+            .unwrap()
+            .unwrap();
+        catalog
+            .report(
+                client_id,
+                task.task_id,
+                &RemoteUpdateReportRequest {
+                    worker_instance_id: worker,
+                    lease_token: claim.lease_token,
+                    report: RemoteUpdateWorkerReport::Started {
+                        stage: RemoteUpdateStage::Applying,
+                    },
+                },
+                3,
+            )
+            .unwrap();
+        catalog
+            .cancel(
+                task.task_id,
+                &CancelRemoteUpdateTaskRequest {
+                    confirmation: "CANCEL".to_owned(),
+                },
+                4,
+            )
+            .unwrap();
+        catalog
+            .sweep(claim.lease_deadline_unix_seconds + 1)
+            .unwrap();
+        let task = catalog
+            .detail(task.task_id, claim.lease_deadline_unix_seconds + 1)
+            .unwrap()
+            .task;
+        assert_eq!(task.state, RemoteUpdateTaskState::Failed);
+        assert_eq!(task.recovery_state, RemoteUpdateRecoveryState::FailedClosed);
+        assert_eq!(task.error_code, Some(RemoteUpdateErrorCode::FailedClosed));
+    }
+
+    #[test]
+    fn noisy_events_are_sampled_with_a_fixed_per_task_budget() {
+        let client_id = Uuid::new_v4();
+        let catalog = catalog_with_client(client_id);
+        let request = CreateRemoteUpdateTaskRequest {
+            target_client_id: client_id,
+            action: RemoteUpdateAction::Check,
+            idempotency_key: "bounded-replay-events".to_owned(),
+            confirmation: "CHECK".to_owned(),
+        };
+        let task = catalog.create(&request, "admin", 1).unwrap();
+        for now in 2..32 {
+            let replay = catalog.create(&request, "admin", now).unwrap();
+            assert_eq!(replay.task_id, task.task_id);
+        }
+        let detail = catalog.detail(task.task_id, 32).unwrap();
+        assert_eq!(
+            detail
+                .events
+                .iter()
+                .filter(|event| event.kind == RemoteUpdateEventKind::IdempotentReplay)
+                .count(),
+            MAX_REPLAY_EVENTS_PER_TASK as usize
+        );
+        assert!(detail.events.len() <= MAX_EVENTS_PER_TASK as usize);
     }
 }
