@@ -12,9 +12,7 @@ use crate::{
 use bytes::Bytes;
 use linklake_core::{
     read_control_frame, read_udp_data_plane_control_frame,
-    socks5_fragment::{
-        Socks5FragmentConfig, Socks5FragmentError, Socks5FragmentOutcome, Socks5FragmentReassembler,
-    },
+    socks5_fragment::{Socks5FragmentError, Socks5FragmentOutcome, Socks5FragmentReassembler},
     socks5_udp::{
         decode_socks5_udp_datagram, decode_socks5_udp_fragment, encode_socks5_udp_datagram,
         Socks5UdpError,
@@ -151,6 +149,7 @@ struct BindPeerConstraint {
 
 struct BoundListener {
     lease: Option<Box<dyn DynamicPortLease>>,
+    lease_activity: Option<BindLeaseActivity>,
     listener: TcpListener,
     advertised: SocketAddr,
 }
@@ -163,6 +162,7 @@ impl BoundListener {
                 tracing::debug!(lease_id = %lease_id, "SOCKS5 BIND lease release failed: {error}");
             }
         }
+        drop(self.lease_activity.take());
     }
 }
 
@@ -471,7 +471,10 @@ async fn run_udp_runtime(
     });
     let connection = authenticated.connection.clone();
     let mut reassembler = UdpReassembler::new(UdpReassemblyConfig::default())?;
-    let mut socks_fragments = Socks5FragmentReassembler::new(Socks5FragmentConfig::default())?;
+    let mut socks_fragments = Socks5FragmentReassembler::new_with_global_budget(
+        context.state.socks5_fragment_config,
+        context.state.socks5_fragment_budget.clone(),
+    )?;
     let mut receive_buffer = vec![0_u8; MAX_UDP_DATAGRAM_BYTES];
     let mut next_datagram_id = 1_u64;
     let mut usage_pending = 0_u64;
@@ -1165,9 +1168,7 @@ async fn serve_bind(
             return;
         }
     };
-    let lease_activity = BindLeaseActivity::begin(context.statistics.clone());
     serve_bound_listener(context, external, constraint, allowed_ips, bound, stop).await;
-    drop(lease_activity);
 }
 
 enum BindAcceptResult {
@@ -1412,6 +1413,7 @@ async fn bind_dynamic_listener(
         let advertised = bind_reply_address(local_ip, port);
         return Ok(BoundListener {
             lease: Some(lease),
+            lease_activity: Some(BindLeaseActivity::begin(context.statistics.clone())),
             listener,
             advertised,
         });

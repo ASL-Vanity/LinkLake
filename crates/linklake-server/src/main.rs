@@ -79,6 +79,7 @@ use http_route_catalog::{
     UpdateHttpRoutePolicy,
 };
 use lifecycle::{LifecycleController, LifecyclePhase, LifecycleSnapshot, LifecycleTransitionError};
+use linklake_core::socks5_fragment::{Socks5FragmentConfig, Socks5FragmentGlobalBudget};
 use linklake_core::{
     agent_enrollment_message, agent_instance_id_from_public_key, managed_config_revision, BoxedIo,
     BuildInfo, ClientEnrollmentRequest, ClientEnrollmentResponse, ManagedClientConfig,
@@ -91,7 +92,9 @@ use policy_service::{
     BindFleetCredential, FleetCredentialBinding, FleetPolicyKind, FleetReconcileRequest,
     FleetReconcileResult, FleetRuntimeInvalidation, FleetSourceStatus, PolicyService,
 };
-use public_port_policy::{PublicPortPolicy, PublicPortPolicyView};
+use public_port_policy::{
+    DynamicPortLeaseProvider, LocalDynamicPortLeaseProvider, PublicPortPolicy, PublicPortPolicyView,
+};
 use rusqlite::{params, Connection};
 use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use secret_tunnel_catalog::{
@@ -546,6 +549,9 @@ struct AppState {
     traffic_controls: Mutex<TrafficControlCatalog>,
     management_cookies_secure: bool,
     public_port_policy: PublicPortPolicy,
+    dynamic_port_leases: Arc<dyn DynamicPortLeaseProvider>,
+    socks5_fragment_config: Socks5FragmentConfig,
+    socks5_fragment_budget: Arc<Socks5FragmentGlobalBudget>,
     udp_public_bind_mode: PublicUdpBindMode,
     clients: Mutex<ClientRegistry>,
     tunnel_catalog: Mutex<TunnelCatalog>,
@@ -1116,6 +1122,14 @@ struct MetricsResponse {
     socks5_authentication_failures: u64,
     socks5_rejected_connections: u64,
     socks5_bind_rejected_total: u64,
+    socks5_bind_requests_total: u64,
+    socks5_bind_active_leases: usize,
+    socks5_bind_first_replies_total: u64,
+    socks5_bind_second_replies_total: u64,
+    socks5_bind_accept_timeouts_total: u64,
+    socks5_bind_peer_rejections_total: u64,
+    socks5_bind_failures_total: u64,
+    socks5_bind_cancellations_total: u64,
     socks5_bytes_from_public: u64,
     socks5_bytes_to_public: u64,
     socks5_handshake_errors: u64,
@@ -1131,6 +1145,16 @@ struct MetricsResponse {
     socks5_udp_dropped_datagrams: u64,
     socks5_udp_dropped_bandwidth_limit: u64,
     socks5_udp_fragmentation_unsupported_total: u64,
+    socks5_udp_fragments_from_public_total: u64,
+    socks5_udp_fragmented_datagrams_completed_total: u64,
+    socks5_udp_fragment_duplicates_total: u64,
+    socks5_udp_fragment_rejections_total: u64,
+    socks5_udp_fragment_budget_rejections_total: u64,
+    socks5_udp_fragment_timeouts_total: u64,
+    socks5_udp_fragment_source_rejections_total: u64,
+    socks5_udp_fragment_inflight_datagrams: usize,
+    socks5_udp_fragment_buffered_fragments: usize,
+    socks5_udp_fragment_buffered_bytes: usize,
     http_proxy_active_connections: usize,
     http_proxy_requests_total: u64,
     http_proxy_connect_requests: u64,
@@ -1672,8 +1696,8 @@ impl Socks5CapabilitiesView {
         Self {
             connect: true,
             udp_associate,
-            bind: false,
-            udp_fragmentation: false,
+            bind: true,
+            udp_fragmentation: udp_associate,
         }
     }
 }
@@ -1691,6 +1715,14 @@ struct Socks5ProxyView {
     rejected_connections: u64,
     unsupported_commands: u64,
     bind_rejected_total: u64,
+    bind_requests_total: u64,
+    bind_active_leases: usize,
+    bind_first_replies_total: u64,
+    bind_second_replies_total: u64,
+    bind_accept_timeouts_total: u64,
+    bind_peer_rejections_total: u64,
+    bind_failures_total: u64,
+    bind_cancellations_total: u64,
     handshake_errors: u64,
     handshake_timeouts: u64,
     bytes_from_public: u64,
@@ -1707,6 +1739,16 @@ struct Socks5ProxyView {
     udp_dropped_datagrams: u64,
     udp_dropped_bandwidth_limit: u64,
     udp_fragmentation_unsupported_total: u64,
+    udp_fragments_from_public_total: u64,
+    udp_fragmented_datagrams_completed_total: u64,
+    udp_fragment_duplicates_total: u64,
+    udp_fragment_rejections_total: u64,
+    udp_fragment_budget_rejections_total: u64,
+    udp_fragment_timeouts_total: u64,
+    udp_fragment_source_rejections_total: u64,
+    udp_fragment_inflight_datagrams: usize,
+    udp_fragment_buffered_fragments: usize,
+    udp_fragment_buffered_bytes: usize,
 }
 
 #[derive(Serialize)]
@@ -1895,6 +1937,11 @@ fn coded_http_route_creation_error(error: CreateHttpRouteError) -> CodedApiError
             StatusCode::BAD_REQUEST,
             "invalid_connection_limit",
             "HTTP route connection limit is invalid",
+        ),
+        CreateHttpRouteError::InvalidGrpcBackend => CodedApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_grpc_backend",
+            "gRPC backend TLS policy is invalid",
         ),
         CreateHttpRouteError::Database(_) => CodedApiError(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -4094,6 +4141,10 @@ async fn run_server(
     let management_cookies_secure = management_tls.is_some();
     let policy_service = PolicyService::open_with_database(&database, public_port_policy.clone())?;
     let instance_id = policy_service.local_instance_id()?.to_string();
+    let socks5_fragment_config = Socks5FragmentConfig::default();
+    let socks5_fragment_budget = Arc::new(Socks5FragmentGlobalBudget::from_config(
+        socks5_fragment_config,
+    ));
     let state = Arc::new(AppState {
         _database: database.clone(),
         started_at: Instant::now(),
@@ -4119,6 +4170,9 @@ async fn run_server(
         traffic_controls: Mutex::new(TrafficControlCatalog::open_with_database(&database)?),
         management_cookies_secure,
         public_port_policy: public_port_policy.clone(),
+        dynamic_port_leases: Arc::new(LocalDynamicPortLeaseProvider::default()),
+        socks5_fragment_config,
+        socks5_fragment_budget,
         udp_public_bind_mode,
         clients: Mutex::new(ClientRegistry::open_with_database(&database)?),
         tunnel_catalog: Mutex::new(TunnelCatalog::open_with_database(
@@ -5568,6 +5622,7 @@ async fn metrics(
             .map(|statistics| load(statistics))
             .sum()
     };
+    let socks5_fragment_budget = state.socks5_fragment_budget.snapshot();
     let http_proxy_statistics = state
         .http_proxy_statistics
         .lock()
@@ -5713,6 +5768,35 @@ async fn metrics(
         socks5_bind_rejected_total: sum_socks5_u64(|statistics| {
             statistics.bind_rejected_total.load(Ordering::Relaxed)
         }),
+        socks5_bind_requests_total: sum_socks5_u64(|statistics| {
+            statistics.bind_requests_total.load(Ordering::Relaxed)
+        }),
+        socks5_bind_active_leases: socks5_statistics
+            .values()
+            .map(|statistics| statistics.bind_active_leases.load(Ordering::Relaxed))
+            .sum(),
+        socks5_bind_first_replies_total: sum_socks5_u64(|statistics| {
+            statistics.bind_first_replies_total.load(Ordering::Relaxed)
+        }),
+        socks5_bind_second_replies_total: sum_socks5_u64(|statistics| {
+            statistics.bind_second_replies_total.load(Ordering::Relaxed)
+        }),
+        socks5_bind_accept_timeouts_total: sum_socks5_u64(|statistics| {
+            statistics
+                .bind_accept_timeouts_total
+                .load(Ordering::Relaxed)
+        }),
+        socks5_bind_peer_rejections_total: sum_socks5_u64(|statistics| {
+            statistics
+                .bind_peer_rejections_total
+                .load(Ordering::Relaxed)
+        }),
+        socks5_bind_failures_total: sum_socks5_u64(|statistics| {
+            statistics.bind_failures_total.load(Ordering::Relaxed)
+        }),
+        socks5_bind_cancellations_total: sum_socks5_u64(|statistics| {
+            statistics.bind_cancellations_total.load(Ordering::Relaxed)
+        }),
         socks5_bytes_from_public: sum_socks5_u64(|statistics| {
             statistics.bytes_from_public.load(Ordering::Relaxed)
         }),
@@ -5763,6 +5847,44 @@ async fn metrics(
                 .udp_fragmentation_unsupported_total
                 .load(Ordering::Relaxed)
         }),
+        socks5_udp_fragments_from_public_total: sum_socks5_u64(|statistics| {
+            statistics
+                .udp_fragments_from_public_total
+                .load(Ordering::Relaxed)
+        }),
+        socks5_udp_fragmented_datagrams_completed_total: sum_socks5_u64(|statistics| {
+            statistics
+                .udp_fragmented_datagrams_completed_total
+                .load(Ordering::Relaxed)
+        }),
+        socks5_udp_fragment_duplicates_total: sum_socks5_u64(|statistics| {
+            statistics
+                .udp_fragment_duplicates_total
+                .load(Ordering::Relaxed)
+        }),
+        socks5_udp_fragment_rejections_total: sum_socks5_u64(|statistics| {
+            statistics
+                .udp_fragment_rejections_total
+                .load(Ordering::Relaxed)
+        }),
+        socks5_udp_fragment_budget_rejections_total: sum_socks5_u64(|statistics| {
+            statistics
+                .udp_fragment_budget_rejections_total
+                .load(Ordering::Relaxed)
+        }),
+        socks5_udp_fragment_timeouts_total: sum_socks5_u64(|statistics| {
+            statistics
+                .udp_fragment_timeouts_total
+                .load(Ordering::Relaxed)
+        }),
+        socks5_udp_fragment_source_rejections_total: sum_socks5_u64(|statistics| {
+            statistics
+                .udp_fragment_source_rejections_total
+                .load(Ordering::Relaxed)
+        }),
+        socks5_udp_fragment_inflight_datagrams: socks5_fragment_budget.inflight_datagrams,
+        socks5_udp_fragment_buffered_fragments: socks5_fragment_budget.buffered_fragments,
+        socks5_udp_fragment_buffered_bytes: socks5_fragment_budget.buffered_bytes,
         http_proxy_active_connections: http_proxy_statistics
             .values()
             .map(|statistics| statistics.active_connections.load(Ordering::Relaxed))
@@ -11454,6 +11576,27 @@ async fn list_socks5_proxies(
                     }),
                     bind_rejected_total: current
                         .map_or(0, |value| value.bind_rejected_total.load(Ordering::Relaxed)),
+                    bind_requests_total: current
+                        .map_or(0, |value| value.bind_requests_total.load(Ordering::Relaxed)),
+                    bind_active_leases: current
+                        .map_or(0, |value| value.bind_active_leases.load(Ordering::Relaxed)),
+                    bind_first_replies_total: current.map_or(0, |value| {
+                        value.bind_first_replies_total.load(Ordering::Relaxed)
+                    }),
+                    bind_second_replies_total: current.map_or(0, |value| {
+                        value.bind_second_replies_total.load(Ordering::Relaxed)
+                    }),
+                    bind_accept_timeouts_total: current.map_or(0, |value| {
+                        value.bind_accept_timeouts_total.load(Ordering::Relaxed)
+                    }),
+                    bind_peer_rejections_total: current.map_or(0, |value| {
+                        value.bind_peer_rejections_total.load(Ordering::Relaxed)
+                    }),
+                    bind_failures_total: current
+                        .map_or(0, |value| value.bind_failures_total.load(Ordering::Relaxed)),
+                    bind_cancellations_total: current.map_or(0, |value| {
+                        value.bind_cancellations_total.load(Ordering::Relaxed)
+                    }),
                     handshake_errors: current
                         .map_or(0, |value| value.handshake_errors.load(Ordering::Relaxed)),
                     handshake_timeouts: current
@@ -11494,6 +11637,48 @@ async fn list_socks5_proxies(
                         value
                             .udp_fragmentation_unsupported_total
                             .load(Ordering::Relaxed)
+                    }),
+                    udp_fragments_from_public_total: current.map_or(0, |value| {
+                        value
+                            .udp_fragments_from_public_total
+                            .load(Ordering::Relaxed)
+                    }),
+                    udp_fragmented_datagrams_completed_total: current.map_or(0, |value| {
+                        value
+                            .udp_fragmented_datagrams_completed_total
+                            .load(Ordering::Relaxed)
+                    }),
+                    udp_fragment_duplicates_total: current.map_or(0, |value| {
+                        value.udp_fragment_duplicates_total.load(Ordering::Relaxed)
+                    }),
+                    udp_fragment_rejections_total: current.map_or(0, |value| {
+                        value.udp_fragment_rejections_total.load(Ordering::Relaxed)
+                    }),
+                    udp_fragment_budget_rejections_total: current.map_or(0, |value| {
+                        value
+                            .udp_fragment_budget_rejections_total
+                            .load(Ordering::Relaxed)
+                    }),
+                    udp_fragment_timeouts_total: current.map_or(0, |value| {
+                        value.udp_fragment_timeouts_total.load(Ordering::Relaxed)
+                    }),
+                    udp_fragment_source_rejections_total: current.map_or(0, |value| {
+                        value
+                            .udp_fragment_source_rejections_total
+                            .load(Ordering::Relaxed)
+                    }),
+                    udp_fragment_inflight_datagrams: current.map_or(0, |value| {
+                        value
+                            .udp_fragment_inflight_datagrams
+                            .load(Ordering::Relaxed)
+                    }),
+                    udp_fragment_buffered_fragments: current.map_or(0, |value| {
+                        value
+                            .udp_fragment_buffered_fragments
+                            .load(Ordering::Relaxed)
+                    }),
+                    udp_fragment_buffered_bytes: current.map_or(0, |value| {
+                        value.udp_fragment_buffered_bytes.load(Ordering::Relaxed)
                     }),
                     policy,
                 }
@@ -15015,7 +15200,7 @@ mod tests {
     use crate::{
         admin_auth::SessionIdentity,
         certificate_catalog::{CertificateState, CertificateStatus, RouteTlsMode, RouteTlsPolicy},
-        http_route_catalog::{CreateHttpRouteError, HttpRoutePolicy},
+        http_route_catalog::{CreateHttpRouteError, GrpcBackendTransport, HttpRoutePolicy},
         tcp_tunnel::TunnelStatistics,
         udp_tunnel::UdpTunnelStatisticsSnapshot,
     };
@@ -15041,6 +15226,9 @@ mod tests {
             hostname: hostname.to_owned(),
             target_addr: "127.0.0.1:8080".to_owned(),
             max_connections: 64,
+            grpc_backend_transport: GrpcBackendTransport::H2c,
+            grpc_backend_server_name: None,
+            grpc_backend_trust_profile: None,
             enabled,
         }
     }
@@ -15381,15 +15569,15 @@ mod tests {
             .expect("SOCKS5 capabilities should serialize");
         assert_eq!(tcp_only["connect"], true);
         assert_eq!(tcp_only["udp_associate"], false);
-        assert_eq!(tcp_only["bind"], false);
+        assert_eq!(tcp_only["bind"], true);
         assert_eq!(tcp_only["udp_fragmentation"], false);
 
         let tcp_and_udp = serde_json::to_value(Socks5CapabilitiesView::new(true))
             .expect("SOCKS5 capabilities should serialize");
         assert_eq!(tcp_and_udp["connect"], true);
         assert_eq!(tcp_and_udp["udp_associate"], true);
-        assert_eq!(tcp_and_udp["bind"], false);
-        assert_eq!(tcp_and_udp["udp_fragmentation"], false);
+        assert_eq!(tcp_and_udp["bind"], true);
+        assert_eq!(tcp_and_udp["udp_fragmentation"], true);
     }
 
     #[test]
