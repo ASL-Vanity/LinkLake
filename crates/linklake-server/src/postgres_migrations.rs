@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tokio_postgres::{Client, Transaction};
 
-pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 3;
+pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 4;
 const ADVISORY_LOCK_ID: i64 = 0x4c4c_4841_4d49_4752;
 
 const MIGRATION_V1_NAME: &str = "ha_coordination_foundation";
@@ -159,6 +159,66 @@ ALTER TABLE linklake_job_leases
     ALTER COLUMN lease_id SET NOT NULL;
 "#;
 
+const MIGRATION_V4_NAME: &str = "remote_update_coordination";
+const MIGRATION_V4_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS linklake_update_tasks (
+    task_id TEXT PRIMARY KEY,
+    target_client_id TEXT NOT NULL,
+    requested_by TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL CHECK(length(request_fingerprint) = 64),
+    state TEXT NOT NULL CHECK(state IN (
+        'queued', 'claimed', 'running', 'cancel_requested',
+        'succeeded', 'failed', 'cancelled'
+    )),
+    created_unix_seconds BIGINT NOT NULL CHECK(created_unix_seconds > 0),
+    lease_deadline_unix_seconds BIGINT,
+    lease_token_sha256 TEXT,
+    snapshot_json TEXT NOT NULL,
+    UNIQUE(requested_by, idempotency_key),
+    CHECK(
+        (lease_deadline_unix_seconds IS NULL AND lease_token_sha256 IS NULL)
+        OR
+        (lease_deadline_unix_seconds IS NOT NULL AND lease_deadline_unix_seconds > 0
+         AND lease_token_sha256 IS NOT NULL AND length(lease_token_sha256) = 64)
+    )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS linklake_update_tasks_one_active_target
+    ON linklake_update_tasks(target_client_id)
+    WHERE state IN ('queued', 'claimed', 'running', 'cancel_requested');
+CREATE INDEX IF NOT EXISTS linklake_update_tasks_target_created
+    ON linklake_update_tasks(target_client_id, created_unix_seconds DESC);
+CREATE INDEX IF NOT EXISTS linklake_update_tasks_claim_queue
+    ON linklake_update_tasks(target_client_id, state, created_unix_seconds ASC);
+CREATE INDEX IF NOT EXISTS linklake_update_tasks_active_lease
+    ON linklake_update_tasks(lease_deadline_unix_seconds)
+    WHERE state IN ('claimed', 'running', 'cancel_requested');
+
+CREATE TABLE IF NOT EXISTS linklake_update_task_events (
+    event_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES linklake_update_tasks(task_id) ON DELETE RESTRICT,
+    sequence BIGINT NOT NULL CHECK(sequence > 0),
+    kind TEXT NOT NULL,
+    created_unix_seconds BIGINT NOT NULL CHECK(created_unix_seconds > 0),
+    event_json TEXT NOT NULL,
+    UNIQUE(task_id, sequence)
+);
+CREATE INDEX IF NOT EXISTS linklake_update_task_events_sequence
+    ON linklake_update_task_events(task_id, sequence ASC);
+
+CREATE OR REPLACE FUNCTION linklake_reject_update_task_event_mutation()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'linklake_update_task_events is append-only';
+END;
+$$;
+DROP TRIGGER IF EXISTS linklake_update_task_events_no_mutation
+    ON linklake_update_task_events;
+CREATE TRIGGER linklake_update_task_events_no_mutation
+BEFORE UPDATE OR DELETE ON linklake_update_task_events
+FOR EACH ROW EXECUTE FUNCTION linklake_reject_update_task_event_mutation();
+"#;
+
 struct Migration {
     version: i64,
     name: &'static str,
@@ -192,6 +252,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 3,
         name: MIGRATION_V3_NAME,
         sql: MIGRATION_V3_SQL,
+    },
+    Migration {
+        version: 4,
+        name: MIGRATION_V4_NAME,
+        sql: MIGRATION_V4_SQL,
     },
 ];
 
@@ -400,6 +465,34 @@ async fn verify_schema_structure(transaction: &Transaction<'_>) -> anyhow::Resul
                 required("detected_at", "timestamptz"),
                 optional("resolved_at", "timestamptz"),
                 optional("resolution", "text"),
+            ],
+        },
+        TableExpectation {
+            name: "linklake_update_tasks",
+            primary_key: &["task_id"],
+            columns: &[
+                required("task_id", "text"),
+                required("target_client_id", "text"),
+                required("requested_by", "text"),
+                required("idempotency_key", "text"),
+                required("request_fingerprint", "text"),
+                required("state", "text"),
+                required("created_unix_seconds", "int8"),
+                optional("lease_deadline_unix_seconds", "int8"),
+                optional("lease_token_sha256", "text"),
+                required("snapshot_json", "text"),
+            ],
+        },
+        TableExpectation {
+            name: "linklake_update_task_events",
+            primary_key: &["event_id"],
+            columns: &[
+                required("event_id", "text"),
+                required("task_id", "text"),
+                required("sequence", "int8"),
+                required("kind", "text"),
+                required("created_unix_seconds", "int8"),
+                required("event_json", "text"),
             ],
         },
     ];

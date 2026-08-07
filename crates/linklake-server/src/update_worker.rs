@@ -45,14 +45,10 @@ pub(crate) fn spawn_update_task_sweeper(state: Arc<AppState>) -> tokio::task::Jo
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            let catalog = state
-                .update_tasks
-                .lock()
-                .expect("remote update task catalog lock poisoned");
-            if !catalog.is_maintenance_leader() {
+            if !state.update_tasks.is_maintenance_leader() {
                 continue;
             }
-            let result = catalog.sweep(unix_seconds());
+            let result = state.update_tasks.sweep(unix_seconds()).await;
             if let Err(error) = result {
                 tracing::error!(%error, "Remote update task lease sweep failed");
             }
@@ -69,9 +65,8 @@ pub(crate) async fn claim_remote_update_task(
     authenticate_worker(&state, client_id, &headers)?;
     let claim = state
         .update_tasks
-        .lock()
-        .expect("remote update task catalog lock poisoned")
         .claim(client_id, &request, unix_seconds())
+        .await
         .map_err(update_task_api_error)?;
     Ok(Json(RemoteUpdateClaimResponse { claim }))
 }
@@ -85,9 +80,8 @@ pub(crate) async fn renew_remote_update_task(
     authenticate_worker(&state, client_id, &headers)?;
     let response = state
         .update_tasks
-        .lock()
-        .expect("remote update task catalog lock poisoned")
         .renew(client_id, task_id, &request, unix_seconds())
+        .await
         .map_err(update_task_api_error)?;
     Ok(Json(response))
 }
@@ -101,9 +95,8 @@ pub(crate) async fn report_remote_update_task(
     authenticate_worker(&state, client_id, &headers)?;
     let task = state
         .update_tasks
-        .lock()
-        .expect("remote update task catalog lock poisoned")
         .report(client_id, task_id, &request, unix_seconds())
+        .await
         .map_err(update_task_api_error)?;
     Ok(Json(RemoteUpdateReportResponse { task }))
 }

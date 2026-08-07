@@ -138,7 +138,7 @@ use std::{
     task::Poll,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use storage::{CoordinationStorage, StorageConfig};
+use storage::{CoordinationStorage, StorageBackend, StorageConfig};
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch, Mutex as AsyncMutex, Semaphore};
 use tokio_rustls::{
@@ -156,7 +156,7 @@ use tunnel_catalog::{
     UpdateSocks5ProxyPolicy, UpdateTcpTunnelPolicy, UpdateUdpTunnelPolicy,
 };
 use udp_data_plane::{UdpDataPlane, UdpDataPlaneConfig};
-use update_tasks::{UpdateTaskCatalog, UpdateTaskCoordinationStorage};
+use update_tasks::{PostgresUpdateTaskCatalog, UpdateTaskCatalog, UpdateTaskCoordinationStorage};
 use uuid::Uuid;
 
 const MANAGEMENT_UI_DOCUMENT: &str = include_str!("../web/index.html");
@@ -573,7 +573,7 @@ struct AppState {
     policy_mutation_lock: AsyncMutex<()>,
     server_update_data_directory: Option<PathBuf>,
     server_update_operation_lock: AsyncMutex<()>,
-    update_tasks: Mutex<Box<dyn UpdateTaskCoordinationStorage>>,
+    update_tasks: Arc<dyn UpdateTaskCoordinationStorage>,
     fleet_health: Mutex<FleetHealthCatalog>,
     traffic_controls: Mutex<TrafficControlCatalog>,
     management_cookies_secure: bool,
@@ -4189,7 +4189,7 @@ async fn run_server(
     let storage_config = StorageConfig::from_environment()?;
     let coordination_storage = CoordinationStorage::open(&storage_config, &database).await?;
     let ha_runtime = Arc::new(HaRuntime::open(
-        coordination_storage,
+        coordination_storage.clone(),
         HaRuntimeConfig::from_environment(&instance_id)?,
     )?);
     let bootstrap_timeout = ha_runtime
@@ -4215,10 +4215,16 @@ async fn run_server(
     ));
     // 独立部署注入 SQLite 实现；HA 接线必须在这里替换为共享 PostgreSQL/账本实现。
     // 只有协调存储确认当前实例为 leader 时才允许驱动启动恢复与定时 sweep。
-    let update_tasks: Box<dyn UpdateTaskCoordinationStorage> =
-        Box::new(UpdateTaskCatalog::open(&database)?);
+    let update_tasks: Arc<dyn UpdateTaskCoordinationStorage> = match storage_config.backend() {
+        StorageBackend::Sqlite => Arc::new(UpdateTaskCatalog::open(&database)?),
+        StorageBackend::Postgres => Arc::new(PostgresUpdateTaskCatalog::open(
+            coordination_storage,
+            &database,
+            ha_runtime.clone(),
+        )?),
+    };
     if update_tasks.is_maintenance_leader() {
-        update_tasks.reconcile_after_restart(unix_seconds())?;
+        update_tasks.reconcile_after_restart(unix_seconds()).await?;
     }
     let state = Arc::new(AppState {
         _database: database.clone(),
@@ -4242,7 +4248,7 @@ async fn run_server(
         policy_mutation_lock: AsyncMutex::new(()),
         server_update_data_directory: data_dir.clone(),
         server_update_operation_lock: AsyncMutex::new(()),
-        update_tasks: Mutex::new(update_tasks),
+        update_tasks,
         fleet_health: Mutex::new(FleetHealthCatalog::open_with_database(&database)?),
         traffic_controls: Mutex::new(TrafficControlCatalog::open_with_database(&database)?),
         management_cookies_secure,

@@ -19,8 +19,12 @@ use linklake_core::remote_update::{
 use rusqlite::{params, OptionalExtension, Transaction};
 use serde::{de::DeserializeOwned, Serialize};
 use sha2::{Digest, Sha256};
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, future::Future, pin::Pin};
 use uuid::Uuid;
+
+#[path = "update_tasks_postgres.rs"]
+mod postgres;
+pub(crate) use postgres::PostgresUpdateTaskCatalog;
 
 const MAX_REQUESTED_BY_BYTES: usize = 128;
 const MAX_TASK_LIST_LIMIT: usize = 500;
@@ -333,8 +337,12 @@ pub(crate) enum UpdateTaskError {
     LeaseExpired,
     InvalidTransition,
     CapacityExceeded,
+    NotLeader,
     Storage(anyhow::Error),
 }
+
+pub(crate) type UpdateTaskFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, UpdateTaskError>> + Send + 'a>>;
 
 #[derive(Clone, Debug)]
 struct TerminalReportReplay {
@@ -357,66 +365,66 @@ impl TerminalReportReplay {
 ///
 /// HA 实现必须在共享事务中维持幂等键、单目标活动任务、lease CAS、追加事件序列和
 /// restart binding；`is_maintenance_leader` 只允许当前 leader 驱动启动恢复与 sweep。
-pub(crate) trait UpdateTaskCoordinationStorage: Send {
+pub(crate) trait UpdateTaskCoordinationStorage: Send + Sync {
     fn is_maintenance_leader(&self) -> bool;
 
-    fn create(
-        &self,
-        request: &CreateRemoteUpdateTaskRequest,
-        requested_by: &str,
+    fn create<'a>(
+        &'a self,
+        request: &'a CreateRemoteUpdateTaskRequest,
+        requested_by: &'a str,
         now: u64,
-    ) -> Result<RemoteUpdateTask, UpdateTaskError>;
+    ) -> UpdateTaskFuture<'a, RemoteUpdateTask>;
 
-    fn list(
-        &self,
+    fn list<'a>(
+        &'a self,
         target_client_id: Option<Uuid>,
         requested_limit: usize,
         now: u64,
-    ) -> Result<Vec<RemoteUpdateTask>, UpdateTaskError>;
+    ) -> UpdateTaskFuture<'a, Vec<RemoteUpdateTask>>;
 
-    fn detail(&self, task_id: Uuid, now: u64) -> Result<RemoteUpdateTaskDetail, UpdateTaskError>;
+    fn detail(&self, task_id: Uuid, now: u64) -> UpdateTaskFuture<'_, RemoteUpdateTaskDetail>;
 
-    fn reconcile_after_restart(&self, now: u64) -> Result<(), UpdateTaskError>;
+    fn reconcile_after_restart(&self, now: u64) -> UpdateTaskFuture<'_, ()>;
 
-    fn sweep(&self, now: u64) -> Result<(), UpdateTaskError>;
+    fn sweep(&self, now: u64) -> UpdateTaskFuture<'_, ()>;
 
-    fn claim(
-        &self,
+    fn claim<'a>(
+        &'a self,
         target_client_id: Uuid,
-        request: &RemoteUpdateClaimRequest,
+        request: &'a RemoteUpdateClaimRequest,
         now: u64,
-    ) -> Result<Option<RemoteUpdateClaim>, UpdateTaskError>;
+    ) -> UpdateTaskFuture<'a, Option<RemoteUpdateClaim>>;
 
-    fn renew(
-        &self,
-        target_client_id: Uuid,
-        task_id: Uuid,
-        request: &RemoteUpdateLeaseRenewRequest,
-        now: u64,
-    ) -> Result<RemoteUpdateLeaseRenewResponse, UpdateTaskError>;
-
-    fn reconcile(
-        &self,
+    fn renew<'a>(
+        &'a self,
         target_client_id: Uuid,
         task_id: Uuid,
-        request: &RemoteUpdateReconcileRequest,
+        request: &'a RemoteUpdateLeaseRenewRequest,
         now: u64,
-    ) -> Result<RemoteUpdateReconcileResponse, UpdateTaskError>;
+    ) -> UpdateTaskFuture<'a, RemoteUpdateLeaseRenewResponse>;
 
-    fn report(
-        &self,
+    fn reconcile<'a>(
+        &'a self,
         target_client_id: Uuid,
         task_id: Uuid,
-        request: &RemoteUpdateReportRequest,
+        request: &'a RemoteUpdateReconcileRequest,
         now: u64,
-    ) -> Result<RemoteUpdateTask, UpdateTaskError>;
+    ) -> UpdateTaskFuture<'a, RemoteUpdateReconcileResponse>;
 
-    fn cancel(
-        &self,
+    fn report<'a>(
+        &'a self,
+        target_client_id: Uuid,
         task_id: Uuid,
-        request: &CancelRemoteUpdateTaskRequest,
+        request: &'a RemoteUpdateReportRequest,
         now: u64,
-    ) -> Result<RemoteUpdateTask, UpdateTaskError>;
+    ) -> UpdateTaskFuture<'a, RemoteUpdateTask>;
+
+    fn cancel<'a>(
+        &'a self,
+        task_id: Uuid,
+        request: &'a CancelRemoteUpdateTaskRequest,
+        now: u64,
+    ) -> UpdateTaskFuture<'a, RemoteUpdateTask>;
 }
 
 impl fmt::Display for UpdateTaskError {
@@ -441,6 +449,9 @@ impl fmt::Display for UpdateTaskError {
             }
             Self::CapacityExceeded => {
                 formatter.write_str("remote update task retention capacity was reached")
+            }
+            Self::NotLeader => {
+                formatter.write_str("this instance is not the HA maintenance leader")
             }
             Self::Storage(error) => {
                 write!(formatter, "remote update task storage failed: {error:#}")
@@ -1009,82 +1020,90 @@ impl UpdateTaskCoordinationStorage for UpdateTaskCatalog {
         true
     }
 
-    fn create(
-        &self,
-        request: &CreateRemoteUpdateTaskRequest,
-        requested_by: &str,
+    fn create<'a>(
+        &'a self,
+        request: &'a CreateRemoteUpdateTaskRequest,
+        requested_by: &'a str,
         now: u64,
-    ) -> Result<RemoteUpdateTask, UpdateTaskError> {
-        UpdateTaskCatalog::create(self, request, requested_by, now)
+    ) -> UpdateTaskFuture<'a, RemoteUpdateTask> {
+        Box::pin(async move { UpdateTaskCatalog::create(self, request, requested_by, now) })
     }
 
-    fn list(
-        &self,
+    fn list<'a>(
+        &'a self,
         target_client_id: Option<Uuid>,
         requested_limit: usize,
         now: u64,
-    ) -> Result<Vec<RemoteUpdateTask>, UpdateTaskError> {
-        UpdateTaskCatalog::list(self, target_client_id, requested_limit, now)
+    ) -> UpdateTaskFuture<'a, Vec<RemoteUpdateTask>> {
+        Box::pin(
+            async move { UpdateTaskCatalog::list(self, target_client_id, requested_limit, now) },
+        )
     }
 
-    fn detail(&self, task_id: Uuid, now: u64) -> Result<RemoteUpdateTaskDetail, UpdateTaskError> {
-        UpdateTaskCatalog::detail(self, task_id, now)
+    fn detail(&self, task_id: Uuid, now: u64) -> UpdateTaskFuture<'_, RemoteUpdateTaskDetail> {
+        Box::pin(async move { UpdateTaskCatalog::detail(self, task_id, now) })
     }
 
-    fn reconcile_after_restart(&self, now: u64) -> Result<(), UpdateTaskError> {
-        UpdateTaskCatalog::reconcile_after_restart(self, now)
+    fn reconcile_after_restart(&self, now: u64) -> UpdateTaskFuture<'_, ()> {
+        Box::pin(async move { UpdateTaskCatalog::reconcile_after_restart(self, now) })
     }
 
-    fn sweep(&self, now: u64) -> Result<(), UpdateTaskError> {
-        UpdateTaskCatalog::sweep(self, now)
+    fn sweep(&self, now: u64) -> UpdateTaskFuture<'_, ()> {
+        Box::pin(async move { UpdateTaskCatalog::sweep(self, now) })
     }
 
-    fn claim(
-        &self,
+    fn claim<'a>(
+        &'a self,
         target_client_id: Uuid,
-        request: &RemoteUpdateClaimRequest,
+        request: &'a RemoteUpdateClaimRequest,
         now: u64,
-    ) -> Result<Option<RemoteUpdateClaim>, UpdateTaskError> {
-        UpdateTaskCatalog::claim(self, target_client_id, request, now)
+    ) -> UpdateTaskFuture<'a, Option<RemoteUpdateClaim>> {
+        Box::pin(async move { UpdateTaskCatalog::claim(self, target_client_id, request, now) })
     }
 
-    fn renew(
-        &self,
-        target_client_id: Uuid,
-        task_id: Uuid,
-        request: &RemoteUpdateLeaseRenewRequest,
-        now: u64,
-    ) -> Result<RemoteUpdateLeaseRenewResponse, UpdateTaskError> {
-        UpdateTaskCatalog::renew(self, target_client_id, task_id, request, now)
-    }
-
-    fn reconcile(
-        &self,
+    fn renew<'a>(
+        &'a self,
         target_client_id: Uuid,
         task_id: Uuid,
-        request: &RemoteUpdateReconcileRequest,
+        request: &'a RemoteUpdateLeaseRenewRequest,
         now: u64,
-    ) -> Result<RemoteUpdateReconcileResponse, UpdateTaskError> {
-        UpdateTaskCatalog::reconcile(self, target_client_id, task_id, request, now)
+    ) -> UpdateTaskFuture<'a, RemoteUpdateLeaseRenewResponse> {
+        Box::pin(
+            async move { UpdateTaskCatalog::renew(self, target_client_id, task_id, request, now) },
+        )
     }
 
-    fn report(
-        &self,
+    fn reconcile<'a>(
+        &'a self,
         target_client_id: Uuid,
         task_id: Uuid,
-        request: &RemoteUpdateReportRequest,
+        request: &'a RemoteUpdateReconcileRequest,
         now: u64,
-    ) -> Result<RemoteUpdateTask, UpdateTaskError> {
-        UpdateTaskCatalog::report(self, target_client_id, task_id, request, now)
+    ) -> UpdateTaskFuture<'a, RemoteUpdateReconcileResponse> {
+        Box::pin(async move {
+            UpdateTaskCatalog::reconcile(self, target_client_id, task_id, request, now)
+        })
     }
 
-    fn cancel(
-        &self,
+    fn report<'a>(
+        &'a self,
+        target_client_id: Uuid,
         task_id: Uuid,
-        request: &CancelRemoteUpdateTaskRequest,
+        request: &'a RemoteUpdateReportRequest,
         now: u64,
-    ) -> Result<RemoteUpdateTask, UpdateTaskError> {
-        UpdateTaskCatalog::cancel(self, task_id, request, now)
+    ) -> UpdateTaskFuture<'a, RemoteUpdateTask> {
+        Box::pin(
+            async move { UpdateTaskCatalog::report(self, target_client_id, task_id, request, now) },
+        )
+    }
+
+    fn cancel<'a>(
+        &'a self,
+        task_id: Uuid,
+        request: &'a CancelRemoteUpdateTaskRequest,
+        now: u64,
+    ) -> UpdateTaskFuture<'a, RemoteUpdateTask> {
+        Box::pin(async move { UpdateTaskCatalog::cancel(self, task_id, request, now) })
     }
 }
 
@@ -1350,6 +1369,12 @@ fn reconcile_lost_lease(
     mut task: RemoteUpdateTask,
     now: u64,
 ) -> anyhow::Result<()> {
+    let event_kind = apply_lost_lease(&mut task, now);
+    persist_task_after_report(transaction, &task, None)?;
+    append_event(transaction, &task, event_kind, now)
+}
+
+fn apply_lost_lease(task: &mut RemoteUpdateTask, now: u64) -> RemoteUpdateEventKind {
     let cancellation_is_known_safe =
         task.stage == RemoteUpdateStage::Claimed || task.action.safe_to_requeue_after_lease_loss();
     let event_kind = if task.cancel_requested && cancellation_is_known_safe {
@@ -1375,9 +1400,8 @@ fn reconcile_lost_lease(
     };
     task.updated_unix_seconds = now;
     task.restart = None;
-    clear_task_lease(&mut task);
-    persist_task_after_report(transaction, &task, None)?;
-    append_event(transaction, &task, event_kind, now)
+    clear_task_lease(task);
+    event_kind
 }
 
 fn replay_terminal_report(
@@ -1474,11 +1498,39 @@ fn authorize_lease(
         [task.task_id.to_string()],
         |row| row.get(0),
     )?;
-    let presented = lease_token_sha256(lease_token);
-    if !stored
-        .as_deref()
-        .is_some_and(|stored| constant_time_equal(stored.as_bytes(), presented.as_bytes()))
+    authorize_lease_token(
+        task,
+        stored.as_deref(),
+        worker_instance_id,
+        lease_token,
+        now,
+    )
+}
+
+fn authorize_lease_token(
+    task: &RemoteUpdateTask,
+    stored: Option<&str>,
+    worker_instance_id: &Uuid,
+    lease_token: Uuid,
+    now: u64,
+) -> anyhow::Result<()> {
+    if !matches!(
+        task.state,
+        RemoteUpdateTaskState::Claimed
+            | RemoteUpdateTaskState::Running
+            | RemoteUpdateTaskState::CancelRequested
+    ) || task.lease_owner != Some(*worker_instance_id)
     {
+        return Err(domain_error(UpdateTaskError::LeaseConflict));
+    }
+    if task
+        .lease_deadline_unix_seconds
+        .is_none_or(|deadline| deadline <= now)
+    {
+        return Err(domain_error(UpdateTaskError::LeaseExpired));
+    }
+    let presented = lease_token_sha256(lease_token);
+    if !stored.is_some_and(|stored| constant_time_equal(stored.as_bytes(), presented.as_bytes())) {
         return Err(domain_error(UpdateTaskError::LeaseConflict));
     }
     Ok(())

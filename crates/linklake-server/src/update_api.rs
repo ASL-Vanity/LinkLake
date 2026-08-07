@@ -48,9 +48,8 @@ pub(crate) async fn list_remote_update_tasks(
     )?;
     let tasks = state
         .update_tasks
-        .lock()
-        .expect("remote update task catalog lock poisoned")
         .list(query.target_client_id, query.limit, unix_seconds())
+        .await
         .map_err(update_task_api_error)?;
     Ok(Json(RemoteUpdateTaskList { tasks }))
 }
@@ -70,9 +69,8 @@ pub(crate) async fn create_remote_update_task(
     let now = unix_seconds();
     let task = state
         .update_tasks
-        .lock()
-        .expect("remote update task catalog lock poisoned")
         .create(&request, &principal.username, now)
+        .await
         .map_err(update_task_api_error)?;
     record_audit(
         &state,
@@ -105,9 +103,8 @@ pub(crate) async fn get_remote_update_task(
     )?;
     let detail = state
         .update_tasks
-        .lock()
-        .expect("remote update task catalog lock poisoned")
         .detail(task_id, unix_seconds())
+        .await
         .map_err(update_task_api_error)?;
     Ok(Json(detail))
 }
@@ -127,9 +124,8 @@ pub(crate) async fn cancel_remote_update_task(
     )?;
     let task = state
         .update_tasks
-        .lock()
-        .expect("remote update task catalog lock poisoned")
         .cancel(task_id, &request, unix_seconds())
+        .await
         .map_err(update_task_api_error)?;
     record_audit(
         &state,
@@ -215,6 +211,11 @@ pub(crate) fn update_task_api_error(error: UpdateTaskError) -> CodedApiError {
             StatusCode::INTERNAL_SERVER_ERROR,
             "remote_update_requester_invalid",
             "the authenticated requester cannot be persisted safely",
+        ),
+        UpdateTaskError::NotLeader => CodedApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "remote_update_not_leader",
+            "the active HA leader must handle this remote update operation",
         ),
         UpdateTaskError::Storage(error) => {
             tracing::error!(%error, "Remote update task storage failed");
