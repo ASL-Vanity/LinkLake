@@ -109,8 +109,8 @@ extension PolicyKindInfo on PolicyKind {
       zh ? '使用一次性访问密钥的私密转发' : 'Private forwarding protected by an access key',
     PolicyKind.socks5 =>
       zh
-          ? '支持 CONNECT 与可选 UDP ASSOCIATE 的 SOCKS5 代理'
-          : 'SOCKS5 CONNECT with optional UDP ASSOCIATE',
+          ? '支持 CONNECT、BIND、UDP ASSOCIATE 与 UDP FRAG 的 SOCKS5 代理'
+          : 'SOCKS5 proxy with CONNECT, BIND, UDP ASSOCIATE, and UDP FRAG',
     PolicyKind.proxy =>
       zh
           ? '支持普通请求和 CONNECT 的 HTTP 代理'
@@ -973,15 +973,41 @@ class _PolicyPageState extends State<PolicyPage> {
     final capabilities = policy['capabilities'] is Map
         ? Map<String, dynamic>.from(policy['capabilities'] as Map)
         : const <String, dynamic>{};
-    if (capabilities['udp_associate'] == true) {
+    if (capabilities['connect'] == true &&
+        capabilities['bind'] == true &&
+        capabilities['udp_associate'] == true &&
+        capabilities['udp_fragmentation'] == true) {
       return t(
-        'CONNECT 与 UDP ASSOCIATE 当前可用；BIND 与 UDP FRAG 按设计不受支持。',
-        'CONNECT and UDP ASSOCIATE are available. BIND and UDP FRAG are intentionally unsupported.',
+        'CONNECT、BIND、UDP ASSOCIATE 与 UDP FRAG 当前均可用。',
+        'CONNECT and UDP ASSOCIATE are available. BIND and UDP FRAG are also available.',
       );
     }
+    if (capabilities['connect'] == true &&
+        capabilities['bind'] == true &&
+        capabilities['udp_associate'] == false &&
+        capabilities['udp_fragmentation'] == false) {
+      return t(
+        'CONNECT 与 BIND 当前可用；UDP relay 未启用，因此 UDP ASSOCIATE 与 UDP FRAG 不可用。',
+        'CONNECT and BIND are available. UDP ASSOCIATE and UDP FRAG are unavailable because the UDP relay is disabled.',
+      );
+    }
+    const entries = <(String, String)>[
+      ('CONNECT', 'connect'),
+      ('BIND', 'bind'),
+      ('UDP ASSOCIATE', 'udp_associate'),
+      ('UDP FRAG', 'udp_fragmentation'),
+    ];
+    final available = entries
+        .where((entry) => capabilities[entry.$2] == true)
+        .map((entry) => entry.$1)
+        .join(', ');
+    final unavailable = entries
+        .where((entry) => capabilities[entry.$2] != true)
+        .map((entry) => entry.$1)
+        .join(', ');
     return t(
-      'CONNECT 当前可用；UDP relay 未启用，因此 UDP ASSOCIATE 不可用；BIND 与 UDP FRAG 按设计不受支持。',
-      'CONNECT is available. UDP ASSOCIATE is unavailable because the UDP relay is disabled. BIND and UDP FRAG are intentionally unsupported.',
+      '可用：${available.isEmpty ? '—' : available}。不可用或未上报：${unavailable.isEmpty ? '—' : unavailable}。',
+      'Available: ${available.isEmpty ? '—' : available}. Unavailable or not reported: ${unavailable.isEmpty ? '—' : unavailable}.',
     );
   }
 
@@ -1087,8 +1113,20 @@ class _PolicyPageState extends State<PolicyPage> {
     PolicyKind.socks5 => [
       (t('活动', 'Active'), '${policy['active_connections'] ?? 0}'),
       (t('请求', 'Requests'), '${policy['requests_total'] ?? 0}'),
+      (
+        'BIND ${t('活动', 'active')}/${t('请求', 'requests')}',
+        '${policy['bind_active_leases'] ?? 0}/${policy['bind_requests_total'] ?? 0}',
+      ),
       ('UDP', '${policy['udp_active_associations'] ?? 0}'),
+      (
+        'UDP FRAG ${t('完成', 'completed')}/${t('失败', 'failed')}',
+        '${policy['udp_fragmented_datagrams_completed_total'] ?? 0}/${_socks5FragmentFailures(policy)}',
+      ),
       (t('失败', 'Failed'), '${_errors(policy)}'),
+      (
+        t('流量', 'Traffic'),
+        '${_formatBytes((policy['bytes_from_public'] as num? ?? 0) + (policy['udp_bytes_from_public'] as num? ?? 0))} / ${_formatBytes((policy['bytes_to_public'] as num? ?? 0) + (policy['udp_bytes_to_public'] as num? ?? 0))}',
+      ),
     ],
     PolicyKind.proxy => [
       (t('活动', 'Active'), '${policy['active_connections'] ?? 0}'),
@@ -1116,10 +1154,24 @@ class _PolicyPageState extends State<PolicyPage> {
           ? (value['udp_active_associations'] as num? ?? 0)
           : 0);
 
-  num _errors(Map<String, dynamic> value) =>
-      (value['authentication_failures'] as num? ?? 0) +
-      (value['connect_failures'] as num? ?? 0) +
-      (value['malformed_requests'] as num? ?? 0);
+  num _errors(Map<String, dynamic> value) {
+    final common =
+        (value['authentication_failures'] as num? ?? 0) +
+        (value['connect_failures'] as num? ?? 0) +
+        (value['malformed_requests'] as num? ?? 0);
+    if (widget.kind != PolicyKind.socks5) return common;
+    return common +
+        (value['handshake_errors'] as num? ?? 0) +
+        (value['bind_failures_total'] as num? ?? 0) +
+        (value['bind_accept_timeouts_total'] as num? ?? 0) +
+        (value['bind_peer_rejections_total'] as num? ?? 0) +
+        _socks5FragmentFailures(value);
+  }
+
+  num _socks5FragmentFailures(Map<String, dynamic> value) =>
+      (value['udp_fragment_rejections_total'] as num? ?? 0) +
+      (value['udp_fragment_timeouts_total'] as num? ?? 0) +
+      (value['udp_fragment_source_rejections_total'] as num? ?? 0);
 
   String _formatBytes(Object? raw) {
     var value = (raw as num? ?? 0).toDouble();
@@ -1497,8 +1549,13 @@ class _PolicyInsights extends StatelessWidget {
       return (value['bytes_from_visitor'] as num? ?? 0) +
           (value['bytes_to_visitor'] as num? ?? 0);
     }
-    return (value['bytes_from_public'] as num? ?? 0) +
+    final publicTraffic =
+        (value['bytes_from_public'] as num? ?? 0) +
         (value['bytes_to_public'] as num? ?? 0);
+    if (kind != PolicyKind.socks5) return publicTraffic;
+    return publicTraffic +
+        (value['udp_bytes_from_public'] as num? ?? 0) +
+        (value['udp_bytes_to_public'] as num? ?? 0);
   }
 
   String _formatBytes(num raw) {

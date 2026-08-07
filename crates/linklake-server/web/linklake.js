@@ -11,10 +11,10 @@
           trafficTrend: 'Traffic trend', trafficTrendHelp: 'Server-side traffic history is persisted for up to 30 days.', inbound: 'Inbound', outbound: 'Outbound', activeSessions: 'Active sessions', noTrendData: 'Waiting for enough samples to calculate throughput.', noTrafficRange: 'No traffic in the selected range.',
           serviceHealth: 'Service health', serviceHealthHelp: 'Online policies by protocol.', certificateSummary: 'Certificates', alerts: 'Alerts', noAlerts: 'No active alerts.', clients: 'Clients', forwardingServices: 'Forwarding services', p2pNodes: 'Fresh / total P2P nodes', totalTraffic: 'Total traffic', configIssues: 'Configuration issues',
           protocolActivity: 'Protocol activity', protocolActivityHelp: 'Current active connections and sessions.', failureOverview: 'Failure overview', failureOverviewHelp: 'Cumulative failures since server startup.', serverUptime: 'Server uptime', requestsTotal: 'Requests', failuresTotal: 'Failures', reconnects: 'Reconnects', authenticationFailures: 'Authentication failures',
-          tcpMetrics: 'TCP', udpMetrics: 'UDP', webMetrics: 'Web / TLS', proxyMetrics: 'Forward proxies', p2pMetrics: 'P2P', certificateMetrics: 'Certificates / ACME', systemMetrics: 'System', active: 'Active', pending: 'Pending', sessions: 'Sessions', packets: 'Packets', traffic: 'Traffic in / out', rejected: 'Rejected', failed: 'Failed', timeouts: 'Timeouts', transportErrors: 'Transport errors', drops: 'Drops', connections: 'Connections', direct: 'Direct', relay: 'Relay', managed: 'Managed', valid: 'Valid', expiring: 'Expiring soon', expired: 'Expired', nearestExpiry: 'Nearest expiry', orders: 'Orders', renewals: 'Renewals', challenges: 'HTTP-01 challenges',
+          tcpMetrics: 'TCP', udpMetrics: 'UDP', webMetrics: 'Web / TLS', proxyMetrics: 'Forward proxies', p2pMetrics: 'P2P', certificateMetrics: 'Certificates / ACME', systemMetrics: 'System', active: 'Active', pending: 'Pending', sessions: 'Sessions', packets: 'Packets', traffic: 'Traffic in / out', rejected: 'Rejected', failed: 'Failed', completed: 'Completed', timeouts: 'Timeouts', transportErrors: 'Transport errors', drops: 'Drops', connections: 'Connections', direct: 'Direct', relay: 'Relay', managed: 'Managed', valid: 'Valid', expiring: 'Expiring soon', expired: 'Expired', nearestExpiry: 'Nearest expiry', orders: 'Orders', renewals: 'Renewals', challenges: 'HTTP-01 challenges',
           newPolicy: 'New policy', editPolicy: 'Edit', duplicate: 'Duplicate', enable: 'Enable', disable: 'Disable', delete: 'Delete', cancel: 'Cancel', save: 'Save', create: 'Create', saving: 'Saving…', search: 'Search', searchPolicies: 'Search by name, endpoint or client', status: 'Status', allStatuses: 'All statuses', online: 'Online', offline: 'Offline', enabled: 'Enabled', disabled: 'Disabled', all: 'All', policyCount: '{visible} of {total}', noPolicies: 'No policies match the current filters.', confirmDelete: 'Delete this policy and close its active sessions?', policyCreated: 'Policy created.', policyUpdated: 'Policy updated.', policyDeleted: 'Policy deleted.', policyEnabled: 'Policy enabled.', policyDisabled: 'Policy disabled.', exportPolicies: 'Export', exportCsv: 'Export CSV', importPolicies: 'Import', selectVisible: 'Select visible', selectedPolicies: '{count} selected', migrateClient: 'Migrate client', bulkCompleted: 'Bulk operation completed.', importCompleted: '{count} policies imported.', invalidImport: 'The policy import file is invalid.', confirmBulkDelete: 'Delete {count} selected policies and close their active sessions?', trafficControl: 'Traffic control', trafficControlHelp: 'Restrict sources, new connections, daily traffic and active UTC time windows.', allowedCidrs: 'Allowed CIDRs', deniedCidrs: 'Denied CIDRs', cidrPlaceholder: 'One CIDR per line, such as 203.0.113.0/24', connectionRate: 'New connections / minute', dailyQuota: 'Daily quota (MiB)', activeWeekdays: 'Weekdays UTC (0-6)', weekdaysPlaceholder: '0,1,2,3,4 for Monday-Friday', activeWindow: 'UTC active window', usageToday: 'Used today: {value}', trafficControlSaved: 'Traffic control saved.', targetPoolHelp: 'Use commas for multiple targets and @weight for weighted routing, for example 127.0.0.1:2333@2,127.0.0.1:2444@1.',
           tcpTitle: 'TCP tunnels', tcpSubtitle: 'Expose a TCP port and forward each connection to a selected client.', udpTitle: 'UDP tunnels', udpSubtitle: 'Forward UDP datagrams with session tracking and bandwidth controls.', portsTitle: 'Port groups', portsSubtitle: 'Manage multiple TCP or UDP port mappings as one policy.', httpTitle: 'HTTP / HTTPS routes', httpSubtitle: 'Route HTTP/1.1, HTTP/2 and native gRPC by hostname with optional automatic HTTPS.', httpTransportCapabilities: 'Public HTTP/1.1 and HTTP/2 are supported. Native gRPC uses a pooled h2c backend; HTTPS negotiates h2 with ALPN.', sniTitle: 'TLS SNI pass-through', sniSubtitle: 'Forward TLS connections by SNI without terminating TLS.', secretTitle: 'Secret tunnels', secretSubtitle: 'Credential-based private access between provider and visitor clients.', socks5Title: 'SOCKS5 proxy', socks5Subtitle: 'Expose authenticated SOCKS5 TCP and UDP access.', httpProxyTitle: 'HTTP forward proxy', httpProxySubtitle: 'Expose an authenticated HTTP and CONNECT proxy.', acmeTitle: 'ACME automation', acmeSubtitle: 'Configure certificate issuance and renewal for HTTP routes.',
-          socks5CapabilitiesWithUdp: 'CONNECT and UDP ASSOCIATE are available. BIND and UDP FRAG are intentionally unsupported.', socks5CapabilitiesTcpOnly: 'CONNECT is available. UDP ASSOCIATE is unavailable because the UDP relay is disabled. BIND and UDP FRAG are intentionally unsupported.',
+          socks5CapabilitiesWithUdp: 'CONNECT and UDP ASSOCIATE are available. BIND and UDP FRAG are also available.', socks5CapabilitiesTcpOnly: 'CONNECT and BIND are available. UDP ASSOCIATE and UDP FRAG are unavailable because the UDP relay is disabled.', socks5CapabilitiesPartial: 'Available: {available}. Unavailable or not reported: {unavailable}.',
           client: 'Client', name: 'Name', tunnelName: 'Tunnel name', routeName: 'Route name', proxyName: 'Proxy name', publicPort: 'Public port', targetAddress: 'Target address', maxConnections: 'Maximum connections', bandwidthLimit: 'Bandwidth limit (B/s)', maxSessions: 'Maximum sessions', idleTimeout: 'Idle timeout (seconds)', protocol: 'Protocol', publicPorts: 'Public ports', targetHost: 'Target host', targetPorts: 'Target ports', hostname: 'Hostname', tlsMode: 'TLS mode', tlsDisabled: 'Disabled', tlsAutomatic: 'Automatic ACME', redirectHttps: 'Redirect HTTP to HTTPS', providerClient: 'Provider client', allowedVisitor: 'Allowed visitor client', anyAuthenticatedClient: 'Any authenticated client', proxyUsername: 'Proxy username', optional: 'Optional', unlimited: 'Unlimited', selectClient: 'Select a client', noClients: 'No enrolled clients are available.',
           createTcp: 'Create TCP tunnel', editTcp: 'Edit TCP tunnel', createUdp: 'Create UDP tunnel', editUdp: 'Edit UDP tunnel', createPorts: 'Create port group', editPorts: 'Edit port group', createHttp: 'Create HTTP route', editHttp: 'Edit HTTP route', createSni: 'Create SNI route', editSni: 'Edit SNI route', createSecret: 'Create secret tunnel', editSecret: 'Edit secret tunnel', createSocks5: 'Create SOCKS5 proxy', editSocks5: 'Edit SOCKS5 proxy', createHttpProxy: 'Create HTTP proxy', editHttpProxy: 'Edit HTTP proxy',
           secretCreated: 'Copy this access key now. It will not be shown again: {key}', socks5Created: 'Copy these SOCKS5 credentials now. Username: {username} Password: {password}', httpProxyCreated: 'Copy these HTTP proxy credentials now. Username: {username} Password: {password}',
@@ -39,10 +39,10 @@
           trafficTrend: '流量趋势', trafficTrendHelp: '服务端持久化保留最多 30 天流量历史。', inbound: '入站', outbound: '出站', activeSessions: '活跃会话', noTrendData: '正在等待足够的样本以计算实时速率。', noTrafficRange: '所选时间范围内没有流量。',
           serviceHealth: '服务健康度', serviceHealthHelp: '按协议查看在线策略数量。', certificateSummary: '证书摘要', alerts: '告警', noAlerts: '当前没有活动告警。', clients: '客户端', forwardingServices: '转发服务', p2pNodes: '新鲜 / 全部 P2P 节点', totalTraffic: '累计流量', configIssues: '配置问题',
           protocolActivity: '协议活动', protocolActivityHelp: '当前活跃连接和会话。', failureOverview: '故障概览', failureOverviewHelp: '服务启动以来的累计故障。', serverUptime: '运行时间', requestsTotal: '请求数', failuresTotal: '故障数', reconnects: '重连次数', authenticationFailures: '认证失败',
-          tcpMetrics: 'TCP', udpMetrics: 'UDP', webMetrics: '网站 / TLS', proxyMetrics: '正向代理', p2pMetrics: 'P2P', certificateMetrics: '证书 / ACME', systemMetrics: '系统', active: '活跃', pending: '待配对', sessions: '会话', packets: '数据包', traffic: '入站 / 出站流量', rejected: '拒绝', failed: '失败', timeouts: '超时', transportErrors: '传输错误', drops: '丢弃', connections: '连接', direct: '直连', relay: '中继', managed: '托管', valid: '有效', expiring: '即将到期', expired: '已过期', nearestExpiry: '最近到期', orders: '订单', renewals: '续期', challenges: 'HTTP-01 挑战',
+          tcpMetrics: 'TCP', udpMetrics: 'UDP', webMetrics: '网站 / TLS', proxyMetrics: '正向代理', p2pMetrics: 'P2P', certificateMetrics: '证书 / ACME', systemMetrics: '系统', active: '活跃', pending: '待配对', sessions: '会话', packets: '数据包', traffic: '入站 / 出站流量', rejected: '拒绝', failed: '失败', completed: '完成', timeouts: '超时', transportErrors: '传输错误', drops: '丢弃', connections: '连接', direct: '直连', relay: '中继', managed: '托管', valid: '有效', expiring: '即将到期', expired: '已过期', nearestExpiry: '最近到期', orders: '订单', renewals: '续期', challenges: 'HTTP-01 挑战',
           newPolicy: '新建策略', editPolicy: '编辑', duplicate: '复制', enable: '启用', disable: '停用', delete: '删除', cancel: '取消', save: '保存', create: '创建', saving: '正在保存…', search: '搜索', searchPolicies: '按名称、端点或客户端搜索', status: '状态', allStatuses: '全部状态', online: '在线', offline: '离线', enabled: '已启用', disabled: '已停用', all: '全部', policyCount: '显示 {visible} / {total}', noPolicies: '没有符合当前筛选条件的策略。', confirmDelete: '确定删除此策略并关闭活动会话吗？', policyCreated: '策略已创建。', policyUpdated: '策略已更新。', policyDeleted: '策略已删除。', policyEnabled: '策略已启用。', policyDisabled: '策略已停用。', exportPolicies: '导出', exportCsv: '导出 CSV', importPolicies: '导入', selectVisible: '选择当前结果', selectedPolicies: '已选择 {count} 项', migrateClient: '迁移客户端', bulkCompleted: '批量操作已完成。', importCompleted: '已导入 {count} 条策略。', invalidImport: '策略导入文件无效。', confirmBulkDelete: '确定删除选中的 {count} 条策略并关闭活动会话吗？', trafficControl: '流量控制', trafficControlHelp: '限制来源、新建连接速率、每日流量和 UTC 生效时段。', allowedCidrs: '允许的 CIDR', deniedCidrs: '拒绝的 CIDR', cidrPlaceholder: '每行一个 CIDR，例如 203.0.113.0/24', connectionRate: '每分钟新建连接数', dailyQuota: '每日配额（MiB）', activeWeekdays: 'UTC 生效星期（0-6）', weekdaysPlaceholder: '0,1,2,3,4 表示周一到周五', activeWindow: 'UTC 生效时段', usageToday: '今日已用：{value}', trafficControlSaved: '流量控制已保存。', targetPoolHelp: '多个目标用逗号分隔，使用 @权重 进行加权路由，例如 127.0.0.1:2333@2,127.0.0.1:2444@1。',
           tcpTitle: 'TCP 隧道', tcpSubtitle: '开放一个 TCP 端口，并将每个连接转发到指定客户端。', udpTitle: 'UDP 隧道', udpSubtitle: '通过会话跟踪和带宽控制转发 UDP 数据报。', portsTitle: '端口组', portsSubtitle: '将多个 TCP 或 UDP 端口映射作为一项策略管理。', httpTitle: 'HTTP / HTTPS 路由', httpSubtitle: '按域名转发 HTTP/1.1、HTTP/2 与原生 gRPC，并可自动管理 HTTPS 证书。', httpTransportCapabilities: '公网支持 HTTP/1.1 与 HTTP/2。原生 gRPC 使用复用的 h2c 后端连接池；HTTPS 通过 ALPN 协商 h2。', sniTitle: 'TLS SNI 原样透传', sniSubtitle: '根据 SNI 转发 TLS 连接，不在服务端终止 TLS。', secretTitle: '私密隧道', secretSubtitle: '通过一次性凭据在服务提供端和访问端之间建立私密连接。', socks5Title: 'SOCKS5 代理', socks5Subtitle: '开放带认证的 SOCKS5 TCP 和 UDP 访问。', httpProxyTitle: 'HTTP 正向代理', httpProxySubtitle: '开放带认证的 HTTP 和 CONNECT 代理。', acmeTitle: 'ACME 自动化', acmeSubtitle: '配置 HTTP 路由的证书签发和自动续期。',
-          socks5CapabilitiesWithUdp: 'CONNECT 与 UDP ASSOCIATE 当前可用；BIND 与 UDP FRAG 按设计不受支持。', socks5CapabilitiesTcpOnly: 'CONNECT 当前可用；UDP relay 未启用，因此 UDP ASSOCIATE 不可用；BIND 与 UDP FRAG 按设计不受支持。',
+          socks5CapabilitiesWithUdp: 'CONNECT、BIND、UDP ASSOCIATE 与 UDP FRAG 当前均可用。', socks5CapabilitiesTcpOnly: 'CONNECT 与 BIND 当前可用；UDP relay 未启用，因此 UDP ASSOCIATE 与 UDP FRAG 不可用。', socks5CapabilitiesPartial: '可用：{available}。不可用或未上报：{unavailable}。',
           client: '客户端', name: '名称', tunnelName: '隧道名称', routeName: '路由名称', proxyName: '代理名称', publicPort: '公网端口', targetAddress: '目标地址', maxConnections: '最大连接数', bandwidthLimit: '带宽上限（B/s）', maxSessions: '最大会话数', idleTimeout: '空闲超时（秒）', protocol: '协议', publicPorts: '公网端口', targetHost: '目标主机', targetPorts: '目标端口', hostname: '域名', tlsMode: 'TLS 模式', tlsDisabled: '停用', tlsAutomatic: '自动 ACME', redirectHttps: '将 HTTP 重定向到 HTTPS', providerClient: '服务提供客户端', allowedVisitor: '允许访问的客户端', anyAuthenticatedClient: '任意已认证客户端', proxyUsername: '代理用户名', optional: '可选', unlimited: '不限速', selectClient: '选择客户端', noClients: '当前没有已注册客户端。',
           createTcp: '新建 TCP 隧道', editTcp: '编辑 TCP 隧道', createUdp: '新建 UDP 隧道', editUdp: '编辑 UDP 隧道', createPorts: '新建端口组', editPorts: '编辑端口组', createHttp: '新建 HTTP 路由', editHttp: '编辑 HTTP 路由', createSni: '新建 SNI 路由', editSni: '编辑 SNI 路由', createSecret: '新建私密隧道', editSecret: '编辑私密隧道', createSocks5: '新建 SOCKS5 代理', editSocks5: '编辑 SOCKS5 代理', createHttpProxy: '新建 HTTP 代理', editHttpProxy: '编辑 HTTP 代理',
           secretCreated: '请立即复制访问密钥，此后不会再次显示：{key}', socks5Created: '请立即复制 SOCKS5 凭据。用户名：{username} 密码：{password}', httpProxyCreated: '请立即复制 HTTP 代理凭据。用户名：{username} 密码：{password}',
@@ -1138,7 +1138,12 @@
         const metrics = dashboard.metrics;
         const activeTotal = metrics.tcp_active_connections + metrics.udp_active_sessions + metrics.http_active_connections + metrics.https_active_connections + metrics.sni_active_connections + metrics.socks5_active_connections + metrics.socks5_udp_active_associations + metrics.http_proxy_active_connections;
         const requestTotal = metrics.socks5_requests_total + metrics.http_proxy_requests_total + metrics.http_requests_total + metrics.https_requests_total;
-        const failureTotal = metrics.tcp_failed_connections + metrics.udp_dropped_packets + metrics.http_failed_requests + metrics.https_handshake_failures_total + metrics.socks5_authentication_failures + metrics.http_proxy_authentication_failures;
+        const socks5FailureTotal = sumMetrics([
+          'socks5_authentication_failures', 'socks5_connect_failures', 'socks5_handshake_errors',
+          'socks5_bind_failures_total', 'socks5_bind_accept_timeouts_total', 'socks5_bind_peer_rejections_total',
+          'socks5_udp_fragment_rejections_total', 'socks5_udp_fragment_timeouts_total', 'socks5_udp_fragment_source_rejections_total'
+        ]);
+        const failureTotal = metrics.tcp_failed_connections + metrics.udp_dropped_packets + metrics.http_failed_requests + metrics.https_handshake_failures_total + socks5FailureTotal + metrics.http_proxy_authentication_failures;
         const traffic = aggregateTraffic();
         elements.metrics_kpis.replaceChildren(
           createKpi(formatDuration(metrics.uptime_seconds), t('serverUptime')),
@@ -1160,7 +1165,7 @@
           { label: 'TCP', value: metrics.tcp_failed_connections + metrics.tcp_rejected_policy_limit + metrics.tcp_rejected_global_limit + metrics.tcp_rejected_pending_limit },
           { label: 'UDP', value: metrics.udp_dropped_packets + metrics.udp_transport_errors },
           { label: 'Web', value: metrics.http_failed_requests + metrics.https_handshake_failures_total + metrics.sni_client_hello_errors + metrics.sni_unknown_hostname },
-          { label: 'SOCKS5', value: metrics.socks5_authentication_failures + metrics.socks5_connect_failures + metrics.socks5_handshake_errors },
+          { label: 'SOCKS5', value: socks5FailureTotal },
           { label: 'Proxy', value: metrics.http_proxy_authentication_failures + metrics.http_proxy_malformed_requests + metrics.http_proxy_connect_failures }
         ], true, true);
 
@@ -1189,6 +1194,8 @@
           { label: 'SOCKS5 requests', value: metrics.socks5_requests_total },
           { label: 'SOCKS5 auth', value: metrics.socks5_authentication_failures },
           { label: 'SOCKS5 UDP', value: metrics.socks5_udp_active_associations },
+          { label: `BIND ${t('active')} / ${t('requestsTotal')}`, value: metrics.socks5_bind_active_leases, display: `${metrics.socks5_bind_active_leases} / ${metrics.socks5_bind_requests_total}` },
+          { label: `UDP FRAG ${t('completed')} / ${t('failed')}`, value: metrics.socks5_udp_fragmented_datagrams_completed_total, display: `${metrics.socks5_udp_fragmented_datagrams_completed_total} / ${metrics.socks5_udp_fragment_rejections_total + metrics.socks5_udp_fragment_timeouts_total + metrics.socks5_udp_fragment_source_rejections_total}` },
           { label: 'HTTP requests', value: metrics.http_proxy_requests_total },
           { label: 'HTTP failures', value: metrics.http_proxy_authentication_failures + metrics.http_proxy_malformed_requests + metrics.http_proxy_connect_failures },
           { label: t('traffic'), value: metrics.socks5_bytes_from_public + metrics.socks5_bytes_to_public + metrics.socks5_udp_bytes_from_public + metrics.socks5_udp_bytes_to_public + metrics.http_proxy_bytes_from_public + metrics.http_proxy_bytes_to_public, display: `${formatBytes(metrics.socks5_bytes_from_public + metrics.socks5_udp_bytes_from_public + metrics.http_proxy_bytes_from_public)} / ${formatBytes(metrics.socks5_bytes_to_public + metrics.socks5_udp_bytes_to_public + metrics.http_proxy_bytes_to_public)}` }
@@ -1265,12 +1272,39 @@
         if (type === 'http') return [[t('active'), `${policy.active_connections}/${policy.max_connections}`], ['H2', `${policy.http2_active_streams || 0}/${policy.http2_requests_total || 0}`], ['gRPC', policy.grpc_requests_total || 0], ['Reuse', `${policy.http2_backend_reused_total || 0}/${policy.http2_backend_connections_total || 0}`], [t('failed'), Number(policy.failed_requests || 0) + Number(policy.grpc_failures_total || 0)], [t('certificate'), tlsStatusText(policy.tls?.status)]];
         if (type === 'sni') return [[t('active'), policy.active_connections], [t('connections'), policy.connections_total], ['Unknown SNI', policy.unknown_sni], [t('traffic'), `${formatBytes(policy.bytes_from_public)} / ${formatBytes(policy.bytes_to_public)}`]];
         if (type === 'secret') return [[t('active'), `${policy.active_connections}/${policy.max_connections}`], [t('connections'), policy.connections_total], [t('rejected'), policy.rejected_connections], [t('traffic'), `${formatBytes(policy.bytes_from_visitor)} / ${formatBytes(policy.bytes_to_visitor)}`]];
-        if (type === 'socks5') return [[t('active'), policy.active_connections], [t('requestsTotal'), policy.requests_total], ['UDP', policy.udp_active_associations], [t('failed'), policy.authentication_failures + policy.connect_failures]];
+        if (type === 'socks5') return [
+          [t('active'), policy.active_connections],
+          [t('requestsTotal'), policy.requests_total],
+          [`BIND ${t('active')}/${t('requestsTotal')}`, `${policy.bind_active_leases || 0}/${policy.bind_requests_total || 0}`],
+          ['UDP', policy.udp_active_associations],
+          [`UDP FRAG ${t('completed')}/${t('failed')}`, `${policy.udp_fragmented_datagrams_completed_total || 0}/${socks5FragmentFailureTotal(policy)}`],
+          [t('failed'), policyErrorTotal(type, policy)],
+          [t('traffic'), `${formatBytes(Number(policy.bytes_from_public || 0) + Number(policy.udp_bytes_from_public || 0))} / ${formatBytes(Number(policy.bytes_to_public || 0) + Number(policy.udp_bytes_to_public || 0))}`]
+        ];
         return [[t('active'), policy.active_connections], [t('requestsTotal'), policy.requests_total], ['CONNECT', policy.connect_requests], [t('failed'), policy.authentication_failures + policy.malformed_requests + policy.connect_failures]];
       }
 
       function socks5CapabilityText(policy) {
-        return t(policy.capabilities?.udp_associate ? 'socks5CapabilitiesWithUdp' : 'socks5CapabilitiesTcpOnly');
+        const capabilities = policy.capabilities || {};
+        if (capabilities.connect === true && capabilities.bind === true && capabilities.udp_associate === true && capabilities.udp_fragmentation === true) {
+          return t('socks5CapabilitiesWithUdp');
+        }
+        if (capabilities.connect === true && capabilities.bind === true && capabilities.udp_associate === false && capabilities.udp_fragmentation === false) {
+          return t('socks5CapabilitiesTcpOnly');
+        }
+        const entries = [
+          ['CONNECT', 'connect'], ['BIND', 'bind'], ['UDP ASSOCIATE', 'udp_associate'], ['UDP FRAG', 'udp_fragmentation']
+        ];
+        const available = entries.filter(([, key]) => capabilities[key] === true).map(([label]) => label);
+        const unavailable = entries.filter(([, key]) => capabilities[key] !== true).map(([label]) => label);
+        return t('socks5CapabilitiesPartial', {
+          available: available.length ? available.join(', ') : '—',
+          unavailable: unavailable.length ? unavailable.join(', ') : '—'
+        });
+      }
+
+      function socks5FragmentFailureTotal(policy) {
+        return Number(policy.udp_fragment_rejections_total || 0) + Number(policy.udp_fragment_timeouts_total || 0) + Number(policy.udp_fragment_source_rejections_total || 0);
       }
 
       function policyWorkload(type, policy) {
@@ -1287,11 +1321,13 @@
         if (type === 'http') return Number(policy.failed_requests || 0);
         if (type === 'sni') return Number(policy.unknown_sni || 0);
         if (type === 'secret') return Number(policy.rejected_connections || 0) + Number(policy.failed_connections || 0);
+        if (type === 'socks5') return Number(policy.authentication_failures || 0) + Number(policy.connect_failures || 0) + Number(policy.handshake_errors || 0) + Number(policy.bind_failures_total || 0) + Number(policy.bind_accept_timeouts_total || 0) + Number(policy.bind_peer_rejections_total || 0) + socks5FragmentFailureTotal(policy);
         return Number(policy.authentication_failures || 0) + Number(policy.connect_failures || 0) + Number(policy.malformed_requests || 0);
       }
 
       function policyTrafficBytes(type, policy) {
         if (type === 'secret') return Number(policy.bytes_from_visitor || 0) + Number(policy.bytes_to_visitor || 0);
+        if (type === 'socks5') return Number(policy.bytes_from_public || 0) + Number(policy.bytes_to_public || 0) + Number(policy.udp_bytes_from_public || 0) + Number(policy.udp_bytes_to_public || 0);
         return Number(policy.bytes_from_public || 0) + Number(policy.bytes_to_public || 0);
       }
 
