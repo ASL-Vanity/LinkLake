@@ -1,31 +1,34 @@
-# ADR 0003：明确 SOCKS5 的支持边界
+# ADR 0003：以有界方式支持 SOCKS5 BIND 与 UDP FRAG
 
-- 状态：接受
-- 日期：2026-08-03
+- 状态：接受（修订）
+- 原决定日期：2026-08-03
+- 修订日期：2026-08-08
 
 ## 背景
 
-LinkLake 已实现 SOCKS5 `CONNECT` 与 `UDP ASSOCIATE`。RFC 1928 还定义了 `BIND`，并允许 SOCKS5 UDP 应用层使用 `FRAG` 字段。现有代码会拒绝 BIND 并丢弃非零 FRAG，但管理 API 只提供通用“命令不支持”和“UDP 丢弃”统计，容易让使用者把稳定产品边界误解为待修复故障。
+早期实现正式支持 `CONNECT` 与可选 `UDP ASSOCIATE`，并把 `BIND` 和非零 `FRAG` 作为明确拒绝的产品边界。v1.1 已补齐动态 TCP 端口租约、两阶段 BIND 响应、来源约束、SOCKS5 应用层分片重组、超时、每会话预算、进程级预算和细分指标，因此原来的“永久不支持”决定已经不再描述实际代码。
 
 ## 决定
 
-- 正式支持 `CONNECT`。
+- 继续正式支持 `CONNECT`。
 - UDP relay 启用时支持 `UDP ASSOCIATE`；未启用时明确报告不可用。
-- 不实现 `BIND`，继续确定性返回 reply `0x07`（Command not supported）。
-- 不实现 SOCKS5 UDP `FRAG`，继续丢弃所有非零 FRAG 数据报。
-- 在策略列表和聚合指标中返回只读 capability：`connect`、`udp_associate`、`bind`、`udp_fragmentation`。
-- BIND 和 FRAG 分别增加独立累计指标，同时保留原有通用计数以兼容现有监控。
-- Web UI 与 Flutter Manager 只展示 capability，不提供无法生效的 BIND 或 FRAG 配置项。
+- 正式支持 `BIND`，但临时监听端口必须从服务端允许且未保留的 TCP 公网端口范围租用，并在真实 bind 成功后才返回。
+- BIND 请求中的地址/端口作为入站对端约束；服务端先返回监听端口，匹配对端到达后才返回第二次成功。等待、DNS、错误对端数量、租约和连接生命周期全部有界。
+- UDP relay 启用时正式支持 SOCKS5 UDP `FRAG`。默认只接受从序号 1 开始的连续分片，按数据报、会话和进程限制分片数、字节数与并发重组，并在固定超时后清理。
+- 在策略列表和聚合指标中返回只读 capability：`connect`、`udp_associate`、`bind`、`udp_fragmentation`。`bind` 始终可用；`udp_associate` 和 `udp_fragmentation` 随 UDP relay 可用性变化。
+- 保留旧拒绝字段用于向后兼容，但新增的 BIND/FRAG 运行指标才是 v1.1 的权威可观测契约。
+- Web UI 与 Flutter Manager 只展示 capability 和固定安全边界，不提供关闭来源约束、放宽全局内存预算或绕过公网端口策略的开关。
 
 ## 原因
 
-SOCKS5 BIND 需要服务端建立临时公网监听端口并发送两次响应，会扩大动态端口、防火墙和滥用控制面，主要服务于主动 FTP 等低需求旧式协议。UDP FRAG 需要在 SOCKS5 会话层增加有序重组、超时、内存预算和攻击防护；LinkLake 内部 QUIC 数据平面的分片重组不能替代这一应用层语义。
+BIND 的风险不是“两次响应”本身，而是临时公网监听器可能绕过端口治理、长期占用资源或接收非预期对端。动态端口租约、真实 bind、请求对端约束、流量控制、两分钟等待上限、错误对端上限和全路径释放把这一能力限制在可审计范围内。
 
-当前产品定位优先保证常用代理能力、网络可达性和行为可预测性。明确拒绝并提供可观测性，比提供不完整实现更安全。
+UDP FRAG 的风险是伪造来源、稀疏序列、重复/冲突分片和内存放大。先完成 UDP 关联来源校验，再使用严格序列、有界重组、五秒超时、每会话与进程共享预算，可以在不把 UDP 变成可靠传输的前提下实现 RFC 1928 应用层语义。内部 QUIC 分片仍是独立传输层机制。
 
-## 兼容性
+## 兼容性与非目标
 
-- CONNECT 与 UDP ASSOCIATE 数据路径不变。
-- BIND 仍返回原有 `0x07`，非零 FRAG 仍被丢弃。
-- 原有 `unsupported_commands` 与 `udp_dropped_datagrams` 继续累计。
-- 新字段只读且向后兼容；旧 Web UI、Manager 和 API 客户端可以忽略。
+- 现有 `CONNECT` 与未分片 `UDP ASSOCIATE` 数据路径保持兼容。
+- 过去依赖 BIND reply `0x07` 或依赖非零 FRAG 必然丢弃的测试必须改为验证正向能力与受限失败路径。
+- 旧 API 客户端可以忽略新增指标；但不能再用 `bind_rejected_total` 或 `udp_fragmentation_unsupported_total` 判断当前支持状态。
+- 当前默认动态端口租约只协调单个服务端进程；跨服务端端口所有权和完整应用状态 HA 不属于本 ADR 的完成声明。
+- UDP 仍为最佳努力传输；重组成功不保证公网路径、目标服务或回包一定可达。

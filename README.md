@@ -22,7 +22,7 @@ LinkLake 的代码实现、自动化测试与项目文档由 OpenAI GPT-5.6 完�
 
 - [Docker Compose](deploy/docker-compose.yml) 提供 LinkLake、Prometheus 和 Grafana；`/api/v1/metrics/prometheus` 使用 Bearer 鉴权并输出 `linklake_` 指标。
 - [部署指南](docs/deployment.md) 包含 Nginx、Caddy、Cloudflare DNS-only/代理边界、最小权限 DNS Token、DEB/RPM 和容器证书要求。
-- [SOCKS5 支持边界说明](docs/adr/0003-socks5-supported-boundaries.md) 明确记录 CONNECT、可选 UDP ASSOCIATE、BIND 拒绝和 UDP FRAG 丢弃语义。
+- [SOCKS5 支持边界说明](docs/socks5-supported-boundaries.md) 记录 CONNECT、可选 UDP ASSOCIATE、受限 BIND 与有界 UDP FRAG 重组的安全边界。
 - Linux 发布资产包含 `.deb`、`.rpm` 及 SHA-256；Cloudflare DNS 幂等更新脚本位于 `scripts/cloudflare-dns-upsert.ps1`。
 
 ## TCP 生产能力
@@ -142,18 +142,19 @@ path_policy = "prefer_direct"
 ## SOCKS5 TCP/UDP 代理
 
 - 服务端在同一数值端口监听 SOCKS5 TCP 与 UDP，目标域名解析和出口连接由指定 LinkLake 客户端执行
-- 支持 SOCKS5 `CONNECT` 和 `UDP ASSOCIATE`；`BIND` 明确返回“不支持命令”
+- 支持 SOCKS5 `CONNECT`、`BIND`，并在 UDP relay 启用时支持 `UDP ASSOCIATE` 与 UDP `FRAG` 重组
 - 强制 RFC 1929 用户名/密码认证，不允许匿名或免认证模式
 - Web UI 创建策略时生成高熵 `llp_...` 密码，密码只显示一次，SQLite 仅保存 SHA-256 哈希
 - 用户名限制为 1 到 64 个 ASCII 字母、数字、点、下划线或连字符
 - TCP 和 UDP 均支持 IPv4、IPv6 和域名目标，域名由出口客户端解析；UDP 每个关联最多记录 256 个已访问目标，只接受这些目标的响应
 - UDP 关联绑定到已认证的 TCP 控制连接、客户端源 IP 和首个 UDP endpoint；控制连接关闭时立即撤销关联
 - `UDP ASSOCIATE` 的公网 UDP 监听遵循 `LINKLAKE_UDP_PUBLIC_BIND_MODE`；服务端按实际接收地址族回包，`BND.ADDR` 始终描述服务端侧地址族，不回显客户端请求地址
-- SOCKS5 UDP `FRAG` 不受支持，非零 `FRAG` 数据报会被丢弃并计入指标
+- `BIND` 的临时 TCP 监听端口只从服务端允许且未保留的公网端口范围租用；请求中的地址/端口会约束入站对端，首个响应公布监听端口，匹配对端到达后才发送第二个成功响应。等待上限为 120 秒，租约会在取消、超时、策略停止或会话结束时释放
+- UDP `FRAG` 仅在已认证 `UDP ASSOCIATE` 内进行有界重组：默认要求从序号 1 开始并严格连续，单数据报最多 64 片、`65507` 字节，5 秒未完成即丢弃；每会话与整个进程还有独立的并发、分片数和内存预算
 - TCP/UDP 共享策略聚合带宽上限，并支持策略/全局/待配对连接限制、握手和配对超时、启停/删除和客户端自动重连
-- Web UI 和指标提供连接、CONNECT 请求、认证失败、握手错误、不支持命令、目标连接失败、TCP/UDP 流量、UDP 关联/数据报/限速丢包和传输错误统计
+- Web UI 和指标提供连接、CONNECT 请求、BIND 请求/活动租约/两阶段响应/超时/对端拒绝，以及 UDP FRAG 接收/完成/重复/预算拒绝/超时/来源拒绝和缓冲占用统计
 
-SOCKS5 TCP 与普通 TCP 隧道共享 TCP 公网端口命名空间；启用 UDP relay 后，SOCKS5 还会占用相同数值的 UDP 端口，因此也不能与普通 UDP 策略使用同一端口。若服务端未配置 UDP relay，SOCKS5 `CONNECT` 仍可用，但 `UDP ASSOCIATE` 会返回“不支持命令”。SOCKS5 UDP 复用上文的 QUIC DATAGRAM relay，属于最佳努力传输并具有相同的公网 MTU 风险。公网 SOCKS5 属于通用网络出口，必须保管好一次性密码、只开放实际需要的来源，并保留云防火墙、主机防火墙和上游滥用防护。
+SOCKS5 TCP 与普通 TCP 隧道共享 TCP 公网端口命名空间；BIND 临时端口也来自同一 TCP 允许范围，并通过真实 bind 检查避开已占用端口。启用 UDP relay 后，SOCKS5 还会占用相同数值的 UDP 端口，因此不能与普通 UDP 策略使用同一端口。若服务端未配置 UDP relay，`CONNECT` 与 `BIND` 仍可用，但 `UDP ASSOCIATE` 和 UDP `FRAG` capability 为 false。SOCKS5 UDP 复用上文的 QUIC DATAGRAM relay，属于最佳努力传输并具有相同的公网 MTU 风险；SOCKS5 层重组完成后，内部 QUIC 仍可能独立分片。公网 SOCKS5 属于通用网络出口，必须保护凭据、限制来源并保留云防火墙、主机防火墙和上游滥用防护。
 
 ## HTTP 正向代理 / CONNECT
 
@@ -178,10 +179,10 @@ HTTP 正向代理、SOCKS5 和普通 TCP 隧道共享 TCP 公网端口命名空�
 - Cloudflare Token 仅从 `LINKLAKE_CLOUDFLARE_API_TOKEN` 或 `LINKLAKE_CLOUDFLARE_API_TOKEN_FILE` 读取；管理 API、SQLite、审计事件和状态响应都不接收或回显原始 Token
 - Web UI 提供中英文 ACME 设置、路由 TLS 开关、立即签发/续期、证书状态和错误展示
 - 可在证书生效后使用 `308` 将 HTTP 跳转到 HTTPS；HTTP-01 挑战路径始终保持明文可达
-- 公网明文入口自动识别 HTTP/1.1 和 HTTP/2 prior knowledge；原生 HTTPS 通过 ALPN 优先协商 `h2`，并保留 `http/1.1` 回退
-- 普通 HTTP/2 请求会转换为 HTTP/1.1 后端请求以兼容现有网站；`Content-Type: application/grpc` 的原生 gRPC 请求使用持久化 h2c 后端连接池
+- 公网明文入口自动识别 HTTP/1.1 和 HTTP/2 prior knowledge，并受限支持 HTTP/1.1 `Upgrade: h2c`；Upgrade 请求必须无请求体、只携带唯一且合法的 `Upgrade`/`Connection`/`HTTP2-Settings` 组合，并受全局并发、握手和最长生命周期限制。原生 HTTPS 通过 ALPN 优先协商 `h2`，并保留 `http/1.1` 回退
+- 普通 HTTP/2 请求会转换为池化 HTTP/1.1 后端请求以兼容现有网站；`Content-Type: application/grpc` 的原生 gRPC 请求使用持久化 HTTP/2 后端连接池
 - gRPC 支持长流、双向流、trailers、取消、连接复用、GOAWAY 排空与后续连接恢复；策略并发限制按 HTTP/2 流生效
-- 当前 gRPC 本地目标必须提供明文 HTTP/2 prior knowledge（h2c），暂不支持 h2c Upgrade 或本地目标 TLS；详细边界见 [HTTP/2 与 gRPC 指南](docs/http2-grpc.md)
+- 每条路由可选择 `grpc_backend_transport = "h2c"`（默认）或 `"tls"`。TLS 模式必须提供 DNS 形式的 `grpc_backend_server_name`，强制 SNI、证书校验和 ALPN `h2`；未指定 `grpc_backend_trust_profile` 时使用系统信任根，指定时从 `LINKLAKE_GRPC_TRUST_PROFILE_DIR/<profile>.pem` 加载受限 CA 集。详细边界见 [HTTP/2 与 gRPC 指南](docs/http2-grpc.md)
 - WebSocket/WSS 继续使用 HTTP/1.1 Upgrade；Cloudflare DNS-01 与通配符证书已支持，HTTP-01 与 DNS-01 均沿用现有路由和证书生命周期
 
 使用前需要把路由域名的 DNS 记录指向 LinkLake 服务端。HTTP-01 要求公网 80 端口能够按原始 Host 到达 `LINKLAKE_HTTP_BIND`；业务 HTTPS 的公网 443 端口必须把 TLS 原样送到 `LINKLAKE_HTTPS_BIND`，由 LinkLake 完成 SNI 选证书和 TLS 终止。
@@ -325,6 +326,27 @@ linklake-server update recover --yes --data-dir <服务端数据目录>
 独立信任根位于 `security/release-keys.json`。每个标签 Release（稳定版或语义版本预发布版）都必须由 CI secret 提供与仓库生产公钥匹配的 Ed25519 私钥，否则流水线关闭失败；仓库只含公钥、格式和明确标记的 RFC 8032 测试夹具。开发测试必须显式使用 `--development-signature`，生产默认绝不接受测试密钥。密钥轮换通过并行登记新旧公钥及版本有效区间完成。完整威胁模型、清单格式和轮换步骤见 `docs/update-security.zh-CN.md`。
 
 Manager UI 不直接替换自身文件。`linklake-client manager-update download/apply/status/rollback` 提供稳定 JSON 契约，`apply`/`rollback` 必须传入 `--manager-pid <pid>`。命令返回 schema v2 且 `requires_manager_exit=true` 后 Manager 才退出；独立帮助进程等待该 PID，复核完整暂存/安装目录树摘要，在同卷切换目录并自动回滚失败。机器可读契约位于 `docs/manager-update-json-schema.json`，Flutter 封装位于 `apps/linklake_manager/lib/update_protocol.dart`。
+
+### 服务端协调的客户端远程更新
+
+客户端远程更新 worker 默认关闭，必须在对应客户端身份中显式启用，并由服务管理器或外部 supervisor 把退出码 `75` 解释为安全重启请求：
+
+```toml
+[client.remote_update]
+enabled = true
+api_base_url = "https://link.example.com"
+poll_interval_seconds = 30
+lease_seconds = 60
+restart_supervisor_enabled = true
+```
+
+- `api_base_url` 必须是没有用户名、密码、路径、查询或片段的 HTTPS origin；worker 禁止重定向，并使用该客户端自己的 Bearer Token 认领、续租和上报任务。
+- 服务端只能下发 `check`、`download`、`apply`、`status`、`recover`、`rollback` 六种封闭动作，不能下发命令、脚本、仓库名、下载 URL、签名策略或降级开关。客户端固定使用官方仓库、Stable 通道、Production Ed25519 验证和禁止网络降级策略。
+- 创建任务只接受交互式管理员 Cookie 会话；Bearer/API Token 即使有 administrator scope 也会被拒绝。创建与取消都要求 same-origin/CSRF 校验和精确确认词：`CHECK`、`DOWNLOAD`、`UPDATE`、`STATUS`、`RECOVER`、`ROLLBACK`，取消使用 `CANCEL`；创建任务还必须提供幂等键。
+- 每个目标同一时刻只有一个活动任务；租约范围为 15–300 秒（默认 60 秒），同一客户端进程的全部云入口共享单次安装锁，更新器另有跨进程锁。租约丢失后，`check`、`download`、`status` 可安全重新排队；已经开始的变更安装动作会关闭失败，不会猜测或重复执行。
+- `apply` 与 `rollback` 使用两阶段重启续跑：替换前持久化绑定任务、worker、租约、操作 ID、版本和管理 origin 的 receipt；重启后必须在固定 30 分钟窗口内验证本地安装结果并上报。任务、事件、结果与恢复状态持久化在服务端并可审计。
+
+当前边界是“单个 LinkLake 服务端协调已注册客户端”，不是完整 PostgreSQL 应用状态 HA，也不承诺多个服务端对同一客户端更新任务自动达成共识。
 
 ## 管理与指标
 
@@ -479,7 +501,7 @@ sh scripts/package-manager-linux.sh
 sh scripts/verify-manager-linux.sh
 ```
 
-TCP 端到端测试覆盖真实二进制回显、限速、连接限制、重连、策略生命周期、配对超时和指标。UDP 端到端测试覆盖同一业务端口的 IPv4/IPv6 双栈回显、`0` 到 `65507` 字节真实数据报回显、多会话、限速丢包、空闲回收、分片重组、策略生命周期、重连、TCP/UDP 同数值端口、TCP/UDP 连续端口组的全部映射及指标；生产验收还覆盖独立公网服务器、Linux 服务端和 Windows 客户端。TLS SNI E2E 使用真实自签名目标和 .NET `SslStream`，覆盖原始 ClientHello 透传、真实 TLS 握手/回显、未知 SNI 拒绝、启停恢复、删除和指标。Secret E2E 覆盖托管目标端、单次访问密钥隔离、访问客户端白名单、错误密钥、连接限制、启停恢复、删除失效、统计、两个独立客户端之间的真实 P2P 直连、不可达候选下的显式中继回退，以及服务端无公网业务监听。SOCKS5 E2E 覆盖托管出口、单次凭据隔离、强制认证、错误凭据、域名/IPv4 CONNECT、IPv4/IPv6 公网传输下的真实 UDP ASSOCIATE 回显、UDP 分片拒绝、TCP 控制连接生命周期、BIND 拒绝、连接限制、策略恢复和指标。HTTP E2E 同时覆盖 Host 路由以及正向代理的单次凭据、强制/错误认证、absolute-form 改写、凭据隔离、GET/POST 请求体、请求走私拒绝、真实 CONNECT 隧道、连接限制、客户端重连、策略生命周期和指标。HTTPS/ACME 测试在 Linux CI 中使用本地 Pebble 与 Cloudflare/DoH Mock，覆盖 HTTP-01、DNS-01、通配符 SNI、TXT 生命周期、证书签发与续期、HTTPS 转发、跳转、持久化、失败恢复和证书指标，不访问公网证书机构或真实 Cloudflare API。
+TCP 端到端测试覆盖真实二进制回显、限速、连接限制、重连、策略生命周期、配对超时和指标。UDP 端到端测试覆盖同一业务端口的 IPv4/IPv6 双栈回显、`0` 到 `65507` 字节真实数据报回显、多会话、限速丢包、空闲回收、分片重组、策略生命周期、重连、TCP/UDP 同数值端口、TCP/UDP 连续端口组的全部映射及指标；生产验收还覆盖独立公网服务器、Linux 服务端和 Windows 客户端。TLS SNI E2E 使用真实自签名目标和 .NET `SslStream`，覆盖原始 ClientHello 透传、真实 TLS 握手/回显、未知 SNI 拒绝、启停恢复、删除和指标。Secret E2E 覆盖托管目标端、单次访问密钥隔离、访问客户端白名单、错误密钥、连接限制、启停恢复、删除失效、统计、两个独立客户端之间的真实 P2P 直连、不可达候选下的显式中继回退，以及服务端无公网业务监听。SOCKS5 E2E 覆盖托管出口、单次凭据隔离、强制认证、错误凭据、域名/IPv4 CONNECT、来源端口约束与两阶段响应的 BIND、IPv4/IPv6 公网传输下的真实 UDP ASSOCIATE 回显、有界 UDP FRAG 重组及缺失首片拒绝、TCP 控制连接生命周期、连接限制、策略恢复和指标。HTTP E2E 同时覆盖 Host 路由以及正向代理的单次凭据、强制/错误认证、absolute-form 改写、凭据隔离、GET/POST 请求体、请求走私拒绝、真实 CONNECT 隧道、连接限制、客户端重连、策略生命周期和指标。HTTPS/ACME 测试在 Linux CI 中使用本地 Pebble 与 Cloudflare/DoH Mock，覆盖 HTTP-01、DNS-01、通配符 SNI、TXT 生命周期、证书签发与续期、HTTPS 转发、跳转、持久化、失败恢复和证书指标，不访问公网证书机构或真实 Cloudflare API。
 
 macOS 开发者可使用 `scripts/package-macos.sh`、`scripts/verify-macos-package.sh`、`scripts/package-manager-macos.sh` 和 `scripts/verify-manager-macos.sh` 从源码构建并校验核心服务与 Flutter 管理客户端。这些仅用于源码/CI 兼容性验证，不会成为 GitHub Release、Attestation、Ed25519 更新清单或自动更新资产。
 

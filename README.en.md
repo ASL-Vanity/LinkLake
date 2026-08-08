@@ -22,7 +22,7 @@ The current release completes production TCP and UDP, multi-port/range forwardin
 
 - [Docker Compose](deploy/docker-compose.yml) includes LinkLake, Prometheus, and Grafana. `/api/v1/metrics/prometheus` requires Bearer authentication and exports `linklake_` metrics.
 - The [deployment guide](docs/deployment.md) covers Nginx, Caddy, Cloudflare DNS-only/proxy boundaries, least-privilege DNS tokens, DEB/RPM, and container certificate requirements.
-- The [SOCKS5 supported-boundaries guide](docs/socks5-supported-boundaries.en.md) documents CONNECT, optional UDP ASSOCIATE, deterministic BIND rejection, and UDP FRAG dropping semantics.
+- The [SOCKS5 supported-boundaries guide](docs/socks5-supported-boundaries.en.md) documents CONNECT, optional UDP ASSOCIATE, constrained BIND, and bounded UDP FRAG reassembly.
 - Linux release assets include `.deb`, `.rpm`, and SHA-256 files. The idempotent Cloudflare DNS helper is `scripts/cloudflare-dns-upsert.ps1`.
 
 ## Production TCP capabilities
@@ -142,18 +142,19 @@ Self-hosted rendezvous uses pinned `iroh-relay 1.0.3`. Production configuration,
 ## SOCKS5 TCP/UDP proxy
 
 - The server listens for SOCKS5 TCP and UDP on the same numeric public port, while the selected LinkLake client resolves target domains and creates outbound connections
-- SOCKS5 `CONNECT` and `UDP ASSOCIATE` are supported; `BIND` explicitly returns command-not-supported
+- SOCKS5 `CONNECT` and `BIND` are supported, with `UDP ASSOCIATE` and UDP `FRAG` reassembly available when the UDP relay is enabled
 - RFC 1929 username/password authentication is mandatory; anonymous and no-auth modes are rejected
 - Policy creation returns a high-entropy `llp_...` password once; SQLite stores only its SHA-256 hash
 - Usernames contain 1 to 64 ASCII letters, digits, dots, underscores, or hyphens
 - TCP and UDP support IPv4, IPv6, and domain targets, with domains resolved by the exit client; each UDP association remembers at most 256 contacted targets and accepts responses only from those targets
 - A UDP association is bound to its authenticated TCP control connection, client source IP, and first UDP endpoint, and is revoked when the control connection closes
 - The public transport for `UDP ASSOCIATE` follows `LINKLAKE_UDP_PUBLIC_BIND_MODE`; replies use the actual receiving family, and `BND.ADDR` always describes the server side instead of echoing the client-requested address
-- SOCKS5 UDP fragmentation is unsupported; datagrams with non-zero `FRAG` are dropped and counted
+- A `BIND` listener leases a temporary TCP port only from the server's allowed, non-reserved public range. The requested address/port constrains the inbound peer; the first reply advertises the listener and the second success reply is sent only after a matching peer arrives. The 120-second wait and its lease end on cancellation, timeout, policy stop, or session completion
+- UDP `FRAG` is reassembled only inside an authenticated `UDP ASSOCIATE`. The default contract starts at sequence 1 and requires strict ordering, with at most 64 fragments and `65507` bytes per datagram and a five-second incomplete-datagram timeout. Per-session and process-wide inflight, fragment-count, and memory budgets also apply
 - TCP and UDP share the policy aggregate bandwidth limit, alongside per-policy/global/pending connection limits, handshake and pairing timeouts, policy lifecycle, and client reconnects
-- The Web UI and metrics report connections, CONNECT requests, authentication failures, handshake errors, unsupported commands, target failures, TCP/UDP traffic, UDP associations/datagrams/rate-limit drops, and transfer errors
+- The Web UI and metrics report connections and CONNECT requests; BIND requests, active leases, two-stage replies, timeouts, and peer rejections; plus UDP FRAG receive, completion, duplicate, budget-rejection, timeout, source-rejection, and buffered-usage counters
 
-SOCKS5 TCP and regular TCP tunnels share the TCP public-port namespace. When the UDP relay is enabled, SOCKS5 also occupies the same numeric UDP port, so a regular UDP policy cannot use that port either. Without a configured UDP relay, SOCKS5 `CONNECT` remains available but `UDP ASSOCIATE` returns command-not-supported. SOCKS5 UDP reuses the QUIC DATAGRAM relay described above, remains best effort, and has the same Internet MTU risks. A public SOCKS5 service is a general network exit: protect the one-time password, restrict source access, and retain cloud firewall, host firewall, and upstream abuse controls.
+SOCKS5 TCP and regular TCP tunnels share the TCP public-port namespace. Temporary BIND ports come from that same allowed TCP range and must also pass a real bind check. When the UDP relay is enabled, SOCKS5 occupies the same numeric UDP port, so a regular UDP policy cannot use that port either. Without a configured UDP relay, `CONNECT` and `BIND` remain available while the `UDP ASSOCIATE` and UDP `FRAG` capabilities are false. SOCKS5 UDP reuses the QUIC DATAGRAM relay described above, remains best effort, and has the same Internet MTU risks; internal QUIC fragmentation may still occur after SOCKS5 reassembly. A public SOCKS5 service is a general network exit: protect credentials, restrict source access, and retain cloud firewall, host firewall, and upstream abuse controls.
 
 ## HTTP forward proxy / CONNECT
 
@@ -178,10 +179,10 @@ HTTP forward proxies, SOCKS5 proxies, and regular TCP tunnels share the TCP publ
 - The Cloudflare token is read only from `LINKLAKE_CLOUDFLARE_API_TOKEN` or `LINKLAKE_CLOUDFLARE_API_TOKEN_FILE`; management APIs, SQLite, audit events, and status responses never accept or echo the raw token
 - Provides bilingual ACME settings, per-route TLS controls, immediate issue/renew actions, certificate status, and errors in the Web UI
 - Can return a `308` HTTP-to-HTTPS redirect after the certificate is active; the HTTP-01 challenge path always remains reachable over plain HTTP
-- The public cleartext listener auto-detects HTTP/1.1 and HTTP/2 prior knowledge. Native HTTPS prefers `h2` through ALPN and retains `http/1.1` fallback
-- Regular HTTP/2 requests are translated to HTTP/1.1 for compatibility with existing websites. Native `Content-Type: application/grpc` requests use a persistent h2c backend pool
+- The public cleartext listener auto-detects HTTP/1.1 and HTTP/2 prior knowledge and accepts a constrained HTTP/1.1 `Upgrade: h2c`. Upgrade requests must have no request body and exactly one valid `Upgrade`/`Connection`/`HTTP2-Settings` combination, and they are bounded by global concurrency, handshake, and maximum-lifetime limits. Native HTTPS prefers `h2` through ALPN and retains `http/1.1` fallback
+- Regular HTTP/2 requests are translated to pooled HTTP/1.1 backend requests for compatibility with existing websites. Native `Content-Type: application/grpc` requests use a persistent HTTP/2 backend pool
 - gRPC supports long-lived and bidirectional streams, trailers, cancellation, connection reuse, GOAWAY draining, and subsequent connection recovery. Route concurrency limits apply per HTTP/2 stream
-- The local gRPC target must currently provide cleartext HTTP/2 prior knowledge (h2c). h2c Upgrade and TLS to the local target are not supported yet; see the [HTTP/2 and gRPC guide](docs/http2-grpc.en.md)
+- Each route selects `grpc_backend_transport = "h2c"` (default) or `"tls"`. TLS requires a DNS-form `grpc_backend_server_name` and enforces SNI, certificate validation, and ALPN `h2`. It uses system roots when `grpc_backend_trust_profile` is absent, or loads a bounded CA set from `LINKLAKE_GRPC_TRUST_PROFILE_DIR/<profile>.pem`; see the [HTTP/2 and gRPC guide](docs/http2-grpc.en.md)
 - WebSocket/WSS continues to use HTTP/1.1 Upgrade. Cloudflare DNS-01 and wildcard certificates are supported, and both HTTP-01 and DNS-01 retain the existing route and certificate lifecycle
 
 Before using a route, point its DNS record to the LinkLake server. HTTP-01 requires public port 80 to reach `LINKLAKE_HTTP_BIND` with the original Host, while public port 443 must deliver the TLS stream unchanged to `LINKLAKE_HTTPS_BIND` so LinkLake can select the certificate by SNI and terminate TLS.
@@ -319,6 +320,27 @@ This automatic-update verification chain applies only to official Windows/Linux 
 The independent trust root is `security/release-keys.json`. Every tagged Release, whether stable or a SemVer prerelease, requires an Ed25519 private key supplied by CI secrets and matching a production public key in the repository; otherwise the workflow fails closed. The repository contains only public keys, formats, and an explicitly labeled RFC 8032 test fixture. Development testing requires `--development-signature`; production policy never accepts a development key. Rotation registers old and new public keys concurrently with semantic-version validity ranges. See `docs/update-security.md`.
 
 Manager never replaces its own files from Flutter. `linklake-client manager-update download/apply/status/rollback` is the stable JSON contract; `apply` and `rollback` require `--manager-pid <pid>`. After the command returns schema v2 with `requires_manager_exit=true`, Manager exits and a detached helper waits for that PID, verifies complete staged/installed directory-tree digests, performs a same-volume directory switch, and rolls back failures. The contract schema is `docs/manager-update-json-schema.json`, and the Flutter adapter is `apps/linklake_manager/lib/update_protocol.dart`.
+
+### Server-coordinated client remote updates
+
+The client remote-update worker is disabled by default. It must be enabled explicitly for the client identity, and a service manager or external supervisor must interpret exit code `75` as a safe restart request:
+
+```toml
+[client.remote_update]
+enabled = true
+api_base_url = "https://link.example.com"
+poll_interval_seconds = 30
+lease_seconds = 60
+restart_supervisor_enabled = true
+```
+
+- `api_base_url` must be an HTTPS origin without credentials, path, query, or fragment. The worker refuses redirects and uses that client's own Bearer token to claim, renew, and report tasks.
+- The server can request only six closed actions: `check`, `download`, `apply`, `status`, `recover`, and `rollback`. It cannot supply commands, scripts, a repository, a download URL, a signature policy, or a downgrade switch. The client fixes the official repository, Stable channel, Production Ed25519 verification, and no-network-downgrade policy locally.
+- Task creation accepts only an interactive administrator Cookie session; Bearer/API tokens are rejected even with administrator scope. Creation and cancellation both require same-origin/CSRF validation and the exact confirmation phrase: `CHECK`, `DOWNLOAD`, `UPDATE`, `STATUS`, `RECOVER`, or `ROLLBACK`; cancellation uses `CANCEL`. Task creation additionally requires an idempotency key.
+- A target has at most one active task. Leases are 15–300 seconds (60 seconds by default), all cloud identities in one client process share a single-install lock, and the updater adds a cross-process lock. After lease loss, `check`, `download`, and `status` may be requeued safely; a mutating installation action that already started fails closed instead of being guessed or replayed.
+- `apply` and `rollback` use two-phase restart continuation. Before replacement, the client persists a receipt binding the task, worker, lease, operation ID, versions, and management origin. After restart it must verify and report the local result within a fixed 30-minute window. The server persists the task, events, result, and recovery state for audit.
+
+The current boundary is one LinkLake server coordinating its registered clients. It is not a complete PostgreSQL application-state HA implementation and does not promise automatic consensus between multiple servers updating the same client.
 
 ## Management and metrics
 
@@ -471,7 +493,7 @@ sh scripts/package-manager-linux.sh
 sh scripts/verify-manager-linux.sh
 ```
 
-The TCP E2E suite covers real binary echo traffic, bandwidth limits, connection limits, reconnects, policy lifecycle, pairing timeout, and metrics. The UDP E2E suite covers IPv4 and IPv6 echo on the same public service port, real datagram echo from `0` through `65507` bytes, multiple sessions, rate-limit drops, idle expiration, fragmentation/reassembly, policy lifecycle, reconnects, same-numbered TCP/UDP ports, every mapping in contiguous TCP and UDP port groups, and metrics. Production acceptance additionally covers an independent public test host, a Linux server, and a Windows client. TLS SNI E2E uses a real self-signed target and .NET `SslStream` to verify original ClientHello forwarding, a real TLS handshake/echo, unknown-SNI rejection, lifecycle recovery, deletion, and metrics. Secret E2E covers a managed provider, single-use access-key isolation, visitor authorization, wrong keys, connection limits, lifecycle recovery, deletion, statistics, a real direct path between two client processes, explicit relay fallback for an unreachable candidate, and the absence of a public business listener. SOCKS5 E2E covers a managed exit, single-use credential isolation, mandatory and failed authentication, domain/IPv4 CONNECT, real UDP ASSOCIATE echo over IPv4 and IPv6 public transport, UDP fragmentation rejection, TCP control-connection lifecycle, BIND rejection, connection limits, lifecycle recovery, and metrics. HTTP E2E covers both Host routing and forward-proxy single-use credentials, mandatory/failed authentication, absolute-form rewriting, credential isolation, GET/POST bodies, smuggling rejection, a real CONNECT tunnel, connection limits, client reconnects, policy lifecycle, and metrics. Linux CI runs HTTPS/ACME E2E against local Pebble plus Cloudflare/DoH fixtures, covering HTTP-01, DNS-01, wildcard SNI, TXT lifecycle, issuance and renewal, HTTPS forwarding, redirects, persistence, failure recovery, and certificate metrics without contacting a public CA or the real Cloudflare API.
+The TCP E2E suite covers real binary echo traffic, bandwidth limits, connection limits, reconnects, policy lifecycle, pairing timeout, and metrics. The UDP E2E suite covers IPv4 and IPv6 echo on the same public service port, real datagram echo from `0` through `65507` bytes, multiple sessions, rate-limit drops, idle expiration, fragmentation/reassembly, policy lifecycle, reconnects, same-numbered TCP/UDP ports, every mapping in contiguous TCP and UDP port groups, and metrics. Production acceptance additionally covers an independent public test host, a Linux server, and a Windows client. TLS SNI E2E uses a real self-signed target and .NET `SslStream` to verify original ClientHello forwarding, a real TLS handshake/echo, unknown-SNI rejection, lifecycle recovery, deletion, and metrics. Secret E2E covers a managed provider, single-use access-key isolation, visitor authorization, wrong keys, connection limits, lifecycle recovery, deletion, statistics, a real direct path between two client processes, explicit relay fallback for an unreachable candidate, and the absence of a public business listener. SOCKS5 E2E covers a managed exit, single-use credential isolation, mandatory and failed authentication, domain/IPv4 CONNECT, source-port-constrained two-reply BIND, real UDP ASSOCIATE echo over IPv4 and IPv6 public transport, bounded UDP FRAG reassembly and missing-initial-fragment rejection, TCP control-connection lifecycle, connection limits, lifecycle recovery, and metrics. HTTP E2E covers both Host routing and forward-proxy single-use credentials, mandatory/failed authentication, absolute-form rewriting, credential isolation, GET/POST bodies, smuggling rejection, a real CONNECT tunnel, connection limits, client reconnects, policy lifecycle, and metrics. Linux CI runs HTTPS/ACME E2E against local Pebble plus Cloudflare/DoH fixtures, covering HTTP-01, DNS-01, wildcard SNI, TXT lifecycle, issuance and renewal, HTTPS forwarding, redirects, persistence, failure recovery, and certificate metrics without contacting a public CA or the real Cloudflare API.
 
 macOS developers can use `scripts/package-macos.sh`, `scripts/verify-macos-package.sh`, `scripts/package-manager-macos.sh`, and `scripts/verify-manager-macos.sh` to build and verify the core services and Flutter manager from source. These are source/CI compatibility checks only and do not become GitHub Release, attestation, Ed25519 updater-manifest, or automatic-update assets.
 

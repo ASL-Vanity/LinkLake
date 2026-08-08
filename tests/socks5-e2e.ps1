@@ -118,6 +118,36 @@ function Write-Bytes {
     $Stream.Flush()
 }
 
+function Read-Socks5Reply {
+    param([IO.Stream]$Stream)
+    $replyHeader = Read-Exact -Stream $Stream -Length 4
+    if ($replyHeader[0] -ne 5 -or $replyHeader[2] -ne 0) {
+        throw 'The SOCKS5 reply header is invalid.'
+    }
+    $boundAddressLength = switch ($replyHeader[3]) {
+        1 { 4 }
+        4 { 16 }
+        3 {
+            $domainLength = Read-Exact -Stream $Stream -Length 1
+            [int]$domainLength[0]
+        }
+        default { throw "SOCKS5 returned unsupported address type $($replyHeader[3])." }
+    }
+    $boundAddressBytes = Read-Exact -Stream $Stream -Length $boundAddressLength
+    $boundPortBytes = Read-Exact -Stream $Stream -Length 2
+    $boundAddress = if ($replyHeader[3] -eq 3) {
+        [Text.Encoding]::ASCII.GetString($boundAddressBytes)
+    } else {
+        ([Net.IPAddress]::new($boundAddressBytes)).ToString()
+    }
+    return [pscustomobject]@{
+        Reply = $replyHeader[1]
+        BoundAddressType = $replyHeader[3]
+        BoundAddress = $boundAddress
+        BoundPort = ([int]$boundPortBytes[0] -shl 8) -bor [int]$boundPortBytes[1]
+    }
+}
+
 function Open-Socks5Connection {
     param(
         [int]$ProxyPort,
@@ -168,30 +198,14 @@ function Open-Socks5Connection {
         $request.Add([byte](($TargetPort -shr 8) -band 255))
         $request.Add([byte]($TargetPort -band 255))
         Write-Bytes -Stream $stream -Bytes $request.ToArray()
-        $replyHeader = Read-Exact -Stream $stream -Length 4
-        $boundAddressLength = switch ($replyHeader[3]) {
-            1 { 4 }
-            4 { 16 }
-            3 {
-                $domainLength = Read-Exact -Stream $stream -Length 1
-                [int]$domainLength[0]
-            }
-            default { throw "SOCKS5 returned unsupported address type $($replyHeader[3])." }
-        }
-        $boundAddressBytes = Read-Exact -Stream $stream -Length $boundAddressLength
-        $boundPortBytes = Read-Exact -Stream $stream -Length 2
-        $boundAddress = if ($replyHeader[3] -eq 3) {
-            [Text.Encoding]::ASCII.GetString($boundAddressBytes)
-        } else {
-            ([Net.IPAddress]::new($boundAddressBytes)).ToString()
-        }
+        $reply = Read-Socks5Reply -Stream $stream
         return [pscustomobject]@{
             Client = $tcp
             Stream = $stream
-            Reply = $replyHeader[1]
-            BoundAddressType = $replyHeader[3]
-            BoundAddress = $boundAddress
-            BoundPort = ([int]$boundPortBytes[0] -shl 8) -bor [int]$boundPortBytes[1]
+            Reply = $reply.Reply
+            BoundAddressType = $reply.BoundAddressType
+            BoundAddress = $reply.BoundAddress
+            BoundPort = $reply.BoundPort
         }
     } catch {
         $tcp.Dispose()
@@ -261,6 +275,8 @@ try {
     $udpTargetPort = Get-FreeUdpPort
     $relayPort = Get-FreeUdpPort
     $proxyPort = Get-FreePort -Minimum 32000 -Maximum 32999
+    $bindPeerPort = Get-FreePort
+    do { $wrongBindPeerPort = Get-FreePort } while ($wrongBindPeerPort -eq $bindPeerPort)
     $baseUrl = "http://127.0.0.1:$managementPort"
     $enrollmentToken = [guid]::NewGuid().ToString()
     $managementToken = [guid]::NewGuid().ToString()
@@ -382,7 +398,7 @@ managed_config_path = "$managedTomlPath"
     $proxyContract = Invoke-RestMethod -Uri "$baseUrl/api/v1/socks5-proxies" -Headers $headers |
         Where-Object { $_.id -eq $created.id }
     if (-not $proxyContract.capabilities.connect -or -not $proxyContract.capabilities.udp_associate -or
-        $proxyContract.capabilities.bind -or $proxyContract.capabilities.udp_fragmentation) {
+        -not $proxyContract.capabilities.bind -or -not $proxyContract.capabilities.udp_fragmentation) {
         throw 'The SOCKS5 API capability contract is incorrect.'
     }
 
@@ -428,18 +444,66 @@ managed_config_path = "$managedTomlPath"
         $proxy.active_connections -eq 0
     }
 
-    $stage = 'BIND rejection'
-    $unsupported = Open-Socks5Connection -ProxyPort $proxyPort -Username $created.username `
-        -Password $created.password -TargetHost 'localhost' -TargetPort $targetPort -Command 2
+    $stage = 'constrained BIND'
+    $bind = Open-Socks5Connection -ProxyPort $proxyPort -Username $created.username `
+        -Password $created.password -TargetHost '127.0.0.1' -TargetPort $bindPeerPort -Command 2
+    $wrongBindPeer = $null
+    $matchingBindPeer = $null
     try {
-        if ($unsupported.Reply -ne 7) { throw 'SOCKS5 BIND was not rejected with reply 7.' }
+        if ($bind.Reply -ne 0) { throw "SOCKS5 BIND failed with first reply $($bind.Reply)." }
+        if ($bind.BoundPort -lt 32000 -or $bind.BoundPort -gt 32999 -or $bind.BoundPort -eq $proxyPort) {
+            throw 'SOCKS5 BIND leased a port outside the allowed, non-conflicting TCP range.'
+        }
+        Wait-ForCondition -Failure 'The active SOCKS5 BIND lease was not reported.' -Condition {
+            $proxy = Invoke-RestMethod -Uri "$baseUrl/api/v1/socks5-proxies" -Headers $headers |
+                Where-Object { $_.id -eq $created.id }
+            $proxy.bind_requests_total -ge 1 -and $proxy.bind_active_leases -eq 1 -and
+                $proxy.bind_first_replies_total -ge 1
+        }
+
+        $wrongBindPeer = [Net.Sockets.TcpClient]::new([Net.Sockets.AddressFamily]::InterNetwork)
+        $wrongBindPeer.Client.Bind([Net.IPEndPoint]::new([Net.IPAddress]::Loopback, $wrongBindPeerPort))
+        $wrongBindPeer.Connect([Net.IPAddress]::Loopback, $bind.BoundPort)
+        $wrongBindPeer.Dispose()
+        $wrongBindPeer = $null
+        Wait-ForCondition -Failure 'SOCKS5 BIND did not reject a peer with the wrong source port.' -Condition {
+            $proxy = Invoke-RestMethod -Uri "$baseUrl/api/v1/socks5-proxies" -Headers $headers |
+                Where-Object { $_.id -eq $created.id }
+            $proxy.bind_peer_rejections_total -ge 1 -and $proxy.bind_active_leases -eq 1
+        }
+
+        $matchingBindPeer = [Net.Sockets.TcpClient]::new([Net.Sockets.AddressFamily]::InterNetwork)
+        $matchingBindPeer.Client.Bind([Net.IPEndPoint]::new([Net.IPAddress]::Loopback, $bindPeerPort))
+        $matchingBindPeer.Connect([Net.IPAddress]::Loopback, $bind.BoundPort)
+        $matchingBindPeer.GetStream().ReadTimeout = 10000
+        $secondReply = Read-Socks5Reply -Stream $bind.Stream
+        if ($secondReply.Reply -ne 0 -or $secondReply.BoundAddress -ne '127.0.0.1' -or
+            $secondReply.BoundPort -ne $bindPeerPort) {
+            throw 'SOCKS5 BIND returned an invalid second peer reply.'
+        }
+
+        $toPeer = [Text.Encoding]::UTF8.GetBytes('socks5-bind-to-peer')
+        Write-Bytes -Stream $bind.Stream -Bytes $toPeer
+        $receivedByPeer = Read-Exact -Stream $matchingBindPeer.GetStream() -Length $toPeer.Length
+        if ([Text.Encoding]::UTF8.GetString($receivedByPeer) -ne 'socks5-bind-to-peer') {
+            throw 'SOCKS5 BIND corrupted traffic sent to the accepted peer.'
+        }
+        $toControl = [Text.Encoding]::UTF8.GetBytes('socks5-bind-to-control')
+        Write-Bytes -Stream $matchingBindPeer.GetStream() -Bytes $toControl
+        $receivedByControl = Read-Exact -Stream $bind.Stream -Length $toControl.Length
+        if ([Text.Encoding]::UTF8.GetString($receivedByControl) -ne 'socks5-bind-to-control') {
+            throw 'SOCKS5 BIND corrupted traffic returned to the control connection.'
+        }
     } finally {
-        $unsupported.Client.Dispose()
+        if ($wrongBindPeer) { $wrongBindPeer.Dispose() }
+        if ($matchingBindPeer) { $matchingBindPeer.Dispose() }
+        $bind.Client.Dispose()
     }
-    Wait-ForCondition -Failure 'The SOCKS5 BIND rejection metric was not updated.' -Condition {
+    Wait-ForCondition -Failure 'The completed SOCKS5 BIND did not release its lease and connection permit.' -Condition {
         $proxy = Invoke-RestMethod -Uri "$baseUrl/api/v1/socks5-proxies" -Headers $headers |
             Where-Object { $_.id -eq $created.id }
-        $proxy.bind_rejected_total -ge 1 -and $proxy.unsupported_commands -ge 1
+        $proxy.bind_active_leases -eq 0 -and $proxy.active_connections -eq 0 -and
+            $proxy.bind_second_replies_total -ge 1
     }
 
     $stage = 'disable policy'
@@ -506,19 +570,48 @@ managed_config_path = "$managedTomlPath"
             throw 'The SOCKS5 UDP response payload was corrupted.'
         }
 
-        $fragmented = $udpRequest.ToArray()
-        $fragmented[2] = 1
+        $fragmentPayloadOne = [Text.Encoding]::UTF8.GetBytes('socks5-frag-')
+        $fragmentPayloadTwo = [Text.Encoding]::UTF8.GetBytes('echo')
+        $fragmentOne = [Collections.Generic.List[byte]]::new()
+        $fragmentOne.AddRange([byte[]](0, 0, 1, 1, 127, 0, 0, 1))
+        $fragmentOne.Add([byte](($udpTargetPort -shr 8) -band 255))
+        $fragmentOne.Add([byte]($udpTargetPort -band 255))
+        $fragmentOne.AddRange($fragmentPayloadOne)
+        $fragmentTwo = [Collections.Generic.List[byte]]::new()
+        $fragmentTwo.AddRange([byte[]](0, 0, 130, 1, 127, 0, 0, 1))
+        $fragmentTwo.Add([byte](($udpTargetPort -shr 8) -band 255))
+        $fragmentTwo.Add([byte]($udpTargetPort -band 255))
+        $fragmentTwo.AddRange($fragmentPayloadTwo)
+        $null = $udpClient.Send($fragmentOne.ToArray(), $fragmentOne.Count, $relayEndpoint)
+        $null = $udpClient.Send($fragmentTwo.ToArray(), $fragmentTwo.Count, $relayEndpoint)
+        $responseSource = [Net.IPEndPoint]::new([Net.IPAddress]::Any, 0)
+        $fragmentedResponse = $udpClient.Receive([ref]$responseSource)
+        if ($fragmentedResponse.Length -lt 10 -or $fragmentedResponse[2] -ne 0) {
+            throw 'The reassembled SOCKS5 UDP response header is invalid.'
+        }
+        $fragmentedResponsePayload = [byte[]]$fragmentedResponse[10..($fragmentedResponse.Length - 1)]
+        if ([Text.Encoding]::UTF8.GetString($fragmentedResponsePayload) -ne 'socks5-frag-echo') {
+            throw 'SOCKS5 UDP FRAG reassembly corrupted the payload.'
+        }
+        Wait-ForCondition -Failure 'The SOCKS5 UDP FRAG completion metric was not updated.' -Condition {
+            $proxy = Invoke-RestMethod -Uri "$baseUrl/api/v1/socks5-proxies" -Headers $headers |
+                Where-Object { $_.id -eq $created.id }
+            $proxy.udp_fragments_from_public_total -ge 2 -and
+                $proxy.udp_fragmented_datagrams_completed_total -ge 1
+        }
+
+        $missingInitialFragment = $fragmentTwo.ToArray()
         $udpClient.Client.ReceiveTimeout = 1000
-        $null = $udpClient.Send($fragmented, $fragmented.Length, $relayEndpoint)
+        $null = $udpClient.Send($missingInitialFragment, $missingInitialFragment.Length, $relayEndpoint)
         try {
             $unexpectedSource = [Net.IPEndPoint]::new([Net.IPAddress]::Any, 0)
             $null = $udpClient.Receive([ref]$unexpectedSource)
-            throw 'A fragmented SOCKS5 UDP datagram was forwarded.'
+            throw 'A SOCKS5 UDP fragment without sequence 1 was forwarded.'
         } catch [Net.Sockets.SocketException] {}
-        Wait-ForCondition -Failure 'The SOCKS5 UDP FRAG rejection metric was not updated.' -Condition {
+        Wait-ForCondition -Failure 'The bounded SOCKS5 UDP FRAG rejection metric was not updated.' -Condition {
             $proxy = Invoke-RestMethod -Uri "$baseUrl/api/v1/socks5-proxies" -Headers $headers |
                 Where-Object { $_.id -eq $created.id }
-            $proxy.udp_fragmentation_unsupported_total -ge 1
+            $proxy.udp_fragment_rejections_total -ge 1
         }
     } finally {
         $udpClient.Dispose()
@@ -577,19 +670,24 @@ managed_config_path = "$managedTomlPath"
     $proxyStats = Invoke-RestMethod -Uri "$baseUrl/api/v1/socks5-proxies" -Headers $headers |
         Where-Object { $_.id -eq $created.id }
     $metrics = Invoke-RestMethod -Uri "$baseUrl/api/v1/metrics" -Headers $headers
-    if ($proxyStats.requests_total -lt 2 -or $proxyStats.authentication_failures -lt 2 -or
-        $proxyStats.unsupported_commands -lt 1 -or $proxyStats.bind_rejected_total -lt 1 -or
-        $proxyStats.udp_fragmentation_unsupported_total -lt 1 -or
-        $metrics.socks5_requests_total -lt 2 -or $metrics.socks5_bind_rejected_total -lt 1 -or
-        $metrics.socks5_udp_fragmentation_unsupported_total -lt 1 -or
+    if ($proxyStats.requests_total -lt 3 -or $proxyStats.authentication_failures -lt 2 -or
+        $proxyStats.bind_requests_total -lt 1 -or $proxyStats.bind_first_replies_total -lt 1 -or
+        $proxyStats.bind_second_replies_total -lt 1 -or $proxyStats.bind_peer_rejections_total -lt 1 -or
+        $proxyStats.udp_fragments_from_public_total -lt 3 -or
+        $proxyStats.udp_fragmented_datagrams_completed_total -lt 1 -or
+        $proxyStats.udp_fragment_rejections_total -lt 1 -or
+        $metrics.socks5_requests_total -lt 3 -or $metrics.socks5_bind_requests_total -lt 1 -or
+        $metrics.socks5_bind_second_replies_total -lt 1 -or
+        $metrics.socks5_udp_fragmented_datagrams_completed_total -lt 1 -or
+        $metrics.socks5_udp_fragment_rejections_total -lt 1 -or
         $proxyStats.udp_datagrams_from_public -lt 2 -or $proxyStats.udp_datagrams_to_public -lt 2 -or
         $proxyStats.udp_dropped_datagrams -lt 1 -or $metrics.socks5_udp_datagrams_from_public -lt 1) {
         throw 'SOCKS5 policy or aggregate metrics were not updated as expected.'
     }
     if (-not $metrics.socks5_capabilities.connect -or
         -not $metrics.socks5_capabilities.udp_associate -or
-        $metrics.socks5_capabilities.bind -or
-        $metrics.socks5_capabilities.udp_fragmentation) {
+        -not $metrics.socks5_capabilities.bind -or
+        -not $metrics.socks5_capabilities.udp_fragmentation) {
         throw 'The aggregate SOCKS5 capability contract is incorrect.'
     }
     if ([uint64]$metrics.udp_public_ipv6_bind_successes_total -lt 1 -or
@@ -603,7 +701,7 @@ managed_config_path = "$managedTomlPath"
         -not ($remaining | Where-Object { $_.id -eq $created.id })
     }
 
-    Write-Host 'SOCKS5 TCP/UDP E2E passed: managed exit, one-time password, mandatory auth, CONNECT, IPv4/IPv6 UDP ASSOCIATE, explicit BIND/FRAG boundaries, limits, lifecycle, capabilities, and metrics.'
+    Write-Host 'SOCKS5 TCP/UDP E2E passed: managed exit, one-time password, mandatory auth, CONNECT, constrained two-reply BIND, IPv4/IPv6 UDP ASSOCIATE, bounded UDP FRAG reassembly/rejection, limits, lifecycle, capabilities, and metrics.'
 } finally {
     foreach ($process in $processes) {
         if ($process -and -not $process.HasExited) {
