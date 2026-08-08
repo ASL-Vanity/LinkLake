@@ -59,7 +59,35 @@ test('native Linux DEB and RPM release contracts are isolated, pinned, and befor
   assert.match(contract, /Run this native package contract test as root inside a disposable container/);
   assert.match(contract, /assert_new_installation_ready/);
   assert.match(contract, /assert_operator_configuration_is_preserved/);
+  assert.match(contract, /assert_failed_activation_rolls_back/);
+  assert.match(contract, /remove_package/);
+  assert.match(contract, /preserve-user-data/);
   assert.match(contract, /systemd-analyze verify/);
+
+  const packaging = read('scripts/package-native-linux.sh');
+  for (const marker of [
+    'packaging/linux/package-lifecycle.sh',
+    'set -- prepare-upgrade',
+    "s/%/%%/g' packaging/linux/package-lifecycle.sh",
+    'package-lifecycle activate',
+    'package-lifecycle remove',
+    '%preun',
+    '%postun',
+    'DEBIAN/prerm',
+    'DEBIAN/postrm',
+  ]) {
+    assert.ok(packaging.includes(marker), `native package lifecycle is missing ${marker}`);
+  }
+  const lifecycle = read('packaging/linux/package-lifecycle.sh');
+  for (const marker of [
+    'validate_installation',
+    'rollback_upgrade',
+    'restore_recorded_services',
+    'rolled-back',
+    'refusing symbolic-link',
+  ]) {
+    assert.ok(lifecycle.includes(marker), `package lifecycle helper is missing ${marker}`);
+  }
 
   for (const relative of [
     'tests/native-linux-package-contract-deb.Dockerfile',

@@ -1,5 +1,31 @@
 replicaCount: 1
 
+storage:
+  # PostgreSQL 当前承载协调、健康、Fleet 与更新账本；其余应用状态仍需由外部系统逐副本复制。
+  backend: sqlite
+  postgres:
+    existingSecret: ""
+    urlKey: postgres-url
+    poolSize: 16
+    acquireTimeoutSeconds: 5
+    connectTimeoutSeconds: 10
+    healthTimeoutSeconds: 5
+    allowInsecureLoopback: false
+    replicatedStateAcknowledged: false
+
+ha:
+  enabled: false
+  memberLeaseSeconds: 30
+  leaderLeaseSeconds: 15
+  heartbeatSeconds: 5
+  resourceLeaseSeconds: 15
+  jobLeaseSeconds: 30
+  updateStrategy:
+    partition: 0
+  pvcRetention:
+    whenDeleted: Retain
+    whenScaled: Retain
+
 image:
   repository: ghcr.io/asl-vanity/linklake
   tag: ""
@@ -69,12 +95,14 @@ persistence:
     storageClass: ""
     accessModes: [ReadWriteOnce]
     size: 10Gi
+    retainOnDelete: true
   logs:
     enabled: true
     existingClaim: ""
     storageClass: ""
     accessModes: [ReadWriteOnce]
     size: 5Gi
+    retainOnDelete: true
 
 podAnnotations: {}
 podLabels: {}

@@ -1,16 +1,58 @@
 {{- $authSecret := required "auth.existingSecret is required" .Values.auth.existingSecret -}}
 {{- $managementSecret := required "tls.managementSecret is required" .Values.tls.managementSecret -}}
 {{- $controlSecret := required "tls.controlSecret is required" .Values.tls.controlSecret -}}
+{{- $backend := lower .Values.storage.backend -}}
+{{- $haEnabled := .Values.ha.enabled -}}
+{{- if and (eq $backend "sqlite") (ne (int .Values.replicaCount) 1) -}}
+{{- fail "replicaCount must be 1 when storage.backend=sqlite" -}}
+{{- end -}}
+{{- if and $haEnabled (ne $backend "postgres") -}}
+{{- fail "ha.enabled requires storage.backend=postgres" -}}
+{{- end -}}
+{{- if and (gt (int .Values.replicaCount) 1) (not $haEnabled) -}}
+{{- fail "replicaCount greater than 1 requires ha.enabled=true" -}}
+{{- end -}}
+{{- if and $haEnabled (or (not .Values.persistence.data.enabled) .Values.persistence.data.existingClaim) -}}
+{{- fail "HA requires per-Pod data PVCs: persistence.data.enabled=true and existingClaim empty" -}}
+{{- end -}}
+{{- if and $haEnabled .Values.persistence.logs.existingClaim -}}
+{{- fail "HA requires an empty persistence.logs.existingClaim so every Pod receives an independent log volume" -}}
+{{- end -}}
+{{- if gt (int .Values.ha.leaderLeaseSeconds) (int .Values.ha.memberLeaseSeconds) -}}
+{{- fail "ha.leaderLeaseSeconds must not exceed ha.memberLeaseSeconds" -}}
+{{- end -}}
+{{- if or (ge (int .Values.ha.heartbeatSeconds) (int .Values.ha.memberLeaseSeconds)) (ge (int .Values.ha.heartbeatSeconds) (int .Values.ha.leaderLeaseSeconds)) (ge (int .Values.ha.heartbeatSeconds) (int .Values.ha.resourceLeaseSeconds)) (ge (int .Values.ha.heartbeatSeconds) (int .Values.ha.jobLeaseSeconds)) -}}
+{{- fail "ha.heartbeatSeconds must be lower than every configured HA lease" -}}
+{{- end -}}
+{{- $postgresSecret := "" -}}
+{{- if eq $backend "postgres" -}}
+{{- $postgresSecret = required "storage.postgres.existingSecret is required for PostgreSQL" .Values.storage.postgres.existingSecret -}}
+{{- if not .Values.storage.postgres.replicatedStateAcknowledged -}}
+{{- fail "storage.postgres.replicatedStateAcknowledged=true is required until all application state uses PostgreSQL" -}}
+{{- end -}}
+{{- end -}}
 apiVersion: apps/v1
-kind: Deployment
+kind: {{ ternary "StatefulSet" "Deployment" $haEnabled }}
 metadata:
   name: {{ include "linklake.fullname" . }}
   labels:
     {{- include "linklake.labels" . | nindent 4 }}
 spec:
-  replicas: 1
+  replicas: {{ .Values.replicaCount }}
+  {{- if $haEnabled }}
+  serviceName: {{ include "linklake.fullname" . }}-headless
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: {{ .Values.ha.updateStrategy.partition }}
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: {{ .Values.ha.pvcRetention.whenDeleted }}
+    whenScaled: {{ .Values.ha.pvcRetention.whenScaled }}
+  {{- else }}
   strategy:
     type: Recreate
+  {{- end }}
   selector:
     matchLabels:
       {{- include "linklake.selectorLabels" . | nindent 6 }}
@@ -58,6 +100,41 @@ spec:
               value: {{ .Values.server.reservedUdpPorts | quote }}
             - name: LINKLAKE_UDP_PUBLIC_BIND_MODE
               value: {{ .Values.server.udpPublicBindMode | quote }}
+            - name: LINKLAKE_STORAGE_BACKEND
+              value: {{ $backend | quote }}
+            {{- if eq $backend "postgres" }}
+            - name: LINKLAKE_POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $postgresSecret }}
+                  key: {{ .Values.storage.postgres.urlKey }}
+            - name: LINKLAKE_POSTGRES_POOL_SIZE
+              value: {{ .Values.storage.postgres.poolSize | quote }}
+            - name: LINKLAKE_POSTGRES_ACQUIRE_TIMEOUT_SECONDS
+              value: {{ .Values.storage.postgres.acquireTimeoutSeconds | quote }}
+            - name: LINKLAKE_POSTGRES_CONNECT_TIMEOUT_SECONDS
+              value: {{ .Values.storage.postgres.connectTimeoutSeconds | quote }}
+            - name: LINKLAKE_POSTGRES_HEALTH_TIMEOUT_SECONDS
+              value: {{ .Values.storage.postgres.healthTimeoutSeconds | quote }}
+            - name: LINKLAKE_POSTGRES_ALLOW_INSECURE_LOOPBACK
+              value: {{ .Values.storage.postgres.allowInsecureLoopback | quote }}
+            - name: LINKLAKE_HA_REPLICATED_STATE
+              value: "true"
+            - name: LINKLAKE_HA_INSTANCE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: LINKLAKE_HA_MEMBER_LEASE_SECONDS
+              value: {{ .Values.ha.memberLeaseSeconds | quote }}
+            - name: LINKLAKE_HA_LEADER_LEASE_SECONDS
+              value: {{ .Values.ha.leaderLeaseSeconds | quote }}
+            - name: LINKLAKE_HA_HEARTBEAT_SECONDS
+              value: {{ .Values.ha.heartbeatSeconds | quote }}
+            - name: LINKLAKE_HA_RESOURCE_LEASE_SECONDS
+              value: {{ .Values.ha.resourceLeaseSeconds | quote }}
+            - name: LINKLAKE_HA_JOB_LEASE_SECONDS
+              value: {{ .Values.ha.jobLeaseSeconds | quote }}
+            {{- end }}
             - name: LINKLAKE_MANAGEMENT_CERT_PATH
               value: /etc/linklake/management/tls.crt
             - name: LINKLAKE_MANAGEMENT_KEY_PATH
@@ -171,6 +248,7 @@ spec:
               mountPath: /etc/linklake/control
               readOnly: true
       volumes:
+        {{- if or (not $haEnabled) (not .Values.persistence.data.enabled) }}
         - name: data
           {{- if .Values.persistence.data.enabled }}
           persistentVolumeClaim:
@@ -178,6 +256,8 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        {{- end }}
+        {{- if or (not $haEnabled) (not .Values.persistence.logs.enabled) }}
         - name: logs
           {{- if .Values.persistence.logs.enabled }}
           persistentVolumeClaim:
@@ -185,6 +265,7 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        {{- end }}
         - name: tmp
           emptyDir: {}
         - name: management-tls
@@ -209,3 +290,30 @@ spec:
       topologySpreadConstraints:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+  {{- if $haEnabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.data.accessModes | nindent 10 }}
+        {{- with .Values.persistence.data.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.data.size }}
+    {{- if .Values.persistence.logs.enabled }}
+    - metadata:
+        name: logs
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.logs.accessModes | nindent 10 }}
+        {{- with .Values.persistence.logs.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.logs.size }}
+    {{- end }}
+  {{- end }}

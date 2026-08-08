@@ -1,10 +1,14 @@
-{{- if and .Values.persistence.data.enabled (not .Values.persistence.data.existingClaim) }}
+{{- if and (not .Values.ha.enabled) .Values.persistence.data.enabled (not .Values.persistence.data.existingClaim) }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: {{ include "linklake.fullname" . }}-data
   labels:
     {{- include "linklake.labels" . | nindent 4 }}
+  {{- if .Values.persistence.data.retainOnDelete }}
+  annotations:
+    helm.sh/resource-policy: keep
+  {{- end }}
 spec:
   accessModes:
     {{- toYaml .Values.persistence.data.accessModes | nindent 4 }}
@@ -16,13 +20,17 @@ spec:
       storage: {{ .Values.persistence.data.size }}
 ---
 {{- end }}
-{{- if and .Values.persistence.logs.enabled (not .Values.persistence.logs.existingClaim) }}
+{{- if and (not .Values.ha.enabled) .Values.persistence.logs.enabled (not .Values.persistence.logs.existingClaim) }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: {{ include "linklake.fullname" . }}-logs
   labels:
     {{- include "linklake.labels" . | nindent 4 }}
+  {{- if .Values.persistence.logs.retainOnDelete }}
+  annotations:
+    helm.sh/resource-policy: keep
+  {{- end }}
 spec:
   accessModes:
     {{- toYaml .Values.persistence.logs.accessModes | nindent 4 }}

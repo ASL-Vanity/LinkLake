@@ -2,7 +2,53 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "properties": {
-    "replicaCount": { "type": "integer", "const": 1 },
+    "replicaCount": { "type": "integer", "minimum": 1, "maximum": 32 },
+    "storage": {
+      "type": "object",
+      "required": ["backend", "postgres"],
+      "properties": {
+        "backend": { "type": "string", "enum": ["sqlite", "postgres"] },
+        "postgres": {
+          "type": "object",
+          "required": ["existingSecret", "urlKey", "replicatedStateAcknowledged"],
+          "properties": {
+            "existingSecret": { "type": "string" },
+            "urlKey": { "type": "string", "minLength": 1 },
+            "poolSize": { "type": "integer", "minimum": 1, "maximum": 128 },
+            "acquireTimeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 120 },
+            "connectTimeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 120 },
+            "healthTimeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 120 },
+            "allowInsecureLoopback": { "type": "boolean" },
+            "replicatedStateAcknowledged": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "ha": {
+      "type": "object",
+      "required": ["enabled", "memberLeaseSeconds", "leaderLeaseSeconds", "heartbeatSeconds", "resourceLeaseSeconds", "jobLeaseSeconds"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "memberLeaseSeconds": { "type": "integer", "minimum": 2, "maximum": 300 },
+        "leaderLeaseSeconds": { "type": "integer", "minimum": 2, "maximum": 120 },
+        "heartbeatSeconds": { "type": "integer", "minimum": 1, "maximum": 60 },
+        "resourceLeaseSeconds": { "type": "integer", "minimum": 2, "maximum": 300 },
+        "jobLeaseSeconds": { "type": "integer", "minimum": 2, "maximum": 300 },
+        "updateStrategy": {
+          "type": "object",
+          "properties": {
+            "partition": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "pvcRetention": {
+          "type": "object",
+          "properties": {
+            "whenDeleted": { "type": "string", "enum": ["Retain", "Delete"] },
+            "whenScaled": { "type": "string", "enum": ["Retain", "Delete"] }
+          }
+        }
+      }
+    },
     "auth": {
       "type": "object",
       "required": ["existingSecret"],
@@ -49,6 +95,27 @@
         }
       }
     },
+    "persistence": {
+      "type": "object",
+      "properties": {
+        "data": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "existingClaim": { "type": "string" },
+            "retainOnDelete": { "type": "boolean" }
+          }
+        },
+        "logs": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "existingClaim": { "type": "string" },
+            "retainOnDelete": { "type": "boolean" }
+          }
+        }
+      }
+    },
     "services": {
       "type": "object",
       "properties": {
@@ -69,5 +136,77 @@
         }
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "storage": { "properties": { "backend": { "const": "sqlite" } } }
+        }
+      },
+      "then": {
+        "properties": {
+          "replicaCount": { "const": 1 },
+          "ha": { "properties": { "enabled": { "const": false } } }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "storage": { "properties": { "backend": { "const": "postgres" } } }
+        }
+      },
+      "then": {
+        "properties": {
+          "storage": {
+            "properties": {
+              "postgres": {
+                "properties": {
+                  "existingSecret": { "minLength": 1 },
+                  "replicatedStateAcknowledged": { "const": true }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "ha": { "properties": { "enabled": { "const": true } } }
+        }
+      },
+      "then": {
+        "properties": {
+          "replicaCount": { "minimum": 2 },
+          "storage": { "properties": { "backend": { "const": "postgres" } } },
+          "persistence": {
+            "properties": {
+              "data": {
+                "properties": {
+                  "enabled": { "const": true },
+                  "existingClaim": { "maxLength": 0 }
+                }
+              },
+              "logs": {
+                "properties": {
+                  "existingClaim": { "maxLength": 0 }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "replicaCount": { "minimum": 2 } } },
+      "then": {
+        "properties": {
+          "ha": { "properties": { "enabled": { "const": true } } }
+        }
+      }
+    }
+  ]
 }

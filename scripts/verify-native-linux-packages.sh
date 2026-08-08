@@ -29,6 +29,7 @@ if command -v dpkg-deb >/dev/null 2>&1; then
   for entry in \
     /usr/local/bin/linklake-server \
     /usr/local/bin/linklake-client \
+    /usr/libexec/linklake/package-lifecycle \
     /lib/systemd/system/linklake-server.service \
     /lib/systemd/system/linklake-update-resume.service \
     /lib/systemd/system/linklake-client.service \
@@ -52,6 +53,11 @@ if command -v dpkg-deb >/dev/null 2>&1; then
   grep -F 'install -o root -g root -m 0600 /etc/linklake/server.env.example /etc/linklake/server.env' "$control_root/postinst" >/dev/null
   grep -F 'if [ ! -e /etc/linklake/client.toml ] && [ ! -L /etc/linklake/client.toml ]; then' "$control_root/postinst" >/dev/null
   grep -F 'install -o linklake -g linklake -m 0600 /etc/linklake/client.toml.example /etc/linklake/client.toml' "$control_root/postinst" >/dev/null
+  grep -F 'set -- prepare-upgrade' "$control_root/preinst" >/dev/null
+  grep -F 'rollback_upgrade()' "$control_root/preinst" >/dev/null
+  grep -F 'package-lifecycle activate' "$control_root/postinst" >/dev/null
+  grep -F 'package-lifecycle remove' "$control_root/prerm" >/dev/null
+  grep -F 'rm -f -- /etc/linklake/server.env /etc/linklake/client.toml' "$control_root/postrm" >/dev/null
   rm -rf -- "$control_root"
   verified=$((verified + 1))
 fi
@@ -70,6 +76,7 @@ if command -v rpm >/dev/null 2>&1; then
   for entry in \
     /usr/local/bin/linklake-server \
     /usr/local/bin/linklake-client \
+    /usr/libexec/linklake/package-lifecycle \
     /lib/systemd/system/linklake-server.service \
     /lib/systemd/system/linklake-update-resume.service \
     /lib/systemd/system/linklake-client.service \
@@ -91,6 +98,10 @@ if command -v rpm >/dev/null 2>&1; then
   rpm -qp --scripts "$rpm_package" | grep -F 'install -o root -g root -m 0600 /etc/linklake/server.env.example /etc/linklake/server.env' >/dev/null
   rpm -qp --scripts "$rpm_package" | grep -F 'if [ ! -e /etc/linklake/client.toml ] && [ ! -L /etc/linklake/client.toml ]; then' >/dev/null
   rpm -qp --scripts "$rpm_package" | grep -F 'install -o linklake -g linklake -m 0600 /etc/linklake/client.toml.example /etc/linklake/client.toml' >/dev/null
+  rpm -qp --scripts "$rpm_package" | grep -F 'set -- prepare-upgrade' >/dev/null
+  rpm -qp --scripts "$rpm_package" | grep -F 'rollback_upgrade()' >/dev/null
+  rpm -qp --scripts "$rpm_package" | grep -F 'package-lifecycle activate' >/dev/null
+  rpm -qp --scripts "$rpm_package" | grep -F 'package-lifecycle remove' >/dev/null
   verified=$((verified + 1))
 fi
 

@@ -24,12 +24,13 @@ mkdir -p "$out"
 stage="$(mktemp -d)"
 trap 'rm -rf -- "$stage"' EXIT
 
-install -d "$stage/usr/local/bin" "$stage/lib/systemd/system" "$stage/etc/linklake" \
+install -d "$stage/usr/local/bin" "$stage/usr/libexec/linklake" "$stage/lib/systemd/system" "$stage/etc/linklake" \
   "$stage/var/lib/linklake" "$stage/var/log/linklake" \
   "$stage/var/lib/linklake-client" "$stage/var/log/linklake-client"
 install -d -m 0700 "$stage/var/lib/linklake-updater" "$stage/var/lib/linklake-updater/server"
 install -m 0755 "$binary_dir/linklake-server" "$stage/usr/local/bin/"
 install -m 0755 "$binary_dir/linklake-client" "$stage/usr/local/bin/"
+install -m 0755 packaging/linux/package-lifecycle.sh "$stage/usr/libexec/linklake/package-lifecycle"
 install -m 0644 packaging/systemd/linklake-server.service "$stage/lib/systemd/system/"
 install -m 0644 packaging/systemd/linklake-update-resume.service "$stage/lib/systemd/system/"
 install -m 0644 packaging/systemd/linklake-client.service "$stage/lib/systemd/system/"
@@ -66,9 +67,34 @@ fi
 chown -R linklake:linklake /var/lib/linklake /var/log/linklake /var/lib/linklake-client /var/log/linklake-client
 chown root:root /var/lib/linklake-updater /var/lib/linklake-updater/server
 chmod 0700 /var/lib/linklake-updater /var/lib/linklake-updater/server
+mode=install
+if [ "${1:-}" = configure ] && [ -n "${2:-}" ]; then
+  mode=upgrade
+fi
+/usr/libexec/linklake/package-lifecycle activate "$mode"
+EOF
+  cat >"$stage/DEBIAN/preinst" <<'EOF'
+#!/bin/sh
+if [ "${1:-}" != upgrade ]; then exit 0; fi
+set -- prepare-upgrade
+EOF
+  sed '1d' packaging/linux/package-lifecycle.sh >>"$stage/DEBIAN/preinst"
+  cat >"$stage/DEBIAN/prerm" <<'EOF'
+#!/bin/sh
+set -e
+if [ "${1:-}" = remove ] || [ "${1:-}" = deconfigure ]; then
+  /usr/libexec/linklake/package-lifecycle remove
+fi
+EOF
+  cat >"$stage/DEBIAN/postrm" <<'EOF'
+#!/bin/sh
+set -e
+if [ "${1:-}" = purge ]; then
+  rm -f -- /etc/linklake/server.env /etc/linklake/client.toml
+fi
 systemctl daemon-reload >/dev/null 2>&1 || true
 EOF
-  chmod 0755 "$stage/DEBIAN/postinst"
+  chmod 0755 "$stage/DEBIAN/preinst" "$stage/DEBIAN/postinst" "$stage/DEBIAN/prerm" "$stage/DEBIAN/postrm"
   dpkg-deb --build --root-owner-group "$stage" "$out/linklake_${version}_${deb_arch}.deb"
   rm -rf "$stage/DEBIAN"
 fi
@@ -92,6 +118,12 @@ LinkLake secure tunnel server and client.
 %install
 mkdir -p %{buildroot}
 tar -xzf %{SOURCE0} -C %{buildroot}
+%pre
+if [ \$1 -le 1 ]; then exit 0; fi
+set -- prepare-upgrade
+EOF
+  sed '1d; s/%/%%/g' packaging/linux/package-lifecycle.sh >>"$top/SPECS/linklake.spec"
+  cat >>"$top/SPECS/linklake.spec" <<EOF
 %post
 getent group linklake >/dev/null || groupadd --system linklake
 getent passwd linklake >/dev/null || useradd --system --gid linklake --home-dir /var/lib/linklake --shell /sbin/nologin linklake
@@ -104,10 +136,19 @@ fi
 chown -R linklake:linklake /var/lib/linklake /var/log/linklake /var/lib/linklake-client /var/log/linklake-client
 chown root:root /var/lib/linklake-updater /var/lib/linklake-updater/server
 chmod 0700 /var/lib/linklake-updater /var/lib/linklake-updater/server
+mode=install
+if [ \$1 -gt 1 ]; then mode=upgrade; fi
+/usr/libexec/linklake/package-lifecycle activate "\$mode"
+%preun
+if [ \$1 -eq 0 ] && [ -x /usr/libexec/linklake/package-lifecycle ]; then
+  /usr/libexec/linklake/package-lifecycle remove
+fi
+%postun
 systemctl daemon-reload >/dev/null 2>&1 || true
 %files
 /usr/local/bin/linklake-server
 /usr/local/bin/linklake-client
+/usr/libexec/linklake/package-lifecycle
 /lib/systemd/system/linklake-server.service
 /lib/systemd/system/linklake-update-resume.service
 /lib/systemd/system/linklake-client.service

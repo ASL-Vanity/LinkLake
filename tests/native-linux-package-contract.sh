@@ -48,13 +48,14 @@ create_fixture() {
   fixture="$1"
   version="$2"
   template_marker="$3"
-  mkdir -p "$fixture/scripts" "$fixture/packaging/systemd" "$fixture/examples" "$fixture/bin"
+  mkdir -p "$fixture/scripts" "$fixture/packaging/systemd" "$fixture/packaging/linux" "$fixture/examples" "$fixture/bin"
   cp "$root/scripts/package-native-linux.sh" "$fixture/scripts/package-native-linux.sh"
   cp "$root/scripts/verify-native-linux-packages.sh" "$fixture/scripts/verify-native-linux-packages.sh"
   cp "$root/packaging/systemd/linklake-server.service" "$fixture/packaging/systemd/"
   cp "$root/packaging/systemd/linklake-update-resume.service" "$fixture/packaging/systemd/"
   cp "$root/packaging/systemd/linklake-client.service" "$fixture/packaging/systemd/"
   cp "$root/packaging/systemd/server.env.example" "$fixture/packaging/systemd/server.env.example"
+  cp "$root/packaging/linux/package-lifecycle.sh" "$fixture/packaging/linux/package-lifecycle.sh"
   cp "$root/examples/linklake-client.toml" "$fixture/examples/linklake-client.toml"
   printf '\n# native-package-contract-template=%s\n' "$template_marker" >>"$fixture/packaging/systemd/server.env.example"
   printf '\n# native-package-contract-template=%s\n' "$template_marker" >>"$fixture/examples/linklake-client.toml"
@@ -116,6 +117,7 @@ assert_new_installation_ready() {
   assert_owner_mode /etc/linklake/client.toml "$(id -u linklake):$(id -g linklake):600"
   assert_owner_mode /var/lib/linklake-updater '0:0:700'
   assert_owner_mode /var/lib/linklake-updater/server '0:0:700'
+  test -x /usr/libexec/linklake/package-lifecycle
   assert_unit_contract
 }
 
@@ -151,6 +153,28 @@ EOF
   cmp "$retained_client" /etc/linklake/client.toml
 }
 
+assert_failed_activation_rolls_back() {
+  server_before="$test_root/linklake-server-before-failed-activation"
+  cp /usr/local/bin/linklake-server "$server_before"
+  /usr/libexec/linklake/package-lifecycle prepare-upgrade
+  cat >/usr/local/bin/linklake-server <<'EOF'
+#!/usr/bin/env sh
+exit 42
+EOF
+  chmod 0755 /usr/local/bin/linklake-server
+  if /usr/libexec/linklake/package-lifecycle activate upgrade; then
+    echo 'A broken package activation unexpectedly succeeded.' >&2
+    exit 1
+  fi
+  cmp "$server_before" /usr/local/bin/linklake-server
+  test -f /var/lib/linklake/package-backup/pending/rolled-back
+
+  # 模拟安装修复后的包：新一轮 prepare 会先恢复并清理失败现场，再建立新的受控备份。
+  /usr/libexec/linklake/package-lifecycle prepare-upgrade
+  /usr/libexec/linklake/package-lifecycle activate upgrade
+  test ! -e /var/lib/linklake/package-backup/pending
+}
+
 fixture_v1="$test_root/fixture-v1"
 fixture_v2="$test_root/fixture-v2"
 out_v1="$test_root/out-v1"
@@ -169,6 +193,7 @@ case "$mode" in
     for entry in \
       /usr/local/bin/linklake-server \
       /usr/local/bin/linklake-client \
+      /usr/libexec/linklake/package-lifecycle \
       /lib/systemd/system/linklake-server.service \
       /lib/systemd/system/linklake-update-resume.service \
       /lib/systemd/system/linklake-client.service \
@@ -180,6 +205,8 @@ case "$mode" in
     ! printf '%s\n' "$entries" | grep -Fx '/etc/linklake/client.toml' >/dev/null
     install_package() { dpkg -i "$1" >/dev/null; }
     upgrade_package() { dpkg --force-confold -i "$1" >/dev/null; }
+    remove_package() { dpkg -r linklake >/dev/null; }
+    purge_package() { dpkg --purge linklake >/dev/null; }
     ;;
   rpm)
     package_v1="$(find "$out_v1" -maxdepth 1 -name 'linklake-1.0.0-1*.rpm' -print -quit)"
@@ -189,6 +216,7 @@ case "$mode" in
     for entry in \
       /usr/local/bin/linklake-server \
       /usr/local/bin/linklake-client \
+      /usr/libexec/linklake/package-lifecycle \
       /lib/systemd/system/linklake-server.service \
       /lib/systemd/system/linklake-update-resume.service \
       /lib/systemd/system/linklake-client.service \
@@ -200,11 +228,25 @@ case "$mode" in
     ! printf '%s\n' "$entries" | grep -Fx '/etc/linklake/client.toml' >/dev/null
     install_package() { rpm -ivh --nosignature "$1" >/dev/null; }
     upgrade_package() { rpm -Uvh --replacepkgs --nosignature "$1" >/dev/null; }
+    remove_package() { rpm -e linklake >/dev/null; }
     ;;
 esac
 
 install_package "$package_v1"
 assert_new_installation_ready
 assert_operator_configuration_is_preserved
+assert_failed_activation_rolls_back
 
-echo "Native Linux $mode package install and upgrade contract passed."
+printf 'preserve-user-data\n' >/var/lib/linklake/operator-data
+remove_package
+test -f /var/lib/linklake/operator-data
+test -f /etc/linklake/server.env
+test -f /etc/linklake/client.toml
+if [ "$mode" = deb ]; then
+  purge_package
+  test ! -e /etc/linklake/server.env
+  test ! -e /etc/linklake/client.toml
+  test -f /var/lib/linklake/operator-data
+fi
+
+echo "Native Linux $mode package install, upgrade, rollback, and uninstall contract passed."
