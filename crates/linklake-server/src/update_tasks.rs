@@ -877,7 +877,12 @@ impl UpdateTaskCatalog {
             request
                 .report
                 .validate_for_task(task.action, task.stage, task.cancel_requested)
-                .map_err(|error| domain_error(UpdateTaskError::Contract(error)))?;
+                .map_err(|error| match error {
+                    RemoteUpdateContractError::InvalidTransition => {
+                        domain_error(UpdateTaskError::InvalidTransition)
+                    }
+                    error => domain_error(UpdateTaskError::Contract(error)),
+                })?;
             authorize_lease(
                 transaction,
                 &task,
