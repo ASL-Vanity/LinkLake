@@ -16148,7 +16148,16 @@ mod tests {
         }
         assert!(!MANAGEMENT_UI.contains("{ name: 'http2'"));
         assert!(!MANAGEMENT_UI.contains("{ name: 'grpc'"));
-        assert!(!MANAGEMENT_UI.contains("{ name: 'grpc_backend_transport'"));
+        for field in [
+            "{ name: 'grpc_backend_transport'",
+            "{ name: 'grpc_backend_server_name'",
+            "{ name: 'grpc_backend_trust_profile'",
+        ] {
+            assert!(
+                MANAGEMENT_UI.contains(field),
+                "Web UI does not configure HTTP route field {field}"
+            );
+        }
     }
 
     #[test]
@@ -16415,7 +16424,7 @@ mod tests {
     }
 
     #[test]
-    fn web_ui_exposes_secure_update_center_without_remote_client_replacement() {
+    fn web_ui_exposes_secure_server_and_remote_client_updates() {
         for marker in [
             "href=\"#/updates\"",
             "id=\"updates-view\"",
@@ -16427,8 +16436,11 @@ mod tests {
             "operation_active",
             "state.dashboard.updateOverview.operation_active = true",
             "Production signatures only",
-            "Remote client replacement is intentionally unavailable",
-            "linklake-client update apply --yes",
+            "/api/v1/updates/clients/tasks",
+            "check: 'CHECK', download: 'DOWNLOAD', apply: 'UPDATE', status: 'STATUS', recover: 'RECOVER', rollback: 'ROLLBACK'",
+            "promptForUpdateConfirmation('confirmCancelRemoteUpdate', 'CANCEL')",
+            "renderRemoteUpdateTasks()",
+            "openRemoteUpdateTask(task.task_id)",
         ] {
             assert!(
                 MANAGEMENT_UI.contains(marker),

@@ -158,6 +158,7 @@ class LinkLakeApiClient implements LinkLakeApi {
     request.headers.set(HttpHeaders.acceptHeader, 'application/json');
     if (!const ['GET', 'HEAD', 'OPTIONS'].contains(method.toUpperCase())) {
       request.headers.set('X-LinkLake-CSRF', '1');
+      request.headers.set('Origin', baseUri.origin);
     }
     if (includeCookie && _cookie != null) {
       request.headers.set(HttpHeaders.cookieHeader, _cookie!);

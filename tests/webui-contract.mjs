@@ -44,7 +44,12 @@ for (const marker of [
   "promptForUpdateConfirmation('confirmApplyUpdate', 'UPDATE')",
   'operation_active',
   'state.dashboard.updateOverview.operation_active = true',
-  'Remote client replacement is intentionally unavailable'
+  '/api/v1/updates/clients/tasks',
+  "check: 'CHECK', download: 'DOWNLOAD', apply: 'UPDATE', status: 'STATUS', recover: 'RECOVER', rollback: 'ROLLBACK'",
+  "promptForUpdateConfirmation('confirmCancelRemoteUpdate', 'CANCEL')",
+  "{ name: 'grpc_backend_transport'",
+  "{ name: 'grpc_backend_server_name'",
+  "{ name: 'grpc_backend_trust_profile'"
 ]) {
   ensure(`${html}\n${app}`.includes(marker), `secure update contract missing: ${marker}`);
 }

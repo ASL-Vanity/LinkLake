@@ -23,6 +23,7 @@ class RoleCapabilities {
   bool get canManageApiTokens => isAdministrator;
   bool get canManageFleet => isAdministrator;
   bool get canViewFleet => isAdministrator;
+  bool get canManageUpdates => isAdministrator;
   bool get canManageTrafficControl => isAdministrator;
   bool get canManageTotp => role != ManagementRole.auditor;
 }
@@ -62,6 +63,12 @@ List<DashboardRequest> dashboardRequestPlan(ManagementRole role) {
       DashboardRequest('sessions', '/api/v1/sessions'),
       DashboardRequest('apiTokens', '/api/v1/api-tokens'),
       DashboardRequest('fleet', '/api/v1/fleet/overview', object: true),
+      DashboardRequest('serverUpdate', '/api/v1/updates/server', object: true),
+      DashboardRequest(
+        'remoteUpdateTasks',
+        '/api/v1/updates/clients/tasks?limit=100',
+        object: true,
+      ),
     ]);
   }
   return requests;
@@ -80,6 +87,7 @@ List<String> visibleDestinationIds(ManagementRole role) => [
   'proxy',
   'p2p',
   if (role == ManagementRole.administrator) 'fleet',
+  if (role == ManagementRole.administrator) 'updates',
   'alerts',
   'users',
   'diagnostics',

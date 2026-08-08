@@ -286,6 +286,28 @@ extension PolicyKindInfo on PolicyKind {
         max: 1024,
       ),
       PolicyField(
+        'grpc_backend_transport',
+        'gRPC 后端传输',
+        'gRPC backend transport',
+        type: PolicyFieldType.select,
+        required: true,
+        defaultValue: 'h2c',
+        options: ['h2c', 'tls'],
+      ),
+      PolicyField(
+        'grpc_backend_server_name',
+        'gRPC TLS 服务器名称',
+        'gRPC TLS server name',
+        required: true,
+        visibleWhen: ('grpc_backend_transport', 'tls'),
+      ),
+      PolicyField(
+        'grpc_backend_trust_profile',
+        'gRPC 信任配置',
+        'gRPC trust profile',
+        visibleWhen: ('grpc_backend_transport', 'tls'),
+      ),
+      PolicyField(
         'tls_mode',
         'TLS 模式',
         'TLS mode',
@@ -750,6 +772,23 @@ class _PolicyPageState extends State<PolicyPage> {
           payload['allowed_client_id'] == '') {
         payload['allowed_client_id'] = null;
       }
+      if (widget.kind == PolicyKind.http) {
+        if (payload['grpc_backend_transport'] != 'tls') {
+          payload['grpc_backend_transport'] = 'h2c';
+          payload['grpc_backend_server_name'] = null;
+          payload['grpc_backend_trust_profile'] = null;
+        } else {
+          payload['grpc_backend_server_name'] =
+              payload['grpc_backend_server_name']?.toString().trim();
+          final trustProfile = payload['grpc_backend_trust_profile']
+              ?.toString()
+              .trim();
+          payload['grpc_backend_trust_profile'] =
+              trustProfile == null || trustProfile.isEmpty
+              ? null
+              : trustProfile;
+        }
+      }
       Map<String, dynamic>? response;
       var primarySaved = false;
       try {
@@ -1016,9 +1055,22 @@ class _PolicyPageState extends State<PolicyPage> {
         ? Map<String, dynamic>.from(policy['capabilities'] as Map)
         : const <String, dynamic>{};
     if (capabilities['http2'] == true && capabilities['grpc'] == true) {
+      final transport = policy['grpc_backend_transport'] == 'tls'
+          ? 'TLS'
+          : 'h2c';
+      final serverName = policy['grpc_backend_server_name']?.toString().trim();
+      final trustProfile = policy['grpc_backend_trust_profile']
+          ?.toString()
+          .trim();
+      final backend = transport == 'TLS'
+          ? t(
+              'gRPC 后端：TLS · 服务器名称 ${serverName?.isNotEmpty == true ? serverName : '—'} · 信任 ${trustProfile?.isNotEmpty == true ? trustProfile : '系统证书库'}。',
+              'gRPC backend: TLS · server name ${serverName?.isNotEmpty == true ? serverName : '—'} · trust ${trustProfile?.isNotEmpty == true ? trustProfile : 'system trust store'}.',
+            )
+          : t('gRPC 后端：h2c 明文连接。', 'gRPC backend: cleartext h2c.');
       return t(
-        '公网支持 HTTP/1.1 与 HTTP/2；原生 gRPC 使用复用的 h2c 后端连接池，HTTPS 通过 ALPN 协商 h2。',
-        'Public HTTP/1.1 and HTTP/2 are supported. Native gRPC uses a pooled h2c backend, and HTTPS negotiates h2 with ALPN.',
+        '公网支持 HTTP/1.1 与 HTTP/2，HTTPS 通过 ALPN 协商 h2。$backend',
+        'Public HTTP/1.1 and HTTP/2 are supported, and HTTPS negotiates h2 with ALPN. $backend',
       );
     }
     return t(
@@ -1322,8 +1374,16 @@ class _PolicyEditorDialogState extends State<_PolicyEditorDialog> {
         decoration: InputDecoration(labelText: label),
         items: [
           for (final option in field.options)
-            DropdownMenuItem(value: option, child: Text(option.toUpperCase())),
+            DropdownMenuItem(
+              key: Key('option-${field.name}-$option'),
+              value: option,
+              child: Text(option.toUpperCase()),
+            ),
         ],
+        validator: field.required
+            ? (value) =>
+                  value == null || value.isEmpty ? t('必填', 'Required') : null
+            : null,
         onChanged: (value) => setState(() => _values[field.name] = value),
       );
     }

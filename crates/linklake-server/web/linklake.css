@@ -316,6 +316,15 @@
       .update-release a { color: var(--accent); font-weight: 800; }
       .command-list { display: grid; gap: 7px; margin: 13px 0; }
       .command-list code { display: block; padding: 9px 10px; overflow-x: auto; border: 1px solid var(--line-soft); border-radius: 8px; color: var(--text-strong); background: var(--surface-3); font: 10px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: nowrap; }
+      .remote-update-request-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(150px, .7fr); gap: 10px; margin: 14px 0 10px; }
+      .remote-update-task-panel { margin-bottom: 12px; }
+      .remote-update-table td:nth-child(1), .remote-update-table td:nth-child(5) { max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
+      .remote-update-task-modal { width: min(760px, 100%); max-height: min(820px, calc(100vh - 40px)); overflow-y: auto; }
+      .remote-update-events { display: grid; gap: 8px; margin-top: 10px; }
+      .remote-update-event { display: grid; grid-template-columns: 72px minmax(0, 1fr) auto; gap: 10px; align-items: start; padding: 9px 10px; border: 1px solid var(--line-soft); border-radius: 9px; background: var(--surface-3); }
+      .remote-update-event strong { color: var(--text-strong); }
+      .remote-update-event span { color: var(--muted); overflow-wrap: anywhere; }
+      .remote-update-event time { color: var(--faint); font-size: 9px; white-space: nowrap; }
       .update-warning p { margin: 7px 0 0; font-size: 11px; }
       .drawer-backdrop { position: fixed; inset: 0; z-index: 90; background: var(--overlay); }
       .drawer { position: fixed; top: 0; right: 0; z-index: 100; display: grid; grid-template-rows: auto minmax(0, 1fr); width: min(520px, 100vw); height: 100vh; border-left: var(--panel-border-width) var(--material-border-style) var(--line); background: var(--dialog-material); box-shadow: var(--drawer-shadow, -24px 0 70px var(--shadow)); -webkit-backdrop-filter: var(--dialog-filter); backdrop-filter: var(--dialog-filter); }
@@ -556,6 +565,8 @@
         .workspace-header, .section-heading, .service-header, .panel-heading { align-items: flex-start; flex-direction: column; }
         .header-actions { justify-content: flex-start; }
         .utility-session .time-pill, .utility-session .health-pill { display: none; }
+        .remote-update-request-grid { grid-template-columns: 1fr; }
+        .remote-update-event { grid-template-columns: 1fr; gap: 4px; }
         .range-switch { width: 100%; max-width: 100%; overflow-x: auto; justify-content: flex-start; }
         .range-switch button { flex: 0 0 auto; }
         .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }

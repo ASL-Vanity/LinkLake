@@ -100,15 +100,16 @@
         policyStatusChartLabel: 'Policy availability and workload chart',
         clientStatusChartLabel: 'Client availability chart',
         clientPlatformChartLabel: 'Client platform and configuration chart',
+        httpTransportCapabilities: 'Public HTTP/1.1 and HTTP/2 are supported. Native gRPC uses the configured h2c or TLS backend transport; HTTPS negotiates h2 with ALPN.',
         systemManagement: 'System',
         updateCenter: 'Update center',
         updateCenterHelp: 'Inspect signed release status and perform explicitly confirmed server maintenance.',
         serverUpdate: 'Server update',
         serverUpdateHelp: 'Check, verify and schedule a signed stable release.',
         clientUpdate: 'Client update',
-        clientUpdateHelp: 'Clients update locally so the server cannot silently replace endpoint binaries.',
+        clientUpdateHelp: 'Create a bounded update task for an enrolled client.',
         localOnly: 'Local only',
-        clientUpdateBoundary: 'Remote client replacement is intentionally unavailable. Run the signed updater on each client host or through your own authorized device-management system.',
+        clientUpdateBoundary: 'Only the six built-in signed updater actions can be requested. Arbitrary commands, URLs and scripts are never accepted.',
         productionSignatureOnly: 'Production signatures only',
         production: 'Production',
         signaturePolicy: 'Signature policy',
@@ -118,7 +119,7 @@
         downloadUpdate: 'Download and verify',
         applyUpdate: 'Apply update',
         rollbackRecovery: 'Rollback and recovery',
-        rollbackRecoveryHelp: 'Database-aware rollback and interrupted-update recovery remain local administrator operations because they can require explicit data-loss consent.',
+        rollbackRecoveryHelp: 'Server database-aware rollback and interrupted-update recovery remain local administrator operations because they can require explicit data-loss consent.',
         installedVersion: 'Installed version',
         targetPlatform: 'Target platform',
         sourceRepository: 'Source repository',
@@ -151,7 +152,19 @@
         signedManifestProtected: 'Ed25519 signed manifest',
         rollbackProtected: 'Automatic validation and rollback',
         remoteClientUpdateDisabled: 'Remote client update disabled',
-        releaseDetails: 'Release details'
+        releaseDetails: 'Release details',
+        targetClient: 'Target client', updateAction: 'Update action', updateStage: 'Stage', requestedBy: 'Requested by', updatedAt: 'Updated',
+        remoteActionCheck: 'Check', remoteActionDownload: 'Download', remoteActionApply: 'Apply', remoteActionStatus: 'Status', remoteActionRecover: 'Recover', remoteActionRollback: 'Rollback',
+        remoteConfirmationRequired: 'Exact administrator confirmation', createUpdateTask: 'Create update task', clientUpdateTasks: 'Client update tasks', clientUpdateTasksHelp: 'Inspect progress, event history and cancellation state.',
+        updateTaskDetails: 'Update task details', taskEvents: 'Task events', cancelUpdateTask: 'Cancel task', viewDetails: 'Details', noUpdateTasks: 'No client update tasks.', remoteUpdateAvailable: 'Remote tasks enabled',
+        confirmRemoteUpdate: 'Create the {action} task for {client}?', confirmCancelRemoteUpdate: 'Request cancellation for this client update task?', remoteTaskCreated: 'Client update task created.', remoteTaskCancelRequested: 'Cancellation requested.',
+        remoteStateQueued: 'Queued', remoteStateClaimed: 'Claimed', remoteStateRunning: 'Running', remoteStateCancelRequested: 'Cancel requested', remoteStateSucceeded: 'Succeeded', remoteStateFailed: 'Failed', remoteStateCancelled: 'Cancelled',
+        remoteStageQueued: 'Queued', remoteStageClaimed: 'Claimed', remoteStageChecking: 'Checking', remoteStageDownloading: 'Downloading', remoteStageApplying: 'Applying', remoteStageInspecting: 'Inspecting', remoteStageRecovering: 'Recovering', remoteStageRollingBack: 'Rolling back', remoteStageAwaitingRestart: 'Awaiting restart', remoteStageCompleted: 'Completed', remoteStageFailed: 'Failed', remoteStageCancelled: 'Cancelled',
+        remoteEventCreated: 'Created', remoteEventIdempotentReplay: 'Idempotent replay', remoteEventClaimed: 'Claimed', remoteEventLeaseRenewed: 'Lease renewed', remoteEventStageReported: 'Stage reported', remoteEventCancelRequested: 'Cancel requested', remoteEventCancelled: 'Cancelled', remoteEventSucceeded: 'Succeeded', remoteEventFailed: 'Failed', remoteEventLeaseExpiredRequeued: 'Lease expired; requeued', remoteEventLeaseExpiredFailedClosed: 'Lease expired; failed closed', remoteEventRestartReconciled: 'Restart reconciled',
+        taskId: 'Task ID', recoveryState: 'Recovery state', attempt: 'Attempt', errorCode: 'Error code', taskResult: 'Result', createdAt: 'Created', completedAt: 'Completed', noTaskEvents: 'No task events were returned.',
+        grpcBackendTransport: 'gRPC backend transport', grpcBackendH2c: 'h2c (cleartext)', grpcBackendTls: 'TLS', grpcBackendServerName: 'gRPC TLS server name', grpcBackendTrustProfile: 'gRPC trust profile', grpcTrustSystem: 'System trust store',
+        errorInvalidGrpcBackend: 'The gRPC backend TLS configuration is invalid. TLS requires a server name; the trust profile is optional.',
+        errorRemoteConfirmation: 'The exact confirmation phrase is required.', errorRemoteTargetNotFound: 'The target client does not exist.', errorRemoteTaskNotFound: 'The update task does not exist.', errorRemoteTargetBusy: 'The target client already has an active update task.', errorRemoteIdempotencyConflict: 'The idempotency key conflicts with another request.', errorRemoteLeaseConflict: 'Another worker owns this update task lease.', errorRemoteLeaseExpired: 'The update task lease expired.', errorRemoteInvalidTransition: 'The update task cannot perform that transition.', errorRemoteCapacity: 'The remote update task capacity has been reached.', errorRemoteStorage: 'Remote update task storage is unavailable.', errorRemoteInvalidRequest: 'The remote update request is invalid.', errorRemoteRequester: 'The update requester identity is invalid.'
       });
 
       Object.assign(WORDS.zh, {
@@ -195,15 +208,16 @@
         policyStatusChartLabel: '策略可用性与负载图',
         clientStatusChartLabel: '客户端可用性图',
         clientPlatformChartLabel: '客户端平台与配置图',
+        httpTransportCapabilities: '公网支持 HTTP/1.1 与 HTTP/2；原生 gRPC 使用所配置的 h2c 或 TLS 后端传输，HTTPS 通过 ALPN 协商 h2。',
         systemManagement: '系统',
         updateCenter: '更新中心',
         updateCenterHelp: '查看签名版本状态，并执行需要明确确认的服务端维护操作。',
         serverUpdate: '服务端更新',
         serverUpdateHelp: '检查、校验并调度经过签名的稳定版本。',
         clientUpdate: '客户端更新',
-        clientUpdateHelp: '客户端在本机完成更新，服务端不能静默替换端点程序。',
+        clientUpdateHelp: '为已注册客户端创建受限的远程更新任务。',
         localOnly: '仅本机',
-        clientUpdateBoundary: '当前有意不提供远程替换客户端程序的能力。请在每台客户端主机上运行签名更新器，或使用你已授权的设备管理系统。',
+        clientUpdateBoundary: '仅可请求六种内置签名更新动作，永远不接受任意命令、URL 或脚本。',
         productionSignatureOnly: '仅信任生产签名',
         production: '生产',
         signaturePolicy: '签名策略',
@@ -213,7 +227,7 @@
         downloadUpdate: '下载并校验',
         applyUpdate: '应用更新',
         rollbackRecovery: '回滚与恢复',
-        rollbackRecoveryHelp: '数据库感知回滚和中断更新恢复仍由本机管理员执行，因为它们可能需要明确的数据丢失确认。',
+        rollbackRecoveryHelp: '服务端数据库感知回滚和中断更新恢复仍由本机管理员执行，因为它们可能需要明确的数据丢失确认。',
         installedVersion: '已安装版本',
         targetPlatform: '目标平台',
         sourceRepository: '来源仓库',
@@ -246,7 +260,19 @@
         signedManifestProtected: 'Ed25519 签名清单',
         rollbackProtected: '自动验证与回滚',
         remoteClientUpdateDisabled: '已禁用远程客户端更新',
-        releaseDetails: '版本详情'
+        releaseDetails: '版本详情',
+        targetClient: '目标客户端', updateAction: '更新动作', updateStage: '阶段', requestedBy: '请求人', updatedAt: '更新时间',
+        remoteActionCheck: '检查', remoteActionDownload: '下载', remoteActionApply: '应用', remoteActionStatus: '状态', remoteActionRecover: '恢复', remoteActionRollback: '回滚',
+        remoteConfirmationRequired: '管理员精确确认', createUpdateTask: '创建更新任务', clientUpdateTasks: '客户端更新任务', clientUpdateTasksHelp: '查看执行进度、事件历史和取消状态。',
+        updateTaskDetails: '更新任务详情', taskEvents: '任务事件', cancelUpdateTask: '取消任务', viewDetails: '详情', noUpdateTasks: '暂无客户端更新任务。', remoteUpdateAvailable: '远程任务已启用',
+        confirmRemoteUpdate: '为 {client} 创建“{action}”任务吗？', confirmCancelRemoteUpdate: '请求取消这个客户端更新任务吗？', remoteTaskCreated: '客户端更新任务已创建。', remoteTaskCancelRequested: '已请求取消任务。',
+        remoteStateQueued: '排队中', remoteStateClaimed: '已领取', remoteStateRunning: '执行中', remoteStateCancelRequested: '已请求取消', remoteStateSucceeded: '成功', remoteStateFailed: '失败', remoteStateCancelled: '已取消',
+        remoteStageQueued: '排队中', remoteStageClaimed: '已领取', remoteStageChecking: '正在检查', remoteStageDownloading: '正在下载', remoteStageApplying: '正在应用', remoteStageInspecting: '正在检查状态', remoteStageRecovering: '正在恢复', remoteStageRollingBack: '正在回滚', remoteStageAwaitingRestart: '等待重启', remoteStageCompleted: '已完成', remoteStageFailed: '失败', remoteStageCancelled: '已取消',
+        remoteEventCreated: '已创建', remoteEventIdempotentReplay: '幂等重放', remoteEventClaimed: '已领取', remoteEventLeaseRenewed: '租约已续期', remoteEventStageReported: '阶段已上报', remoteEventCancelRequested: '已请求取消', remoteEventCancelled: '已取消', remoteEventSucceeded: '成功', remoteEventFailed: '失败', remoteEventLeaseExpiredRequeued: '租约过期并重新排队', remoteEventLeaseExpiredFailedClosed: '租约过期并关闭失败', remoteEventRestartReconciled: '重启状态已协调',
+        taskId: '任务 ID', recoveryState: '恢复状态', attempt: '尝试次数', errorCode: '错误代码', taskResult: '结果', createdAt: '创建时间', completedAt: '完成时间', noTaskEvents: '服务端未返回任务事件。',
+        grpcBackendTransport: 'gRPC 后端传输', grpcBackendH2c: 'h2c（明文）', grpcBackendTls: 'TLS', grpcBackendServerName: 'gRPC TLS 服务器名称', grpcBackendTrustProfile: 'gRPC 信任配置', grpcTrustSystem: '系统信任库',
+        errorInvalidGrpcBackend: 'gRPC 后端 TLS 配置无效。TLS 必须填写服务器名称，信任配置可留空。',
+        errorRemoteConfirmation: '必须输入精确确认词。', errorRemoteTargetNotFound: '目标客户端不存在。', errorRemoteTaskNotFound: '更新任务不存在。', errorRemoteTargetBusy: '目标客户端已有活动更新任务。', errorRemoteIdempotencyConflict: '幂等键与其他请求冲突。', errorRemoteLeaseConflict: '另一个工作进程持有该更新任务租约。', errorRemoteLeaseExpired: '更新任务租约已过期。', errorRemoteInvalidTransition: '更新任务当前不能执行该状态转换。', errorRemoteCapacity: '远程更新任务容量已满。', errorRemoteStorage: '远程更新任务存储不可用。', errorRemoteInvalidRequest: '远程更新请求无效。', errorRemoteRequester: '更新请求人身份无效。'
       });
 
       const POLICY_TYPES = {
@@ -296,6 +322,9 @@
             { name: 'hostname', label: 'hostname', type: 'text', required: true, full: true },
             { name: 'target_addr', label: 'targetAddress', type: 'text', required: true, full: true },
             { name: 'max_connections', label: 'maxConnections', type: 'number', min: 1, max: 1024, required: true, default: 64 },
+            { name: 'grpc_backend_transport', label: 'grpcBackendTransport', type: 'select', options: [{ value: 'h2c', labelKey: 'grpcBackendH2c' }, { value: 'tls', labelKey: 'grpcBackendTls' }], required: true, default: 'h2c' },
+            { name: 'grpc_backend_server_name', label: 'grpcBackendServerName', type: 'text', required: true, full: true, when: { field: 'grpc_backend_transport', value: 'tls' } },
+            { name: 'grpc_backend_trust_profile', label: 'grpcBackendTrustProfile', type: 'text', full: true, when: { field: 'grpc_backend_transport', value: 'tls' } },
             { name: 'tls_mode', label: 'tlsMode', type: 'select', options: [{ value: 'disabled', labelKey: 'tlsDisabled' }, { value: 'acme', labelKey: 'tlsAutomatic' }], default: 'disabled' },
             { name: 'redirect_http_to_https', label: 'redirectHttps', type: 'checkbox', full: true, when: { field: 'tls_mode', value: 'acme' } }
           ]
@@ -392,6 +421,7 @@
         resetUsername: null,
         alertEditorId: null,
         serverUpdateCheck: null,
+        clientUpdateTaskId: null,
         toastTimer: null,
         activeControllers: new Set()
       };
@@ -401,7 +431,7 @@
         'overview-view', 'overview-kpis', 'traffic-chart', 'traffic-tooltip', 'traffic-chart-summary', 'export-metrics', 'service-health-summary', 'overview-alert-panel', 'overview-alerts', 'overview-alert-more',
         'metrics-view', 'metrics-kpis', 'activity-chart', 'failure-chart', 'tcp-metric-panel', 'udp-metric-panel', 'proxy-metric-panel', 'web-metric-panel', 'network-health-panel', 'system-metric-panel',
         'services-view', 'service-insights', 'service-trend-title', 'service-insight-kpis', 'service-trend-chart', 'service-status-chart', 'new-policy', 'export-policies', 'import-policies', 'import-policies-file', 'service-toolbar', 'service-search', 'service-status-filter', 'service-count', 'service-bulk-toolbar', 'select-visible-policies', 'selected-policy-count', 'bulk-enable-policies', 'bulk-disable-policies', 'bulk-client-target', 'bulk-migrate-policies', 'bulk-delete-policies', 'service-list', 'acme-page',
-        'p2p-view', 'p2p-list', 'fleet-view', 'new-fleet-peer', 'preview-fleet-sync', 'apply-fleet-sync', 'fleet-summary', 'fleet-conflicts', 'fleet-list', 'clients-view', 'client-insight-kpis', 'client-status-chart', 'client-platform-chart', 'client-search', 'client-status-filter', 'client-count', 'clients-list', 'users-view', 'new-user', 'user-search', 'user-role-filter', 'user-count', 'users-list', 'sessions-view', 'totp-status', 'totp-action', 'new-api-token', 'api-tokens-list', 'sessions-list', 'updates-view', 'update-kpis', 'server-update-state', 'server-update-details', 'server-update-security', 'check-server-update', 'download-server-update', 'apply-server-update', 'server-update-release', 'alerts-view', 'new-alert-rule', 'alert-channels', 'alert-events', 'alert-rules', 'activity-view', 'audit-search', 'audit-category', 'audit-count', 'audit-list', 'audit-load-more', 'export-audit',
+        'p2p-view', 'p2p-list', 'fleet-view', 'new-fleet-peer', 'preview-fleet-sync', 'apply-fleet-sync', 'fleet-summary', 'fleet-conflicts', 'fleet-list', 'clients-view', 'client-insight-kpis', 'client-status-chart', 'client-platform-chart', 'client-search', 'client-status-filter', 'client-count', 'clients-list', 'users-view', 'new-user', 'user-search', 'user-role-filter', 'user-count', 'users-list', 'sessions-view', 'totp-status', 'totp-action', 'new-api-token', 'api-tokens-list', 'sessions-list', 'updates-view', 'update-kpis', 'server-update-state', 'server-update-details', 'server-update-security', 'check-server-update', 'download-server-update', 'apply-server-update', 'server-update-release', 'client-update-availability', 'client-update-target', 'client-update-action', 'create-client-update', 'client-update-task-count', 'client-update-tasks', 'alerts-view', 'new-alert-rule', 'alert-channels', 'alert-events', 'alert-rules', 'activity-view', 'audit-search', 'audit-category', 'audit-count', 'audit-list', 'audit-load-more', 'export-audit',
         'drawer-backdrop', 'policy-drawer', 'drawer-title', 'drawer-subtitle', 'drawer-close', 'drawer-cancel', 'policy-form', 'policy-fields', 'drawer-submit',
         'password-modal', 'password-modal-close', 'password-form', 'account-new-password', 'account-confirm-password', 'password-cancel',
         'user-modal', 'user-modal-title', 'user-modal-help', 'user-modal-close', 'user-form', 'user-username', 'user-display-name', 'user-role', 'user-password-label', 'user-password', 'user-enabled-label', 'user-enabled', 'user-force-change-label', 'user-force-change', 'user-cancel',
@@ -410,7 +440,7 @@
         'api-token-modal', 'api-token-title', 'api-token-close', 'api-token-form', 'api-token-fields', 'api-token-name', 'api-token-scope', 'api-token-expiry', 'api-token-value-label', 'api-token-value', 'api-token-cancel', 'api-token-submit', 'api-token-copy',
         'fleet-modal', 'fleet-modal-title', 'fleet-modal-close', 'fleet-form', 'fleet-name', 'fleet-url', 'fleet-region', 'fleet-token-env', 'fleet-priority', 'fleet-weight', 'fleet-enabled', 'fleet-cancel',
         'traffic-control-modal', 'traffic-control-title', 'traffic-control-close', 'traffic-control-form', 'traffic-allowed', 'traffic-denied', 'traffic-rate', 'traffic-quota', 'traffic-weekdays', 'traffic-start', 'traffic-end', 'traffic-enabled', 'traffic-usage', 'traffic-control-cancel',
-        'client-modal', 'client-modal-title', 'client-modal-id', 'client-modal-close', 'client-form', 'client-name', 'client-group', 'client-tags', 'client-notes', 'client-enabled', 'client-cancel', 'client-token-modal', 'client-token-close', 'client-token-value', 'client-token-copy', 'client-token-done', 'alert-rule-modal', 'alert-rule-title', 'alert-rule-close', 'alert-rule-form', 'alert-rule-name', 'alert-rule-metric', 'alert-rule-comparator', 'alert-rule-threshold', 'alert-rule-target', 'alert-rule-window', 'alert-rule-cooldown', 'alert-rule-severity', 'alert-rule-enabled', 'alert-rule-webhook', 'alert-rule-email', 'alert-rule-cancel', 'toast'
+        'client-modal', 'client-modal-title', 'client-modal-id', 'client-modal-close', 'client-form', 'client-name', 'client-group', 'client-tags', 'client-notes', 'client-enabled', 'client-cancel', 'client-token-modal', 'client-token-close', 'client-token-value', 'client-token-copy', 'client-token-done', 'client-update-task-modal', 'client-update-task-title', 'client-update-task-id', 'client-update-task-close', 'client-update-task-details', 'client-update-task-events', 'client-update-task-cancel', 'client-update-task-done', 'alert-rule-modal', 'alert-rule-title', 'alert-rule-close', 'alert-rule-form', 'alert-rule-name', 'alert-rule-metric', 'alert-rule-comparator', 'alert-rule-threshold', 'alert-rule-target', 'alert-rule-window', 'alert-rule-cooldown', 'alert-rule-severity', 'alert-rule-enabled', 'alert-rule-webhook', 'alert-rule-email', 'alert-rule-cancel', 'toast'
       ].map(id => [id.replaceAll('-', '_'), document.getElementById(id)]));
 
       const systemTheme = matchMedia('(prefers-color-scheme: dark)');
@@ -522,7 +552,7 @@
       function readApiErrorCode(code, fallback = 'requestFailed') {
         if (code === 'invalid_public_port') return t('errorInvalidPort', { ports: portPolicyDescription() });
         const map = {
-          unknown_client: 'errorUnknownClient', invalid_name: 'errorInvalidName', invalid_public_port: 'errorInvalidPort', duplicate_public_port: 'errorDuplicatePort', duplicate_tcp_public_port: 'errorDuplicatePort', invalid_target: 'errorInvalidTarget', invalid_hostname: 'errorInvalidHostname', duplicate_hostname: 'errorDuplicateHostname', duplicate_sni_hostname: 'errorDuplicateHostname', invalid_connection_limit: 'errorInvalidLimit', invalid_session_limit: 'errorInvalidLimit', invalid_idle_timeout: 'errorInvalidLimit', invalid_bandwidth_limit: 'errorInvalidLimit', invalid_socks5_username: 'errorInvalidUsername', invalid_http_proxy_username: 'errorInvalidUsername', invalid_port_expression: 'errorInvalidPortExpression', port_count_mismatch: 'errorPortCountMismatch', duplicate_port_in_group: 'errorDuplicatePortInGroup', too_many_port_mappings: 'errorTooManyMappings', unknown_policy: 'errorUnknownPolicy', unknown_udp_tunnel: 'errorUnknownPolicy', unknown_port_group: 'errorUnknownPolicy', unknown_http_route: 'errorUnknownPolicy', unknown_sni_route: 'errorUnknownPolicy', unknown_secret_tunnel: 'errorUnknownPolicy', unknown_socks5_proxy: 'errorUnknownPolicy', unknown_http_proxy: 'errorUnknownPolicy', tcp_policy_storage_error: 'errorStorage', udp_policy_storage_error: 'errorStorage', port_group_policy_storage_error: 'errorStorage', http_route_policy_storage_error: 'errorStorage', sni_route_policy_storage_error: 'errorStorage', secret_policy_storage_error: 'errorStorage', socks5_policy_storage_error: 'errorStorage', http_proxy_policy_storage_error: 'errorStorage', server_update_busy: 'updateBusy', server_update_unavailable: 'updateUnavailable', server_update_failed: 'updateOperationFailed', update_confirmation_required: 'localConfirmationRequired', session_authentication_required: 'updateSecurityCheckFailed', csrf_check_failed: 'updateSecurityCheckFailed', update_origin_check_failed: 'updateSecurityCheckFailed'
+          unknown_client: 'errorUnknownClient', invalid_name: 'errorInvalidName', invalid_public_port: 'errorInvalidPort', duplicate_public_port: 'errorDuplicatePort', duplicate_tcp_public_port: 'errorDuplicatePort', invalid_target: 'errorInvalidTarget', invalid_hostname: 'errorInvalidHostname', duplicate_hostname: 'errorDuplicateHostname', duplicate_sni_hostname: 'errorDuplicateHostname', invalid_connection_limit: 'errorInvalidLimit', invalid_session_limit: 'errorInvalidLimit', invalid_idle_timeout: 'errorInvalidLimit', invalid_bandwidth_limit: 'errorInvalidLimit', invalid_socks5_username: 'errorInvalidUsername', invalid_http_proxy_username: 'errorInvalidUsername', invalid_port_expression: 'errorInvalidPortExpression', port_count_mismatch: 'errorPortCountMismatch', duplicate_port_in_group: 'errorDuplicatePortInGroup', too_many_port_mappings: 'errorTooManyMappings', invalid_grpc_backend: 'errorInvalidGrpcBackend', unknown_policy: 'errorUnknownPolicy', unknown_udp_tunnel: 'errorUnknownPolicy', unknown_port_group: 'errorUnknownPolicy', unknown_http_route: 'errorUnknownPolicy', unknown_sni_route: 'errorUnknownPolicy', unknown_secret_tunnel: 'errorUnknownPolicy', unknown_socks5_proxy: 'errorUnknownPolicy', unknown_http_proxy: 'errorUnknownPolicy', tcp_policy_storage_error: 'errorStorage', udp_policy_storage_error: 'errorStorage', port_group_policy_storage_error: 'errorStorage', http_route_policy_storage_error: 'errorStorage', sni_route_policy_storage_error: 'errorStorage', secret_policy_storage_error: 'errorStorage', socks5_policy_storage_error: 'errorStorage', http_proxy_policy_storage_error: 'errorStorage', server_update_busy: 'updateBusy', server_update_unavailable: 'updateUnavailable', server_update_failed: 'updateOperationFailed', update_confirmation_required: 'localConfirmationRequired', session_authentication_required: 'updateSecurityCheckFailed', csrf_check_failed: 'updateSecurityCheckFailed', update_origin_check_failed: 'updateSecurityCheckFailed', remote_update_confirmation_required: 'errorRemoteConfirmation', remote_update_target_not_found: 'errorRemoteTargetNotFound', remote_update_task_not_found: 'errorRemoteTaskNotFound', remote_update_target_busy: 'errorRemoteTargetBusy', remote_update_idempotency_conflict: 'errorRemoteIdempotencyConflict', remote_update_lease_conflict: 'errorRemoteLeaseConflict', remote_update_lease_expired: 'errorRemoteLeaseExpired', remote_update_invalid_transition: 'errorRemoteInvalidTransition', remote_update_capacity_exceeded: 'errorRemoteCapacity', remote_update_storage_failed: 'errorRemoteStorage', remote_update_invalid_request: 'errorRemoteInvalidRequest', remote_update_requester_invalid: 'errorRemoteRequester'
         };
         if (String(code || '').includes('acme') || String(code || '').includes('certificate') || String(code || '').includes('tls_')) return t('errorAcme');
         return t(map[code] || fallback);
@@ -1376,7 +1406,7 @@
       }
 
       function policySearchText(type, policy) {
-        return [policy.name, policy.client_id, policy.provider_client_id, policy.allowed_client_id, policy.hostname, policy.target_addr, policy.target_host, policy.public_port, policy.public_ports, policy.username, clientName(policy.client_id), clientName(policy.provider_client_id)].filter(Boolean).join(' ').toLowerCase();
+        return [policy.name, policy.client_id, policy.provider_client_id, policy.allowed_client_id, policy.hostname, policy.target_addr, policy.target_host, policy.public_port, policy.public_ports, policy.username, policy.grpc_backend_transport, policy.grpc_backend_server_name, policy.grpc_backend_trust_profile, clientName(policy.client_id), clientName(policy.provider_client_id)].filter(Boolean).join(' ').toLowerCase();
       }
 
       function matchesPolicyFilter(type, policy) {
@@ -1397,6 +1427,14 @@
         if (action) button.dataset.action = action;
         button.addEventListener('click', handler);
         return button;
+      }
+
+      function httpBackendText(policy) {
+        const transport = policy.grpc_backend_transport === 'tls' ? 'tls' : 'h2c';
+        if (transport === 'tls') {
+          return `${t('grpcBackendTransport')}: ${t('grpcBackendTls')} · ${t('grpcBackendServerName')}: ${policy.grpc_backend_server_name || '—'} · ${t('grpcBackendTrustProfile')}: ${policy.grpc_backend_trust_profile || t('grpcTrustSystem')}`;
+        }
+        return `${t('grpcBackendTransport')}: ${t('grpcBackendH2c')} · ${t('httpTransportCapabilities')}`;
       }
 
       function createServiceCard(type, policy) {
@@ -1447,7 +1485,7 @@
         if (type === 'http') {
           const capability = document.createElement('div');
           capability.className = 'capability-note';
-          capability.textContent = t('httpTransportCapabilities');
+          capability.textContent = httpBackendText(policy);
           content.append(capability);
         }
         const errorText = type === 'http' ? policy.tls?.last_error_message : '';
@@ -2531,6 +2569,176 @@
         return status.message || updateStateText(status, operationActive);
       }
 
+      const remoteUpdateConfirmations = { check: 'CHECK', download: 'DOWNLOAD', apply: 'UPDATE', status: 'STATUS', recover: 'RECOVER', rollback: 'ROLLBACK' };
+      const terminalRemoteUpdateStates = new Set(['succeeded', 'failed', 'cancelled']);
+
+      function remoteActionText(action) {
+        const map = { check: 'remoteActionCheck', download: 'remoteActionDownload', apply: 'remoteActionApply', status: 'remoteActionStatus', recover: 'remoteActionRecover', rollback: 'remoteActionRollback' };
+        return t(map[action] || 'unknown');
+      }
+
+      function remoteStateText(value) {
+        const map = { queued: 'remoteStateQueued', claimed: 'remoteStateClaimed', running: 'remoteStateRunning', cancel_requested: 'remoteStateCancelRequested', succeeded: 'remoteStateSucceeded', failed: 'remoteStateFailed', cancelled: 'remoteStateCancelled' };
+        return t(map[value] || 'unknown');
+      }
+
+      function remoteStageText(value) {
+        const map = { queued: 'remoteStageQueued', claimed: 'remoteStageClaimed', checking: 'remoteStageChecking', downloading: 'remoteStageDownloading', applying: 'remoteStageApplying', inspecting: 'remoteStageInspecting', recovering: 'remoteStageRecovering', rolling_back: 'remoteStageRollingBack', awaiting_restart: 'remoteStageAwaitingRestart', completed: 'remoteStageCompleted', failed: 'remoteStageFailed', cancelled: 'remoteStageCancelled' };
+        return t(map[value] || 'unknown');
+      }
+
+      function remoteEventText(value) {
+        const map = { created: 'remoteEventCreated', idempotent_replay: 'remoteEventIdempotentReplay', claimed: 'remoteEventClaimed', lease_renewed: 'remoteEventLeaseRenewed', stage_reported: 'remoteEventStageReported', cancel_requested: 'remoteEventCancelRequested', cancelled: 'remoteEventCancelled', succeeded: 'remoteEventSucceeded', failed: 'remoteEventFailed', lease_expired_requeued: 'remoteEventLeaseExpiredRequeued', lease_expired_failed_closed: 'remoteEventLeaseExpiredFailedClosed', restart_reconciled: 'remoteEventRestartReconciled' };
+        return t(map[value] || 'unknown');
+      }
+
+      function remoteTaskCanCancel(task) {
+        return task && !terminalRemoteUpdateStates.has(task.state) && task.state !== 'cancel_requested' && !task.cancel_requested;
+      }
+
+      function populateRemoteUpdateTargets() {
+        const current = elements.client_update_target.value;
+        elements.client_update_target.replaceChildren();
+        const clients = (state.dashboard?.clients || []).filter(client => client.enabled !== false);
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.disabled = true;
+        placeholder.textContent = clients.length ? t('selectClient') : t('noClients');
+        elements.client_update_target.append(placeholder);
+        clients.forEach(client => {
+          const option = document.createElement('option');
+          option.value = client.client_id;
+          option.textContent = `${client.name || client.client_id} · ${client.platform || t('unknown')}`;
+          elements.client_update_target.append(option);
+        });
+        if (clients.some(client => client.client_id === current)) elements.client_update_target.value = current;
+        else if (clients.length) elements.client_update_target.value = clients[0].client_id;
+        else elements.client_update_target.value = '';
+      }
+
+      function renderRemoteUpdateTasks() {
+        const tasks = [...(state.dashboard?.clientUpdateTasks?.tasks || [])].sort((left, right) => Number(right.updated_unix_seconds || 0) - Number(left.updated_unix_seconds || 0));
+        elements.client_update_task_count.textContent = String(tasks.length);
+        elements.client_update_tasks.replaceChildren();
+        if (!tasks.length) {
+          const row = document.createElement('tr');
+          const cell = document.createElement('td');
+          cell.colSpan = 7;
+          cell.className = 'empty-state';
+          cell.textContent = t('noUpdateTasks');
+          row.append(cell);
+          elements.client_update_tasks.append(row);
+          return;
+        }
+        tasks.forEach(task => {
+          const row = document.createElement('tr');
+          const target = document.createElement('td');
+          target.textContent = clientName(task.target_client_id);
+          target.title = task.target_client_id || '';
+          const action = document.createElement('td'); action.textContent = remoteActionText(task.action);
+          const status = document.createElement('td');
+          const badge = document.createElement('span');
+          badge.className = `badge ${task.state === 'succeeded' ? 'online' : ['failed', 'cancelled'].includes(task.state) ? 'offline' : 'warning'}`;
+          badge.textContent = remoteStateText(task.state);
+          status.append(badge);
+          const stage = document.createElement('td'); stage.textContent = remoteStageText(task.stage);
+          const requester = document.createElement('td'); requester.textContent = task.requested_by || '—';
+          const updated = document.createElement('td'); updated.textContent = formatTimestamp(task.updated_unix_seconds);
+          const actions = document.createElement('td');
+          const details = actionButton(t('viewDetails'), () => openRemoteUpdateTask(task.task_id), 'soft-button');
+          actions.append(details);
+          if (remoteTaskCanCancel(task)) actions.append(actionButton(t('cancelUpdateTask'), () => cancelRemoteUpdateTask(task.task_id), 'danger-button'));
+          row.append(target, action, status, stage, requester, updated, actions);
+          elements.client_update_tasks.append(row);
+        });
+      }
+
+      function renderRemoteUpdateTaskDetail(detail) {
+        const task = detail.task || {};
+        elements.client_update_task_id.textContent = task.task_id || '—';
+        elements.client_update_task_details.replaceChildren();
+        appendUpdateDetail(elements.client_update_task_details, t('targetClient'), `${clientName(task.target_client_id)} · ${task.target_client_id || '—'}`);
+        appendUpdateDetail(elements.client_update_task_details, t('updateAction'), remoteActionText(task.action));
+        appendUpdateDetail(elements.client_update_task_details, t('status'), remoteStateText(task.state));
+        appendUpdateDetail(elements.client_update_task_details, t('updateStage'), remoteStageText(task.stage));
+        appendUpdateDetail(elements.client_update_task_details, t('recoveryState'), task.recovery_state || 'none');
+        appendUpdateDetail(elements.client_update_task_details, t('attempt'), String(task.attempt ?? 0));
+        appendUpdateDetail(elements.client_update_task_details, t('requestedBy'), task.requested_by);
+        appendUpdateDetail(elements.client_update_task_details, t('createdAt'), formatTimestamp(task.created_unix_seconds));
+        appendUpdateDetail(elements.client_update_task_details, t('updatedAt'), formatTimestamp(task.updated_unix_seconds));
+        appendUpdateDetail(elements.client_update_task_details, t('completedAt'), formatTimestamp(task.completed_unix_seconds));
+        if (task.error_code) appendUpdateDetail(elements.client_update_task_details, t('errorCode'), task.error_code);
+        if (task.result) appendUpdateDetail(elements.client_update_task_details, t('taskResult'), JSON.stringify(task.result));
+        elements.client_update_task_events.replaceChildren();
+        const events = Array.isArray(detail.events) ? detail.events : [];
+        if (!events.length) {
+          const empty = document.createElement('div'); empty.className = 'empty-state'; empty.textContent = t('noTaskEvents'); elements.client_update_task_events.append(empty);
+        } else events.forEach(event => {
+          const item = document.createElement('article'); item.className = 'remote-update-event';
+          const sequence = document.createElement('strong'); sequence.textContent = `#${event.sequence}`;
+          const summary = document.createElement('span'); summary.textContent = `${remoteEventText(event.kind)} · ${remoteStateText(event.state)} / ${remoteStageText(event.stage)}${event.error_code ? ` · ${event.error_code}` : ''}`;
+          const time = document.createElement('time'); time.textContent = formatTimestamp(event.created_unix_seconds);
+          item.append(sequence, summary, time);
+          elements.client_update_task_events.append(item);
+        });
+        elements.client_update_task_cancel.disabled = !remoteTaskCanCancel(task);
+      }
+
+      async function openRemoteUpdateTask(taskId) {
+        try {
+          const response = await apiFetch(`/api/v1/updates/clients/tasks/${encodeURIComponent(taskId)}`, { headers: { Accept: 'application/json' }, scope: 'update' });
+          if (!response.ok) return showToast(await responseError(response), true);
+          const detail = await response.json();
+          state.clientUpdateTaskId = taskId;
+          renderRemoteUpdateTaskDetail(detail);
+          elements.client_update_task_modal.classList.remove('hidden');
+        } catch (_) { showToast(t('requestFailed'), true); }
+      }
+
+      function closeRemoteUpdateTask() {
+        state.clientUpdateTaskId = null;
+        elements.client_update_task_modal.classList.add('hidden');
+        elements.client_update_task_details.replaceChildren();
+        elements.client_update_task_events.replaceChildren();
+      }
+
+      function remoteUpdateIdempotencyKey(action, clientId) {
+        const nonce = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        return `${action}:${clientId}:${nonce}`.slice(0, 128);
+      }
+
+      async function createRemoteUpdateTask() {
+        const targetClientId = elements.client_update_target.value;
+        const action = elements.client_update_action.value;
+        const confirmationPhrase = remoteUpdateConfirmations[action];
+        if (!targetClientId || !confirmationPhrase) return;
+        const confirmation = promptForUpdateConfirmation('confirmRemoteUpdate', confirmationPhrase, { action: remoteActionText(action), client: clientName(targetClientId) });
+        if (!confirmation) return;
+        setBusy(elements.create_client_update, true, 'saving');
+        try {
+          const response = await apiFetch('/api/v1/updates/clients/tasks', { method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, body: JSON.stringify({ target_client_id: targetClientId, action, idempotency_key: remoteUpdateIdempotencyKey(action, targetClientId), confirmation }), scope: 'update' });
+          if (!response.ok) return showToast(await responseError(response), true);
+          showToast(t('remoteTaskCreated'));
+          await loadManagementData({ forceHistory: false });
+        } catch (_) { showToast(t('requestFailed'), true); }
+        finally { setBusy(elements.create_client_update, false); renderUpdateCenter(); }
+      }
+
+      async function cancelRemoteUpdateTask(taskId = state.clientUpdateTaskId) {
+        if (!taskId) return;
+        const confirmation = promptForUpdateConfirmation('confirmCancelRemoteUpdate', 'CANCEL');
+        if (!confirmation) return;
+        setBusy(elements.client_update_task_cancel, true, 'saving');
+        try {
+          const response = await apiFetch(`/api/v1/updates/clients/tasks/${encodeURIComponent(taskId)}/cancel`, { method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, body: JSON.stringify({ confirmation }), scope: 'update' });
+          if (!response.ok) return showToast(await responseError(response), true);
+          showToast(t('remoteTaskCancelRequested'));
+          closeRemoteUpdateTask();
+          await loadManagementData({ forceHistory: false });
+        } catch (_) { showToast(t('requestFailed'), true); }
+        finally { setBusy(elements.client_update_task_cancel, false); }
+      }
+
       function renderServerUpdateRelease(check) {
         elements.server_update_release.replaceChildren();
         elements.server_update_release.classList.toggle('hidden', !check);
@@ -2577,6 +2785,12 @@
         elements.download_server_update.disabled = !overview || busy;
         elements.apply_server_update.disabled = unavailable || busy;
         elements.apply_server_update.title = unavailable ? t('updateUnavailable') : '';
+        const remoteAvailable = overview?.remote_client_update_available === true;
+        elements.client_update_availability.textContent = remoteAvailable ? t('remoteUpdateAvailable') : t('remoteClientUpdateDisabled');
+        elements.client_update_availability.classList.toggle('warning', !remoteAvailable);
+        populateRemoteUpdateTargets();
+        elements.create_client_update.disabled = !remoteAvailable || !elements.client_update_target.value;
+        renderRemoteUpdateTasks();
         renderServerUpdateRelease(state.serverUpdateCheck);
       }
 
@@ -2592,8 +2806,8 @@
         finally { setBusy(elements.check_server_update, false); renderUpdateCenter(); }
       }
 
-      function promptForUpdateConfirmation(messageKey, phrase) {
-        const confirmation = window.prompt(`${t(messageKey)}\n\n${t('typeUpdateConfirmation', { phrase })}`, '');
+      function promptForUpdateConfirmation(messageKey, phrase, params = {}) {
+        const confirmation = window.prompt(`${t(messageKey, params)}\n\n${t('typeUpdateConfirmation', { phrase })}`, '');
         if (confirmation === null) return null;
         if (confirmation !== phrase) {
           showToast(t('updateConfirmationMismatch'), true);
@@ -2983,6 +3197,14 @@
         }
         if (type === 'secret' && !payload.allowed_client_id) payload.allowed_client_id = null;
         if (type === 'http') {
+          if (payload.grpc_backend_transport !== 'tls') {
+            payload.grpc_backend_transport = 'h2c';
+            payload.grpc_backend_server_name = null;
+            payload.grpc_backend_trust_profile = null;
+          } else {
+            payload.grpc_backend_server_name = String(payload.grpc_backend_server_name || '').trim();
+            payload.grpc_backend_trust_profile = String(payload.grpc_backend_trust_profile || '').trim() || null;
+          }
           delete payload.tls_mode;
           delete payload.redirect_http_to_https;
         }
@@ -3153,6 +3375,7 @@
         state.historyRequestGeneration += 1;
         state.historyActiveKey = null;
         state.historyPromise = null;
+        closeRemoteUpdateTask();
         cancelEdit(true);
         togglePopover(elements.account_menu, elements.account_button, false);
         showLogin(messageKey);
@@ -3357,7 +3580,7 @@
 
       function emptyDashboard() {
         const metrics = new Proxy({}, { get(target, key) { return key in target ? target[key] : 0; } });
-        return { status: {}, metrics, events: [], users: [], sessions: [], apiTokens: [], updateOverview: null, fleetOverview: { peers: [], conflicts: [], failover_order: [] }, alertRules: [], alertEvents: [], alertChannels: {}, tcpPolicies: [], udpPolicies: [], portGroups: [], httpRoutes: [], sniRoutes: [], secretPolicies: [], socks5Policies: [], httpProxyPolicies: [], clients: [], p2pNodes: [], publicPortPolicy: { tcp_allowed: '32000-32999', udp_allowed: '32000-32999', tcp_reserved: '', udp_reserved: '' }, acme: { enabled: false, environment: 'staging', directory_url: acmeDirectories.staging, contact_email: '', terms_accepted: false, renew_before_days: 30, account_registered: false } };
+        return { status: {}, metrics, events: [], users: [], sessions: [], apiTokens: [], updateOverview: null, clientUpdateTasks: { tasks: [] }, fleetOverview: { peers: [], conflicts: [], failover_order: [] }, alertRules: [], alertEvents: [], alertChannels: {}, tcpPolicies: [], udpPolicies: [], portGroups: [], httpRoutes: [], sniRoutes: [], secretPolicies: [], socks5Policies: [], httpProxyPolicies: [], clients: [], p2pNodes: [], publicPortPolicy: { tcp_allowed: '32000-32999', udp_allowed: '32000-32999', tcp_reserved: '', udp_reserved: '' }, acme: { enabled: false, environment: 'staging', directory_url: acmeDirectories.staging, contact_email: '', terms_accepted: false, renew_before_days: 30, account_registered: false } };
       }
 
       function managementRequestPlan({ includeHistory = false } = {}) {
@@ -3374,7 +3597,7 @@
         if (state.route.view === 'clients') return [...common, { key: 'clients', url: '/api/v1/clients' }];
         if (state.route.view === 'users') return [...common, { key: 'users', url: '/api/v1/users' }];
         if (state.route.view === 'sessions') return [...common, { key: 'sessions', url: '/api/v1/sessions' }, { key: 'apiTokens', url: '/api/v1/api-tokens' }];
-        if (state.route.view === 'updates') return [...common, { key: 'updateOverview', url: '/api/v1/updates/server' }];
+        if (state.route.view === 'updates') return [...common, { key: 'clients', url: '/api/v1/clients' }, { key: 'updateOverview', url: '/api/v1/updates/server' }, { key: 'clientUpdateTasks', url: '/api/v1/updates/clients/tasks?limit=100' }];
         if (state.route.view === 'alerts') return [...common, { key: 'alertRules', url: '/api/v1/alerts/rules' }, { key: 'alertEvents', url: '/api/v1/alerts/events?active=true&limit=100' }, { key: 'alertChannels', url: '/api/v1/alerts/channels' }];
         if (state.route.view === 'activity') return [...common, { key: 'events', url: `/api/v1/audit?limit=${Math.min(100, state.auditLimit)}` }];
         if (state.route.service === 'acme') return [...common, { key: 'acme', url: '/api/v1/acme/config' }];
@@ -3578,6 +3801,12 @@
         elements.check_server_update.addEventListener('click', checkServerUpdate);
         elements.download_server_update.addEventListener('click', downloadServerUpdate);
         elements.apply_server_update.addEventListener('click', applyServerUpdate);
+        elements.client_update_target.addEventListener('change', () => { elements.create_client_update.disabled = !elements.client_update_target.value || state.dashboard?.updateOverview?.remote_client_update_available !== true; });
+        elements.create_client_update.addEventListener('click', createRemoteUpdateTask);
+        elements.client_update_task_close.addEventListener('click', closeRemoteUpdateTask);
+        elements.client_update_task_done.addEventListener('click', closeRemoteUpdateTask);
+        elements.client_update_task_cancel.addEventListener('click', () => cancelRemoteUpdateTask());
+        elements.client_update_task_modal.addEventListener('click', event => { if (event.target === elements.client_update_task_modal) closeRemoteUpdateTask(); });
         elements.refresh.addEventListener('click', () => loadManagementData({ forceHistory: true }));
         elements.overview_alert_more.addEventListener('click', () => { location.hash = '#/alerts'; });
         elements.export_metrics.addEventListener('click', () => { window.location.href = `/api/v1/metrics/history/export?range=${encodeURIComponent(state.trendRange)}&protocol=total&format=csv`; });
@@ -3589,6 +3818,7 @@
         }));
         window.addEventListener('hashchange', () => {
           if (state.drawer.open) cancelEdit(true);
+          if (!elements.client_update_task_modal.classList.contains('hidden')) closeRemoteUpdateTask();
           state.selectedPolicies.clear();
           state.routeGeneration += 1;
           state.historyRequestGeneration += 1;
@@ -3638,6 +3868,7 @@
             return;
           }
           if (event.key === 'Escape') {
+            if (!elements.client_update_task_modal.classList.contains('hidden')) return closeRemoteUpdateTask();
             if (!elements.traffic_control_modal.classList.contains('hidden')) return closeTrafficControl();
             if (!elements.fleet_modal.classList.contains('hidden')) return closeFleetModal();
             if (!elements.api_token_modal.classList.contains('hidden')) return closeApiTokenModal();

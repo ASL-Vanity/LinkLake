@@ -14,6 +14,7 @@ import 'metric_charts.dart';
 import 'policy_pages.dart';
 import 'rbac.dart';
 import 'refresh_queue.dart';
+import 'remote_update_management.dart';
 import 'server_profiles.dart';
 import 'update_protocol.dart';
 import 'user_management.dart';
@@ -570,6 +571,8 @@ class _DashboardPageState extends State<DashboardPage> {
   List<dynamic> _apiTokens = [];
   Map<String, dynamic> _identity = {};
   Map<String, dynamic> _fleet = {};
+  Map<String, dynamic> _serverUpdate = {};
+  List<dynamic> _remoteUpdateTasks = [];
   Map<String, dynamic> _diagnostics = {};
   String? _latestRelease;
   bool? _updateAvailable;
@@ -653,6 +656,8 @@ class _DashboardPageState extends State<DashboardPage> {
           _sessions = [];
           _apiTokens = [];
           _fleet = {};
+          _serverUpdate = {};
+          _remoteUpdateTasks = [];
         }
         if (!visibleDestinationIds(role).contains(_page)) _page = 'overview';
         for (final result in results) {
@@ -708,6 +713,13 @@ class _DashboardPageState extends State<DashboardPage> {
         _apiTokens = value as List<dynamic>;
       case 'fleet':
         _fleet = Map<String, dynamic>.from(value as Map);
+      case 'serverUpdate':
+        _serverUpdate = Map<String, dynamic>.from(value as Map);
+      case 'remoteUpdateTasks':
+        final response = Map<String, dynamic>.from(value as Map);
+        _remoteUpdateTasks = List<dynamic>.from(
+          response['tasks'] as List? ?? const [],
+        );
       default:
         _resources[key] = value as List<dynamic>;
     }
@@ -1168,6 +1180,7 @@ class _DashboardPageState extends State<DashboardPage> {
       'proxy': (Icons.language_outlined, 'HTTP Proxy'),
       'p2p': (Icons.hub_outlined, 'P2P'),
       'fleet': (Icons.cloud_sync_outlined, t('多云', 'Multi-cloud')),
+      'updates': (Icons.system_update_alt, t('更新', 'Updates')),
       'alerts': (Icons.warning_amber_outlined, t('告警', 'Alerts')),
       'users': (
         Icons.manage_accounts_outlined,
@@ -1195,6 +1208,7 @@ class _DashboardPageState extends State<DashboardPage> {
     'proxy' => _policyPage(PolicyKind.proxy),
     'p2p' => _p2pPage(),
     'fleet' when _capabilities.canViewFleet => _fleetPage(),
+    'updates' when _capabilities.canManageUpdates => _updatesPage(),
     'alerts' => _alertsPage(),
     'users' => _usersPage(),
     'diagnostics' => _diagnosticsPage(),
@@ -1337,6 +1351,19 @@ class _DashboardPageState extends State<DashboardPage> {
         for (final raw in _p2p) _p2pCard(raw as Map<String, dynamic>),
       ],
     ),
+  );
+
+  Widget _updatesPage() => RemoteUpdateManagementPage(
+    key: const Key('remote-update-management-page'),
+    api: widget.api,
+    clients: _clients,
+    serverUpdate: _serverUpdate,
+    tasks: _remoteUpdateTasks,
+    chinese: zh,
+    onRefresh: () => _refresh(silent: true),
+    onError: (error) {
+      if (mounted) setState(() => _error = error.toString());
+    },
   );
 
   Widget _alertsPage() => _pagePadding(

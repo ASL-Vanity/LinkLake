@@ -67,6 +67,9 @@ void main() {
         'hostname',
         'target_addr',
         'max_connections',
+        'grpc_backend_transport',
+        'grpc_backend_server_name',
+        'grpc_backend_trust_profile',
         'tls_mode',
         'redirect_http_to_https',
       },
@@ -200,9 +203,59 @@ void main() {
       'mode': 'acme',
       'redirect_http_to_https': true,
     });
+    expect(api.posts.single.$2['grpc_backend_transport'], 'h2c');
+    expect(api.posts.single.$2['grpc_backend_server_name'], isNull);
+    expect(api.posts.single.$2['grpc_backend_trust_profile'], isNull);
   });
 
-  testWidgets('HTTP transport capabilities and H2 metrics are read-only', (
+  testWidgets('HTTP route saves gRPC TLS backend identity and trust profile', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1200, 1000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final api = FakeLinkLakeApi();
+    api.objectResponses['/api/v1/http-routes'] = {'id': 'route-grpc'};
+    await tester.pumpWidget(policyHarness(api: api, kind: PolicyKind.http));
+    await tester.tap(find.byKey(const Key('create-http')));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byKey(const Key('field-name')), 'grpc');
+    await tester.enterText(
+      find.byKey(const Key('field-hostname')),
+      'grpc.example.com',
+    );
+    await tester.enterText(
+      find.byKey(const Key('field-target_addr')),
+      '127.0.0.1:50051',
+    );
+    await tester.tap(find.byKey(const Key('field-grpc_backend_transport')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('TLS').last);
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find.byKey(const Key('field-grpc_backend_server_name')),
+      'backend.internal',
+    );
+    await tester.enterText(
+      find.byKey(const Key('field-grpc_backend_trust_profile')),
+      'corp-root',
+    );
+    await tester.tap(find.byKey(const Key('save-policy')));
+    await tester.pumpAndSettle();
+
+    expect(api.posts.single.$2, containsPair('grpc_backend_transport', 'tls'));
+    expect(
+      api.posts.single.$2,
+      containsPair('grpc_backend_server_name', 'backend.internal'),
+    );
+    expect(
+      api.posts.single.$2,
+      containsPair('grpc_backend_trust_profile', 'corp-root'),
+    );
+  });
+
+  testWidgets('HTTP transport capabilities expose configurable gRPC backend', (
     tester,
   ) async {
     tester.view.physicalSize = const Size(1200, 900);
@@ -251,7 +304,7 @@ void main() {
       find.byKey(const Key('http-transport-capabilities-route-h2')),
       findsOneWidget,
     );
-    expect(find.textContaining('pooled h2c backend'), findsOneWidget);
+    expect(find.textContaining('gRPC backend: cleartext h2c'), findsOneWidget);
     expect(find.text('H2: 2/10'), findsOneWidget);
     expect(find.text('gRPC: 8'), findsOneWidget);
     expect(
@@ -261,6 +314,14 @@ void main() {
     expect(
       PolicyKind.http.fields.map((field) => field.name),
       isNot(contains('grpc')),
+    );
+    expect(
+      PolicyKind.http.fields.map((field) => field.name),
+      containsAll({
+        'grpc_backend_transport',
+        'grpc_backend_server_name',
+        'grpc_backend_trust_profile',
+      }),
     );
   });
 
@@ -476,8 +537,14 @@ void main() {
       find.byKey(const Key('socks5-capabilities-proxy-capabilities')),
       findsOneWidget,
     );
-    expect(find.textContaining('UDP ASSOCIATE are available'), findsOneWidget);
-    expect(find.textContaining('BIND and UDP FRAG'), findsOneWidget);
+    expect(
+      find.textContaining('Available: CONNECT, UDP ASSOCIATE'),
+      findsOneWidget,
+    );
+    expect(
+      find.textContaining('Unavailable or not reported: BIND, UDP FRAG'),
+      findsOneWidget,
+    );
     expect(
       PolicyKind.socks5.fields.map((field) => field.name),
       isNot(contains('bind')),

@@ -28,6 +28,7 @@ void main() {
       isFalse,
     );
     expect(RoleCapabilities(ManagementRole.operator).canManageTotp, isTrue);
+    expect(RoleCapabilities(ManagementRole.operator).canManageUpdates, isFalse);
     expect(RoleCapabilities(ManagementRole.auditor).canWritePolicies, isFalse);
     expect(RoleCapabilities(ManagementRole.auditor).canManageUsers, isFalse);
     expect(RoleCapabilities(ManagementRole.auditor).canManageSessions, isFalse);
@@ -36,6 +37,10 @@ void main() {
       isFalse,
     );
     expect(RoleCapabilities(ManagementRole.auditor).canManageTotp, isFalse);
+    expect(
+      RoleCapabilities(ManagementRole.administrator).canManageUpdates,
+      isTrue,
+    );
     expect(visibleDestinationIds(ManagementRole.operator), contains('users'));
     expect(visibleDestinationIds(ManagementRole.auditor), contains('users'));
   });
@@ -46,6 +51,8 @@ void main() {
       '/api/v1/sessions',
       '/api/v1/api-tokens',
       '/api/v1/fleet/overview',
+      '/api/v1/updates/server',
+      '/api/v1/updates/clients/tasks?limit=100',
     };
     for (final role in [ManagementRole.operator, ManagementRole.auditor]) {
       final paths = dashboardRequestPlan(
@@ -91,10 +98,19 @@ void main() {
         find.byKey(const Key('nav-fleet')),
         isAdmin ? findsOneWidget : findsNothing,
       );
+      expect(
+        find.byKey(const Key('nav-updates')),
+        isAdmin ? findsOneWidget : findsNothing,
+      );
       expect(api.calls.contains('/api/v1/users'), isAdmin);
       expect(api.calls.contains('/api/v1/sessions'), isAdmin);
       expect(api.calls.contains('/api/v1/api-tokens'), isAdmin);
       expect(api.calls.contains('/api/v1/fleet/overview'), isAdmin);
+      expect(api.calls.contains('/api/v1/updates/server'), isAdmin);
+      expect(
+        api.calls.contains('/api/v1/updates/clients/tasks?limit=100'),
+        isAdmin,
+      );
 
       if (!isAdmin) {
         await tester.tap(find.byKey(const Key('nav-users')));
