@@ -885,15 +885,12 @@ impl UpdateTaskCatalog {
             if task.state.is_terminal() {
                 return replay_terminal_report(transaction, &task, &request, now);
             }
-            request
-                .report
-                .validate_for_task(task.action, task.stage, task.cancel_requested)
-                .map_err(|error| match error {
-                    RemoteUpdateContractError::InvalidTransition => {
-                        domain_error(UpdateTaskError::InvalidTransition)
-                    }
-                    error => domain_error(UpdateTaskError::Contract(error)),
-                })?;
+            validate_worker_report_transition(
+                &request.report,
+                task.action,
+                task.stage,
+                task.cancel_requested,
+            )?;
             authorize_lease(
                 transaction,
                 &task,
@@ -1583,6 +1580,22 @@ fn valid_renew_transition(
         || (current == RemoteUpdateStage::AwaitingRestart && requested == current)
 }
 
+fn validate_worker_report_transition(
+    report: &RemoteUpdateWorkerReport,
+    action: RemoteUpdateAction,
+    stage: RemoteUpdateStage,
+    cancel_requested: bool,
+) -> anyhow::Result<()> {
+    report
+        .validate_for_task(action, stage, cancel_requested)
+        .map_err(|error| match error {
+            RemoteUpdateContractError::InvalidTransition => {
+                domain_error(UpdateTaskError::InvalidTransition)
+            }
+            error => domain_error(UpdateTaskError::Contract(error)),
+        })
+}
+
 fn apply_worker_report(
     task: &mut RemoteUpdateTask,
     report: &RemoteUpdateWorkerReport,
@@ -2135,6 +2148,19 @@ mod tests {
             failed.recovery_state,
             RemoteUpdateRecoveryState::FailedClosed
         );
+    }
+
+    #[test]
+    fn worker_transition_error_mapping_is_backend_independent() {
+        assert!(matches!(
+            map_database_result(validate_worker_report_transition(
+                &RemoteUpdateWorkerReport::Cancelled,
+                RemoteUpdateAction::Status,
+                RemoteUpdateStage::Claimed,
+                false,
+            )),
+            Err(UpdateTaskError::InvalidTransition)
+        ));
     }
 
     #[test]

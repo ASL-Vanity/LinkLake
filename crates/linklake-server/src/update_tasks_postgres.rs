@@ -542,14 +542,12 @@ impl PostgresUpdateTaskCatalog {
             transaction.commit().await?;
             return Ok(stored.task);
         }
-        request
-            .report
-            .validate_for_task(
-                stored.task.action,
-                stored.task.stage,
-                stored.task.cancel_requested,
-            )
-            .map_err(|error| domain_error(UpdateTaskError::Contract(error)))?;
+        validate_worker_report_transition(
+            &request.report,
+            stored.task.action,
+            stored.task.stage,
+            stored.task.cancel_requested,
+        )?;
         authorize_lease_token(
             &stored.task,
             stored.lease_token_sha256.as_deref(),
