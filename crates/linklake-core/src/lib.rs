@@ -312,6 +312,36 @@ pub fn agent_instance_id_from_public_key(public_key: &[u8; 32]) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetHealthProbeKind {
+    Tcp,
+    Http,
+    Tls,
+    Udp,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TargetHealthProbeRequest {
+    pub probe_id: Uuid,
+    pub target_key: String,
+    pub target_addr: String,
+    pub kind: TargetHealthProbeKind,
+    pub server_name: Option<String>,
+    pub timeout_millis: u32,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TargetHealthProbeResult {
+    pub probe_id: Uuid,
+    pub target_key: String,
+    pub target_addr: String,
+    pub revision: u64,
+    pub healthy: bool,
+    pub error_summary: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ControlFrame {
@@ -414,12 +444,15 @@ pub enum ControlFrame {
         target_addr: String,
     },
     TcpTunnelRegistered {
+        policy_id: Uuid,
         public_port: u16,
     },
     HttpRouteRegistered {
+        policy_id: Uuid,
         hostname: String,
     },
     TlsRouteRegistered {
+        policy_id: Uuid,
         hostname: String,
     },
     RegisterP2pNode {
@@ -472,6 +505,7 @@ pub enum ControlFrame {
         session_idle_timeout_seconds: u32,
     },
     UdpTunnelRegistered {
+        policy_id: Uuid,
         registration_id: Uuid,
         public_port: u16,
     },
@@ -488,6 +522,12 @@ pub enum ControlFrame {
     },
     ControlHeartbeatAck {
         nonce: u64,
+    },
+    TargetHealthProbe {
+        probe: TargetHealthProbeRequest,
+    },
+    TargetHealthProbeResult {
+        result: TargetHealthProbeResult,
     },
     Error {
         message: String,

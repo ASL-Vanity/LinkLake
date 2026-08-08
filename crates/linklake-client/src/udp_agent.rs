@@ -1,9 +1,10 @@
 use super::{
-    connect_control, send_control_heartbeats, ControlTransport, CONTROL_HEARTBEAT_TIMEOUT,
-    TARGET_CONNECT_TIMEOUT,
+    connect_control,
+    target_probe::{TargetProbePolicy, TargetProbeSession},
+    ControlTransport, CONTROL_HEARTBEAT_TIMEOUT, TARGET_CONNECT_TIMEOUT,
 };
 use bytes::Bytes;
-use linklake_core::target_pool::{parse_target_pool, WeightedTarget};
+use linklake_core::target_pool::WeightedTarget;
 use linklake_core::{
     read_control_frame, read_udp_data_plane_control_frame,
     udp_protocol::{fragment_datagram, UdpDirection, UdpFragment, MAX_UDP_DATAGRAM_BYTES},
@@ -65,8 +66,9 @@ struct TargetSession {
     worker: tokio::task::JoinHandle<()>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ResolvedTarget {
+    source: String,
     address: SocketAddr,
     weight: u32,
 }
@@ -199,7 +201,7 @@ async fn run_udp_agent_session(
     };
 
     let mut data_plane = establish_data_plane(&transport, client_id, &offer).await?;
-    match timeout(
+    let policy_id = match timeout(
         CONTROL_HEARTBEAT_TIMEOUT,
         read_control_frame(&mut tcp_control),
     )
@@ -207,23 +209,31 @@ async fn run_udp_agent_session(
     .map_err(|_| anyhow::anyhow!("UDP registration acknowledgement timed out"))??
     {
         ControlFrame::UdpTunnelRegistered {
+            policy_id,
             registration_id,
             public_port: registered_port,
         } if registration_id == offer.registration_id && registered_port == public_port => {
             tracing::info!("UDP tunnel registered on public port {public_port}.");
+            policy_id
         }
         ControlFrame::Error { message } => {
             anyhow::bail!("server rejected UDP tunnel after data-plane attach: {message}")
         }
         frame => anyhow::bail!("unexpected UDP registration response: {frame:?}"),
-    }
+    };
 
-    let target_addresses = timeout(TARGET_CONNECT_TIMEOUT, resolve_target_pool(&target))
+    let probe_session = TargetProbeSession::new(policy_id, TargetProbePolicy::Udp, &target)?;
+    let target_pool = probe_session.targets();
+    let target_addresses = timeout(TARGET_CONNECT_TIMEOUT, resolve_target_pool(&target_pool))
         .await
         .map_err(|_| anyhow::anyhow!("UDP target address resolution timed out"))??;
     let (tcp_reader, tcp_writer) = split(tcp_control);
-    let heartbeat = tokio::spawn(send_control_heartbeats(tcp_writer));
-    let tcp_monitor = tokio::spawn(monitor_registered_tcp_control(tcp_reader));
+    let (command_tx, writer_task) = super::target_probe::spawn_control_writer(tcp_writer);
+    let tcp_monitor = tokio::spawn(monitor_registered_tcp_control(
+        tcp_reader,
+        probe_session.clone(),
+        command_tx,
+    ));
     let result = run_data_plane(
         data_plane.connection.clone(),
         &mut data_plane.control_send,
@@ -231,11 +241,12 @@ async fn run_udp_agent_session(
         data_plane.max_datagram_size,
         offer.session_idle_timeout,
         target_addresses,
+        probe_session,
         queue_budget,
         tcp_monitor,
+        writer_task,
     )
     .await;
-    heartbeat.abort();
     data_plane
         .connection
         .close(0_u32.into(), b"control session ended");
@@ -319,8 +330,10 @@ async fn run_data_plane(
     max_datagram_size: usize,
     session_idle_timeout: Duration,
     target_addresses: Vec<ResolvedTarget>,
+    probe_session: TargetProbeSession,
     queue_budget: Arc<Semaphore>,
     mut tcp_monitor: tokio::task::JoinHandle<anyhow::Result<()>>,
+    mut writer_task: tokio::task::JoinHandle<anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         !session_idle_timeout.is_zero(),
@@ -342,6 +355,9 @@ async fn run_data_plane(
             tcp_result = &mut tcp_monitor => {
                 break tcp_result
                     .map_err(|error| anyhow::anyhow!("UDP TCP control reader task failed: {error}"))?;
+            }
+            writer_result = &mut writer_task => {
+                break super::control_writer_result(writer_result);
             }
             control_event = control_event_rx.recv() => {
                 match control_event {
@@ -404,8 +420,25 @@ async fn run_data_plane(
                 if let std::collections::hash_map::Entry::Vacant(entry) =
                     sessions.entry(session_id)
                 {
-                    let target_address = select_resolved_target(&target_addresses, target_sequence)
-                        .ok_or_else(|| anyhow::anyhow!("UDP target pool is empty"))?;
+                    let Some(target_address) = select_resolved_target(
+                        &target_addresses,
+                        &probe_session,
+                        target_sequence,
+                    ) else {
+                        tracing::warn!(
+                            "Rejected UDP session {session_id} because no healthy target is available."
+                        );
+                        closed_sessions.insert(
+                            session_id,
+                            Instant::now() + CLOSED_SESSION_RETENTION,
+                        );
+                        send_close_session(
+                            control_send,
+                            session_id,
+                            UdpSessionCloseReason::TargetUnavailable,
+                        ).await?;
+                        continue;
+                    };
                     target_sequence = target_sequence.wrapping_add(1);
                     match create_target_session(
                         session_id,
@@ -495,31 +528,42 @@ async fn run_data_plane(
     if !tcp_monitor.is_finished() {
         tcp_monitor.abort();
     }
+    if !writer_task.is_finished() {
+        writer_task.abort();
+    }
     result
 }
 
-async fn resolve_target_pool(value: &str) -> anyhow::Result<Vec<ResolvedTarget>> {
-    let parsed = parse_target_pool(value)?;
-    let mut resolved = Vec::with_capacity(parsed.len());
-    for WeightedTarget { address, weight } in parsed {
+async fn resolve_target_pool(targets: &[WeightedTarget]) -> anyhow::Result<Vec<ResolvedTarget>> {
+    let mut resolved = Vec::with_capacity(targets.len());
+    for WeightedTarget { address, weight } in targets {
         resolved.push(ResolvedTarget {
-            address: resolve_target(&address).await?,
-            weight,
+            source: address.clone(),
+            address: resolve_target(address).await?,
+            weight: *weight,
         });
     }
     Ok(resolved)
 }
 
-fn select_resolved_target(targets: &[ResolvedTarget], sequence: u64) -> Option<SocketAddr> {
+fn select_resolved_target(
+    targets: &[ResolvedTarget],
+    probe_session: &TargetProbeSession,
+    sequence: u64,
+) -> Option<SocketAddr> {
     let total = targets
         .iter()
+        .filter(|target| probe_session.is_healthy(&target.source))
         .map(|target| u64::from(target.weight))
         .sum::<u64>();
     if total == 0 {
         return None;
     }
     let mut slot = sequence % total;
-    for target in targets {
+    for target in targets
+        .iter()
+        .filter(|target| probe_session.is_healthy(&target.source))
+    {
         let weight = u64::from(target.weight);
         if slot < weight {
             return Some(target.address);
@@ -692,12 +736,17 @@ async fn read_data_plane_control(
 
 async fn monitor_registered_tcp_control(
     mut reader: ReadHalf<linklake_core::BoxedIo>,
+    probe_session: TargetProbeSession,
+    command_tx: mpsc::Sender<ControlFrame>,
 ) -> anyhow::Result<()> {
     loop {
         let frame = timeout(CONTROL_HEARTBEAT_TIMEOUT, read_control_frame(&mut reader))
             .await
             .map_err(|_| anyhow::anyhow!("UDP control heartbeat acknowledgement timed out"))??;
         match frame {
+            ControlFrame::TargetHealthProbe { probe } => {
+                probe_session.handle_probe(probe, command_tx.clone())?;
+            }
             ControlFrame::ControlHeartbeatAck { .. } => {}
             ControlFrame::Error { message } => anyhow::bail!("server closed UDP tunnel: {message}"),
             frame => anyhow::bail!("unexpected UDP control frame: {frame:?}"),

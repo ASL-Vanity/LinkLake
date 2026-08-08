@@ -38,6 +38,7 @@ mod sni_tunnel;
 mod socks5_tunnel;
 mod storage;
 mod target_health;
+mod target_probe;
 mod tcp_tunnel;
 mod traffic_control;
 mod tunnel_catalog;
@@ -4202,6 +4203,7 @@ async fn run_server(
             .map_err(|_| anyhow::anyhow!("HA bootstrap timed out"))??;
     tracing::info!(
         backend = storage_config.backend().as_str(),
+        replicated_application_state = storage_config.replicated_state(),
         instance_id = %ha_member.instance_id,
         incarnation_id = %ha_member.incarnation_id,
         ?leadership_transition,
@@ -4313,6 +4315,7 @@ async fn run_server(
         .route("/api/v1/health", get(health))
         .route("/livez", get(live_probe))
         .route("/readyz", get(ready_probe))
+        .route("/leaderz", get(leader_probe))
         .route("/startupz", get(startup_probe))
         .route("/api/v1/health/live", get(live_probe))
         .route("/api/v1/health/ready", get(ready_probe))
@@ -4608,6 +4611,10 @@ async fn run_server(
             post(update_worker::report_remote_update_task),
         )
         .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            enforce_ha_leader_mutation,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             enforce_fleet_ownership,
@@ -5074,6 +5081,22 @@ async fn live_probe(State(state): State<Arc<AppState>>) -> Response {
 
 async fn ready_probe(State(state): State<Arc<AppState>>) -> Response {
     lifecycle_probe(&state, state.lifecycle.is_ready(), "ready", "not_ready")
+}
+
+async fn leader_probe(State(state): State<Arc<AppState>>) -> Response {
+    let (healthy, status) =
+        leader_probe_state(state.lifecycle.is_ready(), state.ha_runtime.is_leader());
+    lifecycle_probe(&state, healthy, "leader", status)
+}
+
+fn leader_probe_state(lifecycle_ready: bool, is_ha_leader: bool) -> (bool, &'static str) {
+    if !lifecycle_ready {
+        (false, "not_ready")
+    } else if !is_ha_leader {
+        (false, "not_leader")
+    } else {
+        (true, "leader")
+    }
 }
 
 async fn startup_probe(State(state): State<Arc<AppState>>) -> Response {
@@ -14780,6 +14803,7 @@ async fn enforce_management_role(
         || path == "/api/v1/health"
         || path == "/livez"
         || path == "/readyz"
+        || path == "/leaderz"
         || path == "/startupz"
         || path == "/api/v1/health/live"
         || path == "/api/v1/health/ready"
@@ -14850,6 +14874,26 @@ async fn enforce_management_role(
         }
     }
     next.run(request).await
+}
+
+async fn enforce_ha_leader_mutation(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if requires_ha_leader(request.method(), request.uri().path()) && !state.ha_runtime.is_leader() {
+        return CodedApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ha_leader_required",
+            "the active HA leader must handle this state-changing request",
+        )
+        .into_response();
+    }
+    next.run(request).await
+}
+
+fn requires_ha_leader(method: &Method, path: &str) -> bool {
+    path.starts_with("/api/v1/") && !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
 }
 
 async fn enforce_fleet_ownership(
@@ -15313,10 +15357,10 @@ mod tests {
     use super::{
         apply_cache_control, auth_me_response, build_metrics_history_response,
         certificate_target_matches, coded_http_route_creation_error, coded_tcp_policy_error,
-        collect_slo_metrics, fleet_mutation_target, login_throttle_identity,
+        collect_slo_metrics, fleet_mutation_target, leader_probe_state, login_throttle_identity,
         management_origin_matches_host, management_session_cookie, normalize_metrics_history_step,
         parse_metrics_history_range, release_certificate_job_slot, render_prometheus_metrics,
-        require_same_origin_update_request, require_server_update_confirmation,
+        require_same_origin_update_request, require_server_update_confirmation, requires_ha_leader,
         reserve_certificate_job_slot, resolve_certificate_identifier_update,
         select_certificate_maintenance_operation, session_cookie_header, spawn_listener_task,
         tcp_history_error_total, udp_history_error_total, udp_metrics_response,
@@ -15427,6 +15471,38 @@ mod tests {
             ),
             Some((FleetPolicyKind::HttpRoute, id))
         );
+    }
+
+    #[test]
+    fn ha_followers_allow_reads_but_reject_every_api_mutation() {
+        for method in [
+            axum::http::Method::POST,
+            axum::http::Method::PUT,
+            axum::http::Method::PATCH,
+            axum::http::Method::DELETE,
+        ] {
+            assert!(requires_ha_leader(&method, "/api/v1/tcp-tunnels"));
+        }
+        for method in [
+            axum::http::Method::GET,
+            axum::http::Method::HEAD,
+            axum::http::Method::OPTIONS,
+        ] {
+            assert!(!requires_ha_leader(&method, "/api/v1/tcp-tunnels"));
+        }
+        assert!(!requires_ha_leader(&axum::http::Method::POST, "/healthz"));
+        assert!(!requires_ha_leader(
+            &axum::http::Method::POST,
+            "/api/v10/tcp-tunnels"
+        ));
+    }
+
+    #[test]
+    fn leader_probe_is_independent_from_process_readiness() {
+        assert_eq!(leader_probe_state(true, true), (true, "leader"));
+        assert_eq!(leader_probe_state(true, false), (false, "not_leader"));
+        assert_eq!(leader_probe_state(false, true), (false, "not_ready"));
+        assert_eq!(leader_probe_state(false, false), (false, "not_ready"));
     }
 
     #[test]

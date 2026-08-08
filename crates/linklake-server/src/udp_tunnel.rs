@@ -7,6 +7,7 @@ use crate::{
     public_port_lease::HaPublicPortLease,
     public_port_ownership::PublicPortProtocol,
     record_audit,
+    target_probe::TargetProbeSet,
     udp_data_plane::AuthenticatedUdpConnection,
     AppState,
 };
@@ -20,7 +21,8 @@ use linklake_core::{
         UdpReassembler, UdpReassemblyConfig, UdpReassemblyError, UdpReassemblyOutcome,
     },
     write_control_frame, write_udp_data_plane_control_frame, BoxedIo, ControlFrame,
-    UdpDataPlaneControlFrame, UdpSessionCloseReason,
+    TargetHealthProbeKind, TargetHealthProbeResult, UdpDataPlaneControlFrame,
+    UdpSessionCloseReason,
 };
 use std::{
     collections::HashMap,
@@ -360,6 +362,8 @@ struct RegisteredTunnelRuntime {
     statistics: Arc<UdpTunnelStatistics>,
     control_stream: BoxedIo,
     stop: watch::Receiver<()>,
+    target_probes: TargetProbeSet,
+    probe_commands: mpsc::Receiver<ControlFrame>,
 }
 
 pub(crate) async fn register_tunnel(
@@ -406,6 +410,25 @@ pub(crate) async fn register_tunnel(
         )
         .await;
         return;
+    };
+    let target_probes = match TargetProbeSet::new(
+        runtime_policy.policy_id,
+        "udp",
+        &target_addr,
+        TargetHealthProbeKind::Udp,
+        None,
+    ) {
+        Ok(probes) => probes,
+        Err(error) => {
+            tracing::warn!("Could not initialize UDP target probes: {error}");
+            reject_registration(
+                &state,
+                &mut stream,
+                "UDP target health configuration is invalid",
+            )
+            .await;
+            return;
+        }
     };
     let Some(data_plane) = state.udp_data_plane.clone() else {
         reject_registration(
@@ -546,6 +569,7 @@ pub(crate) async fn register_tunnel(
     if write_control_frame(
         &mut stream,
         &ControlFrame::UdpTunnelRegistered {
+            policy_id: target_probes.policy_id(),
             registration_id,
             public_port,
         },
@@ -562,6 +586,19 @@ pub(crate) async fn register_tunnel(
 
     let statistics = statistics_for(&state, runtime_policy.policy_id);
     let (stop_tx, stop_rx) = watch::channel(());
+    let (probe_command_tx, probe_commands) = mpsc::channel(64);
+    let probe_task =
+        match target_probes.spawn_scheduler(state.clone(), probe_command_tx, stop_rx.clone()) {
+            Ok(task) => task,
+            Err(error) => {
+                tracing::warn!("Could not start UDP target probes: {error}");
+                port_lease.release().await;
+                authenticated
+                    .connection
+                    .close(8_u8.into(), b"UDP target health scheduler unavailable");
+                return;
+            }
+        };
     port_lease.spawn_supervisor(stop_rx.clone(), stop_tx.clone());
     {
         let mut tunnels = state
@@ -610,8 +647,11 @@ pub(crate) async fn register_tunnel(
         statistics,
         control_stream: stream,
         stop: stop_rx,
+        target_probes,
+        probe_commands,
     })
     .await;
+    probe_task.abort();
 }
 
 async fn write_ready(
@@ -650,6 +690,8 @@ async fn run_tunnel(runtime: RegisteredTunnelRuntime) {
         statistics,
         control_stream,
         stop,
+        target_probes,
+        probe_commands,
     } = runtime;
     let AuthenticatedUdpConnection {
         connection,
@@ -662,6 +704,15 @@ async fn run_tunnel(runtime: RegisteredTunnelRuntime) {
     let tcp_reader_task = tokio::spawn(read_tcp_control_frames(control_reader, tcp_frames_tx));
     let (quic_frames_tx, quic_frames_rx) = mpsc::channel(16);
     let quic_reader_task = tokio::spawn(read_quic_control_frames(control_receive, quic_frames_tx));
+    let (probe_results_tx, mut probe_results_rx) = mpsc::channel(32);
+    let probe_state = state.clone();
+    let probe_result_set = target_probes.clone();
+    let probe_recorder = tokio::spawn(async move {
+        while let Some(result) = probe_results_rx.recv().await {
+            probe_result_set.record_result(&probe_state, result).await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    });
 
     let stop_reason = run_tunnel_loop(
         &state,
@@ -675,6 +726,9 @@ async fn run_tunnel(runtime: RegisteredTunnelRuntime) {
         policy,
         &statistics,
         stop,
+        probe_commands,
+        probe_results_tx,
+        probe_recorder,
     )
     .await;
     tcp_reader_task.abort();
@@ -701,6 +755,9 @@ async fn run_tunnel_loop(
     policy: crate::tunnel_catalog::UdpTunnelRuntimePolicy,
     statistics: &Arc<UdpTunnelStatistics>,
     mut stop: watch::Receiver<()>,
+    mut probe_commands: mpsc::Receiver<ControlFrame>,
+    probe_results: mpsc::Sender<TargetHealthProbeResult>,
+    mut probe_recorder: tokio::task::JoinHandle<anyhow::Result<()>>,
 ) -> RuntimeStop {
     let policy_permits = Arc::new(Semaphore::new(policy.max_sessions));
     let mut sessions_by_external = HashMap::<PublicUdpEndpoint, UdpSession>::new();
@@ -723,6 +780,35 @@ async fn run_tunnel_loop(
                 statistics.transport_errors.fetch_add(1, Ordering::Relaxed);
                 break RuntimeStop::DataPlaneClosed;
             }
+            recorded = &mut probe_recorder => {
+                statistics.transport_errors.fetch_add(1, Ordering::Relaxed);
+                match recorded {
+                    Ok(Ok(())) => tracing::warn!(
+                        public_port,
+                        "UDP target health recorder stopped unexpectedly"
+                    ),
+                    Ok(Err(error)) => tracing::warn!(
+                        public_port,
+                        "Rejected UDP target health result: {error}"
+                    ),
+                    Err(error) => tracing::warn!(
+                        public_port,
+                        "UDP target health recorder failed: {error}"
+                    ),
+                }
+                break RuntimeStop::ControlClosed;
+            }
+            command = probe_commands.recv() => match command {
+                Some(command) => {
+                    if !matches!(timeout(
+                        CONTROL_WRITE_TIMEOUT,
+                        write_control_frame(&mut tcp_control_writer, &command),
+                    ).await, Ok(Ok(()))) {
+                        break RuntimeStop::ControlClosed;
+                    }
+                }
+                None => break RuntimeStop::ControlClosed,
+            },
             frame = tcp_frames.recv() => match frame {
                 Some(ControlFrame::ControlHeartbeat { nonce }) => {
                     control_deadline = Instant::now() + CONTROL_IDLE_TIMEOUT;
@@ -735,6 +821,13 @@ async fn run_tunnel_loop(
                     )
                     .await, Ok(Ok(())))
                     {
+                        break RuntimeStop::ControlClosed;
+                    }
+                }
+                Some(ControlFrame::TargetHealthProbeResult { result }) => {
+                    control_deadline = Instant::now() + CONTROL_IDLE_TIMEOUT;
+                    if probe_results.try_send(result).is_err() {
+                        statistics.transport_errors.fetch_add(1, Ordering::Relaxed);
                         break RuntimeStop::ControlClosed;
                     }
                 }
@@ -1019,6 +1112,7 @@ async fn run_tunnel_loop(
             UdpSessionCloseReason::DataPlaneClosed
         }
     };
+    probe_recorder.abort();
     if usage_pending != 0 {
         if let Err(error) = state
             .traffic_controls

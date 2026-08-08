@@ -1,11 +1,12 @@
 use crate::traffic_control::{TrafficDecision, TrafficPolicyKind};
 use crate::{
     client_registry::Authentication, public_port_lease::HaPublicPortLease,
-    public_port_ownership::PublicPortProtocol, record_audit, AppState,
+    public_port_ownership::PublicPortProtocol, record_audit, target_probe::TargetProbeSet,
+    AppState,
 };
 use linklake_core::{
     read_control_frame, write_control_frame, write_control_frame_and_shutdown, BoxedIo,
-    ControlFrame, ManagedConfigMode, ManagedConfigStatus,
+    ControlFrame, ManagedConfigMode, ManagedConfigStatus, TargetHealthProbeKind,
 };
 use std::{
     net::SocketAddr,
@@ -182,6 +183,18 @@ pub(crate) async fn handle_connection(
             return;
         }
     };
+    if !state.ha_runtime.is_leader() {
+        state
+            .metrics
+            .registration_rejections_total
+            .fetch_add(1, Ordering::Relaxed);
+        send_error(
+            &mut stream,
+            "this LinkLake instance is not the active HA leader",
+        )
+        .await;
+        return;
+    }
     if starts_new_work(&frame) && !state.accepts_public_work() {
         state
             .metrics
@@ -554,6 +567,24 @@ async fn register_tunnel(
         .await;
         return;
     };
+    let target_probes = match TargetProbeSet::new(
+        runtime_policy.policy_id,
+        "tcp",
+        &target_addr,
+        TargetHealthProbeKind::Tcp,
+        None,
+    ) {
+        Ok(probes) => probes,
+        Err(error) => {
+            tracing::warn!("Could not initialize TCP target probes: {error}");
+            state
+                .metrics
+                .registration_rejections_total
+                .fetch_add(1, Ordering::Relaxed);
+            send_error(&mut stream, "TCP target health configuration is invalid").await;
+            return;
+        }
+    };
     let port_lease = match HaPublicPortLease::acquire(
         &state.ha_runtime,
         PublicPortProtocol::Tcp,
@@ -597,6 +628,7 @@ async fn register_tunnel(
         }
     };
     let (command_tx, command_rx) = mpsc::channel(64);
+    let probe_command_tx = command_tx.clone();
     let (stop_tx, stop_rx) = watch::channel(());
     port_lease.spawn_supervisor(stop_rx.clone(), stop_tx.clone());
     let control_stop = stop_rx.clone();
@@ -665,7 +697,10 @@ async fn register_tunnel(
     let (reader, mut writer) = split(stream);
     if write_control_frame(
         &mut writer,
-        &ControlFrame::TcpTunnelRegistered { public_port },
+        &ControlFrame::TcpTunnelRegistered {
+            policy_id: target_probes.policy_id(),
+            public_port,
+        },
     )
     .await
     .is_err()
@@ -673,22 +708,37 @@ async fn register_tunnel(
         remove_tunnel(&state, public_port, registration_id);
         return;
     }
+    let probe_task = match target_probes.spawn_scheduler(
+        state.clone(),
+        probe_command_tx,
+        control_stop.clone(),
+    ) {
+        Ok(task) => task,
+        Err(error) => {
+            tracing::warn!("Could not start TCP target probes: {error}");
+            remove_tunnel(&state, public_port, registration_id);
+            return;
+        }
+    };
     run_registered_control(
         state,
         public_port,
         registration_id,
+        target_probes,
         reader,
         writer,
         command_rx,
         control_stop,
     )
     .await;
+    probe_task.abort();
 }
 
 async fn run_registered_control(
     state: Arc<AppState>,
     public_port: u16,
     registration_id: Uuid,
+    target_probes: TargetProbeSet,
     mut reader: ReadHalf<BoxedIo>,
     mut writer: WriteHalf<BoxedIo>,
     mut commands: mpsc::Receiver<ControlFrame>,
@@ -729,6 +779,20 @@ async fn run_registered_control(
                     .await
                     .is_err()
                     {
+                        break;
+                    }
+                }
+                Some(ControlFrame::TargetHealthProbeResult { result }) => {
+                    idle_timeout.as_mut().reset(Instant::now() + CONTROL_IDLE_TIMEOUT);
+                    if let Err(error) = target_probes.record_result(&state, result).await {
+                        state
+                            .metrics
+                            .control_protocol_errors_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            public_port,
+                            "Rejected TCP target health result: {error}"
+                        );
                         break;
                     }
                 }

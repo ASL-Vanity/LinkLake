@@ -29,6 +29,7 @@ pub(crate) const POSTGRES_INSECURE_LOOPBACK_ENV: &str = "LINKLAKE_POSTGRES_ALLOW
 pub(crate) const POSTGRES_ACQUIRE_TIMEOUT_ENV: &str = "LINKLAKE_POSTGRES_ACQUIRE_TIMEOUT_SECONDS";
 pub(crate) const POSTGRES_CONNECT_TIMEOUT_ENV: &str = "LINKLAKE_POSTGRES_CONNECT_TIMEOUT_SECONDS";
 pub(crate) const POSTGRES_HEALTH_TIMEOUT_ENV: &str = "LINKLAKE_POSTGRES_HEALTH_TIMEOUT_SECONDS";
+pub(crate) const HA_REPLICATED_STATE_ENV: &str = "LINKLAKE_HA_REPLICATED_STATE";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -65,6 +66,7 @@ impl std::str::FromStr for StorageBackend {
 pub(crate) struct StorageConfig {
     backend: StorageBackend,
     postgres_url: Option<String>,
+    replicated_state: bool,
 }
 
 impl fmt::Debug for StorageConfig {
@@ -76,6 +78,7 @@ impl fmt::Debug for StorageConfig {
                 "postgres_url",
                 &self.postgres_url.as_ref().map(|_| "<redacted>"),
             )
+            .field("replicated_state", &self.replicated_state)
             .finish()
     }
 }
@@ -89,24 +92,50 @@ impl StorageConfig {
             .ok()
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty());
+        let replicated_state = parse_boolean_environment(HA_REPLICATED_STATE_ENV)?;
+        Self::from_parts(backend, postgres_url, replicated_state)
+    }
+
+    fn from_parts(
+        backend: StorageBackend,
+        postgres_url: Option<String>,
+        replicated_state: bool,
+    ) -> anyhow::Result<Self> {
         match backend {
-            StorageBackend::Sqlite => anyhow::ensure!(
-                postgres_url.is_none(),
-                "{POSTGRES_URL_ENV} is set while {STORAGE_BACKEND_ENV}=sqlite; refusing ambiguous storage configuration"
-            ),
-            StorageBackend::Postgres => anyhow::ensure!(
-                postgres_url.is_some(),
-                "{POSTGRES_URL_ENV} is required when {STORAGE_BACKEND_ENV}=postgres"
-            ),
+            StorageBackend::Sqlite => {
+                anyhow::ensure!(
+                    postgres_url.is_none(),
+                    "{POSTGRES_URL_ENV} is set while {STORAGE_BACKEND_ENV}=sqlite; refusing ambiguous storage configuration"
+                );
+                anyhow::ensure!(
+                    !replicated_state,
+                    "{HA_REPLICATED_STATE_ENV} is only valid with PostgreSQL coordination storage"
+                );
+            }
+            StorageBackend::Postgres => {
+                anyhow::ensure!(
+                    postgres_url.is_some(),
+                    "{POSTGRES_URL_ENV} is required when {STORAGE_BACKEND_ENV}=postgres"
+                );
+                anyhow::ensure!(
+                    replicated_state,
+                    "{HA_REPLICATED_STATE_ENV}=true is required in PostgreSQL HA mode because application identities and policies still use externally replicated local state"
+                );
+            }
         }
         Ok(Self {
             backend,
             postgres_url,
+            replicated_state,
         })
     }
 
     pub(crate) fn backend(&self) -> StorageBackend {
         self.backend
+    }
+
+    pub(crate) fn replicated_state(&self) -> bool {
+        self.replicated_state
     }
 }
 
@@ -411,4 +440,47 @@ fn parse_duration_environment(
 
 fn nonnegative_time(value: i64) -> anyhow::Result<u64> {
     u64::try_from(value).map_err(|_| anyhow::anyhow!("database clock returned a negative value"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StorageBackend, StorageConfig};
+
+    #[test]
+    fn postgres_requires_explicit_replicated_application_state_acknowledgement() {
+        let error = StorageConfig::from_parts(
+            StorageBackend::Postgres,
+            Some("postgresql://example.invalid/linklake".to_owned()),
+            false,
+        )
+        .expect_err("PostgreSQL HA without replicated application state must fail closed");
+        assert!(error
+            .to_string()
+            .contains("LINKLAKE_HA_REPLICATED_STATE=true"));
+
+        let config = StorageConfig::from_parts(
+            StorageBackend::Postgres,
+            Some("postgresql://example.invalid/linklake".to_owned()),
+            true,
+        )
+        .expect("explicit acknowledgement should enable PostgreSQL coordination storage");
+        assert_eq!(config.backend(), StorageBackend::Postgres);
+        assert!(config.replicated_state());
+    }
+
+    #[test]
+    fn sqlite_rejects_postgres_only_configuration() {
+        assert!(StorageConfig::from_parts(
+            StorageBackend::Sqlite,
+            Some("postgresql://example.invalid/linklake".to_owned()),
+            false,
+        )
+        .is_err());
+        assert!(StorageConfig::from_parts(StorageBackend::Sqlite, None, true).is_err());
+
+        let config = StorageConfig::from_parts(StorageBackend::Sqlite, None, false)
+            .expect("default SQLite mode should remain valid");
+        assert_eq!(config.backend(), StorageBackend::Sqlite);
+        assert!(!config.replicated_state());
+    }
 }

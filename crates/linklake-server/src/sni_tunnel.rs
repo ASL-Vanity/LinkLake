@@ -3,10 +3,13 @@ use crate::{
     client_registry::Authentication,
     http_route_catalog::normalize_hostname,
     record_audit,
+    target_probe::TargetProbeSet,
     tcp_tunnel::{copy_bidirectional_with_limit, BandwidthLimiter},
     AppState,
 };
-use linklake_core::{read_control_frame, write_control_frame, BoxedIo, ControlFrame};
+use linklake_core::{
+    read_control_frame, write_control_frame, BoxedIo, ControlFrame, TargetHealthProbeKind,
+};
 use std::{
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -340,9 +343,33 @@ pub(crate) async fn register_route(
         .await;
         return;
     };
+    let target_probes = match TargetProbeSet::new(
+        runtime.policy_id,
+        "sni",
+        &target_addr,
+        TargetHealthProbeKind::Tls,
+        Some(hostname.clone()),
+    ) {
+        Ok(probes) => probes,
+        Err(error) => {
+            tracing::warn!("Could not initialize TLS SNI target probes: {error}");
+            state
+                .metrics
+                .registration_rejections_total
+                .fetch_add(1, Ordering::Relaxed);
+            send_error(
+                &mut stream,
+                "TLS SNI target health configuration is invalid",
+            )
+            .await;
+            return;
+        }
+    };
     let registration_id = Uuid::new_v4();
     let (command_tx, command_rx) = mpsc::channel(64);
+    let probe_command_tx = command_tx.clone();
     let (stop_tx, stop_rx) = watch::channel(());
+    let probe_stop = stop_rx.clone();
     let statistics = {
         let mut all = state
             .sni_route_statistics
@@ -389,6 +416,7 @@ pub(crate) async fn register_route(
     if write_control_frame(
         &mut writer,
         &ControlFrame::TlsRouteRegistered {
+            policy_id: target_probes.policy_id(),
             hostname: hostname.clone(),
         },
     )
@@ -398,22 +426,34 @@ pub(crate) async fn register_route(
         remove_route(&state, &hostname, registration_id);
         return;
     }
+    let probe_task =
+        match target_probes.spawn_scheduler(state.clone(), probe_command_tx, probe_stop) {
+            Ok(task) => task,
+            Err(error) => {
+                tracing::warn!("Could not start TLS SNI target probes: {error}");
+                remove_route(&state, &hostname, registration_id);
+                return;
+            }
+        };
     run_registered_control(
         state,
         hostname,
         registration_id,
+        target_probes,
         reader,
         writer,
         command_rx,
         stop_rx,
     )
     .await;
+    probe_task.abort();
 }
 
 async fn run_registered_control(
     state: Arc<AppState>,
     hostname: String,
     registration_id: Uuid,
+    target_probes: TargetProbeSet,
     mut reader: ReadHalf<BoxedIo>,
     mut writer: WriteHalf<BoxedIo>,
     mut commands: mpsc::Receiver<ControlFrame>,
@@ -431,7 +471,26 @@ async fn run_registered_control(
                     Ok(Ok(ControlFrame::ControlHeartbeat { nonce })) => {
                         if write_control_frame(&mut writer, &ControlFrame::ControlHeartbeatAck { nonce }).await.is_err() { break; }
                     }
-                    Ok(Ok(_)) => break,
+                    Ok(Ok(ControlFrame::TargetHealthProbeResult { result })) => {
+                        if let Err(error) = target_probes.record_result(&state, result).await {
+                            state
+                                .metrics
+                                .control_protocol_errors_total
+                                .fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!(
+                                hostname = %hostname,
+                                "Rejected TLS SNI target health result: {error}"
+                            );
+                            break;
+                        }
+                    }
+                    Ok(Ok(_)) => {
+                        state
+                            .metrics
+                            .control_protocol_errors_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
                     Ok(Err(_)) | Err(_) => break,
                 }
             }

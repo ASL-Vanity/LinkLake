@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use ed25519_dalek::{Signer, SigningKey};
 use getrandom::fill as random_fill;
 use linklake_core::port_mapping::{parse_port_mappings, MAX_PORT_MAPPINGS};
-use linklake_core::target_pool::{parse_target_pool, select_weighted_target, WeightedTarget};
+use linklake_core::target_pool::{parse_target_pool, select_weighted_target};
 use linklake_core::{
     agent_enrollment_message, agent_instance_id_from_public_key, managed_config_revision,
     read_control_frame, write_control_frame, BoxedIo, BuildInfo, ClientEnrollmentRequest,
@@ -25,7 +25,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::{
     io::{copy_bidirectional, split, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
     net::{lookup_host, TcpListener, TcpStream, UdpSocket},
@@ -42,6 +42,7 @@ mod p2p_iroh;
 mod p2p_noise;
 mod remote_update;
 mod socks5_udp_agent;
+mod target_probe;
 mod udp_agent;
 use linklake_update as updater;
 use linklake_update::{SignaturePolicy, UpdateChannel, UpdateProduct};
@@ -3804,17 +3805,40 @@ async fn run_tcp_agent_session(
         },
     )
     .await?;
-    match read_control_frame(&mut stream).await? {
-        ControlFrame::TcpTunnelRegistered { public_port } => {
-            tracing::info!("TCP tunnel registered on public port {public_port}.")
+    let policy_id = match read_control_frame(&mut stream).await? {
+        ControlFrame::TcpTunnelRegistered {
+            policy_id,
+            public_port: registered_port,
+        } => {
+            anyhow::ensure!(
+                registered_port == public_port,
+                "server acknowledged a different TCP public port"
+            );
+            tracing::info!("TCP tunnel registered on public port {registered_port}.");
+            policy_id
         }
         ControlFrame::Error { message } => anyhow::bail!("server rejected TCP tunnel: {message}"),
         frame => anyhow::bail!("unexpected registration response: {frame:?}"),
-    }
+    };
+    let probe_session = target_probe::TargetProbeSession::new(
+        policy_id,
+        target_probe::TargetProbePolicy::Tcp,
+        &target,
+    )?;
     let (reader, writer) = split(stream);
-    let heartbeat = tokio::spawn(send_control_heartbeats(writer));
-    let result = read_registered_control(reader, transport, target, client_id, token).await;
-    heartbeat.abort();
+    let (command_tx, mut writer_task) = target_probe::spawn_control_writer(writer);
+    let result = tokio::select! {
+        result = read_registered_control(
+            reader,
+            transport,
+            target,
+            client_id,
+            token,
+            Some((probe_session, command_tx)),
+        ) => result,
+        writer = &mut writer_task => control_writer_result(writer),
+    };
+    writer_task.abort();
     result
 }
 
@@ -3875,24 +3899,49 @@ async fn run_http_agent_session(
             client_id,
             client_token: token.clone(),
             name,
-            hostname,
+            hostname: hostname.clone(),
             target_addr: target.clone(),
         },
     )
     .await?;
-    match read_control_frame(&mut stream).await? {
-        ControlFrame::HttpRouteRegistered { hostname } => {
-            tracing::info!("HTTP route registered for hostname {hostname}.")
+    let policy_id = match read_control_frame(&mut stream).await? {
+        ControlFrame::HttpRouteRegistered {
+            policy_id,
+            hostname: registered_hostname,
+        } => {
+            anyhow::ensure!(
+                registered_hostname == hostname,
+                "server acknowledged a different HTTP route hostname"
+            );
+            tracing::info!("HTTP route registered for hostname {registered_hostname}.");
+            policy_id
         }
         ControlFrame::Error { message } => {
             anyhow::bail!("server rejected HTTP route: {message}")
         }
         frame => anyhow::bail!("unexpected registration response: {frame:?}"),
-    }
+    };
+    let probe_session = target_probe::TargetProbeSession::new(
+        policy_id,
+        target_probe::TargetProbePolicy::Http {
+            server_name: hostname,
+        },
+        &target,
+    )?;
     let (reader, writer) = split(stream);
-    let heartbeat = tokio::spawn(send_control_heartbeats(writer));
-    let result = read_registered_control(reader, transport, target, client_id, token).await;
-    heartbeat.abort();
+    let (command_tx, mut writer_task) = target_probe::spawn_control_writer(writer);
+    let result = tokio::select! {
+        result = read_registered_control(
+            reader,
+            transport,
+            target,
+            client_id,
+            token,
+            Some((probe_session, command_tx)),
+        ) => result,
+        writer = &mut writer_task => control_writer_result(writer),
+    };
+    writer_task.abort();
     result
 }
 
@@ -3944,22 +3993,47 @@ async fn run_tls_route_agent_session(
             client_id,
             client_token: token.clone(),
             name,
-            hostname,
+            hostname: hostname.clone(),
             target_addr: target.clone(),
         },
     )
     .await?;
-    match read_control_frame(&mut stream).await? {
-        ControlFrame::TlsRouteRegistered { hostname } => {
-            tracing::info!("TLS SNI route registered for hostname {hostname}.")
+    let policy_id = match read_control_frame(&mut stream).await? {
+        ControlFrame::TlsRouteRegistered {
+            policy_id,
+            hostname: registered_hostname,
+        } => {
+            anyhow::ensure!(
+                registered_hostname == hostname,
+                "server acknowledged a different TLS route hostname"
+            );
+            tracing::info!("TLS SNI route registered for hostname {registered_hostname}.");
+            policy_id
         }
         ControlFrame::Error { message } => anyhow::bail!("server rejected TLS route: {message}"),
         frame => anyhow::bail!("unexpected TLS route registration response: {frame:?}"),
-    }
+    };
+    let probe_session = target_probe::TargetProbeSession::new(
+        policy_id,
+        target_probe::TargetProbePolicy::Tls {
+            server_name: hostname,
+        },
+        &target,
+    )?;
     let (reader, writer) = split(stream);
-    let heartbeat = tokio::spawn(send_control_heartbeats(writer));
-    let result = read_registered_control(reader, transport, target, client_id, token).await;
-    heartbeat.abort();
+    let (command_tx, mut writer_task) = target_probe::spawn_control_writer(writer);
+    let result = tokio::select! {
+        result = read_registered_control(
+            reader,
+            transport,
+            target,
+            client_id,
+            token,
+            Some((probe_session, command_tx)),
+        ) => result,
+        writer = &mut writer_task => control_writer_result(writer),
+    };
+    writer_task.abort();
     result
 }
 
@@ -4362,7 +4436,7 @@ async fn run_secret_target_session(
     }
     let (reader, writer) = split(stream);
     let heartbeat = tokio::spawn(send_control_heartbeats(writer));
-    let result = read_registered_control(reader, transport, target, client_id, token).await;
+    let result = read_registered_control(reader, transport, target, client_id, token, None).await;
     heartbeat.abort();
     result
 }
@@ -4979,6 +5053,7 @@ async fn read_registered_control(
     target: String,
     client_id: Uuid,
     token: String,
+    probe_control: Option<(target_probe::TargetProbeSession, mpsc::Sender<ControlFrame>)>,
 ) -> anyhow::Result<()> {
     let targets = Arc::new(parse_target_pool(&target)?);
     let target_sequence = Arc::new(AtomicU64::new(0));
@@ -4990,7 +5065,17 @@ async fn read_registered_control(
             ControlFrame::OpenTcpConnection { connection_id }
             | ControlFrame::OpenSecretConnection { connection_id } => {
                 let transport = transport.clone();
-                let target = select_target(&targets, &target_sequence)?;
+                let slot = target_sequence.fetch_add(1, Ordering::Relaxed);
+                let target = match &probe_control {
+                    Some((probe_session, _)) => probe_session.select_target(slot),
+                    None => select_weighted_target(&targets, slot).map(str::to_owned),
+                };
+                let Some(target) = target else {
+                    tracing::warn!(
+                        "Rejected connection {connection_id} because no healthy target is available."
+                    );
+                    continue;
+                };
                 let token = token.clone();
                 tokio::spawn(async move {
                     if let Err(error) =
@@ -5001,6 +5086,12 @@ async fn read_registered_control(
                     }
                 });
             }
+            ControlFrame::TargetHealthProbe { probe } => {
+                let Some((probe_session, command_tx)) = &probe_control else {
+                    anyhow::bail!("server sent a target probe on an unsupported control session");
+                };
+                probe_session.handle_probe(probe, command_tx.clone())?;
+            }
             ControlFrame::ControlHeartbeatAck { .. } => {}
             ControlFrame::Error { message } => anyhow::bail!("server closed tunnel: {message}"),
             frame => anyhow::bail!("unexpected control frame: {frame:?}"),
@@ -5008,11 +5099,16 @@ async fn read_registered_control(
     }
 }
 
-fn select_target(targets: &[WeightedTarget], sequence: &AtomicU64) -> anyhow::Result<String> {
-    let slot = sequence.fetch_add(1, Ordering::Relaxed);
-    select_weighted_target(targets, slot)
-        .map(str::to_owned)
-        .ok_or_else(|| anyhow::anyhow!("target pool is empty"))
+fn control_writer_result(
+    result: Result<anyhow::Result<()>, tokio::task::JoinError>,
+) -> anyhow::Result<()> {
+    match result {
+        Ok(Ok(())) => anyhow::bail!("registered control writer stopped unexpectedly"),
+        Ok(Err(error)) => Err(error),
+        Err(error) => Err(anyhow::anyhow!(
+            "registered control writer task failed: {error}"
+        )),
+    }
 }
 
 async fn open_tcp_data_connection(

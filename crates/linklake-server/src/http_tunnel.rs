@@ -10,7 +10,9 @@ use crate::{
     },
     http_backend_pool::{BackendProtocol, OriginKey},
     http_route_catalog::normalize_hostname,
-    record_audit, AppState,
+    record_audit,
+    target_probe::TargetProbeSet,
+    AppState,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use bytes::Bytes;
@@ -27,7 +29,9 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo, TokioTimer},
     server::conn::auto as server_auto,
 };
-use linklake_core::{read_control_frame, write_control_frame, BoxedIo, ControlFrame};
+use linklake_core::{
+    read_control_frame, write_control_frame, BoxedIo, ControlFrame, TargetHealthProbeKind,
+};
 use std::{
     collections::HashSet,
     convert::Infallible,
@@ -1519,9 +1523,29 @@ pub(crate) async fn register_route(
         .await;
         return;
     };
+    let target_probes = match TargetProbeSet::new(
+        runtime_policy.policy_id,
+        "http",
+        &target_addr,
+        TargetHealthProbeKind::Http,
+        Some(hostname.clone()),
+    ) {
+        Ok(probes) => probes,
+        Err(error) => {
+            tracing::warn!("Could not initialize HTTP target probes: {error}");
+            state
+                .metrics
+                .registration_rejections_total
+                .fetch_add(1, Ordering::Relaxed);
+            send_error(&mut stream, "HTTP target health configuration is invalid").await;
+            return;
+        }
+    };
     let registration_id = Uuid::new_v4();
     let (command_tx, command_rx) = mpsc::channel(64);
+    let probe_command_tx = command_tx.clone();
     let (stop_tx, stop_rx) = watch::channel(());
+    let probe_stop = stop_rx.clone();
     let statistics = {
         let mut statistics = state
             .http_route_statistics
@@ -1617,6 +1641,7 @@ pub(crate) async fn register_route(
     if write_control_frame(
         &mut writer,
         &ControlFrame::HttpRouteRegistered {
+            policy_id: target_probes.policy_id(),
             hostname: hostname.clone(),
         },
     )
@@ -1626,22 +1651,34 @@ pub(crate) async fn register_route(
         remove_route(&state, &hostname, registration_id);
         return;
     }
+    let probe_task =
+        match target_probes.spawn_scheduler(state.clone(), probe_command_tx, probe_stop) {
+            Ok(task) => task,
+            Err(error) => {
+                tracing::warn!("Could not start HTTP target probes: {error}");
+                remove_route(&state, &hostname, registration_id);
+                return;
+            }
+        };
     run_registered_control(
         state,
         hostname,
         registration_id,
+        target_probes,
         reader,
         writer,
         command_rx,
         stop_rx,
     )
     .await;
+    probe_task.abort();
 }
 
 async fn run_registered_control(
     state: Arc<AppState>,
     hostname: String,
     registration_id: Uuid,
+    target_probes: TargetProbeSet,
     mut reader: ReadHalf<BoxedIo>,
     mut writer: WriteHalf<BoxedIo>,
     mut commands: mpsc::Receiver<ControlFrame>,
@@ -1682,7 +1719,27 @@ async fn run_registered_control(
                         break;
                     }
                 }
-                Some(_) => break,
+                Some(ControlFrame::TargetHealthProbeResult { result }) => {
+                    idle_timeout.as_mut().reset(Instant::now() + CONTROL_IDLE_TIMEOUT);
+                    if let Err(error) = target_probes.record_result(&state, result).await {
+                        state
+                            .metrics
+                            .control_protocol_errors_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            hostname,
+                            "Rejected HTTP target health result: {error}"
+                        );
+                        break;
+                    }
+                }
+                Some(_) => {
+                    state
+                        .metrics
+                        .control_protocol_errors_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
                 None => break,
             }
         }
