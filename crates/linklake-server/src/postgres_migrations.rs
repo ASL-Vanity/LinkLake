@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tokio_postgres::{Client, Transaction};
 
-pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 4;
+pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 5;
 const ADVISORY_LOCK_ID: i64 = 0x4c4c_4841_4d49_4752;
 
 const MIGRATION_V1_NAME: &str = "ha_coordination_foundation";
@@ -219,6 +219,28 @@ BEFORE UPDATE OR DELETE ON linklake_update_task_events
 FOR EACH ROW EXECUTE FUNCTION linklake_reject_update_task_event_mutation();
 "#;
 
+const MIGRATION_V5_NAME: &str = "remote_update_terminal_replay";
+const MIGRATION_V5_SQL: &str = r#"
+ALTER TABLE linklake_update_tasks
+    ADD COLUMN terminal_worker_instance_id TEXT,
+    ADD COLUMN terminal_lease_token_sha256 TEXT,
+    ADD COLUMN terminal_report_sha256 TEXT;
+
+ALTER TABLE linklake_update_tasks
+    ADD CONSTRAINT linklake_update_tasks_terminal_replay_complete CHECK (
+        (terminal_worker_instance_id IS NULL
+         AND terminal_lease_token_sha256 IS NULL
+         AND terminal_report_sha256 IS NULL)
+        OR
+        (state IN ('succeeded', 'failed', 'cancelled')
+         AND terminal_worker_instance_id IS NOT NULL
+         AND terminal_lease_token_sha256 IS NOT NULL
+         AND length(terminal_lease_token_sha256) = 64
+         AND terminal_report_sha256 IS NOT NULL
+         AND length(terminal_report_sha256) = 64)
+    );
+"#;
+
 struct Migration {
     version: i64,
     name: &'static str,
@@ -257,6 +279,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 4,
         name: MIGRATION_V4_NAME,
         sql: MIGRATION_V4_SQL,
+    },
+    Migration {
+        version: 5,
+        name: MIGRATION_V5_NAME,
+        sql: MIGRATION_V5_SQL,
     },
 ];
 
@@ -480,6 +507,9 @@ async fn verify_schema_structure(transaction: &Transaction<'_>) -> anyhow::Resul
                 required("created_unix_seconds", "int8"),
                 optional("lease_deadline_unix_seconds", "int8"),
                 optional("lease_token_sha256", "text"),
+                optional("terminal_worker_instance_id", "text"),
+                optional("terminal_lease_token_sha256", "text"),
+                optional("terminal_report_sha256", "text"),
                 required("snapshot_json", "text"),
             ],
         },

@@ -1412,6 +1412,20 @@ fn replay_terminal_report(
 ) -> anyhow::Result<RemoteUpdateTask> {
     let stored = terminal_report_replay(transaction, task.task_id)?
         .ok_or_else(|| domain_error(UpdateTaskError::InvalidTransition))?;
+    validate_terminal_report_replay(&stored, request)?;
+    append_event(
+        transaction,
+        task,
+        RemoteUpdateEventKind::IdempotentReplay,
+        now,
+    )?;
+    Ok(task.clone())
+}
+
+fn validate_terminal_report_replay(
+    stored: &TerminalReportReplay,
+    request: &RemoteUpdateReportRequest,
+) -> anyhow::Result<()> {
     let presented_lease = lease_token_sha256(request.lease_token);
     if stored.worker_instance_id != request.worker_instance_id
         || !constant_time_equal(
@@ -1425,13 +1439,7 @@ fn replay_terminal_report(
     if !constant_time_equal(stored.report_sha256.as_bytes(), presented_report.as_bytes()) {
         return Err(domain_error(UpdateTaskError::InvalidTransition));
     }
-    append_event(
-        transaction,
-        task,
-        RemoteUpdateEventKind::IdempotentReplay,
-        now,
-    )?;
-    Ok(task.clone())
+    Ok(())
 }
 
 fn terminal_report_replay(

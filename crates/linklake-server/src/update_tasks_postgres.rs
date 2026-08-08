@@ -23,12 +23,14 @@ struct StoredTask {
     task: RemoteUpdateTask,
     lease_token_sha256: Option<String>,
     request_fingerprint: String,
+    terminal_replay: Option<TerminalReportReplay>,
 }
 
 enum TokenUpdate<'a> {
     Preserve,
     Set(&'a str),
     Clear,
+    Terminal(&'a TerminalReportReplay),
 }
 
 impl PostgresUpdateTaskCatalog {
@@ -303,7 +305,9 @@ impl PostgresUpdateTaskCatalog {
         reconcile_expired(&transaction, Some(target_client_id), now).await?;
         let row = transaction
             .query_opt(
-                "SELECT snapshot_json, lease_token_sha256, request_fingerprint
+                "SELECT snapshot_json, lease_token_sha256, request_fingerprint,
+                        terminal_worker_instance_id, terminal_lease_token_sha256,
+                        terminal_report_sha256
                  FROM linklake_update_tasks
                  WHERE target_client_id = $1 AND state = 'queued'
                  ORDER BY created_unix_seconds, task_id LIMIT 1 FOR UPDATE",
@@ -464,6 +468,24 @@ impl PostgresUpdateTaskCatalog {
         request
             .validate(stored.task.action)
             .map_err(|error| domain_error(UpdateTaskError::Contract(error)))?;
+        if stored.task.state.is_terminal() {
+            validate_terminal_report_replay(
+                stored
+                    .terminal_replay
+                    .as_ref()
+                    .ok_or_else(|| domain_error(UpdateTaskError::InvalidTransition))?,
+                request,
+            )?;
+            append_event(
+                &transaction,
+                &stored.task,
+                RemoteUpdateEventKind::IdempotentReplay,
+                now,
+            )
+            .await?;
+            transaction.commit().await?;
+            return Ok(stored.task);
+        }
         request
             .report
             .validate_for_task(
@@ -480,7 +502,15 @@ impl PostgresUpdateTaskCatalog {
             now,
         )?;
         let event = apply_worker_report(&mut stored.task, &request.report, now)?;
-        let token = if stored.task.lease_owner.is_some() {
+        let terminal_replay = stored
+            .task
+            .state
+            .is_terminal()
+            .then(|| TerminalReportReplay::from_request(request))
+            .transpose()?;
+        let token = if let Some(replay) = terminal_replay.as_ref() {
+            TokenUpdate::Terminal(replay)
+        } else if stored.task.lease_owner.is_some() {
             TokenUpdate::Preserve
         } else {
             TokenUpdate::Clear
@@ -702,7 +732,9 @@ async fn task_by_id(
     transaction
         .query_opt(
             &format!(
-                "SELECT snapshot_json, lease_token_sha256, request_fingerprint
+                "SELECT snapshot_json, lease_token_sha256, request_fingerprint,
+                        terminal_worker_instance_id, terminal_lease_token_sha256,
+                        terminal_report_sha256
                  FROM linklake_update_tasks WHERE task_id = $1{suffix}"
             ),
             &[&task_id.to_string()],
@@ -723,7 +755,9 @@ async fn task_by_idempotency(
     transaction
         .query_opt(
             &format!(
-                "SELECT snapshot_json, lease_token_sha256, request_fingerprint
+                "SELECT snapshot_json, lease_token_sha256, request_fingerprint,
+                        terminal_worker_instance_id, terminal_lease_token_sha256,
+                        terminal_report_sha256
                  FROM linklake_update_tasks
                  WHERE requested_by = $1 AND idempotency_key = $2{suffix}"
             ),
@@ -736,10 +770,34 @@ async fn task_by_idempotency(
 }
 
 fn stored_task(row: &Row) -> anyhow::Result<StoredTask> {
+    let terminal_worker: Option<String> = row.get(3);
+    let terminal_lease_token_sha256: Option<String> = row.get(4);
+    let terminal_report_sha256: Option<String> = row.get(5);
+    let terminal_replay = match (
+        terminal_worker,
+        terminal_lease_token_sha256,
+        terminal_report_sha256,
+    ) {
+        (None, None, None) => None,
+        (Some(worker), Some(lease_token_sha256), Some(report_sha256)) => {
+            let worker_instance_id = Uuid::parse_str(&worker)?;
+            anyhow::ensure!(
+                !worker_instance_id.is_nil(),
+                "PostgreSQL terminal replay worker identity is nil"
+            );
+            Some(TerminalReportReplay {
+                worker_instance_id,
+                lease_token_sha256,
+                report_sha256,
+            })
+        }
+        _ => anyhow::bail!("PostgreSQL terminal replay proof is incomplete"),
+    };
     Ok(StoredTask {
         task: task_snapshot(row)?,
         lease_token_sha256: row.get(1),
         request_fingerprint: row.get(2),
+        terminal_replay,
     })
 }
 
@@ -834,6 +892,29 @@ async fn write_task(
                          lease_token_sha256 = NULL, snapshot_json = $4
                      WHERE task_id = $1",
                     &[&task_id, &state, &deadline, &snapshot],
+                )
+                .await?
+        }
+        TokenUpdate::Terminal(replay) => {
+            transaction
+                .execute(
+                    "UPDATE linklake_update_tasks
+                     SET state = $2, lease_deadline_unix_seconds = $3,
+                         lease_token_sha256 = NULL,
+                         terminal_worker_instance_id = $4,
+                         terminal_lease_token_sha256 = $5,
+                         terminal_report_sha256 = $6,
+                         snapshot_json = $7
+                     WHERE task_id = $1",
+                    &[
+                        &task_id,
+                        &state,
+                        &deadline,
+                        &replay.worker_instance_id.to_string(),
+                        &replay.lease_token_sha256,
+                        &replay.report_sha256,
+                        &snapshot,
+                    ],
                 )
                 .await?
         }
