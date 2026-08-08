@@ -6313,6 +6313,18 @@ mod tests {
         SigningKey::from_bytes(&[seed; 32])
     }
 
+    #[test]
+    fn non_server_recovery_is_explicit_and_returns_idle_without_an_active_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        assert!(recover(UpdateProduct::Client, &state, false).is_err());
+        assert!(recover(UpdateProduct::Server, &state, true).is_err());
+
+        let status = recover(UpdateProduct::Client, &state, true).unwrap();
+        assert_eq!(status.state, "idle");
+        assert!(status.operation.is_none());
+    }
+
     fn trusted_key_fixture(
         key_id: &str,
         signing_key: &SigningKey,
