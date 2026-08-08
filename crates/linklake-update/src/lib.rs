@@ -64,7 +64,11 @@ const SERVER_READY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const SERVER_READY_STABLE_POLLS: usize = 6;
 const MAX_UPDATE_STATE_BYTES: u64 = 128 * 1024;
 const MAX_REMOTE_UPDATE_RESUME_BYTES: u64 = 16 * 1024;
+const MAX_REMOTE_UPDATE_QUARANTINE_BYTES: u64 = 64 * 1024;
+const MAX_REMOTE_UPDATE_QUARANTINE_DETAIL_BYTES: usize = 2 * 1024;
 const REMOTE_UPDATE_RESUME_DIRECTORY: &str = "remote-resume";
+const REMOTE_UPDATE_QUARANTINE_DIRECTORY: &str = "remote-quarantine";
+const REMOTE_UPDATE_QUARANTINE_SCHEMA_VERSION: u32 = 1;
 const UPDATE_JOURNAL_SCHEMA_VERSION: u32 = 1;
 const SERVER_STATE_AUTH_SCHEMA_VERSION: u32 = 1;
 const SERVER_STATE_AUTH_KEY_NAME: &str = ".linklake-server-update-auth.key";
@@ -387,6 +391,61 @@ pub struct UpdateStatus {
     pub error: Option<String>,
     pub backup: Option<PathBuf>,
     pub updated_unix_seconds: u64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteUpdateQuarantineReason {
+    DeadlineExceeded,
+    TaskMissing,
+    LeaseAuthorityLost,
+    TerminalConflict,
+    ControlUnavailableAfterDeadline,
+    InvalidReceipt,
+    LocalStateConflict,
+    LocalVerificationFailed,
+}
+
+impl RemoteUpdateQuarantineReason {
+    pub const fn as_code(self) -> &'static str {
+        match self {
+            Self::DeadlineExceeded => "deadline_exceeded",
+            Self::TaskMissing => "task_missing",
+            Self::LeaseAuthorityLost => "lease_authority_lost",
+            Self::TerminalConflict => "terminal_conflict",
+            Self::ControlUnavailableAfterDeadline => "control_unavailable_after_deadline",
+            Self::InvalidReceipt => "invalid_receipt",
+            Self::LocalStateConflict => "local_state_conflict",
+            Self::LocalVerificationFailed => "local_verification_failed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteUpdateQuarantineSummary {
+    pub record_id: String,
+    pub client_id: Uuid,
+    pub api_origin_sha256: String,
+    pub receipt_sha256: String,
+    pub reason: RemoteUpdateQuarantineReason,
+    pub detail: String,
+    pub quarantined_unix_seconds: u64,
+    pub record_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteUpdateQuarantineRecord {
+    schema_version: u32,
+    record_id: String,
+    client_id: Uuid,
+    api_origin_sha256: String,
+    receipt_length: u64,
+    receipt_sha256: String,
+    receipt_base64: String,
+    reason: RemoteUpdateQuarantineReason,
+    detail: String,
+    quarantined_unix_seconds: u64,
 }
 
 /// 候选服务已进入交接窗口后，恢复旧数据库可能会丢弃候选服务已经接受的写入。
@@ -748,6 +807,441 @@ pub fn remove_remote_update_resume_receipt(
 ) -> anyhow::Result<bool> {
     let path = remote_update_resume_path(product, state_directory, client_id, api_origin_sha256)?;
     remove_durable_file_if_exists(&path)
+}
+
+/// 把仍在活动清单中的远程更新续跑凭据转移到受保护的取证隔离区。
+///
+/// 隔离记录先以 create-new 语义落盘并同步，再删除活动凭据；因此任何中途失败都会
+/// 保守地留下活动凭据或完整隔离记录，不会静默丢失唯一证据。
+pub fn quarantine_remote_update_resume_receipt(
+    product: UpdateProduct,
+    state_directory: &Path,
+    client_id: Uuid,
+    api_origin_sha256: &str,
+    reason: RemoteUpdateQuarantineReason,
+    detail: &str,
+) -> anyhow::Result<RemoteUpdateQuarantineSummary> {
+    validate_remote_update_quarantine_detail(detail)?;
+    let resume_path =
+        remote_update_resume_path(product, state_directory, client_id, api_origin_sha256)?;
+    validate_remote_resume_file(&resume_path)?;
+    let receipt = read_limited_bytes(&resume_path, MAX_REMOTE_UPDATE_RESUME_BYTES)?;
+    let receipt_sha256 = sha256_bytes(&receipt);
+    let record_id =
+        remote_update_quarantine_record_id(client_id, api_origin_sha256, receipt.as_slice());
+    let record_path = remote_update_quarantine_path(product, state_directory, &record_id)?;
+    let record = RemoteUpdateQuarantineRecord {
+        schema_version: REMOTE_UPDATE_QUARANTINE_SCHEMA_VERSION,
+        record_id: record_id.clone(),
+        client_id,
+        api_origin_sha256: api_origin_sha256.to_owned(),
+        receipt_length: u64::try_from(receipt.len())
+            .context("remote update receipt length exceeds the supported range")?,
+        receipt_sha256,
+        receipt_base64: BASE64.encode(&receipt),
+        reason,
+        detail: detail.to_owned(),
+        quarantined_unix_seconds: unix_seconds(),
+    };
+    validate_remote_update_quarantine_record(&record, &record_id)?;
+
+    match fs::symlink_metadata(&record_path) {
+        Ok(_) => {
+            let existing = read_remote_update_quarantine_record(&record_path, &record_id)?;
+            anyhow::ensure!(
+                existing.client_id == record.client_id
+                    && existing.api_origin_sha256 == record.api_origin_sha256
+                    && existing.receipt_sha256 == record.receipt_sha256
+                    && existing.receipt_base64 == record.receipt_base64,
+                "remote update quarantine record conflicts with the active receipt"
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let encoded = serde_json::to_vec(&record)?;
+            write_durable_bytes_create_new(
+                &record_path,
+                &encoded,
+                MAX_REMOTE_UPDATE_QUARANTINE_BYTES,
+            )?;
+            validate_remote_quarantine_file(&record_path)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    remove_durable_file_if_exists(&resume_path)?;
+    remote_update_quarantine_summary(
+        read_remote_update_quarantine_record(&record_path, &record_id)?,
+        record_path,
+    )
+}
+
+pub fn any_remote_update_quarantine_exists(
+    product: UpdateProduct,
+    state_directory: &Path,
+) -> anyhow::Result<bool> {
+    let directory = remote_update_quarantine_directory(product, state_directory)?;
+    let mut quarantined = false;
+    for entry in fs::read_dir(&directory)? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("remote update quarantine entry name is not UTF-8"))?;
+        let path = entry.path();
+        if let Some(record_id) = remote_update_quarantine_record_id_from_name(&name) {
+            read_remote_update_quarantine_record(&path, record_id)?;
+            quarantined = true;
+        } else if is_remote_quarantine_temporary_name(&name) {
+            validate_remote_resume_temporary(&path)?;
+            quarantined = true;
+        } else {
+            anyhow::bail!(
+                "remote update quarantine directory contains an unmanaged entry: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(quarantined)
+}
+
+pub fn list_remote_update_quarantine_records(
+    product: UpdateProduct,
+    state_directory: &Path,
+) -> anyhow::Result<Vec<RemoteUpdateQuarantineSummary>> {
+    let directory = remote_update_quarantine_directory(product, state_directory)?;
+    let mut records = Vec::new();
+    for entry in fs::read_dir(&directory)? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("remote update quarantine entry name is not UTF-8"))?;
+        let Some(record_id) = remote_update_quarantine_record_id_from_name(&name) else {
+            anyhow::bail!(
+                "remote update quarantine directory contains an incomplete or unmanaged entry: {}",
+                entry.path().display()
+            );
+        };
+        let path = entry.path();
+        records.push(remote_update_quarantine_summary(
+            read_remote_update_quarantine_record(&path, record_id)?,
+            path,
+        )?);
+    }
+    records.sort_by(|left, right| {
+        left.quarantined_unix_seconds
+            .cmp(&right.quarantined_unix_seconds)
+            .then_with(|| left.record_id.cmp(&right.record_id))
+    });
+    Ok(records)
+}
+
+/// 管理员确认已经完成本机恢复或核验后，清除一条取证隔离记录。
+///
+/// 该操作要求 `--yes` 语义，并在持有更新锁后再次拒绝活动事务或 recovery_required，
+/// 防止清理证据被误当成恢复动作。
+pub fn clear_remote_update_quarantine_record(
+    product: UpdateProduct,
+    state_directory: &Path,
+    record_id: &str,
+    confirmed: bool,
+) -> anyhow::Result<bool> {
+    anyhow::ensure!(
+        confirmed,
+        "pass --yes to confirm remote update quarantine clearance"
+    );
+    validate_lower_sha256(record_id, "remote update quarantine record ID")?;
+    let state_directory = prepare_state_directory(state_directory)?;
+    let _update_lock = UpdateLock::acquire(&state_directory)?;
+    let active_path = state_directory.join("active.json");
+    match fs::symlink_metadata(&active_path) {
+        Ok(_) => {
+            validate_private_file(&active_path)?;
+            anyhow::bail!(
+                "cannot clear remote update quarantine while a local update operation is active"
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let local_status = status(product, &state_directory)?;
+    anyhow::ensure!(
+        !matches!(
+            local_status.state.as_str(),
+            "scheduled" | "installing" | "recovery_required"
+        ),
+        "cannot clear remote update quarantine while local update recovery is required"
+    );
+    let record_path = remote_update_quarantine_path(product, &state_directory, record_id)?;
+    match fs::symlink_metadata(&record_path) {
+        Ok(_) => {
+            read_remote_update_quarantine_record(&record_path, record_id)?;
+            remove_durable_file(&record_path)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn remote_update_quarantine_directory(
+    product: UpdateProduct,
+    state_directory: &Path,
+) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(
+        product != UpdateProduct::Server,
+        "server remote update quarantine is unsupported"
+    );
+    let state_directory = prepare_state_directory(state_directory)?;
+    let directory = state_directory.join(REMOTE_UPDATE_QUARANTINE_DIRECTORY);
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) => anyhow::ensure!(
+            metadata.file_type().is_dir(),
+            "remote update quarantine path is not a directory"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&directory)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let directory = validate_durable_directory(&directory)?;
+    secure_directory(&directory)?;
+    let directory = canonicalize_update_path(&directory)?;
+    anyhow::ensure!(
+        directory.parent() == Some(state_directory.as_path())
+            && directory.file_name() == Some(OsStr::new(REMOTE_UPDATE_QUARANTINE_DIRECTORY)),
+        "remote update quarantine directory escaped the updater state directory"
+    );
+    validate_remote_quarantine_directory(&directory)?;
+    recover_remote_quarantine_temporaries(&directory)?;
+    Ok(directory)
+}
+
+fn remote_update_quarantine_path(
+    product: UpdateProduct,
+    state_directory: &Path,
+    record_id: &str,
+) -> anyhow::Result<PathBuf> {
+    validate_lower_sha256(record_id, "remote update quarantine record ID")?;
+    let directory = remote_update_quarantine_directory(product, state_directory)?;
+    let path = directory.join(format!("remote-quarantine-{record_id}.json"));
+    anyhow::ensure!(
+        path.parent() == Some(directory.as_path()),
+        "remote update quarantine record escaped its managed directory"
+    );
+    Ok(path)
+}
+
+fn remote_update_quarantine_record_id(
+    client_id: Uuid,
+    api_origin_sha256: &str,
+    receipt: &[u8],
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"linklake-remote-update-quarantine-v1\0");
+    digest.update(client_id.as_bytes());
+    digest.update(api_origin_sha256.as_bytes());
+    digest.update(receipt);
+    format!("{:x}", digest.finalize())
+}
+
+fn remote_update_quarantine_record_id_from_name(name: &str) -> Option<&str> {
+    let record_id = name
+        .strip_prefix("remote-quarantine-")?
+        .strip_suffix(".json")?;
+    is_lower_sha256(record_id).then_some(record_id)
+}
+
+fn is_remote_quarantine_temporary_name(name: &str) -> bool {
+    remote_quarantine_temporary_target_name(name).is_some()
+}
+
+fn remote_quarantine_temporary_target_name(name: &str) -> Option<&str> {
+    let value = name.strip_prefix('.')?;
+    let (target, temporary_identity) = value.rsplit_once(".tmp-")?;
+    let (pid, nonce) = temporary_identity.split_once('-')?;
+    (remote_update_quarantine_record_id_from_name(target).is_some()
+        && !pid.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && nonce.len() == 32
+        && nonce.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    .then_some(target)
+}
+
+fn recover_remote_quarantine_temporaries(directory: &Path) -> anyhow::Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("remote update quarantine entry name is not UTF-8"))?;
+        let Some(target_name) = remote_quarantine_temporary_target_name(&name) else {
+            continue;
+        };
+        let temporary = entry.path();
+        let metadata = fs::symlink_metadata(&temporary)?;
+        validate_remote_resume_temporary(&temporary)?;
+        if metadata.modified()?.elapsed().unwrap_or_default() < Duration::from_secs(5) {
+            continue;
+        }
+        let temporary_bytes = read_limited_bytes(&temporary, MAX_REMOTE_UPDATE_QUARANTINE_BYTES)?;
+        let target = directory.join(target_name);
+        match fs::symlink_metadata(&target) {
+            Ok(_) => {
+                let target_bytes = read_limited_bytes(&target, MAX_REMOTE_UPDATE_QUARANTINE_BYTES)?;
+                anyhow::ensure!(
+                    target_bytes == temporary_bytes,
+                    "remote update quarantine target conflicts with an interrupted create-new write"
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::hard_link(&temporary, &target).with_context(|| {
+                    format!(
+                        "cannot recover interrupted remote update quarantine record {}",
+                        target.display()
+                    )
+                })?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        remove_durable_file(&temporary)?;
+        validate_remote_quarantine_file(&target)?;
+    }
+    Ok(())
+}
+
+fn read_remote_update_quarantine_record(
+    path: &Path,
+    expected_record_id: &str,
+) -> anyhow::Result<RemoteUpdateQuarantineRecord> {
+    validate_remote_quarantine_file(path)?;
+    let record: RemoteUpdateQuarantineRecord =
+        read_durable_json(path, MAX_REMOTE_UPDATE_QUARANTINE_BYTES)?;
+    validate_remote_update_quarantine_record(&record, expected_record_id)?;
+    Ok(record)
+}
+
+fn validate_remote_update_quarantine_record(
+    record: &RemoteUpdateQuarantineRecord,
+    expected_record_id: &str,
+) -> anyhow::Result<()> {
+    validate_lower_sha256(expected_record_id, "remote update quarantine record ID")?;
+    validate_lower_sha256(&record.record_id, "remote update quarantine record ID")?;
+    validate_lower_sha256(
+        &record.api_origin_sha256,
+        "remote update quarantine API origin digest",
+    )?;
+    validate_lower_sha256(
+        &record.receipt_sha256,
+        "remote update quarantine receipt digest",
+    )?;
+    validate_remote_update_quarantine_detail(&record.detail)?;
+    anyhow::ensure!(
+        record.schema_version == REMOTE_UPDATE_QUARANTINE_SCHEMA_VERSION
+            && record.record_id == expected_record_id
+            && !record.client_id.is_nil()
+            && record.receipt_length <= MAX_REMOTE_UPDATE_RESUME_BYTES
+            && record.quarantined_unix_seconds > 0,
+        "remote update quarantine record identity is invalid"
+    );
+    let receipt = BASE64
+        .decode(record.receipt_base64.as_bytes())
+        .context("remote update quarantine receipt Base64 is malformed")?;
+    anyhow::ensure!(
+        u64::try_from(receipt.len()).ok() == Some(record.receipt_length)
+            && sha256_bytes(&receipt) == record.receipt_sha256
+            && remote_update_quarantine_record_id(
+                record.client_id,
+                &record.api_origin_sha256,
+                &receipt,
+            ) == record.record_id,
+        "remote update quarantine receipt is not bound to its record"
+    );
+    Ok(())
+}
+
+fn validate_remote_update_quarantine_detail(detail: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !detail.trim().is_empty()
+            && detail.len() <= MAX_REMOTE_UPDATE_QUARANTINE_DETAIL_BYTES
+            && !detail.contains('\0'),
+        "remote update quarantine detail is invalid"
+    );
+    Ok(())
+}
+
+fn validate_lower_sha256(value: &str, label: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(is_lower_sha256(value), "{label} is malformed");
+    Ok(())
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn remote_update_quarantine_summary(
+    record: RemoteUpdateQuarantineRecord,
+    record_path: PathBuf,
+) -> anyhow::Result<RemoteUpdateQuarantineSummary> {
+    validate_remote_update_quarantine_record(&record, &record.record_id)?;
+    Ok(RemoteUpdateQuarantineSummary {
+        record_id: record.record_id,
+        client_id: record.client_id,
+        api_origin_sha256: record.api_origin_sha256,
+        receipt_sha256: record.receipt_sha256,
+        reason: record.reason,
+        detail: record.detail,
+        quarantined_unix_seconds: record.quarantined_unix_seconds,
+        record_path,
+    })
+}
+
+fn validate_remote_quarantine_directory(path: &Path) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        metadata.file_type().is_dir(),
+        "remote update quarantine directory is not a regular directory"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        anyhow::ensure!(
+            metadata.mode() & 0o7777 == 0o700,
+            "remote update quarantine directory permissions are not restricted to the owner"
+        );
+    }
+    #[cfg(windows)]
+    {
+        if windows_process_is_elevated()? {
+            validate_windows_server_security_descriptor(
+                path,
+                WINDOWS_SERVER_AUTHENTICATION_KEY_SECURITY_DESCRIPTOR,
+                "remote update quarantine directory",
+            )?;
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    anyhow::bail!("remote update quarantine permissions cannot be verified on this platform");
+    Ok(())
+}
+
+fn validate_remote_quarantine_file(path: &Path) -> anyhow::Result<()> {
+    validate_private_file(path)?;
+    #[cfg(windows)]
+    {
+        if windows_process_is_elevated()? {
+            validate_windows_server_security_descriptor(
+                path,
+                WINDOWS_SERVER_AUTHENTICATION_KEY_SECURITY_DESCRIPTOR,
+                "remote update quarantine file",
+            )?;
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    anyhow::bail!("remote update quarantine permissions cannot be verified on this platform");
+    Ok(())
 }
 
 fn validate_remote_resume_directory(path: &Path) -> anyhow::Result<()> {
@@ -1845,7 +2339,8 @@ pub fn verify_completed_update(
         installed_sha256,
         backup_sha256,
         backup_directory,
-        verified_unix_seconds: unix_seconds(),
+        // 取持久化状态的完成时间，保证响应丢失后的再次核验产生完全相同的终态报告。
+        verified_unix_seconds: status.updated_unix_seconds,
     })
 }
 
@@ -5650,6 +6145,100 @@ mod tests {
     // 签名与清单单元测试必须独立于当前构建平台。macOS 未使用 Developer ID
     // 签名时，生产代码会明确拒绝官方自动更新；测试夹具不能绕开或改变该门禁。
     const FIXTURE_TARGET: &str = "windows-x86_64";
+
+    #[test]
+    fn remote_resume_quarantine_preserves_evidence_and_requires_safe_admin_clearance() {
+        let root =
+            std::env::temp_dir().join(format!("linklake-remote-quarantine-{}", Uuid::new_v4()));
+        let state = root.join("state");
+        let client_id = Uuid::new_v4();
+        let origin = "a".repeat(64);
+        let receipt = br#"{"lease_token":"forensic-fixture"}"#;
+        write_remote_update_resume_receipt(
+            UpdateProduct::Client,
+            &state,
+            client_id,
+            &origin,
+            receipt,
+        )
+        .unwrap();
+
+        let summary = quarantine_remote_update_resume_receipt(
+            UpdateProduct::Client,
+            &state,
+            client_id,
+            &origin,
+            RemoteUpdateQuarantineReason::TaskMissing,
+            "authoritative task disappeared",
+        )
+        .unwrap();
+        assert!(!remote_update_resume_receipt_exists(
+            UpdateProduct::Client,
+            &state,
+            client_id,
+            &origin,
+        )
+        .unwrap());
+        assert!(any_remote_update_quarantine_exists(UpdateProduct::Client, &state).unwrap());
+        let record =
+            read_remote_update_quarantine_record(&summary.record_path, &summary.record_id).unwrap();
+        assert_eq!(BASE64.decode(record.receipt_base64).unwrap(), receipt);
+        assert_eq!(record.reason, RemoteUpdateQuarantineReason::TaskMissing);
+        assert!(clear_remote_update_quarantine_record(
+            UpdateProduct::Client,
+            &state,
+            &summary.record_id,
+            false,
+        )
+        .is_err());
+
+        write_status(
+            &state,
+            UpdateStatus {
+                schema_version: UPDATE_SCHEMA_VERSION,
+                state: "recovery_required".to_owned(),
+                operation: Some("apply".to_owned()),
+                from_version: Some("1.0.0".to_owned()),
+                to_version: Some("1.1.0".to_owned()),
+                message: "manual recovery required".to_owned(),
+                error: Some("fixture".to_owned()),
+                backup: None,
+                updated_unix_seconds: 1,
+            },
+        )
+        .unwrap();
+        assert!(clear_remote_update_quarantine_record(
+            UpdateProduct::Client,
+            &state,
+            &summary.record_id,
+            true,
+        )
+        .is_err());
+        write_status(
+            &state,
+            UpdateStatus {
+                schema_version: UPDATE_SCHEMA_VERSION,
+                state: "idle".to_owned(),
+                operation: None,
+                from_version: Some("1.0.0".to_owned()),
+                to_version: None,
+                message: "recovered".to_owned(),
+                error: None,
+                backup: None,
+                updated_unix_seconds: 2,
+            },
+        )
+        .unwrap();
+        assert!(clear_remote_update_quarantine_record(
+            UpdateProduct::Client,
+            &state,
+            &summary.record_id,
+            true,
+        )
+        .unwrap());
+        assert!(!any_remote_update_quarantine_exists(UpdateProduct::Client, &state).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn recovery_target_validation_allows_the_power_loss_missing_target_window() {

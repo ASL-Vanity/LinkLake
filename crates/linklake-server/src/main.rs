@@ -4542,6 +4542,10 @@ async fn run_server(
             post(update_worker::renew_remote_update_task),
         )
         .route(
+            "/api/v1/clients/:client_id/update-tasks/:task_id/reconcile",
+            post(update_worker::reconcile_remote_update_task),
+        )
+        .route(
             "/api/v1/clients/:client_id/update-tasks/:task_id/report",
             post(update_worker::report_remote_update_task),
         )

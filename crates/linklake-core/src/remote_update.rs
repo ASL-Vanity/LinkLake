@@ -862,6 +862,86 @@ impl RemoteUpdateLeaseRenewResponse {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteUpdateReconcileRequest {
+    pub worker_instance_id: Uuid,
+    pub lease_token: Uuid,
+    pub action: RemoteUpdateAction,
+    pub plan: RemoteUpdateRestartPlan,
+}
+
+impl RemoteUpdateReconcileRequest {
+    pub fn validate(&self) -> Result<(), RemoteUpdateContractError> {
+        validate_non_nil_uuid(self.worker_instance_id)?;
+        validate_non_nil_uuid(self.lease_token)?;
+        if !self.action.requires_restart() {
+            return Err(RemoteUpdateContractError::InvalidTransition);
+        }
+        self.plan.validate(self.action)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteUpdateReconcileState {
+    Active,
+    Terminal,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteUpdateReconcileResponse {
+    pub state: RemoteUpdateReconcileState,
+    pub task: RemoteUpdateTask,
+}
+
+impl RemoteUpdateReconcileResponse {
+    pub fn validate(
+        &self,
+        expected_task_id: Uuid,
+        expected_client_id: Uuid,
+        request: &RemoteUpdateReconcileRequest,
+        now: u64,
+    ) -> Result<(), RemoteUpdateContractError> {
+        request.validate()?;
+        self.task.validate()?;
+        validate_non_nil_uuid(expected_task_id)?;
+        validate_non_nil_uuid(expected_client_id)?;
+        if self.task.task_id != expected_task_id
+            || self.task.target_client_id != expected_client_id
+            || self.task.action != request.action
+        {
+            return Err(RemoteUpdateContractError::InvalidTaskSnapshot);
+        }
+        let valid = match self.state {
+            RemoteUpdateReconcileState::Active => {
+                matches!(
+                    self.task.state,
+                    RemoteUpdateTaskState::Running | RemoteUpdateTaskState::CancelRequested
+                ) && self.task.stage == RemoteUpdateStage::AwaitingRestart
+                    && self.task.lease_owner == Some(request.worker_instance_id)
+                    && self
+                        .task
+                        .lease_deadline_unix_seconds
+                        .is_some_and(|deadline| deadline > now)
+                    && self.task.restart.as_ref().is_some_and(|binding| {
+                        binding.operation_id == request.plan.operation_id
+                            && binding.operation == request.plan.operation
+                            && binding.from_version == request.plan.from_version
+                            && binding.to_version == request.plan.to_version
+                    })
+            }
+            RemoteUpdateReconcileState::Terminal => self.task.state.is_terminal(),
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(RemoteUpdateContractError::InvalidTaskSnapshot)
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RemoteUpdateWorkerReport {
     Started {
@@ -1221,6 +1301,27 @@ mod tests {
             requested_lease_seconds: REMOTE_UPDATE_DEFAULT_LEASE_SECONDS,
         };
         assert_eq!(claim.validate(), Err(RemoteUpdateContractError::NilUuid));
+    }
+
+    #[test]
+    fn restart_reconcile_contract_accepts_only_bound_restart_actions() {
+        let mut request = RemoteUpdateReconcileRequest {
+            worker_instance_id: Uuid::new_v4(),
+            lease_token: Uuid::new_v4(),
+            action: RemoteUpdateAction::Apply,
+            plan: RemoteUpdateRestartPlan {
+                operation_id: Uuid::new_v4(),
+                operation: RemoteLocalUpdateOperation::Apply,
+                from_version: "1.0.0".to_owned(),
+                to_version: "1.1.0".to_owned(),
+            },
+        };
+        request.validate().unwrap();
+        request.action = RemoteUpdateAction::Check;
+        assert_eq!(
+            request.validate(),
+            Err(RemoteUpdateContractError::InvalidTransition)
+        );
     }
 
     #[test]

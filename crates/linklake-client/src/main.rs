@@ -455,10 +455,38 @@ enum UpdateAction {
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
+    /// 由本机管理员恢复一次被中断的客户端更新；必须显式确认。
+    Recover {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long)]
+        yes: bool,
+    },
     /// 使用最后一份有效备份回滚客户端二进制。
     Rollback {
         #[arg(long)]
         state_dir: Option<PathBuf>,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// 查看或确认清除远程更新取证隔离记录。
+    Quarantine {
+        #[command(subcommand)]
+        action: RemoteUpdateQuarantineAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum RemoteUpdateQuarantineAction {
+    List {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    Clear {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long)]
+        record_id: String,
         #[arg(long)]
         yes: bool,
     },
@@ -1024,6 +1052,18 @@ async fn run_cli() -> anyhow::Result<()> {
                     )?)?
                 );
             }
+            UpdateAction::Recover { state_dir, yes } => {
+                let directory = state_dir
+                    .unwrap_or_else(|| updater::default_state_directory(UpdateProduct::Client));
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&updater::recover(
+                        UpdateProduct::Client,
+                        &directory,
+                        yes
+                    )?)?
+                );
+            }
             UpdateAction::Rollback { state_dir, yes } => {
                 let directory = state_dir
                     .unwrap_or_else(|| updater::default_state_directory(UpdateProduct::Client));
@@ -1036,6 +1076,42 @@ async fn run_cli() -> anyhow::Result<()> {
                     )?)?
                 );
             }
+            UpdateAction::Quarantine { action } => match action {
+                RemoteUpdateQuarantineAction::List { state_dir } => {
+                    let directory = state_dir
+                        .unwrap_or_else(|| updater::default_state_directory(UpdateProduct::Client));
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(
+                            &updater::list_remote_update_quarantine_records(
+                                UpdateProduct::Client,
+                                &directory,
+                            )?
+                        )?
+                    );
+                }
+                RemoteUpdateQuarantineAction::Clear {
+                    state_dir,
+                    record_id,
+                    yes,
+                } => {
+                    let directory = state_dir
+                        .unwrap_or_else(|| updater::default_state_directory(UpdateProduct::Client));
+                    let cleared = updater::clear_remote_update_quarantine_record(
+                        UpdateProduct::Client,
+                        &directory,
+                        &record_id,
+                        yes,
+                    )?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "record_id": record_id,
+                            "cleared": cleared,
+                        }))?
+                    );
+                }
+            },
         },
         Command::ManagerUpdate { action } => {
             let default_state = || updater::default_state_directory(UpdateProduct::Manager);

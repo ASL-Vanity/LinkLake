@@ -10,7 +10,8 @@ use linklake_core::remote_update::{
     validate_non_nil_uuid, CancelRemoteUpdateTaskRequest, CreateRemoteUpdateTaskRequest,
     RemoteUpdateAction, RemoteUpdateClaim, RemoteUpdateClaimRequest, RemoteUpdateContractError,
     RemoteUpdateErrorCode, RemoteUpdateEventKind, RemoteUpdateLeaseRenewRequest,
-    RemoteUpdateLeaseRenewResponse, RemoteUpdateRecoveryState, RemoteUpdateReportRequest,
+    RemoteUpdateLeaseRenewResponse, RemoteUpdateReconcileRequest, RemoteUpdateReconcileResponse,
+    RemoteUpdateReconcileState, RemoteUpdateRecoveryState, RemoteUpdateReportRequest,
     RemoteUpdateRestartBinding, RemoteUpdateStage, RemoteUpdateTask, RemoteUpdateTaskDetail,
     RemoteUpdateTaskEvent, RemoteUpdateTaskState, RemoteUpdateWorkerReport,
     REMOTE_UPDATE_CONTRACT_VERSION, REMOTE_UPDATE_RESTART_RESUME_SECONDS,
@@ -179,6 +180,7 @@ fn ensure_update_task_replay_columns(connection: &rusqlite::Connection) -> anyho
         && columns.contains("terminal_lease_token_sha256")
         && columns.contains("terminal_report_sha256")
     {
+        validate_update_task_event_foreign_keys(connection)?;
         return Ok(());
     }
     anyhow::ensure!(
@@ -268,29 +270,7 @@ fn ensure_update_task_replay_columns(connection: &rusqlite::Connection) -> anyho
             [],
         )?;
         connection.execute_batch("DROP TABLE update_tasks_legacy")?;
-        let event_parent: Option<String> = connection
-            .query_row(
-                "SELECT \"table\" FROM pragma_foreign_key_list('update_task_events')
-                 WHERE \"from\" = 'task_id' LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        anyhow::ensure!(
-            event_parent.as_deref() == Some("update_tasks"),
-            "remote update event foreign key does not reference the rebuilt task table"
-        );
-        let foreign_key_violation: Option<String> = connection
-            .query_row(
-                "SELECT \"table\" FROM pragma_foreign_key_check LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        anyhow::ensure!(
-            foreign_key_violation.is_none(),
-            "remote update task migration left a foreign key violation"
-        );
+        validate_update_task_event_foreign_keys(connection)?;
         connection.execute_batch("COMMIT")?;
         Ok(())
     })();
@@ -305,6 +285,35 @@ fn ensure_update_task_replay_columns(connection: &rusqlite::Connection) -> anyho
         (Ok(()), Err(error), _) | (Ok(()), Ok(()), Err(error)) => Err(error.into()),
         (Ok(()), Ok(()), Ok(())) => Ok(()),
     }
+}
+
+fn validate_update_task_event_foreign_keys(
+    connection: &rusqlite::Connection,
+) -> anyhow::Result<()> {
+    let event_parent: Option<String> = connection
+        .query_row(
+            "SELECT \"table\" FROM pragma_foreign_key_list('update_task_events')
+             WHERE \"from\" = 'task_id' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    anyhow::ensure!(
+        event_parent.as_deref() == Some("update_tasks"),
+        "remote update event foreign key does not reference the task table"
+    );
+    let foreign_key_violation: Option<String> = connection
+        .query_row(
+            "SELECT \"table\" FROM pragma_foreign_key_check LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    anyhow::ensure!(
+        foreign_key_violation.is_none(),
+        "remote update task storage contains a foreign key violation"
+    );
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -385,6 +394,14 @@ pub(crate) trait UpdateTaskCoordinationStorage: Send {
         request: &RemoteUpdateLeaseRenewRequest,
         now: u64,
     ) -> Result<RemoteUpdateLeaseRenewResponse, UpdateTaskError>;
+
+    fn reconcile(
+        &self,
+        target_client_id: Uuid,
+        task_id: Uuid,
+        request: &RemoteUpdateReconcileRequest,
+        now: u64,
+    ) -> Result<RemoteUpdateReconcileResponse, UpdateTaskError>;
 
     fn report(
         &self,
@@ -880,6 +897,69 @@ impl UpdateTaskCatalog {
         }))
     }
 
+    pub(crate) fn reconcile(
+        &self,
+        target_client_id: Uuid,
+        task_id: Uuid,
+        request: &RemoteUpdateReconcileRequest,
+        now: u64,
+    ) -> Result<RemoteUpdateReconcileResponse, UpdateTaskError> {
+        validate_non_nil_uuid(target_client_id)?;
+        validate_non_nil_uuid(task_id)?;
+        request.validate().map_err(UpdateTaskError::Contract)?;
+        let request = request.clone();
+        map_database_result(self.database.with_transaction(|transaction| {
+            let task = task_by_id(transaction, task_id)?
+                .ok_or_else(|| domain_error(UpdateTaskError::TaskNotFound))?;
+            if task.target_client_id != target_client_id || task.action != request.action {
+                return Err(domain_error(UpdateTaskError::TaskNotFound));
+            }
+            reconcile_expired_leases(transaction, Some(target_client_id), now)?;
+            let task = task_by_id(transaction, task_id)?
+                .ok_or_else(|| domain_error(UpdateTaskError::TaskNotFound))?;
+            if task.state.is_terminal() {
+                let stored = terminal_report_replay(transaction, task_id)?
+                    .ok_or_else(|| domain_error(UpdateTaskError::LeaseConflict))?;
+                let presented_lease = lease_token_sha256(request.lease_token);
+                if stored.worker_instance_id != request.worker_instance_id
+                    || !constant_time_equal(
+                        stored.lease_token_sha256.as_bytes(),
+                        presented_lease.as_bytes(),
+                    )
+                {
+                    return Err(domain_error(UpdateTaskError::LeaseConflict));
+                }
+                return Ok(RemoteUpdateReconcileResponse {
+                    state: RemoteUpdateReconcileState::Terminal,
+                    task,
+                });
+            }
+            authorize_lease(
+                transaction,
+                &task,
+                &request.worker_instance_id,
+                request.lease_token,
+                now,
+            )?;
+            let binding = task
+                .restart
+                .as_ref()
+                .ok_or_else(|| domain_error(UpdateTaskError::InvalidTransition))?;
+            if task.stage != RemoteUpdateStage::AwaitingRestart
+                || binding.operation_id != request.plan.operation_id
+                || binding.operation != request.plan.operation
+                || binding.from_version != request.plan.from_version
+                || binding.to_version != request.plan.to_version
+            {
+                return Err(domain_error(UpdateTaskError::InvalidTransition));
+            }
+            Ok(RemoteUpdateReconcileResponse {
+                state: RemoteUpdateReconcileState::Active,
+                task,
+            })
+        }))
+    }
+
     pub(crate) fn cancel(
         &self,
         task_id: Uuid,
@@ -971,6 +1051,16 @@ impl UpdateTaskCoordinationStorage for UpdateTaskCatalog {
         now: u64,
     ) -> Result<RemoteUpdateLeaseRenewResponse, UpdateTaskError> {
         UpdateTaskCatalog::renew(self, target_client_id, task_id, request, now)
+    }
+
+    fn reconcile(
+        &self,
+        target_client_id: Uuid,
+        task_id: Uuid,
+        request: &RemoteUpdateReconcileRequest,
+        now: u64,
+    ) -> Result<RemoteUpdateReconcileResponse, UpdateTaskError> {
+        UpdateTaskCatalog::reconcile(self, target_client_id, task_id, request, now)
     }
 
     fn report(
@@ -1739,8 +1829,9 @@ fn map_database_result<T>(result: anyhow::Result<T>) -> Result<T, UpdateTaskErro
 mod tests {
     use super::*;
     use linklake_core::remote_update::{
-        RemoteLocalUpdateState, RemoteUpdateLeaseRenewRequest, RemoteUpdateReportRequest,
-        RemoteUpdateResult, RemoteUpdateWorkerReport, REMOTE_UPDATE_DEFAULT_LEASE_SECONDS,
+        RemoteLocalUpdateOperation, RemoteLocalUpdateState, RemoteUpdateLeaseRenewRequest,
+        RemoteUpdateReportRequest, RemoteUpdateRestartPlan, RemoteUpdateResult,
+        RemoteUpdateWorkerReport, REMOTE_UPDATE_DEFAULT_LEASE_SECONDS,
     };
 
     fn catalog_with_client(client_id: Uuid) -> UpdateTaskCatalog {
@@ -2149,6 +2240,189 @@ mod tests {
                 .unwrap(),
             failed
         );
+    }
+
+    #[test]
+    fn restart_reconcile_requires_the_original_authority_and_returns_terminal_snapshots() {
+        let client_id = Uuid::new_v4();
+        let catalog = catalog_with_client(client_id);
+        let worker = Uuid::new_v4();
+        let task = catalog
+            .create(
+                &CreateRemoteUpdateTaskRequest {
+                    target_client_id: client_id,
+                    action: RemoteUpdateAction::Apply,
+                    idempotency_key: "restart-reconcile-authority".to_owned(),
+                    confirmation: "UPDATE".to_owned(),
+                },
+                "admin",
+                1,
+            )
+            .unwrap();
+        let claim = catalog
+            .claim(
+                client_id,
+                &RemoteUpdateClaimRequest {
+                    worker_instance_id: worker,
+                    requested_lease_seconds: REMOTE_UPDATE_DEFAULT_LEASE_SECONDS,
+                },
+                2,
+            )
+            .unwrap()
+            .unwrap();
+        catalog
+            .report(
+                client_id,
+                task.task_id,
+                &RemoteUpdateReportRequest {
+                    worker_instance_id: worker,
+                    lease_token: claim.lease_token,
+                    report: RemoteUpdateWorkerReport::Started {
+                        stage: RemoteUpdateStage::Applying,
+                    },
+                },
+                3,
+            )
+            .unwrap();
+        let operation_id = Uuid::new_v4();
+        let plan = RemoteUpdateRestartPlan {
+            operation_id,
+            operation: RemoteLocalUpdateOperation::Apply,
+            from_version: "1.0.0".to_owned(),
+            to_version: "1.1.0".to_owned(),
+        };
+        catalog
+            .report(
+                client_id,
+                task.task_id,
+                &RemoteUpdateReportRequest {
+                    worker_instance_id: worker,
+                    lease_token: claim.lease_token,
+                    report: RemoteUpdateWorkerReport::AwaitingRestart { plan: plan.clone() },
+                },
+                4,
+            )
+            .unwrap();
+        let reconcile = RemoteUpdateReconcileRequest {
+            worker_instance_id: worker,
+            lease_token: claim.lease_token,
+            action: RemoteUpdateAction::Apply,
+            plan,
+        };
+        let active = catalog
+            .reconcile(client_id, task.task_id, &reconcile, 5)
+            .unwrap();
+        assert_eq!(active.state, RemoteUpdateReconcileState::Active);
+
+        let mut wrong_lease = reconcile.clone();
+        wrong_lease.lease_token = Uuid::new_v4();
+        assert!(matches!(
+            catalog.reconcile(client_id, task.task_id, &wrong_lease, 5),
+            Err(UpdateTaskError::LeaseConflict)
+        ));
+
+        let result = RemoteUpdateResult::Installed {
+            operation_id,
+            operation: RemoteLocalUpdateOperation::Apply,
+            from_version: "1.0.0".to_owned(),
+            to_version: "1.1.0".to_owned(),
+            installed_sha256: "a".repeat(64),
+            backup_sha256: "b".repeat(64),
+            verified_unix_seconds: 6,
+        };
+        catalog
+            .report(
+                client_id,
+                task.task_id,
+                &RemoteUpdateReportRequest {
+                    worker_instance_id: worker,
+                    lease_token: claim.lease_token,
+                    report: RemoteUpdateWorkerReport::Succeeded { result },
+                },
+                6,
+            )
+            .unwrap();
+        let terminal = catalog
+            .reconcile(client_id, task.task_id, &reconcile, 7)
+            .unwrap();
+        assert_eq!(terminal.state, RemoteUpdateReconcileState::Terminal);
+        assert_eq!(terminal.task.state, RemoteUpdateTaskState::Succeeded);
+    }
+
+    #[test]
+    fn restart_reconcile_fails_closed_after_the_authoritative_deadline() {
+        let client_id = Uuid::new_v4();
+        let catalog = catalog_with_client(client_id);
+        let worker = Uuid::new_v4();
+        let task = catalog
+            .create(
+                &CreateRemoteUpdateTaskRequest {
+                    target_client_id: client_id,
+                    action: RemoteUpdateAction::Apply,
+                    idempotency_key: "restart-reconcile-expired".to_owned(),
+                    confirmation: "UPDATE".to_owned(),
+                },
+                "admin",
+                1,
+            )
+            .unwrap();
+        let claim = catalog
+            .claim(
+                client_id,
+                &RemoteUpdateClaimRequest {
+                    worker_instance_id: worker,
+                    requested_lease_seconds: REMOTE_UPDATE_DEFAULT_LEASE_SECONDS,
+                },
+                2,
+            )
+            .unwrap()
+            .unwrap();
+        catalog
+            .report(
+                client_id,
+                task.task_id,
+                &RemoteUpdateReportRequest {
+                    worker_instance_id: worker,
+                    lease_token: claim.lease_token,
+                    report: RemoteUpdateWorkerReport::Started {
+                        stage: RemoteUpdateStage::Applying,
+                    },
+                },
+                3,
+            )
+            .unwrap();
+        let plan = RemoteUpdateRestartPlan {
+            operation_id: Uuid::new_v4(),
+            operation: RemoteLocalUpdateOperation::Apply,
+            from_version: "1.0.0".to_owned(),
+            to_version: "1.1.0".to_owned(),
+        };
+        let awaiting = catalog
+            .report(
+                client_id,
+                task.task_id,
+                &RemoteUpdateReportRequest {
+                    worker_instance_id: worker,
+                    lease_token: claim.lease_token,
+                    report: RemoteUpdateWorkerReport::AwaitingRestart { plan: plan.clone() },
+                },
+                4,
+            )
+            .unwrap();
+        let deadline = awaiting.lease_deadline_unix_seconds.unwrap();
+        let reconcile = RemoteUpdateReconcileRequest {
+            worker_instance_id: worker,
+            lease_token: claim.lease_token,
+            action: RemoteUpdateAction::Apply,
+            plan,
+        };
+        assert!(matches!(
+            catalog.reconcile(client_id, task.task_id, &reconcile, deadline + 1),
+            Err(UpdateTaskError::LeaseConflict)
+        ));
+        let failed = catalog.detail(task.task_id, deadline + 1).unwrap().task;
+        assert_eq!(failed.state, RemoteUpdateTaskState::Failed);
+        assert_eq!(failed.error_code, Some(RemoteUpdateErrorCode::FailedClosed));
     }
 
     #[test]

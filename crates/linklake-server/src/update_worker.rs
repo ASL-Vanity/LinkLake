@@ -11,7 +11,8 @@ use axum::{
 };
 use linklake_core::remote_update::{
     RemoteUpdateClaimRequest, RemoteUpdateClaimResponse, RemoteUpdateLeaseRenewRequest,
-    RemoteUpdateLeaseRenewResponse, RemoteUpdateReportRequest, RemoteUpdateReportResponse,
+    RemoteUpdateLeaseRenewResponse, RemoteUpdateReconcileRequest, RemoteUpdateReconcileResponse,
+    RemoteUpdateReportRequest, RemoteUpdateReportResponse,
 };
 use std::sync::{atomic::Ordering, Arc};
 use std::time::Duration;
@@ -25,7 +26,7 @@ pub(crate) fn is_remote_update_worker_path(path: &str) -> bool {
     match parts.as_slice() {
         ["", "api", "v1", "clients", client_id, "update-tasks", "claim"] => non_nil_uuid(client_id),
         ["", "api", "v1", "clients", client_id, "update-tasks", task_id, operation]
-            if matches!(*operation, "renew" | "report") =>
+            if matches!(*operation, "renew" | "reconcile" | "report") =>
         {
             non_nil_uuid(client_id) && non_nil_uuid(task_id)
         }
@@ -105,6 +106,22 @@ pub(crate) async fn report_remote_update_task(
         .report(client_id, task_id, &request, unix_seconds())
         .map_err(update_task_api_error)?;
     Ok(Json(RemoteUpdateReportResponse { task }))
+}
+
+pub(crate) async fn reconcile_remote_update_task(
+    State(state): State<Arc<AppState>>,
+    Path((client_id, task_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+    Json(request): Json<RemoteUpdateReconcileRequest>,
+) -> Result<Json<RemoteUpdateReconcileResponse>, CodedApiError> {
+    authenticate_worker(&state, client_id, &headers)?;
+    let response = state
+        .update_tasks
+        .lock()
+        .expect("remote update task catalog lock poisoned")
+        .reconcile(client_id, task_id, &request, unix_seconds())
+        .map_err(update_task_api_error)?;
+    Ok(Json(response))
 }
 
 fn authenticate_worker(
@@ -204,6 +221,9 @@ mod tests {
         )));
         assert!(is_remote_update_worker_path(&format!(
             "/api/v1/clients/{client_id}/update-tasks/{task_id}/renew"
+        )));
+        assert!(is_remote_update_worker_path(&format!(
+            "/api/v1/clients/{client_id}/update-tasks/{task_id}/reconcile"
         )));
         assert!(!is_remote_update_worker_path(&format!(
             "/api/v1/clients/{client_id}/update-tasks/{task_id}/command"

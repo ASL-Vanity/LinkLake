@@ -8,11 +8,11 @@ use anyhow::Context;
 use linklake_core::remote_update::{
     RemoteLocalUpdateOperation, RemoteLocalUpdateState, RemoteUpdateAction, RemoteUpdateClaim,
     RemoteUpdateClaimRequest, RemoteUpdateClaimResponse, RemoteUpdateErrorCode,
-    RemoteUpdateLeaseRenewRequest, RemoteUpdateLeaseRenewResponse, RemoteUpdateRecoveryState,
+    RemoteUpdateLeaseRenewRequest, RemoteUpdateLeaseRenewResponse, RemoteUpdateReconcileRequest,
+    RemoteUpdateReconcileResponse, RemoteUpdateReconcileState, RemoteUpdateRecoveryState,
     RemoteUpdateReportRequest, RemoteUpdateReportResponse, RemoteUpdateRestartPlan,
     RemoteUpdateResult, RemoteUpdateStage, RemoteUpdateTask, RemoteUpdateWorkerReport,
-    REMOTE_UPDATE_DEFAULT_LEASE_SECONDS, REMOTE_UPDATE_MAX_LEASE_SECONDS,
-    REMOTE_UPDATE_RESTART_RESUME_SECONDS,
+    REMOTE_UPDATE_DEFAULT_LEASE_SECONDS, REMOTE_UPDATE_RESTART_RESUME_SECONDS,
 };
 use linklake_update as updater;
 use linklake_update::{SignaturePolicy, UpdateChannel, UpdateProduct};
@@ -32,6 +32,7 @@ const MAX_API_RESPONSE_BYTES: u64 = 256 * 1024;
 const RESUME_SCHEMA_VERSION: u32 = 1;
 const MAX_RESUME_STATE_BYTES: usize = 8 * 1024;
 const COMPLETION_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const MAX_QUARANTINE_DETAIL_BYTES: usize = 1_900;
 
 /// 同一客户端进程中的所有云入口共享这一把锁。
 ///
@@ -115,6 +116,12 @@ struct RenewContext {
 enum CompletedOperation {
     Final(RemoteUpdateResult),
     RestartScheduled(RestartPlan),
+}
+
+enum ReconcileApiResult {
+    Response(Box<RemoteUpdateReconcileResponse>),
+    TaskMissing,
+    AuthorityLost,
 }
 
 fn default_poll_interval_seconds() -> u32 {
@@ -315,8 +322,23 @@ impl RemoteUpdateWorker {
                 }
             }
 
+            let quarantine_present = match updater::any_remote_update_quarantine_exists(
+                UpdateProduct::Client,
+                &updater::default_state_directory(UpdateProduct::Client),
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::error!(%error, "Remote update quarantine inventory is unsafe; refusing to claim");
+                    drop(single_flight);
+                    if wait_for_idle_or_stop(self.poll_interval, &mut stop_rx).await {
+                        return Ok(());
+                    }
+                    continue;
+                }
+            };
+
             match self.claim().await {
-                Ok(Some(claim)) => match self.execute_claim(claim).await {
+                Ok(Some(claim)) => match self.execute_claim(claim, quarantine_present).await {
                     Ok(true) => return Ok(()),
                     Ok(false) => {}
                     Err(error) => {
@@ -357,7 +379,11 @@ impl RemoteUpdateWorker {
         Ok(response.claim)
     }
 
-    async fn execute_claim(&self, claim: RemoteUpdateClaim) -> anyhow::Result<bool> {
+    async fn execute_claim(
+        &self,
+        claim: RemoteUpdateClaim,
+        quarantine_present: bool,
+    ) -> anyhow::Result<bool> {
         anyhow::ensure!(
             claim.task.target_client_id == self.api.client_id
                 && claim.task.lease_owner == Some(self.worker_instance_id)
@@ -375,6 +401,29 @@ impl RemoteUpdateWorker {
             RemoteUpdateWorkerReport::Started { stage },
         )
         .await?;
+        if quarantine_present
+            && !matches!(
+                action,
+                RemoteUpdateAction::Check | RemoteUpdateAction::Status
+            )
+        {
+            tracing::warn!(
+                task_id = %task_id,
+                ?action,
+                "Remote update mutation rejected because forensic quarantine is active"
+            );
+            self.report(
+                task_id,
+                lease_token,
+                action,
+                RemoteUpdateWorkerReport::Failed {
+                    error_code: RemoteUpdateErrorCode::FailedClosed,
+                    recovery_state: RemoteUpdateRecoveryState::FailedClosed,
+                },
+            )
+            .await?;
+            return Ok(false);
+        }
 
         let (stage_tx, stage_rx) = watch::channel(stage);
         let worker = self;
@@ -564,46 +613,129 @@ impl RemoteUpdateWorker {
     }
 
     async fn resume_pending_restart(&self) -> anyhow::Result<bool> {
-        let receipt = self.read_resume_receipt()?;
-        validate_resume_receipt(&receipt, &self.api)?;
-        let lease_identity = LeaseIdentity {
-            task_id: receipt.task_id,
-            lease_token: receipt.lease_token,
-            action: receipt.action,
-            worker_instance_id: receipt.worker_instance_id,
+        let receipt = match self.read_resume_receipt() {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.quarantine_resume_receipt(
+                    updater::RemoteUpdateQuarantineReason::InvalidReceipt,
+                    &format!("remote update restart receipt could not be decoded: {error:#}"),
+                )?;
+                return Ok(false);
+            }
         };
+        if let Err(error) = validate_resume_receipt(&receipt, &self.api) {
+            self.quarantine_resume_receipt(
+                updater::RemoteUpdateQuarantineReason::InvalidReceipt,
+                &format!("remote update restart receipt validation failed: {error:#}"),
+            )?;
+            return Ok(false);
+        }
         let state_directory = updater::default_state_directory(UpdateProduct::Client);
         let expected_terminal = match receipt.action {
             RemoteUpdateAction::Apply => "succeeded",
             RemoteUpdateAction::Rollback => "rolled_back",
             _ => anyhow::bail!("restart verification receipt contains a non-restart action"),
         };
+        let reconcile_request = reconcile_request(&receipt)?;
         loop {
+            if resume_deadline_expired(&receipt) {
+                self.quarantine_resume_receipt(
+                    updater::RemoteUpdateQuarantineReason::DeadlineExceeded,
+                    "remote update restart verification exceeded its protected 30 minute deadline",
+                )?;
+                return Ok(false);
+            }
+            let reconcile = match self
+                .api
+                .reconcile(receipt.task_id, &reconcile_request)
+                .await
+            {
+                Ok(result) => result,
+                Err(error) if resume_deadline_expired(&receipt) => {
+                    self.quarantine_resume_receipt(
+                        updater::RemoteUpdateQuarantineReason::ControlUnavailableAfterDeadline,
+                        &format!(
+                            "remote update control reconciliation remained unavailable at the deadline: {error:#}"
+                        ),
+                    )?;
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            };
+            let response = match reconcile {
+                ReconcileApiResult::TaskMissing => {
+                    self.quarantine_resume_receipt(
+                        updater::RemoteUpdateQuarantineReason::TaskMissing,
+                        "the authoritative server no longer has the remote update task",
+                    )?;
+                    return Ok(false);
+                }
+                ReconcileApiResult::AuthorityLost => {
+                    self.quarantine_resume_receipt(
+                        updater::RemoteUpdateQuarantineReason::LeaseAuthorityLost,
+                        "the server rejected the protected worker or lease authority",
+                    )?;
+                    return Ok(false);
+                }
+                ReconcileApiResult::Response(response) => {
+                    let response = *response;
+                    if let Err(error) = response.validate(
+                        receipt.task_id,
+                        self.api.client_id,
+                        &reconcile_request,
+                        unix_seconds(),
+                    ) {
+                        self.quarantine_resume_receipt(
+                            updater::RemoteUpdateQuarantineReason::TerminalConflict,
+                            &format!(
+                                "the server returned an inconsistent reconciliation snapshot: {error:#}"
+                            ),
+                        )?;
+                        return Ok(false);
+                    }
+                    response
+                }
+            };
+            let server_terminal = response.state == RemoteUpdateReconcileState::Terminal;
             if updater::update_operation_active(&state_directory)? {
-                self.renew_as(RenewContext {
-                    identity: lease_identity,
-                    stage: RemoteUpdateStage::AwaitingRestart,
-                    lease_seconds: REMOTE_UPDATE_MAX_LEASE_SECONDS,
-                    maximum_deadline: Some(receipt.resume_not_after_unix_seconds),
-                })
-                .await?;
+                if server_terminal {
+                    self.quarantine_resume_receipt(
+                        updater::RemoteUpdateQuarantineReason::TerminalConflict,
+                        "the server is terminal while the protected local update is still active",
+                    )?;
+                    return Ok(false);
+                }
                 sleep(COMPLETION_POLL_INTERVAL).await;
                 continue;
             }
             let status = updater::status(UpdateProduct::Client, &state_directory)?;
             if matches!(status.state.as_str(), "scheduled" | "installing") {
-                self.renew_as(RenewContext {
-                    identity: lease_identity,
-                    stage: RemoteUpdateStage::AwaitingRestart,
-                    lease_seconds: REMOTE_UPDATE_MAX_LEASE_SECONDS,
-                    maximum_deadline: Some(receipt.resume_not_after_unix_seconds),
-                })
-                .await?;
+                if server_terminal {
+                    self.quarantine_resume_receipt(
+                        updater::RemoteUpdateQuarantineReason::TerminalConflict,
+                        "the server is terminal while the local updater still reports an active stage",
+                    )?;
+                    return Ok(false);
+                }
                 sleep(COMPLETION_POLL_INTERVAL).await;
                 continue;
             }
             if status.state == "idle" {
+                if server_terminal {
+                    self.quarantine_resume_receipt(
+                        updater::RemoteUpdateQuarantineReason::TerminalConflict,
+                        "the server is terminal but the protected local operation was never completed",
+                    )?;
+                    return Ok(false);
+                }
                 let plan = self.prepare_resume_plan(&receipt).await?;
+                if resume_deadline_expired(&receipt) {
+                    self.quarantine_resume_receipt(
+                        updater::RemoteUpdateQuarantineReason::DeadlineExceeded,
+                        "the restart artifact could not be prepared before the protected deadline",
+                    )?;
+                    return Ok(false);
+                }
                 let response = self
                     .report_as(
                         receipt.task_id,
@@ -626,6 +758,13 @@ impl RemoteUpdateWorker {
                     receipt.action,
                     &plan,
                 )?;
+                if resume_deadline_expired(&receipt) {
+                    self.quarantine_resume_receipt(
+                        updater::RemoteUpdateQuarantineReason::DeadlineExceeded,
+                        "the local restart could not be scheduled before the protected deadline",
+                    )?;
+                    return Ok(false);
+                }
                 let scheduled = self.schedule_restart(plan)?;
                 anyhow::ensure!(
                     scheduled.operation_id == receipt.operation_id,
@@ -634,15 +773,21 @@ impl RemoteUpdateWorker {
                 let _ = self.restart_tx.send(true);
                 return Ok(true);
             }
-            if status.state == expected_terminal {
-                let verified = updater::verify_completed_update(
+            let report = if status.state == expected_terminal {
+                let verified = match updater::verify_completed_update(
                     UpdateProduct::Client,
                     &state_directory,
                     receipt.operation_id,
-                )
-                .map_err(|error| {
-                    anyhow::anyhow!("remote update completion verification failed: {error:#}")
-                })?;
+                ) {
+                    Ok(verified) => verified,
+                    Err(error) => {
+                        self.quarantine_resume_receipt(
+                            updater::RemoteUpdateQuarantineReason::LocalVerificationFailed,
+                            &format!("remote update completion verification failed: {error:#}"),
+                        )?;
+                        return Ok(false);
+                    }
+                };
                 anyhow::ensure!(
                     verified.operation_id == receipt.operation_id
                         && verified.operation == operation_name(receipt.operation)
@@ -660,36 +805,74 @@ impl RemoteUpdateWorker {
                     verified_unix_seconds: verified.verified_unix_seconds,
                 };
                 result.validate()?;
+                RemoteUpdateWorkerReport::Succeeded { result }
+            } else {
+                let error_code = match receipt.action {
+                    RemoteUpdateAction::Apply => RemoteUpdateErrorCode::ApplyFailed,
+                    RemoteUpdateAction::Rollback => RemoteUpdateErrorCode::RollbackFailed,
+                    _ => RemoteUpdateErrorCode::FailedClosed,
+                };
+                RemoteUpdateWorkerReport::Failed {
+                    error_code,
+                    recovery_state: failure_recovery_state(receipt.action),
+                }
+            };
+            if resume_deadline_expired(&receipt) {
+                self.quarantine_resume_receipt(
+                    updater::RemoteUpdateQuarantineReason::DeadlineExceeded,
+                    "the local terminal result was not reconciled before the protected deadline",
+                )?;
+                return Ok(false);
+            }
+            if server_terminal {
+                let terminal = RemoteUpdateReportResponse {
+                    task: response.task,
+                };
+                if terminal
+                    .validate(receipt.task_id, self.api.client_id, receipt.action, &report)
+                    .is_err()
+                {
+                    self.quarantine_resume_receipt(
+                        updater::RemoteUpdateQuarantineReason::TerminalConflict,
+                        "the authoritative terminal task does not match the verified local result",
+                    )?;
+                    return Ok(false);
+                }
+            } else {
                 self.report_as(
                     receipt.task_id,
                     receipt.lease_token,
                     receipt.action,
-                    RemoteUpdateWorkerReport::Succeeded { result },
+                    report,
                     receipt.worker_instance_id,
                 )
                 .await?;
-                self.remove_resume_receipt()?;
-                return Ok(false);
             }
-            let error_code = match receipt.action {
-                RemoteUpdateAction::Apply => RemoteUpdateErrorCode::ApplyFailed,
-                RemoteUpdateAction::Rollback => RemoteUpdateErrorCode::RollbackFailed,
-                _ => RemoteUpdateErrorCode::FailedClosed,
-            };
-            self.report_as(
-                receipt.task_id,
-                receipt.lease_token,
-                receipt.action,
-                RemoteUpdateWorkerReport::Failed {
-                    error_code,
-                    recovery_state: failure_recovery_state(receipt.action),
-                },
-                receipt.worker_instance_id,
-            )
-            .await?;
             self.remove_resume_receipt()?;
             return Ok(false);
         }
+    }
+
+    fn quarantine_resume_receipt(
+        &self,
+        reason: updater::RemoteUpdateQuarantineReason,
+        detail: &str,
+    ) -> anyhow::Result<()> {
+        let detail = bounded_quarantine_detail(detail);
+        let summary = updater::quarantine_remote_update_resume_receipt(
+            UpdateProduct::Client,
+            &updater::default_state_directory(UpdateProduct::Client),
+            self.api.client_id,
+            &self.resume_origin_sha256,
+            reason,
+            &detail,
+        )?;
+        tracing::error!(
+            record_id = %summary.record_id,
+            reason = reason.as_code(),
+            "Remote update receipt moved to forensic quarantine"
+        );
+        Ok(())
     }
 
     async fn prepare_resume_plan(
@@ -1003,10 +1186,48 @@ fn operation_name(operation: RemoteLocalUpdateOperation) -> &'static str {
     }
 }
 
+fn reconcile_request(
+    receipt: &PendingRestartVerification,
+) -> anyhow::Result<RemoteUpdateReconcileRequest> {
+    let request = RemoteUpdateReconcileRequest {
+        worker_instance_id: receipt.worker_instance_id,
+        lease_token: receipt.lease_token,
+        action: receipt.action,
+        plan: RemoteUpdateRestartPlan {
+            operation_id: receipt.operation_id,
+            operation: receipt.operation,
+            from_version: receipt.from_version.clone(),
+            to_version: receipt.to_version.clone(),
+        },
+    };
+    request.validate()?;
+    Ok(request)
+}
+
+fn resume_deadline_expired(receipt: &PendingRestartVerification) -> bool {
+    unix_seconds() >= receipt.resume_not_after_unix_seconds
+}
+
+fn bounded_quarantine_detail(detail: &str) -> String {
+    let detail = detail.trim();
+    if detail.len() <= MAX_QUARANTINE_DETAIL_BYTES {
+        return detail.to_owned();
+    }
+    let mut output = String::with_capacity(MAX_QUARANTINE_DETAIL_BYTES);
+    for character in detail.chars() {
+        if output.len() + character.len_utf8() > MAX_QUARANTINE_DETAIL_BYTES {
+            break;
+        }
+        output.push(character);
+    }
+    output
+}
+
 fn validate_resume_receipt(
     receipt: &PendingRestartVerification,
     api: &WorkerApi,
 ) -> anyhow::Result<()> {
+    let now = unix_seconds();
     anyhow::ensure!(
         receipt.schema_version == RESUME_SCHEMA_VERSION
             && receipt.client_id == api.client_id
@@ -1016,6 +1237,7 @@ fn validate_resume_receipt(
             && !receipt.lease_token.is_nil()
             && !receipt.operation_id.is_nil()
             && receipt.created_unix_seconds > 0
+            && receipt.created_unix_seconds <= now
             && receipt.resume_not_after_unix_seconds > receipt.created_unix_seconds
             && receipt
                 .resume_not_after_unix_seconds
@@ -1116,6 +1338,40 @@ impl WorkerApi {
         .await
     }
 
+    async fn reconcile(
+        &self,
+        task_id: Uuid,
+        request: &RemoteUpdateReconcileRequest,
+    ) -> anyhow::Result<ReconcileApiResult> {
+        let path = format!(
+            "api/v1/clients/{}/update-tasks/{task_id}/reconcile",
+            self.client_id
+        );
+        let url = self.base.join(&path)?;
+        anyhow::ensure!(
+            same_trusted_origin(&self.base, &url),
+            "remote update API URL left its configured HTTPS origin"
+        );
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(&self.client_token)
+            .json(request)
+            .send()
+            .await?;
+        match response.status() {
+            StatusCode::OK => Ok(ReconcileApiResult::Response(Box::new(
+                decode_bounded_response(response).await?,
+            ))),
+            StatusCode::NOT_FOUND => Ok(ReconcileApiResult::TaskMissing),
+            StatusCode::BAD_REQUEST
+            | StatusCode::UNAUTHORIZED
+            | StatusCode::FORBIDDEN
+            | StatusCode::CONFLICT => Ok(ReconcileApiResult::AuthorityLost),
+            status => anyhow::bail!("remote update API returned HTTP status {status}"),
+        }
+    }
+
     async fn report(
         &self,
         task_id: Uuid,
@@ -1147,7 +1403,7 @@ impl WorkerApi {
             same_trusted_origin(&self.base, &url),
             "remote update API URL left its configured HTTPS origin"
         );
-        let mut response = self
+        let response = self
             .client
             .request(method, url)
             .bearer_auth(&self.client_token)
@@ -1159,27 +1415,36 @@ impl WorkerApi {
             status == StatusCode::OK,
             "remote update API returned HTTP status {status}"
         );
+        decode_bounded_response(response).await
+    }
+}
+
+async fn decode_bounded_response<Response>(
+    mut response: reqwest::Response,
+) -> anyhow::Result<Response>
+where
+    Response: DeserializeOwned,
+{
+    anyhow::ensure!(
+        response
+            .content_length()
+            .is_none_or(|length| length <= MAX_API_RESPONSE_BYTES),
+        "remote update API response exceeds the size limit"
+    );
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        let next_len = bytes
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| anyhow::anyhow!("remote update API response size overflowed"))?;
         anyhow::ensure!(
-            response
-                .content_length()
-                .is_none_or(|length| length <= MAX_API_RESPONSE_BYTES),
+            next_len as u64 <= MAX_API_RESPONSE_BYTES,
             "remote update API response exceeds the size limit"
         );
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
-            let next_len = bytes
-                .len()
-                .checked_add(chunk.len())
-                .ok_or_else(|| anyhow::anyhow!("remote update API response size overflowed"))?;
-            anyhow::ensure!(
-                next_len as u64 <= MAX_API_RESPONSE_BYTES,
-                "remote update API response exceeds the size limit"
-            );
-            bytes.extend_from_slice(&chunk);
-        }
-        serde_json::from_slice::<Response>(&bytes)
-            .context("remote update API returned an invalid bounded response")
+        bytes.extend_from_slice(&chunk);
     }
+    serde_json::from_slice::<Response>(&bytes)
+        .context("remote update API returned an invalid bounded response")
 }
 
 fn validate_api_base_url(value: &str) -> anyhow::Result<Url> {
@@ -1217,6 +1482,24 @@ fn unix_seconds() -> u64 {
 mod tests {
     use super::*;
 
+    fn receipt_fixture(api: &WorkerApi, created: u64) -> PendingRestartVerification {
+        PendingRestartVerification {
+            schema_version: RESUME_SCHEMA_VERSION,
+            client_id: api.client_id,
+            task_id: Uuid::new_v4(),
+            action: RemoteUpdateAction::Apply,
+            worker_instance_id: Uuid::new_v4(),
+            lease_token: Uuid::new_v4(),
+            operation_id: Uuid::new_v4(),
+            operation: RemoteLocalUpdateOperation::Apply,
+            from_version: "1.0.0".to_owned(),
+            to_version: "1.1.0".to_owned(),
+            api_origin_sha256: api.origin_sha256(),
+            created_unix_seconds: created,
+            resume_not_after_unix_seconds: created + REMOTE_UPDATE_RESTART_RESUME_SECONDS,
+        }
+    }
+
     #[test]
     fn remote_updates_are_disabled_by_default() {
         assert!(!RemoteUpdateWorkerConfig::default().enabled);
@@ -1233,5 +1516,33 @@ mod tests {
             assert!(validate_api_base_url(invalid).is_err(), "{invalid}");
         }
         assert!(validate_api_base_url("https://example.com:9443/").is_ok());
+    }
+
+    #[test]
+    fn restart_receipt_cannot_move_its_hard_deadline_into_the_future() {
+        let api = WorkerApi {
+            client: reqwest::Client::new(),
+            base: validate_api_base_url("https://example.com/").unwrap(),
+            client_id: Uuid::new_v4(),
+            client_token: "fixture".to_owned(),
+        };
+        let now = unix_seconds();
+        let valid = receipt_fixture(&api, now);
+        validate_resume_receipt(&valid, &api).unwrap();
+
+        let future = receipt_fixture(&api, now + 60);
+        assert!(validate_resume_receipt(&future, &api).is_err());
+
+        let mut expired = valid;
+        expired.resume_not_after_unix_seconds = now.saturating_sub(1);
+        assert!(resume_deadline_expired(&expired));
+    }
+
+    #[test]
+    fn quarantine_detail_is_utf8_safe_and_bounded() {
+        let detail = "隔".repeat(MAX_QUARANTINE_DETAIL_BYTES);
+        let bounded = bounded_quarantine_detail(&detail);
+        assert!(bounded.len() <= MAX_QUARANTINE_DETAIL_BYTES);
+        assert!(!bounded.is_empty());
     }
 }
