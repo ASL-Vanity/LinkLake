@@ -311,6 +311,22 @@ impl RemoteUpdateResult {
         )
     }
 
+    pub fn matches_restart_plan(&self, plan: &RemoteUpdateRestartPlan) -> bool {
+        matches!(
+            self,
+            Self::Installed {
+                operation_id,
+                operation,
+                from_version,
+                to_version,
+                ..
+            } if *operation_id == plan.operation_id
+                && *operation == plan.operation
+                && from_version == &plan.from_version
+                && to_version == &plan.to_version
+        )
+    }
+
     pub fn validate(&self) -> Result<(), RemoteUpdateContractError> {
         match self {
             Self::Check {
@@ -931,7 +947,15 @@ impl RemoteUpdateReconcileResponse {
                             && binding.to_version == request.plan.to_version
                     })
             }
-            RemoteUpdateReconcileState::Terminal => self.task.state.is_terminal(),
+            RemoteUpdateReconcileState::Terminal => match self.task.state {
+                RemoteUpdateTaskState::Succeeded => self
+                    .task
+                    .result
+                    .as_ref()
+                    .is_some_and(|result| result.matches_restart_plan(&request.plan)),
+                RemoteUpdateTaskState::Failed => true,
+                _ => false,
+            },
         };
         if valid {
             Ok(())
@@ -1321,6 +1345,64 @@ mod tests {
         assert_eq!(
             request.validate(),
             Err(RemoteUpdateContractError::InvalidTransition)
+        );
+    }
+
+    #[test]
+    fn terminal_restart_reconcile_requires_the_verified_install_plan() {
+        let client_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        let request = RemoteUpdateReconcileRequest {
+            worker_instance_id: Uuid::new_v4(),
+            lease_token: Uuid::new_v4(),
+            action: RemoteUpdateAction::Apply,
+            plan: RemoteUpdateRestartPlan {
+                operation_id,
+                operation: RemoteLocalUpdateOperation::Apply,
+                from_version: "1.0.0".to_owned(),
+                to_version: "1.1.0".to_owned(),
+            },
+        };
+        let response = RemoteUpdateReconcileResponse {
+            state: RemoteUpdateReconcileState::Terminal,
+            task: RemoteUpdateTask {
+                schema_version: REMOTE_UPDATE_CONTRACT_VERSION,
+                task_id,
+                target_client_id: client_id,
+                action: RemoteUpdateAction::Apply,
+                state: RemoteUpdateTaskState::Succeeded,
+                stage: RemoteUpdateStage::Completed,
+                recovery_state: RemoteUpdateRecoveryState::None,
+                requested_by: "admin".to_owned(),
+                idempotency_key: "terminal-plan-binding".to_owned(),
+                attempt: 1,
+                cancel_requested: false,
+                lease_owner: None,
+                lease_deadline_unix_seconds: None,
+                restart: None,
+                result: Some(RemoteUpdateResult::Installed {
+                    operation_id,
+                    operation: RemoteLocalUpdateOperation::Apply,
+                    from_version: "1.0.0".to_owned(),
+                    to_version: "1.1.0".to_owned(),
+                    installed_sha256: "a".repeat(64),
+                    backup_sha256: "b".repeat(64),
+                    verified_unix_seconds: 2,
+                }),
+                error_code: None,
+                created_unix_seconds: 1,
+                updated_unix_seconds: 2,
+                completed_unix_seconds: Some(2),
+            },
+        };
+        response.validate(task_id, client_id, &request, 3).unwrap();
+
+        let mut wrong_plan = request;
+        wrong_plan.plan.to_version = "1.2.0".to_owned();
+        assert_eq!(
+            response.validate(task_id, client_id, &wrong_plan, 3),
+            Err(RemoteUpdateContractError::InvalidTaskSnapshot)
         );
     }
 

@@ -110,9 +110,8 @@ pub(crate) async fn reconcile_remote_update_task(
     authenticate_worker(&state, client_id, &headers)?;
     let response = state
         .update_tasks
-        .lock()
-        .expect("remote update task catalog lock poisoned")
         .reconcile(client_id, task_id, &request, unix_seconds())
+        .await
         .map_err(update_task_api_error)?;
     Ok(Json(response))
 }

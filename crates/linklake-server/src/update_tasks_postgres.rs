@@ -445,6 +445,62 @@ impl PostgresUpdateTaskCatalog {
         })
     }
 
+    async fn reconcile_inner(
+        &self,
+        target_client_id: Uuid,
+        task_id: Uuid,
+        request: &RemoteUpdateReconcileRequest,
+    ) -> anyhow::Result<RemoteUpdateReconcileResponse> {
+        validate_non_nil_uuid(target_client_id)
+            .and_then(|_| validate_non_nil_uuid(task_id))
+            .map_err(|error| domain_error(UpdateTaskError::Contract(error)))?;
+        request
+            .validate()
+            .map_err(|error| domain_error(UpdateTaskError::Contract(error)))?;
+
+        let mut client = self.storage.postgres_client().await?;
+        let transaction = client.transaction().await?;
+        self.assert_leader(&transaction).await?;
+        lock_target(&transaction, target_client_id).await?;
+        let now = postgres_now(&transaction).await?;
+        let stored = task_by_id(&transaction, task_id, true)
+            .await?
+            .ok_or_else(|| domain_error(UpdateTaskError::TaskNotFound))?;
+        if stored.task.target_client_id != target_client_id || stored.task.action != request.action
+        {
+            return Err(domain_error(UpdateTaskError::TaskNotFound));
+        }
+
+        reconcile_expired(&transaction, Some(target_client_id), now).await?;
+        let stored = task_by_id(&transaction, task_id, true)
+            .await?
+            .ok_or_else(|| domain_error(UpdateTaskError::TaskNotFound))?;
+        let state = if stored.task.state.is_terminal() {
+            let replay = stored
+                .terminal_replay
+                .as_ref()
+                .ok_or_else(|| domain_error(UpdateTaskError::LeaseConflict))?;
+            validate_terminal_reconcile(&stored.task, replay, request)?;
+            RemoteUpdateReconcileState::Terminal
+        } else {
+            authorize_lease_token(
+                &stored.task,
+                stored.lease_token_sha256.as_deref(),
+                &request.worker_instance_id,
+                request.lease_token,
+                now,
+            )?;
+            validate_active_reconcile(&stored.task, request)?;
+            RemoteUpdateReconcileState::Active
+        };
+        let response = RemoteUpdateReconcileResponse {
+            state,
+            task: stored.task,
+        };
+        transaction.commit().await?;
+        Ok(response)
+    }
+
     async fn report_inner(
         &self,
         target_client_id: Uuid,
@@ -661,6 +717,21 @@ impl UpdateTaskCoordinationStorage for PostgresUpdateTaskCatalog {
     ) -> UpdateTaskFuture<'a, RemoteUpdateLeaseRenewResponse> {
         Box::pin(async move {
             map_database_result(self.renew_inner(target_client_id, task_id, request).await)
+        })
+    }
+
+    fn reconcile<'a>(
+        &'a self,
+        target_client_id: Uuid,
+        task_id: Uuid,
+        request: &'a RemoteUpdateReconcileRequest,
+        _now: u64,
+    ) -> UpdateTaskFuture<'a, RemoteUpdateReconcileResponse> {
+        Box::pin(async move {
+            map_database_result(
+                self.reconcile_inner(target_client_id, task_id, request)
+                    .await,
+            )
         })
     }
 

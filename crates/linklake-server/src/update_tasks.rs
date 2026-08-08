@@ -936,15 +936,7 @@ impl UpdateTaskCatalog {
             if task.state.is_terminal() {
                 let stored = terminal_report_replay(transaction, task_id)?
                     .ok_or_else(|| domain_error(UpdateTaskError::LeaseConflict))?;
-                let presented_lease = lease_token_sha256(request.lease_token);
-                if stored.worker_instance_id != request.worker_instance_id
-                    || !constant_time_equal(
-                        stored.lease_token_sha256.as_bytes(),
-                        presented_lease.as_bytes(),
-                    )
-                {
-                    return Err(domain_error(UpdateTaskError::LeaseConflict));
-                }
+                validate_terminal_reconcile(&task, &stored, &request)?;
                 return Ok(RemoteUpdateReconcileResponse {
                     state: RemoteUpdateReconcileState::Terminal,
                     task,
@@ -957,18 +949,7 @@ impl UpdateTaskCatalog {
                 request.lease_token,
                 now,
             )?;
-            let binding = task
-                .restart
-                .as_ref()
-                .ok_or_else(|| domain_error(UpdateTaskError::InvalidTransition))?;
-            if task.stage != RemoteUpdateStage::AwaitingRestart
-                || binding.operation_id != request.plan.operation_id
-                || binding.operation != request.plan.operation
-                || binding.from_version != request.plan.from_version
-                || binding.to_version != request.plan.to_version
-            {
-                return Err(domain_error(UpdateTaskError::InvalidTransition));
-            }
+            validate_active_reconcile(&task, &request)?;
             Ok(RemoteUpdateReconcileResponse {
                 state: RemoteUpdateReconcileState::Active,
                 task,
@@ -1437,6 +1418,50 @@ fn validate_terminal_report_replay(
     }
     let presented_report = worker_report_sha256(&request.report)?;
     if !constant_time_equal(stored.report_sha256.as_bytes(), presented_report.as_bytes()) {
+        return Err(domain_error(UpdateTaskError::InvalidTransition));
+    }
+    Ok(())
+}
+
+fn validate_terminal_reconcile(
+    task: &RemoteUpdateTask,
+    stored: &TerminalReportReplay,
+    request: &RemoteUpdateReconcileRequest,
+) -> anyhow::Result<()> {
+    let presented_lease = lease_token_sha256(request.lease_token);
+    if stored.worker_instance_id != request.worker_instance_id
+        || !constant_time_equal(
+            stored.lease_token_sha256.as_bytes(),
+            presented_lease.as_bytes(),
+        )
+    {
+        return Err(domain_error(UpdateTaskError::LeaseConflict));
+    }
+    if task.state == RemoteUpdateTaskState::Succeeded
+        && !task
+            .result
+            .as_ref()
+            .is_some_and(|result| result.matches_restart_plan(&request.plan))
+    {
+        return Err(domain_error(UpdateTaskError::InvalidTransition));
+    }
+    Ok(())
+}
+
+fn validate_active_reconcile(
+    task: &RemoteUpdateTask,
+    request: &RemoteUpdateReconcileRequest,
+) -> anyhow::Result<()> {
+    let binding = task
+        .restart
+        .as_ref()
+        .ok_or_else(|| domain_error(UpdateTaskError::InvalidTransition))?;
+    if task.stage != RemoteUpdateStage::AwaitingRestart
+        || binding.operation_id != request.plan.operation_id
+        || binding.operation != request.plan.operation
+        || binding.from_version != request.plan.from_version
+        || binding.to_version != request.plan.to_version
+    {
         return Err(domain_error(UpdateTaskError::InvalidTransition));
     }
     Ok(())
@@ -2412,6 +2437,27 @@ mod tests {
             .unwrap();
         assert_eq!(terminal.state, RemoteUpdateReconcileState::Terminal);
         assert_eq!(terminal.task.state, RemoteUpdateTaskState::Succeeded);
+
+        let mut wrong_plan = reconcile.clone();
+        wrong_plan.plan.to_version = "1.2.0".to_owned();
+        assert!(matches!(
+            catalog.reconcile(client_id, task.task_id, &wrong_plan, 7),
+            Err(UpdateTaskError::InvalidTransition)
+        ));
+
+        let mut wrong_terminal_worker = reconcile.clone();
+        wrong_terminal_worker.worker_instance_id = Uuid::new_v4();
+        assert!(matches!(
+            catalog.reconcile(client_id, task.task_id, &wrong_terminal_worker, 7),
+            Err(UpdateTaskError::LeaseConflict)
+        ));
+
+        let mut wrong_terminal_lease = reconcile;
+        wrong_terminal_lease.lease_token = Uuid::new_v4();
+        assert!(matches!(
+            catalog.reconcile(client_id, task.task_id, &wrong_terminal_lease, 7),
+            Err(UpdateTaskError::LeaseConflict)
+        ));
     }
 
     #[test]

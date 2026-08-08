@@ -401,12 +401,17 @@ impl RemoteUpdateWorker {
             RemoteUpdateWorkerReport::Started { stage },
         )
         .await?;
-        if quarantine_present
-            && !matches!(
-                action,
-                RemoteUpdateAction::Check | RemoteUpdateAction::Status
-            )
-        {
+        let quarantine_present = match updater::any_remote_update_quarantine_exists(
+            UpdateProduct::Client,
+            &updater::default_state_directory(UpdateProduct::Client),
+        ) {
+            Ok(current) => quarantine_present || current,
+            Err(error) => {
+                tracing::error!(%error, "Remote update quarantine changed after claim; failing closed");
+                true
+            }
+        };
+        if quarantine_blocks_action(action, quarantine_present) {
             tracing::warn!(
                 task_id = %task_id,
                 ?action,
@@ -1208,6 +1213,14 @@ fn resume_deadline_expired(receipt: &PendingRestartVerification) -> bool {
     unix_seconds() >= receipt.resume_not_after_unix_seconds
 }
 
+fn quarantine_blocks_action(action: RemoteUpdateAction, quarantine_present: bool) -> bool {
+    quarantine_present
+        && !matches!(
+            action,
+            RemoteUpdateAction::Check | RemoteUpdateAction::Status
+        )
+}
+
 fn bounded_quarantine_detail(detail: &str) -> String {
     let detail = detail.trim();
     if detail.len() <= MAX_QUARANTINE_DETAIL_BYTES {
@@ -1544,5 +1557,30 @@ mod tests {
         let bounded = bounded_quarantine_detail(&detail);
         assert!(bounded.len() <= MAX_QUARANTINE_DETAIL_BYTES);
         assert!(!bounded.is_empty());
+    }
+
+    #[test]
+    fn quarantine_allows_only_read_only_remote_update_actions() {
+        for action in [RemoteUpdateAction::Check, RemoteUpdateAction::Status] {
+            assert!(!quarantine_blocks_action(action, true));
+        }
+        for action in [
+            RemoteUpdateAction::Download,
+            RemoteUpdateAction::Apply,
+            RemoteUpdateAction::Recover,
+            RemoteUpdateAction::Rollback,
+        ] {
+            assert!(quarantine_blocks_action(action, true));
+        }
+        for action in [
+            RemoteUpdateAction::Check,
+            RemoteUpdateAction::Download,
+            RemoteUpdateAction::Apply,
+            RemoteUpdateAction::Status,
+            RemoteUpdateAction::Recover,
+            RemoteUpdateAction::Rollback,
+        ] {
+            assert!(!quarantine_blocks_action(action, false));
+        }
     }
 }
