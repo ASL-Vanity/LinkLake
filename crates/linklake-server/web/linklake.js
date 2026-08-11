@@ -275,6 +275,99 @@
         errorRemoteConfirmation: '必须输入精确确认词。', errorRemoteTargetNotFound: '目标客户端不存在。', errorRemoteTaskNotFound: '更新任务不存在。', errorRemoteTargetBusy: '目标客户端已有活动更新任务。', errorRemoteIdempotencyConflict: '幂等键与其他请求冲突。', errorRemoteLeaseConflict: '另一个工作进程持有该更新任务租约。', errorRemoteLeaseExpired: '更新任务租约已过期。', errorRemoteInvalidTransition: '更新任务当前不能执行该状态转换。', errorRemoteCapacity: '远程更新任务容量已满。', errorRemoteStorage: '远程更新任务存储不可用。', errorRemoteInvalidRequest: '远程更新请求无效。', errorRemoteRequester: '更新请求人身份无效。'
       });
 
+      Object.assign(WORDS.en, {
+        haManagement: 'HA management',
+        haSubtitle: 'Inspect coordination mode, leases, ownership and failover signals.',
+        haMembers: 'Members',
+        haMembersHelp: 'Active member leases and the current leader are shown without private metadata.',
+        haEvents: 'Recent takeover and health events',
+        haEventsHelp: 'Only fixed event codes and safe summaries are retained.',
+        haJobs: 'Job leases',
+        haJobsHelp: 'Active maintenance jobs fenced by the current token.',
+        haPorts: 'Public port ownership',
+        haPortsHelp: 'Ports currently held by a valid member and leader lease.',
+        haTargets: 'Target health',
+        haTargetsHelp: 'Control-channel and application health are summarized without exposing endpoint errors.',
+        sqliteSingleInstance: 'SQLite single instance',
+        postgresHa: 'PostgreSQL HA',
+        coordinationBackend: 'Coordination backend',
+        replicatedState: 'Replicated application state',
+        leader: 'Leader',
+        follower: 'Follower',
+        noLeader: 'No active leader',
+        fencingToken: 'Fencing token',
+        instance: 'Instance',
+        incarnation: 'Incarnation',
+        lease: 'Lease',
+        owner: 'Owner',
+        job: 'Job',
+        policyId: 'Policy',
+        target: 'Target',
+        member: 'Member',
+        controlChannel: 'Control',
+        application: 'Application',
+        lastProbe: 'Last probe',
+        healthy: 'Healthy',
+        unhealthy: 'Unhealthy',
+        activeLease: 'Active',
+        noHaMembers: 'No active HA members.',
+        noHaJobs: 'No active job leases.',
+        noHaPorts: 'No active public port ownership.',
+        noHaTargets: 'No target health records.',
+        noHaEvents: 'No recent HA events.',
+        eventLeaderAcquired: 'Leadership acquired',
+        eventFollowerStarted: 'Follower started',
+        eventLeaderLost: 'Leadership lost',
+        eventHeartbeatFailed: 'Heartbeat failed',
+        eventHeartbeatTimeout: 'Heartbeat timed out'
+      });
+      Object.assign(WORDS.zh, {
+        haManagement: 'HA 管理',
+        haSubtitle: '查看协调模式、租约、公网端口归属和接管信号。',
+        haMembers: '成员',
+        haMembersHelp: '显示活动成员租约和当前 Leader，不展示私有 metadata。',
+        haEvents: '最近接管与健康事件',
+        haEventsHelp: '仅保留固定事件代码和安全摘要。',
+        haJobs: '任务租约',
+        haJobsHelp: '由当前 fencing token 保护的活动维护任务。',
+        haPorts: '公网端口归属',
+        haPortsHelp: '当前由有效成员与 Leader 租约持有的端口。',
+        haTargets: '目标健康',
+        haTargetsHelp: '汇总控制通道和应用健康，不暴露端点错误详情。',
+        sqliteSingleInstance: 'SQLite 单实例',
+        postgresHa: 'PostgreSQL HA',
+        coordinationBackend: '协调后端',
+        replicatedState: '应用状态已复制',
+        leader: 'Leader',
+        follower: 'Follower',
+        noLeader: '暂无活动 Leader',
+        fencingToken: 'Fencing token',
+        instance: '实例',
+        incarnation: '进程世代',
+        lease: '租约',
+        owner: '所有者',
+        job: '任务',
+        policyId: '策略',
+        target: '目标',
+        member: '成员',
+        controlChannel: '控制通道',
+        application: '应用',
+        lastProbe: '上次探测',
+        healthy: '健康',
+        unhealthy: '异常',
+        activeLease: '有效',
+        noHaMembers: '暂无活动 HA 成员。',
+        noHaJobs: '暂无活动任务租约。',
+        noHaPorts: '暂无公网端口归属。',
+        noHaTargets: '暂无目标健康记录。',
+        noHaEvents: '暂无 HA 事件。',
+        eventLeaderAcquired: '已取得 Leader',
+        eventFollowerStarted: '已作为 Follower 启动',
+        eventLeaderLost: 'Leader 已丢失',
+        eventHeartbeatFailed: '心跳失败',
+        eventHeartbeatTimeout: '心跳超时'
+      });
+
       const POLICY_TYPES = {
         tcp: {
           resource: 'tcp-tunnels', dataKey: 'tcpPolicies', titleKey: 'tcpTitle', subtitleKey: 'tcpSubtitle', createKey: 'createTcp', editKey: 'editTcp',
@@ -431,7 +524,7 @@
         'overview-view', 'overview-kpis', 'traffic-chart', 'traffic-tooltip', 'traffic-chart-summary', 'export-metrics', 'service-health-summary', 'overview-alert-panel', 'overview-alerts', 'overview-alert-more',
         'metrics-view', 'metrics-kpis', 'activity-chart', 'failure-chart', 'tcp-metric-panel', 'udp-metric-panel', 'proxy-metric-panel', 'web-metric-panel', 'network-health-panel', 'system-metric-panel',
         'services-view', 'service-insights', 'service-trend-title', 'service-insight-kpis', 'service-trend-chart', 'service-status-chart', 'new-policy', 'export-policies', 'import-policies', 'import-policies-file', 'service-toolbar', 'service-search', 'service-status-filter', 'service-count', 'service-bulk-toolbar', 'select-visible-policies', 'selected-policy-count', 'bulk-enable-policies', 'bulk-disable-policies', 'bulk-client-target', 'bulk-migrate-policies', 'bulk-delete-policies', 'service-list', 'acme-page',
-        'p2p-view', 'p2p-list', 'fleet-view', 'new-fleet-peer', 'preview-fleet-sync', 'apply-fleet-sync', 'fleet-summary', 'fleet-conflicts', 'fleet-list', 'clients-view', 'client-insight-kpis', 'client-status-chart', 'client-platform-chart', 'client-search', 'client-status-filter', 'client-count', 'clients-list', 'users-view', 'new-user', 'user-search', 'user-role-filter', 'user-count', 'users-list', 'sessions-view', 'totp-status', 'totp-action', 'new-api-token', 'api-tokens-list', 'sessions-list', 'updates-view', 'update-kpis', 'server-update-state', 'server-update-details', 'server-update-security', 'check-server-update', 'download-server-update', 'apply-server-update', 'server-update-release', 'client-update-availability', 'client-update-target', 'client-update-action', 'create-client-update', 'client-update-task-count', 'client-update-tasks', 'alerts-view', 'new-alert-rule', 'alert-channels', 'alert-events', 'alert-rules', 'activity-view', 'audit-search', 'audit-category', 'audit-count', 'audit-list', 'audit-load-more', 'export-audit',
+        'p2p-view', 'p2p-list', 'ha-view', 'ha-kpis', 'ha-members-list', 'ha-events-list', 'ha-jobs-list', 'ha-ports-list', 'ha-target-kpis', 'ha-targets-list', 'fleet-view', 'new-fleet-peer', 'preview-fleet-sync', 'apply-fleet-sync', 'fleet-summary', 'fleet-conflicts', 'fleet-list', 'clients-view', 'client-insight-kpis', 'client-status-chart', 'client-platform-chart', 'client-search', 'client-status-filter', 'client-count', 'clients-list', 'users-view', 'new-user', 'user-search', 'user-role-filter', 'user-count', 'users-list', 'sessions-view', 'totp-status', 'totp-action', 'new-api-token', 'api-tokens-list', 'sessions-list', 'updates-view', 'update-kpis', 'server-update-state', 'server-update-details', 'server-update-security', 'check-server-update', 'download-server-update', 'apply-server-update', 'server-update-release', 'client-update-availability', 'client-update-target', 'client-update-action', 'create-client-update', 'client-update-task-count', 'client-update-tasks', 'alerts-view', 'new-alert-rule', 'alert-channels', 'alert-events', 'alert-rules', 'activity-view', 'audit-search', 'audit-category', 'audit-count', 'audit-list', 'audit-load-more', 'export-audit',
         'drawer-backdrop', 'policy-drawer', 'drawer-title', 'drawer-subtitle', 'drawer-close', 'drawer-cancel', 'policy-form', 'policy-fields', 'drawer-submit',
         'password-modal', 'password-modal-close', 'password-form', 'account-new-password', 'account-confirm-password', 'password-cancel',
         'user-modal', 'user-modal-title', 'user-modal-help', 'user-modal-close', 'user-form', 'user-username', 'user-display-name', 'user-role', 'user-password-label', 'user-password', 'user-enabled-label', 'user-enabled', 'user-force-change-label', 'user-force-change', 'user-cancel',
@@ -611,7 +704,7 @@
           history.replaceState(null, '', '#/overview');
           return { view: 'overview', service: state.route.service || 'tcp' };
         }
-        if (['overview', 'metrics', 'clients', 'p2p', 'fleet', 'users', 'sessions', 'updates', 'alerts', 'activity'].includes(parts[0])) return { view: parts[0], service: state.route.service || 'tcp' };
+        if (['overview', 'metrics', 'clients', 'p2p', 'ha', 'fleet', 'users', 'sessions', 'updates', 'alerts', 'activity'].includes(parts[0])) return { view: parts[0], service: state.route.service || 'tcp' };
         history.replaceState(null, '', '#/overview');
         return { view: 'overview', service: state.route.service || 'tcp' };
       }
@@ -627,6 +720,7 @@
           metrics: [t('metrics'), t('metricsSubtitle')],
           clients: [t('clientManagement'), t('clientManagementHelp')],
           p2p: [t('p2p'), t('p2pSubtitle')],
+          ha: [t('haManagement'), t('haSubtitle')],
           fleet: [t('fleet'), t('fleetHelp')],
           users: [t('userManagement'), t('userManagementHelp')],
           sessions: [t('securitySessions'), t('securitySessionsHelp')],
@@ -642,7 +736,7 @@
         const [title, subtitle] = routeCopy();
         elements.workspace_title.textContent = title;
         elements.workspace_subtitle.textContent = subtitle;
-        const views = { overview: elements.overview_view, metrics: elements.metrics_view, services: elements.services_view, clients: elements.clients_view, p2p: elements.p2p_view, fleet: elements.fleet_view, users: elements.users_view, sessions: elements.sessions_view, updates: elements.updates_view, alerts: elements.alerts_view, activity: elements.activity_view };
+        const views = { overview: elements.overview_view, metrics: elements.metrics_view, services: elements.services_view, clients: elements.clients_view, p2p: elements.p2p_view, ha: elements.ha_view, fleet: elements.fleet_view, users: elements.users_view, sessions: elements.sessions_view, updates: elements.updates_view, alerts: elements.alerts_view, activity: elements.activity_view };
         Object.entries(views).forEach(([name, element]) => element.classList.toggle('hidden', name !== state.route.view));
         elements.workspace_service_actions.classList.toggle('hidden', state.route.view !== 'services' || state.route.service === 'acme');
         elements.workspace_fleet_actions.classList.toggle('hidden', state.route.view !== 'fleet');
@@ -659,6 +753,7 @@
         else if (state.route.view === 'services') renderServices();
         else if (state.route.view === 'clients') renderClients();
         else if (state.route.view === 'p2p') renderP2p();
+        else if (state.route.view === 'ha') renderHa();
         else if (state.route.view === 'fleet') renderFleet();
         else if (state.route.view === 'users') renderUsers();
         else if (state.route.view === 'sessions') renderSessions();
@@ -1999,6 +2094,161 @@
           });
           card.append(heading, id, age, candidates);
           elements.p2p_list.append(card);
+        });
+      }
+
+      function haShortId(value) {
+        const text = String(value || '—');
+        return text.length > 12 ? `${text.slice(0, 8)}…${text.slice(-4)}` : text;
+      }
+
+      function haModeText(mode) {
+        return mode === 'postgres_ha' ? t('postgresHa') : t('sqliteSingleInstance');
+      }
+
+      function haEventText(code) {
+        const keys = {
+          leader_acquired: 'eventLeaderAcquired',
+          follower_started: 'eventFollowerStarted',
+          leader_lost: 'eventLeaderLost',
+          heartbeat_failed: 'eventHeartbeatFailed',
+          heartbeat_timeout: 'eventHeartbeatTimeout'
+        };
+        return t(keys[code] || code);
+      }
+
+      function haStatusBadge(healthy, label) {
+        const badge = document.createElement('span');
+        badge.className = `badge ${healthy ? 'online' : 'warning'}`;
+        badge.textContent = label || (healthy ? t('healthy') : t('unhealthy'));
+        return badge;
+      }
+
+      function haEmptyRow(container, columns, message) {
+        const row = document.createElement('tr');
+        const cell = document.createElement('td');
+        cell.colSpan = columns;
+        cell.className = 'empty-state';
+        cell.textContent = message;
+        row.append(cell);
+        container.append(row);
+      }
+
+      function renderHa() {
+        const overview = state.dashboard.haOverview || {};
+        const members = Array.isArray(overview.members) ? overview.members : [];
+        const jobs = Array.isArray(overview.job_leases) ? overview.job_leases : [];
+        const ports = Array.isArray(overview.port_ownership) ? overview.port_ownership : [];
+        const targetSummary = overview.target_health || { total: 0, healthy: 0, unhealthy: 0, with_errors: 0, targets: [] };
+        const targets = Array.isArray(targetSummary.targets) ? targetSummary.targets : [];
+        const events = Array.isArray(overview.recent_events) ? overview.recent_events : [];
+        const leader = overview.current_leader;
+        const leaderName = leader ? haShortId(leader.instance_id) : t('noLeader');
+        elements.ha_kpis.replaceChildren(
+          createKpi(haModeText(overview.mode), t('coordinationBackend'), overview.replicated_state ? t('replicatedState') : t('sqliteSingleInstance')),
+          createKpi(leaderName, t('leader'), leader ? `${t('fencingToken')}: ${leader.fencing_token}` : ''),
+          createKpi(String(members.length), t('haMembers'), `${members.filter(member => member.is_current_instance).length} ${t('instance').toLowerCase()}`),
+          createKpi(`${targetSummary.healthy}/${targetSummary.total}`, t('haTargets'), `${targetSummary.with_errors} ${t('errors')}`),
+          createKpi(String(ports.length), t('haPorts'), `${jobs.length} ${t('haJobs').toLowerCase()}`)
+        );
+
+        elements.ha_members_list.replaceChildren();
+        if (!members.length) haEmptyRow(elements.ha_members_list, 5, t('noHaMembers'));
+        members.forEach(member => {
+          const row = document.createElement('tr');
+          const instance = document.createElement('td');
+          instance.textContent = haShortId(member.instance_id);
+          instance.title = `${member.instance_id} / ${member.incarnation_id}`;
+          const status = document.createElement('td');
+          status.append(haStatusBadge(member.is_leader, member.is_leader ? t('leader') : t('follower')));
+          if (member.is_current_instance) {
+            const local = document.createElement('span');
+            local.className = 'badge';
+            local.textContent = t('currentSession');
+            status.append(document.createTextNode(' '), local);
+          }
+          const lease = document.createElement('td');
+          lease.textContent = `${formatDuration(member.lease_remaining_seconds)} · ${formatTimestamp(member.lease_until_unix_seconds)}`;
+          const seen = document.createElement('td');
+          seen.textContent = formatTimestamp(member.last_seen_unix_seconds);
+          const token = document.createElement('td');
+          token.textContent = member.is_leader && leader ? String(leader.fencing_token) : '—';
+          row.append(instance, status, lease, seen, token);
+          elements.ha_members_list.append(row);
+        });
+
+        elements.ha_events_list.replaceChildren();
+        if (!events.length) {
+          const empty = document.createElement('div');
+          empty.className = 'empty-state';
+          empty.textContent = t('noHaEvents');
+          elements.ha_events_list.append(empty);
+        }
+        events.forEach(event => {
+          const item = document.createElement('div');
+          item.className = `ha-event ${event.severity === 'warning' ? 'warning' : ''}`;
+          const heading = document.createElement('div');
+          heading.className = 'ha-event-heading';
+          const strong = document.createElement('strong');
+          strong.textContent = haEventText(event.code);
+          const time = document.createElement('time');
+          time.textContent = formatTimestamp(event.at_unix_seconds);
+          heading.append(strong, time);
+          const detail = document.createElement('p');
+          detail.textContent = event.message || haEventText(event.code);
+          item.append(heading, detail);
+          elements.ha_events_list.append(item);
+        });
+
+        elements.ha_jobs_list.replaceChildren();
+        if (!jobs.length) haEmptyRow(elements.ha_jobs_list, 4, t('noHaJobs'));
+        jobs.forEach(job => {
+          const row = document.createElement('tr');
+          const name = document.createElement('td');
+          name.textContent = `${job.job_kind}: ${job.job_key}`;
+          const owner = document.createElement('td');
+          owner.textContent = haShortId(job.owner_instance_id);
+          owner.title = `${job.owner_instance_id} / ${job.owner_incarnation_id}`;
+          const lease = document.createElement('td');
+          lease.textContent = `${formatDuration(job.lease_remaining_seconds)} · ${formatTimestamp(job.lease_until_unix_seconds)}`;
+          const error = document.createElement('td');
+          error.textContent = job.last_error_code || '—';
+          row.append(name, owner, lease, error);
+          elements.ha_jobs_list.append(row);
+        });
+
+        elements.ha_ports_list.replaceChildren();
+        if (!ports.length) haEmptyRow(elements.ha_ports_list, 5, t('noHaPorts'));
+        ports.forEach(port => {
+          const row = document.createElement('tr');
+          const protocol = document.createElement('td'); protocol.textContent = String(port.protocol || '').toUpperCase();
+          const number = document.createElement('td'); number.textContent = String(port.public_port || '—');
+          const policy = document.createElement('td'); policy.textContent = haShortId(port.policy_id);
+          policy.title = port.policy_id || '';
+          const owner = document.createElement('td'); owner.textContent = haShortId(port.owner_instance_id);
+          owner.title = `${port.owner_instance_id} / ${port.owner_incarnation_id}`;
+          const lease = document.createElement('td'); lease.textContent = `${formatDuration(port.lease_remaining_seconds)} · ${formatTimestamp(port.lease_until_unix_seconds)}`;
+          row.append(protocol, number, policy, owner, lease);
+          elements.ha_ports_list.append(row);
+        });
+
+        elements.ha_target_kpis.replaceChildren(
+          createInsightKpi(String(targetSummary.healthy), t('healthy')),
+          createInsightKpi(String(targetSummary.unhealthy), t('unhealthy')),
+          createInsightKpi(String(targetSummary.with_errors), t('errors'))
+        );
+        elements.ha_targets_list.replaceChildren();
+        if (!targets.length) haEmptyRow(elements.ha_targets_list, 6, t('noHaTargets'));
+        targets.forEach(target => {
+          const row = document.createElement('tr');
+          const name = document.createElement('td'); name.textContent = target.target_key || '—';
+          const member = document.createElement('td'); member.append(haStatusBadge(Boolean(target.member_alive)));
+          const control = document.createElement('td'); control.append(haStatusBadge(Boolean(target.control_channel_healthy)));
+          const application = document.createElement('td'); application.append(haStatusBadge(Boolean(target.application_healthy)));
+          const effective = document.createElement('td'); effective.append(haStatusBadge(Boolean(target.effective_healthy)));
+          const probe = document.createElement('td'); probe.textContent = formatTimestamp(target.last_probe_unix_seconds);
+          row.append(name, member, control, application, effective, probe);
+          elements.ha_targets_list.append(row);
         });
       }
 
@@ -3580,7 +3830,7 @@
 
       function emptyDashboard() {
         const metrics = new Proxy({}, { get(target, key) { return key in target ? target[key] : 0; } });
-        return { status: {}, metrics, events: [], users: [], sessions: [], apiTokens: [], updateOverview: null, clientUpdateTasks: { tasks: [] }, fleetOverview: { peers: [], conflicts: [], failover_order: [] }, alertRules: [], alertEvents: [], alertChannels: {}, tcpPolicies: [], udpPolicies: [], portGroups: [], httpRoutes: [], sniRoutes: [], secretPolicies: [], socks5Policies: [], httpProxyPolicies: [], clients: [], p2pNodes: [], publicPortPolicy: { tcp_allowed: '32000-32999', udp_allowed: '32000-32999', tcp_reserved: '', udp_reserved: '' }, acme: { enabled: false, environment: 'staging', directory_url: acmeDirectories.staging, contact_email: '', terms_accepted: false, renew_before_days: 30, account_registered: false } };
+        return { status: {}, metrics, events: [], users: [], sessions: [], apiTokens: [], updateOverview: null, clientUpdateTasks: { tasks: [] }, fleetOverview: { peers: [], conflicts: [], failover_order: [] }, haOverview: { mode: 'sqlite_single_instance', backend: 'sqlite', members: [], job_leases: [], port_ownership: [], target_health: { total: 0, healthy: 0, unhealthy: 0, with_errors: 0, targets: [] }, recent_events: [] }, alertRules: [], alertEvents: [], alertChannels: {}, tcpPolicies: [], udpPolicies: [], portGroups: [], httpRoutes: [], sniRoutes: [], secretPolicies: [], socks5Policies: [], httpProxyPolicies: [], clients: [], p2pNodes: [], publicPortPolicy: { tcp_allowed: '32000-32999', udp_allowed: '32000-32999', tcp_reserved: '', udp_reserved: '' }, acme: { enabled: false, environment: 'staging', directory_url: acmeDirectories.staging, contact_email: '', terms_accepted: false, renew_before_days: 30, account_registered: false } };
       }
 
       function managementRequestPlan({ includeHistory = false } = {}) {
@@ -3593,6 +3843,7 @@
         }
         if (state.route.view === 'metrics') return [...common, { key: 'metrics', url: '/api/v1/metrics' }];
         if (state.route.view === 'p2p') return [...common, { key: 'clients', url: '/api/v1/clients' }, { key: 'p2pNodes', url: '/api/v1/p2p/nodes' }];
+        if (state.route.view === 'ha') return [...common, { key: 'haOverview', url: '/api/v1/ha/overview' }];
         if (state.route.view === 'fleet') return [...common, { key: 'fleetOverview', url: '/api/v1/fleet/overview' }];
         if (state.route.view === 'clients') return [...common, { key: 'clients', url: '/api/v1/clients' }];
         if (state.route.view === 'users') return [...common, { key: 'users', url: '/api/v1/users' }];

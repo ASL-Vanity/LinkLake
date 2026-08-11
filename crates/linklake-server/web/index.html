@@ -106,6 +106,7 @@
               <a class="nav-link" href="#/services/acme" data-view="services" data-service-route="acme">ACME</a>
             </div>
             <a class="nav-link" href="#/p2p" data-view="p2p" data-route-prefix="p2p"><span class="nav-icon">◎</span><span data-i18n="p2p">P2P network</span></a>
+            <a class="nav-link" href="#/ha" data-view="ha" data-route-prefix="ha"><span class="nav-icon">⛓</span><span data-i18n="haManagement">HA management</span></a>
             <a class="nav-link admin-only" href="#/fleet" data-view="fleet" data-route-prefix="fleet"><span class="nav-icon">⌘</span><span data-i18n="fleet">Multi-cloud</span></a>
             <div class="nav-group-label admin-only" data-i18n="accessControl">Access control</div>
             <a class="nav-link admin-only" href="#/users" data-view="users" data-route-prefix="users"><span class="nav-icon">♙</span><span data-i18n="userManagement">Users</span></a>
@@ -163,6 +164,25 @@
           </section>
 
           <section id="p2p-view" class="view-panel hidden"><div id="p2p-list" class="p2p-list"></div></section>
+
+          <section id="ha-view" class="view-panel hidden">
+            <div id="ha-kpis" class="kpi-grid"></div>
+            <div class="overview-grid ha-overview-grid">
+              <section class="panel">
+                <div class="panel-heading"><div><h3 data-i18n="haMembers">Members</h3><p data-i18n="haMembersHelp">Active member leases and the current leader are shown without private metadata.</p></div></div>
+                <div class="data-table-wrap"><table class="data-table"><thead><tr><th data-i18n="instance">Instance</th><th data-i18n="status">Status</th><th data-i18n="lease">Lease</th><th data-i18n="lastSeen">Last seen</th><th data-i18n="fencingToken">Fencing token</th></tr></thead><tbody id="ha-members-list"></tbody></table></div>
+              </section>
+              <section class="panel">
+                <div class="panel-heading"><div><h3 data-i18n="haEvents">Recent takeover and health events</h3><p data-i18n="haEventsHelp">Only fixed event codes and safe summaries are retained.</p></div></div>
+                <div id="ha-events-list" class="ha-event-list"></div>
+              </section>
+            </div>
+            <div class="overview-grid ha-overview-grid">
+              <section class="panel"><div class="panel-heading"><div><h3 data-i18n="haJobs">Job leases</h3><p data-i18n="haJobsHelp">Active maintenance jobs fenced by the current token.</p></div></div><div class="data-table-wrap"><table class="data-table"><thead><tr><th data-i18n="job">Job</th><th data-i18n="owner">Owner</th><th data-i18n="lease">Lease</th><th data-i18n="errorCode">Last error</th></tr></thead><tbody id="ha-jobs-list"></tbody></table></div></section>
+              <section class="panel"><div class="panel-heading"><div><h3 data-i18n="haPorts">Public port ownership</h3><p data-i18n="haPortsHelp">Ports currently held by a valid member and leader lease.</p></div></div><div class="data-table-wrap"><table class="data-table"><thead><tr><th data-i18n="protocol">Protocol</th><th data-i18n="publicPort">Port</th><th data-i18n="policyId">Policy</th><th data-i18n="owner">Owner</th><th data-i18n="lease">Lease</th></tr></thead><tbody id="ha-ports-list"></tbody></table></div></section>
+            </div>
+            <section class="panel"><div class="panel-heading"><div><h3 data-i18n="haTargets">Target health</h3><p data-i18n="haTargetsHelp">Control-channel and application health are summarized without exposing endpoint errors.</p></div></div><div id="ha-target-kpis" class="insight-kpis"></div><div class="data-table-wrap"><table class="data-table"><thead><tr><th data-i18n="target">Target</th><th data-i18n="member">Member</th><th data-i18n="controlChannel">Control</th><th data-i18n="application">Application</th><th data-i18n="status">Effective</th><th data-i18n="lastProbe">Last probe</th></tr></thead><tbody id="ha-targets-list"></tbody></table></div></section>
+          </section>
 
           <section id="fleet-view" class="view-panel hidden">
             <div id="fleet-summary" class="kpi-grid" style="margin-bottom:12px"></div>
