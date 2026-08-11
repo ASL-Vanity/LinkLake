@@ -571,6 +571,7 @@ class _DashboardPageState extends State<DashboardPage> {
   List<dynamic> _apiTokens = [];
   Map<String, dynamic> _identity = {};
   Map<String, dynamic> _fleet = {};
+  Map<String, dynamic> _ha = {};
   Map<String, dynamic> _serverUpdate = {};
   List<dynamic> _remoteUpdateTasks = [];
   Map<String, dynamic> _diagnostics = {};
@@ -713,6 +714,8 @@ class _DashboardPageState extends State<DashboardPage> {
         _apiTokens = value as List<dynamic>;
       case 'fleet':
         _fleet = Map<String, dynamic>.from(value as Map);
+      case 'ha':
+        _ha = Map<String, dynamic>.from(value as Map);
       case 'serverUpdate':
         _serverUpdate = Map<String, dynamic>.from(value as Map);
       case 'remoteUpdateTasks':
@@ -1179,6 +1182,7 @@ class _DashboardPageState extends State<DashboardPage> {
       'socks5': (Icons.route_outlined, 'SOCKS5'),
       'proxy': (Icons.language_outlined, 'HTTP Proxy'),
       'p2p': (Icons.hub_outlined, 'P2P'),
+      'ha': (Icons.lan_outlined, t('HA 绠＄悊', 'HA management')),
       'fleet': (Icons.cloud_sync_outlined, t('多云', 'Multi-cloud')),
       'updates': (Icons.system_update_alt, t('更新', 'Updates')),
       'alerts': (Icons.warning_amber_outlined, t('告警', 'Alerts')),
@@ -1207,6 +1211,7 @@ class _DashboardPageState extends State<DashboardPage> {
     'socks5' => _policyPage(PolicyKind.socks5),
     'proxy' => _policyPage(PolicyKind.proxy),
     'p2p' => _p2pPage(),
+    'ha' when _capabilities.canViewHa => _haPage(),
     'fleet' when _capabilities.canViewFleet => _fleetPage(),
     'updates' when _capabilities.canManageUpdates => _updatesPage(),
     'alerts' => _alertsPage(),
@@ -1352,6 +1357,206 @@ class _DashboardPageState extends State<DashboardPage> {
       ],
     ),
   );
+
+  Widget _haPage() {
+    final members = _haRecords(_ha['members']);
+    final jobs = _haRecords(_ha['job_leases']);
+    final ports = _haRecords(_ha['port_ownership']);
+    final events = _haRecords(_ha['recent_events']);
+    final targetHealth = Map<String, dynamic>.from(
+      _ha['target_health'] as Map? ?? const {},
+    );
+    final targets = _haRecords(targetHealth['targets']);
+    final leader = _ha['current_leader'] is Map
+        ? Map<String, dynamic>.from(_ha['current_leader'] as Map)
+        : <String, dynamic>{};
+    final postgresHa = _ha['mode'] == 'postgres_ha';
+    final localLeader = _ha['local_is_leader'] == true;
+    final cards = <(String, String, IconData)>[
+      (
+        t('鍗忚皟妯″紡', 'Coordination mode'),
+        postgresHa ? 'PostgreSQL HA' : t('SQLite 鍗曞疄渚?, 'SQLite single instance'),
+        Icons.storage_outlined,
+      ),
+      (
+        t('褰撳墠瑙掕壊', 'Local role'),
+        localLeader ? 'Leader' : 'Follower',
+        localLeader ? Icons.workspace_premium_outlined : Icons.visibility_outlined,
+      ),
+      (t('娲诲姩鎴愬憳', 'Active members'), '${members.length}', Icons.dns_outlined),
+      (
+        t('鍋ュ悍鐩爣', 'Healthy targets'),
+        '${targetHealth['healthy'] ?? 0}/${targetHealth['total'] ?? 0}',
+        Icons.monitor_heart_outlined,
+      ),
+      (
+        t('绔彛 / 浠诲姟绉熺害', 'Port / job leases'),
+        '${ports.length} / ${jobs.length}',
+        Icons.lock_clock_outlined,
+      ),
+    ];
+    return _pagePadding(
+      ListView(
+        children: [
+          _pageTitle(
+            t('HA 绠＄悊', 'HA management'),
+            t(
+              '鍙鏌ョ湅鎴愬憳銆丩eader銆乫encing銆佺绾︿笌鐩爣鍋ュ悍锛屼笉鏄剧ず杩炴帴涓插拰鍑嵁銆?,
+              'Read-only members, leader, fencing, leases, and target health without connection strings or credentials.',
+            ),
+          ),
+          const SizedBox(height: 18),
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final columns = constraints.maxWidth >= 1100 ? 5 : constraints.maxWidth >= 700 ? 3 : 1;
+              final width = (constraints.maxWidth - (columns - 1) * 12) / columns;
+              return Wrap(
+                spacing: 12,
+                runSpacing: 12,
+                children: [
+                  for (final card in cards)
+                    SizedBox(width: width, child: _metricCard(card)),
+                ],
+              );
+            },
+          ),
+          const SizedBox(height: 18),
+          _haSection(
+            t('Leader 绉熺害', 'Leader lease'),
+            leader.isEmpty
+                ? [_emptyHaLine(t('鏆傛棤娲诲姩 Leader', 'No active leader'))]
+                : [
+                    ListTile(
+                      leading: const Icon(Icons.workspace_premium_outlined),
+                      title: SelectableText(_haShortId(leader['instance_id'])),
+                      subtitle: Text(
+                        '${t('Fencing token', 'Fencing token')}: ${leader['fencing_token']}\n'
+                        '${t('绉熺害鍓╀綑', 'Lease remaining')}: ${_duration(leader['lease_remaining_seconds'])} · ${_haTimestamp(leader['lease_until_unix_seconds'])}',
+                      ),
+                      isThreeLine: true,
+                    ),
+                  ],
+          ),
+          const SizedBox(height: 14),
+          _haSection(
+            t('鎴愬憳绉熺害', 'Member leases'),
+            members.isEmpty
+                ? [_emptyHaLine(t('鏆傛棤娲诲姩鎴愬憳', 'No active HA members'))]
+                : [
+                    for (final member in members)
+                      ListTile(
+                        leading: Icon(
+                          member['is_leader'] == true
+                              ? Icons.workspace_premium
+                              : Icons.dns_outlined,
+                          color: member['is_leader'] == true ? Colors.green : null,
+                        ),
+                        title: SelectableText(_haShortId(member['instance_id'])),
+                        subtitle: Text(
+                          '${t('杩涚▼涓栦唬', 'Incarnation')}: ${_haShortId(member['incarnation_id'])}\n'
+                          '${t('鏈€鍚庡績璺?, 'Last seen')}: ${_haTimestamp(member['last_seen_unix_seconds'])} · ${t('鍓╀綑', 'remaining')} ${_duration(member['lease_remaining_seconds'])}',
+                        ),
+                        trailing: Chip(
+                          label: Text(member['is_leader'] == true ? 'Leader' : 'Follower'),
+                        ),
+                        isThreeLine: true,
+                      ),
+                  ],
+          ),
+          const SizedBox(height: 14),
+          _haSection(
+            t('浠诲姟绉熺害', 'Job leases'),
+            jobs.isEmpty
+                ? [_emptyHaLine(t('鏆傛棤娲诲姩浠诲姟绉熺害', 'No active job leases'))]
+                : [
+                    for (final job in jobs)
+                      ListTile(
+                        leading: const Icon(Icons.task_alt_outlined),
+                        title: SelectableText('${job['job_kind']}: ${job['job_key']}'),
+                        subtitle: Text(
+                          '${t('鎵€鏈夎€?, 'Owner')}: ${_haShortId(job['owner_instance_id'])}\n'
+                          '${t('绉熺害鍓╀綑', 'Lease remaining')}: ${_duration(job['lease_remaining_seconds'])}',
+                        ),
+                        trailing: job['last_error_code'] == null
+                            ? null
+                            : Chip(label: Text(job['last_error_code'].toString())),
+                        isThreeLine: true,
+                      ),
+                  ],
+          ),
+          const SizedBox(height: 14),
+          _haSection(
+            t('鍏綉绔彛褰掑睘', 'Public port ownership'),
+            ports.isEmpty
+                ? [_emptyHaLine(t('鏆傛棤鍏綉绔彛绉熺害', 'No active public port ownership'))]
+                : [
+                    for (final port in ports)
+                      ListTile(
+                        leading: const Icon(Icons.router_outlined),
+                        title: SelectableText(
+                          '${port['protocol']?.toString().toUpperCase()} : ${port['public_port']}',
+                        ),
+                        subtitle: Text(
+                          '${t('绛栫暐', 'Policy')}: ${_haShortId(port['policy_id'])}\n'
+                          '${t('鎵€鏈夎€?, 'Owner')}: ${_haShortId(port['owner_instance_id'])} · ${t('鍓╀綑', 'remaining')} ${_duration(port['lease_remaining_seconds'])}',
+                        ),
+                        isThreeLine: true,
+                      ),
+                  ],
+          ),
+          const SizedBox(height: 14),
+          _haSection(
+            t('鐩爣鍋ュ悍', 'Target health'),
+            targets.isEmpty
+                ? [_emptyHaLine(t('鏆傛棤鐩爣鍋ュ悍璁板綍', 'No target health records'))]
+                : [
+                    for (final target in targets)
+                      ListTile(
+                        leading: Icon(
+                          target['effective_healthy'] == true
+                              ? Icons.check_circle_outline
+                              : Icons.error_outline,
+                          color: target['effective_healthy'] == true
+                              ? Colors.green
+                              : Colors.orange,
+                        ),
+                        title: SelectableText(target['target_key']?.toString() ?? '-'),
+                        subtitle: Text(
+                          '${t('鎴愬憳 / 鎺у埗 / 搴旂敤', 'Member / control / application')}: '
+                          '${_haBool(target['member_alive'])} / ${_haBool(target['control_channel_healthy'])} / ${_haBool(target['application_healthy'])}\n'
+                          '${t('鏈€鍚庢帰娴?, 'Last probe')}: ${_haTimestamp(target['last_probe_unix_seconds'])}',
+                        ),
+                        trailing: target['has_error'] == true
+                            ? Chip(label: Text(t('鏈夊紓甯?, 'Has error')))
+                            : null,
+                        isThreeLine: true,
+                      ),
+                  ],
+          ),
+          const SizedBox(height: 14),
+          _haSection(
+            t('鏈€杩戞帴绠′笌寮傚父', 'Recent takeover and anomalies'),
+            events.isEmpty
+                ? [_emptyHaLine(t('鏆傛棤 HA 浜嬩欢', 'No recent HA events'))]
+                : [
+                    for (final event in events)
+                      ListTile(
+                        leading: Icon(
+                          event['severity'] == 'warning'
+                              ? Icons.warning_amber_outlined
+                              : Icons.info_outline,
+                          color: event['severity'] == 'warning' ? Colors.orange : null,
+                        ),
+                        title: Text(_haEventLabel(event['code'])),
+                        subtitle: Text(event['message']?.toString() ?? ''),
+                        trailing: Text(_haTimestamp(event['at_unix_seconds'])),
+                      ),
+                  ],
+          ),
+        ],
+      ),
+    );
+  }
 
   Widget _updatesPage() => RemoteUpdateManagementPage(
     key: const Key('remote-update-management-page'),
@@ -3175,6 +3380,62 @@ class _DashboardPageState extends State<DashboardPage> {
       ),
     );
   }
+
+  List<Map<String, dynamic>> _haRecords(dynamic value) => List<dynamic>.from(
+    value as List? ?? const [],
+  ).whereType<Map>().map((item) => Map<String, dynamic>.from(item)).toList();
+
+  Widget _haSection(String title, List<Widget> children) => Card(
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(18, 16, 18, 8),
+          child: Text(
+            title,
+            style: Theme.of(
+              context,
+            ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+          ),
+        ),
+        const Divider(height: 1),
+        ...children,
+      ],
+    ),
+  );
+
+  Widget _emptyHaLine(String message) => Padding(
+    padding: const EdgeInsets.all(18),
+    child: Text(message, style: Theme.of(context).textTheme.bodyMedium),
+  );
+
+  String _haShortId(dynamic value) {
+    final text = value?.toString() ?? '-';
+    if (text.length <= 14) return text;
+    return '${text.substring(0, 8)}…${text.substring(text.length - 4)}';
+  }
+
+  String _haTimestamp(dynamic value) {
+    final seconds = int.tryParse(value?.toString() ?? '');
+    if (seconds == null || seconds <= 0) return '-';
+    return DateTime.fromMillisecondsSinceEpoch(
+      seconds * 1000,
+      isUtc: true,
+    ).toLocal().toString().split('.').first;
+  }
+
+  String _haBool(dynamic value) => value == true
+      ? t('鍋ュ悍', 'healthy')
+      : t('寮傚父', 'unhealthy');
+
+  String _haEventLabel(dynamic value) => switch (value?.toString()) {
+    'leader_acquired' => t('宸插彇寰?Leader', 'Leadership acquired'),
+    'follower_started' => t('宸蹭綔涓?Follower 鍚姩', 'Follower started'),
+    'leader_lost' => t('Leader 宸蹭涪澶?, 'Leadership lost'),
+    'heartbeat_failed' => t('蹇冭烦澶辫触', 'Heartbeat failed'),
+    'heartbeat_timeout' => t('蹇冭烦瓒呮椂', 'Heartbeat timed out'),
+    final code => code ?? '-',
+  };
 
   Widget _metricCard((String, String, IconData) value) => Card(
     child: Padding(
