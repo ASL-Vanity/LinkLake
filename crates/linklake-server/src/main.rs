@@ -630,6 +630,19 @@ impl AppState {
     }
 }
 
+fn require_fleet_state_leader(state: &AppState) -> Result<(), CodedApiError> {
+    if state.ha_runtime.coordinator().backend() == storage::StorageBackend::Postgres
+        && !state.ha_runtime.is_leader()
+    {
+        return Err(CodedApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ha_fleet_state_requires_leader",
+            "Fleet state is served by the HA leader; retry through a leader-aware endpoint",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct ServerCounters {
     control_connections_total: AtomicU64,
@@ -9897,6 +9910,7 @@ async fn list_fleet_peers(
     headers: HeaderMap,
 ) -> Result<Json<Vec<FleetPeer>>, CodedApiError> {
     authorize_management(&state, &headers).map_err(coded_management_error)?;
+    require_fleet_state_leader(&state)?;
     Ok(Json(
         state
             .fleet
@@ -9913,6 +9927,7 @@ async fn create_fleet_peer(
     Json(request): Json<UpsertFleetPeer>,
 ) -> Result<(StatusCode, Json<FleetPeer>), CodedApiError> {
     authorize_management(&state, &headers).map_err(coded_management_error)?;
+    require_fleet_state_leader(&state)?;
     let peer = state
         .fleet
         .lock()
@@ -9941,6 +9956,7 @@ async fn update_fleet_peer(
     Json(request): Json<UpsertFleetPeer>,
 ) -> Result<Json<FleetPeer>, CodedApiError> {
     authorize_management(&state, &headers).map_err(coded_management_error)?;
+    require_fleet_state_leader(&state)?;
     let peer = state
         .fleet
         .lock()
@@ -9967,6 +9983,7 @@ async fn delete_fleet_peer(
     Path(peer_id): Path<Uuid>,
 ) -> Result<StatusCode, CodedApiError> {
     authorize_management(&state, &headers).map_err(coded_management_error)?;
+    require_fleet_state_leader(&state)?;
     if !state
         .fleet
         .lock()
@@ -9995,6 +10012,7 @@ async fn get_fleet_health_config(
     Path(peer_id): Path<Uuid>,
 ) -> Result<Json<FleetHealthSnapshot>, CodedApiError> {
     authorize_management(&state, &headers).map_err(coded_management_error)?;
+    require_fleet_state_leader(&state)?;
     if !fleet_peer_exists(&state, peer_id).map_err(coded_fleet_error)? {
         return Err(CodedApiError(
             StatusCode::NOT_FOUND,
@@ -10029,6 +10047,7 @@ async fn update_fleet_health_config(
     Json(request): Json<UpdateFleetHealthConfig>,
 ) -> Result<Json<FleetHealthSnapshot>, CodedApiError> {
     let principal = require_administrator(&state, &headers)?;
+    require_fleet_state_leader(&state)?;
     if !fleet_peer_exists(&state, peer_id).map_err(coded_fleet_error)? {
         return Err(CodedApiError(
             StatusCode::NOT_FOUND,
@@ -10067,6 +10086,7 @@ async fn list_fleet_dns_failovers(
     headers: HeaderMap,
 ) -> Result<Json<Vec<FleetDnsFailover>>, CodedApiError> {
     authorize_management(&state, &headers).map_err(coded_management_error)?;
+    require_fleet_state_leader(&state)?;
     Ok(Json(
         state
             .fleet_health
@@ -10083,6 +10103,7 @@ async fn list_fleet_dns_switch_events(
     Path(failover_id): Path<Uuid>,
 ) -> Result<Json<Vec<FleetDnsSwitchEvent>>, CodedApiError> {
     authorize_management(&state, &headers).map_err(coded_management_error)?;
+    require_fleet_state_leader(&state)?;
     let fleet_health = state
         .fleet_health
         .lock()
@@ -10300,6 +10321,7 @@ async fn fleet_overview(
     headers: HeaderMap,
 ) -> Result<Json<FleetOverview>, CodedApiError> {
     authorize_management(&state, &headers).map_err(coded_management_error)?;
+    require_fleet_state_leader(&state)?;
     let peers = state
         .fleet
         .lock()
@@ -10384,6 +10406,7 @@ async fn export_fleet_bundle_v2(
     headers: HeaderMap,
 ) -> Result<Json<linklake_core::fleet_protocol::FleetBundleV2>, CodedApiError> {
     authorize_management(&state, &headers).map_err(coded_management_error)?;
+    require_fleet_state_leader(&state)?;
     state
         .policy_service
         .export_bundle(unix_seconds())
@@ -10672,6 +10695,7 @@ async fn list_fleet_sources_v2(
     headers: HeaderMap,
 ) -> Result<Json<Vec<FleetSourceStatus>>, CodedApiError> {
     authorize_management(&state, &headers).map_err(coded_management_error)?;
+    require_fleet_state_leader(&state)?;
     state
         .policy_service
         .list_sources()
@@ -10713,6 +10737,7 @@ async fn list_fleet_credential_bindings(
     headers: HeaderMap,
 ) -> Result<Json<Vec<FleetCredentialBinding>>, CodedApiError> {
     authorize_management(&state, &headers).map_err(coded_management_error)?;
+    require_fleet_state_leader(&state)?;
     state
         .policy_service
         .list_credential_bindings()
