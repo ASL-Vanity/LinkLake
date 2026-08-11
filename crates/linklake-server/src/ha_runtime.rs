@@ -9,12 +9,13 @@ use crate::{
     target_health::TargetHealthCatalog,
 };
 use std::{
+    collections::VecDeque,
     env,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     sync::watch,
@@ -40,6 +41,16 @@ const DEFAULT_JOB_LEASE_SECONDS: u64 = 30;
 const DEFAULT_TARGET_SUCCESS_THRESHOLD: u32 = 2;
 const DEFAULT_TARGET_FAILURE_THRESHOLD: u32 = 3;
 const DEFAULT_TARGET_STALE_AFTER_SECONDS: u64 = 30;
+const RUNTIME_EVENT_CAPACITY: usize = 64;
+
+#[derive(Clone, Debug)]
+pub(crate) struct HaRuntimeEvent {
+    pub(crate) at_unix_seconds: u64,
+    pub(crate) code: String,
+    pub(crate) severity: String,
+    pub(crate) message: String,
+    pub(crate) fencing_token: Option<u64>,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct HaRuntimeConfig {
@@ -141,6 +152,7 @@ pub(crate) struct HaRuntime {
     leadership_tx: watch::Sender<Option<LeadershipLease>>,
     leader: Arc<AtomicBool>,
     fencing_token: Arc<AtomicU64>,
+    events: Arc<Mutex<VecDeque<HaRuntimeEvent>>>,
     heartbeat: Duration,
 }
 
@@ -175,6 +187,7 @@ impl HaRuntime {
             leadership_tx,
             leader: Arc::new(AtomicBool::new(false)),
             fencing_token: Arc::new(AtomicU64::new(0)),
+            events: Arc::new(Mutex::new(VecDeque::with_capacity(RUNTIME_EVENT_CAPACITY))),
             heartbeat: config.heartbeat,
         })
     }
@@ -188,6 +201,21 @@ impl HaRuntime {
             LeadershipTransition::Follower
         };
         self.publish_leadership(leadership);
+        if let Some(lease) = self.leadership() {
+            self.record_event(
+                "leader_acquired",
+                "info",
+                "HA leadership acquired",
+                Some(lease.fencing_token),
+            );
+        } else {
+            self.record_event(
+                "follower_started",
+                "info",
+                "HA instance is a follower",
+                None,
+            );
+        }
         Ok((member, transition))
     }
 
@@ -209,6 +237,25 @@ impl HaRuntime {
             (true, true) => LeadershipTransition::Retained,
         };
         self.publish_leadership(next);
+        match transition {
+            LeadershipTransition::Gained => {
+                self.record_event(
+                    "leader_acquired",
+                    "info",
+                    "HA leadership acquired",
+                    self.leadership().map(|lease| lease.fencing_token),
+                );
+            }
+            LeadershipTransition::Lost => {
+                self.record_event(
+                    "leader_lost",
+                    "warning",
+                    "HA leadership was lost and mutating work is fenced",
+                    previous.map(|lease| lease.fencing_token),
+                );
+            }
+            LeadershipTransition::Retained | LeadershipTransition::Follower => {}
+        }
         Ok(transition)
     }
 
@@ -232,10 +279,22 @@ impl HaRuntime {
                         }
                         Ok(Err(error)) => {
                             let lost = self.clear_leadership();
+                            self.record_event(
+                                "heartbeat_failed",
+                                "warning",
+                                "HA heartbeat failed; leadership was cleared",
+                                None,
+                            );
                             tracing::warn!(lost_leadership = lost, "HA heartbeat failed closed: {error}");
                         }
                         Err(_) => {
                             let lost = self.clear_leadership();
+                            self.record_event(
+                                "heartbeat_timeout",
+                                "warning",
+                                "HA heartbeat timed out; leadership was cleared",
+                                None,
+                            );
                             tracing::warn!(lost_leadership = lost, "HA heartbeat timed out and leadership was cleared");
                         }
                     }
@@ -296,6 +355,33 @@ impl HaRuntime {
         &self.fleet
     }
 
+    pub(crate) fn recent_events(&self, limit: usize) -> Vec<HaRuntimeEvent> {
+        self.events
+            .lock()
+            .expect("HA runtime event history lock poisoned")
+            .iter()
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    fn record_event(&self, code: &str, severity: &str, message: &str, fencing_token: Option<u64>) {
+        let mut events = self
+            .events
+            .lock()
+            .expect("HA runtime event history lock poisoned");
+        events.push_front(HaRuntimeEvent {
+            at_unix_seconds: unix_seconds(),
+            code: code.to_owned(),
+            severity: severity.to_owned(),
+            message: message.to_owned(),
+            fencing_token,
+        });
+        while events.len() > RUNTIME_EVENT_CAPACITY {
+            events.pop_back();
+        }
+    }
+
     fn publish_leadership(&self, leadership: Option<LeadershipLease>) {
         match leadership {
             Some(lease) => {
@@ -309,6 +395,12 @@ impl HaRuntime {
             }
         }
     }
+}
+
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 fn parse_duration(

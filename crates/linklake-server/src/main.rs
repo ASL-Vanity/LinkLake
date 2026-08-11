@@ -15,6 +15,7 @@ mod fleet;
 mod fleet_coordination;
 mod fleet_health;
 mod ha_coordination;
+mod ha_management;
 mod ha_runtime;
 mod http2_backend;
 pub mod http_backend_pool;
@@ -4407,6 +4408,13 @@ async fn run_server(
             axum::routing::delete(revoke_session),
         )
         .route("/api/v1/status", get(status))
+        .route("/api/v1/ha/overview", get(ha_overview))
+        .route("/api/v1/ha/members", get(ha_members))
+        .route("/api/v1/ha/leader", get(ha_leader))
+        .route("/api/v1/ha/jobs", get(ha_jobs))
+        .route("/api/v1/ha/ports", get(ha_ports))
+        .route("/api/v1/ha/targets", get(ha_targets))
+        .route("/api/v1/ha/events", get(ha_events))
         .route("/api/v1/updates/server", get(server_update_overview))
         .route("/api/v1/updates/server/check", post(check_server_update))
         .route(
@@ -5773,6 +5781,72 @@ async fn status(
             .map_or(0, CertificateManager::certificate_count),
         clients: clients.count(),
     }))
+}
+
+async fn ha_overview(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<ha_management::HaOverview>, ApiError> {
+    authorize_management(&state, &headers)?;
+    ha_management::collect(&state.ha_runtime)
+        .await
+        .map(Json)
+        .map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not read HA overview",
+            )
+        })
+}
+
+async fn ha_members(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ha_management::HaMemberView>>, ApiError> {
+    Ok(Json(ha_overview(State(state), headers).await?.0.members))
+}
+
+async fn ha_leader(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Option<ha_management::LeadershipLeaseView>>, ApiError> {
+    Ok(Json(
+        ha_overview(State(state), headers).await?.0.current_leader,
+    ))
+}
+
+async fn ha_jobs(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ha_management::JobLeaseView>>, ApiError> {
+    Ok(Json(ha_overview(State(state), headers).await?.0.job_leases))
+}
+
+async fn ha_ports(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ha_management::PublicPortLeaseView>>, ApiError> {
+    Ok(Json(
+        ha_overview(State(state), headers).await?.0.port_ownership,
+    ))
+}
+
+async fn ha_targets(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<ha_management::TargetHealthSummary>, ApiError> {
+    Ok(Json(
+        ha_overview(State(state), headers).await?.0.target_health,
+    ))
+}
+
+async fn ha_events(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ha_management::HaEventView>>, ApiError> {
+    Ok(Json(
+        ha_overview(State(state), headers).await?.0.recent_events,
+    ))
 }
 
 async fn metrics(
