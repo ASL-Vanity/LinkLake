@@ -82,6 +82,9 @@ use database::Database;
 use dual_stack_udp::{DualStackUdpSocket, PublicUdpBindMode};
 use ed25519_dalek::{Signature, VerifyingKey};
 use fleet::{FleetCatalog, FleetImportResult, FleetPeer, FleetPolicyBundle, UpsertFleetPeer};
+use fleet_coordination::{
+    FleetConflictInput, FleetConflictState, FleetGenerationInput, FleetSyncState,
+};
 use fleet_health::{
     FleetDnsChangeResult, FleetDnsFailover, FleetDnsSwitchEvent, FleetHealthCatalog,
     FleetHealthConfig, FleetHealthMetrics, FleetHealthSnapshot, FleetHealthState, FleetPeerHealth,
@@ -100,6 +103,7 @@ use linklake_core::{
     ManagedHttpProxy, ManagedHttpRoute, ManagedSecretTunnel, ManagedSocks5Proxy, ManagedTcpTunnel,
     ManagedTlsRoute, ManagedUdpTunnel, API_VERSION, PRODUCT_NAME,
 };
+use linklake_core::fleet_protocol::FleetBundleV2;
 use linklake_update::{SignaturePolicy, UpdateChannel, UpdateProduct};
 use p2p_node_catalog::{P2pNodeCatalog, P2pNodeRecord};
 use policy_service::{
@@ -1496,6 +1500,18 @@ struct FleetPeerSyncResult {
     idempotent: bool,
     conflicts: Vec<String>,
     error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FleetLedgerQuery {
+    source_instance_id: Option<String>,
+    state: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolveFleetConflictRequest {
+    resolution: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -4442,6 +4458,18 @@ async fn run_server(
         .route(
             "/api/v1/fleet/v2/reconcile",
             post(reconcile_fleet_bundle_v2),
+        )
+        .route(
+            "/api/v1/fleet/v2/generations",
+            get(list_fleet_generations_v2),
+        )
+        .route(
+            "/api/v1/fleet/v2/conflicts",
+            get(list_fleet_conflicts_v2),
+        )
+        .route(
+            "/api/v1/fleet/v2/conflicts/:conflict_id/resolve",
+            post(resolve_fleet_conflict_v2),
         )
         .route("/api/v1/fleet/v2/sources", get(list_fleet_sources_v2))
         .route(
@@ -10370,6 +10398,21 @@ async fn reconcile_fleet_bundle_v2(
 ) -> Result<Json<FleetReconcileResult>, CodedApiError> {
     let source_instance_id = request.bundle.source_instance_id;
     let principal = require_fleet_source(&state, &headers, source_instance_id)?;
+    let fencing_token = state
+        .ha_runtime
+        .fencing_token()
+        .map_err(coded_ha_coordination_error)?;
+    let track_generation = !request.dry_run;
+    if track_generation {
+        record_fleet_generation(
+            &state,
+            &request.bundle,
+            FleetSyncState::Applying,
+            1,
+            fencing_token,
+        )
+        .await?;
+    }
     // 与普通策略写入串行化，避免 ownership 检查和实际 CRUD 之间出现竞态窗口。
     let _mutation_guard = state.policy_mutation_lock.lock().await;
     state
@@ -10383,6 +10426,16 @@ async fn reconcile_fleet_bundle_v2(
                 .metrics
                 .fleet_reconcile_failures_total
                 .fetch_add(1, Ordering::Relaxed);
+            if track_generation {
+                record_fleet_generation(
+                    &state,
+                    &request.bundle,
+                    FleetSyncState::Failed,
+                    0,
+                    fencing_token,
+                )
+                .await?;
+            }
             record_audit(
                 &state,
                 "fleet.v2.reconcile.failed",
@@ -10393,6 +10446,17 @@ async fn reconcile_fleet_bundle_v2(
         }
     };
     if !result.conflicts.is_empty() {
+        if track_generation {
+            record_fleet_generation(
+                &state,
+                &request.bundle,
+                FleetSyncState::Conflicted,
+                0,
+                fencing_token,
+            )
+            .await?;
+            record_fleet_conflicts(&state, &result, fencing_token).await?;
+        }
         state
             .metrics
             .fleet_reconcile_conflicts_total
@@ -10440,7 +10504,167 @@ async fn reconcile_fleet_bundle_v2(
             ),
         );
     }
+    if track_generation && result.conflicts.is_empty() {
+        record_fleet_generation(
+            &state,
+            &request.bundle,
+            FleetSyncState::Ready,
+            100,
+            fencing_token,
+        )
+        .await?;
+    }
     Ok(Json(result))
+}
+
+async fn record_fleet_generation(
+    state: &AppState,
+    bundle: &FleetBundleV2,
+    sync_state: FleetSyncState,
+    sync_progress: u8,
+    fencing_token: u64,
+) -> Result<(), CodedApiError> {
+    let resource_count = u64::try_from(bundle.resources.len()).map_err(|_| {
+        coded_ha_coordination_error(anyhow::anyhow!(
+            "Fleet resource count does not fit in the coordination ledger"
+        ))
+    })?;
+    state
+        .ha_runtime
+        .fleet()
+        .record_generation(
+            FleetGenerationInput {
+                source_instance_id: bundle.source_instance_id.to_string(),
+                generation: bundle.generation,
+                revision: bundle.revision.clone(),
+                resource_count,
+                sync_state,
+                sync_progress,
+            },
+            fencing_token,
+        )
+        .await
+        .map(|_| ())
+        .map_err(coded_ha_coordination_error)
+}
+
+async fn record_fleet_conflicts(
+    state: &AppState,
+    result: &FleetReconcileResult,
+    fencing_token: u64,
+) -> Result<(), CodedApiError> {
+    for (index, conflict) in result.conflicts.iter().enumerate() {
+        let resource_id = conflict
+            .resource_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| format!("conflict-{index}"));
+        let conflict_id = stable_fleet_conflict_id(
+            result.source_instance_id,
+            result.generation,
+            &conflict.code,
+            &resource_id,
+            &conflict.message,
+        );
+        state
+            .ha_runtime
+            .fleet()
+            .record_conflict(
+                FleetConflictInput {
+                    conflict_id,
+                    source_instance_id: result.source_instance_id.to_string(),
+                    generation: result.generation,
+                    resource_kind: conflict.code.clone(),
+                    resource_id,
+                    owner_instance_id: None,
+                    conflict_code: conflict.code.clone(),
+                    detail_summary: conflict.message.clone(),
+                },
+                fencing_token,
+            )
+            .await
+            .map_err(coded_ha_coordination_error)?;
+    }
+    Ok(())
+}
+
+fn stable_fleet_conflict_id(
+    source_instance_id: Uuid,
+    generation: u64,
+    conflict_code: &str,
+    resource_id: &str,
+    detail: &str,
+) -> Uuid {
+    let mut digest = Sha256::new();
+    digest.update(b"linklake-fleet-conflict-v1\0");
+    digest.update(source_instance_id.as_bytes());
+    digest.update(generation.to_be_bytes());
+    digest.update(conflict_code.as_bytes());
+    digest.update([0]);
+    digest.update(resource_id.as_bytes());
+    digest.update([0]);
+    digest.update(detail.as_bytes());
+    let digest = digest.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+async fn list_fleet_generations_v2(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<fleet_coordination::FleetGeneration>>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    state
+        .ha_runtime
+        .fleet()
+        .generations()
+        .await
+        .map(Json)
+        .map_err(coded_ha_coordination_error)
+}
+
+async fn list_fleet_conflicts_v2(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<FleetLedgerQuery>,
+) -> Result<Json<Vec<fleet_coordination::FleetConflict>>, CodedApiError> {
+    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    let state_filter = query
+        .state
+        .as_deref()
+        .map(str::parse::<FleetConflictState>)
+        .transpose()
+        .map_err(coded_ha_coordination_error)?;
+    state
+        .ha_runtime
+        .fleet()
+        .conflicts(query.source_instance_id.as_deref(), state_filter)
+        .await
+        .map(Json)
+        .map_err(coded_ha_coordination_error)
+}
+
+async fn resolve_fleet_conflict_v2(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(conflict_id): Path<Uuid>,
+    Json(request): Json<ResolveFleetConflictRequest>,
+) -> Result<Json<Option<fleet_coordination::FleetConflict>>, CodedApiError> {
+    require_administrator(&state, &headers)?;
+    let fencing_token = state
+        .ha_runtime
+        .fencing_token()
+        .map_err(coded_ha_coordination_error)?;
+    state
+        .ha_runtime
+        .fleet()
+        .resolve_conflict(conflict_id, &request.resolution, fencing_token)
+        .await
+        .map(|write| write.map(|write| write.conflict))
+        .map(Json)
+        .map_err(coded_ha_coordination_error)
 }
 
 async fn list_fleet_sources_v2(
@@ -15077,6 +15301,15 @@ fn coded_fleet_error(error: anyhow::Error) -> CodedApiError {
             "fleet catalog operation failed",
         )
     }
+}
+
+fn coded_ha_coordination_error(error: anyhow::Error) -> CodedApiError {
+    tracing::error!("HA coordination operation failed: {error:#}");
+    CodedApiError(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "ha_coordination_unavailable",
+        "HA coordination state is unavailable",
+    )
 }
 
 fn coded_policy_service_error(error: anyhow::Error) -> CodedApiError {
