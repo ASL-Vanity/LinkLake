@@ -22,6 +22,7 @@ mod http_proxy_tunnel;
 mod http_route_catalog;
 mod http_tunnel;
 mod job_leases;
+mod job_supervisor;
 mod lifecycle;
 mod notifications;
 mod p2p_control;
@@ -1879,6 +1880,26 @@ struct CertificateOperationResponse {
 enum CertificateOperation {
     Issue,
     Renew,
+}
+
+struct PreparedCertificateOperation {
+    manager: CertificateManager,
+    route: HttpRoutePolicy,
+    certificate_identifier: String,
+    acme_config: AcmeConfig,
+    operation: CertificateOperation,
+}
+
+struct CertificateJobGuard {
+    state: Arc<AppState>,
+    certificate_identifier: String,
+    route_id: Uuid,
+}
+
+impl Drop for CertificateJobGuard {
+    fn drop(&mut self) {
+        release_certificate_job(&self.state, &self.certificate_identifier, self.route_id);
+    }
 }
 
 struct ApiError(StatusCode, &'static str);
@@ -4924,21 +4945,41 @@ async fn run_server(
     }
     tracing::info!("{PRODUCT_NAME} startup completed; lifecycle is ready");
 
-    record_metrics_history_sample(&state);
-    tokio::spawn(run_metrics_history_sampler(
+    job_supervisor::spawn_leased_job(
         state.clone(),
         shutdown_rx.clone(),
-    ));
-    tokio::spawn(run_alert_evaluator(state.clone(), shutdown_rx.clone()));
-    tokio::spawn(run_notification_delivery_worker(
+        "metrics_history_sampler",
+        "metrics_history",
+        run_metrics_history_sampler,
+    );
+    job_supervisor::spawn_leased_job(
         state.clone(),
         shutdown_rx.clone(),
-    ));
-    tokio::spawn(run_certificate_maintenance(
+        "alert_evaluator",
+        "alert_evaluation",
+        run_alert_evaluator,
+    );
+    job_supervisor::spawn_leased_job(
         state.clone(),
         shutdown_rx.clone(),
-    ));
-    tokio::spawn(run_fleet_health_monitor(state.clone(), shutdown_rx.clone()));
+        "notification_delivery",
+        "notification_delivery",
+        run_notification_delivery_worker,
+    );
+    job_supervisor::spawn_leased_job(
+        state.clone(),
+        shutdown_rx.clone(),
+        "certificate_maintenance",
+        "certificate_maintenance",
+        run_certificate_maintenance,
+    );
+    job_supervisor::spawn_leased_job(
+        state.clone(),
+        shutdown_rx.clone(),
+        "fleet_health_dns_monitor",
+        "fleet_health_dns",
+        run_fleet_health_monitor,
+    );
 
     let management_name = management_task.listener_name;
     let management_result = management_task.task.await.map_err(|error| {
@@ -6881,7 +6922,11 @@ fn record_metrics_history_sample(state: &AppState) {
         .push(sample);
 }
 
-async fn run_metrics_history_sampler(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
+async fn run_metrics_history_sampler(
+    state: Arc<AppState>,
+    mut stop: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    record_metrics_history_sample(&state);
     let start =
         tokio::time::Instant::now() + Duration::from_secs(METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS);
     let mut interval = tokio::time::interval_at(
@@ -6891,9 +6936,9 @@ async fn run_metrics_history_sampler(state: Arc<AppState>, mut shutdown: watch::
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    break;
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    return Ok(());
                 }
             }
             _ = interval.tick() => record_metrics_history_sample(&state),
@@ -6903,24 +6948,27 @@ async fn run_metrics_history_sampler(state: Arc<AppState>, mut shutdown: watch::
 
 async fn run_notification_delivery_worker(
     state: Arc<AppState>,
-    mut shutdown: watch::Receiver<bool>,
-) {
+    mut stop: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     let mut interval =
         tokio::time::interval(Duration::from_secs(NOTIFICATION_DELIVERY_INTERVAL_SECONDS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    break;
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    return Ok(());
                 }
             }
-            _ = interval.tick() => deliver_due_alert_notifications(&state).await,
+            _ = interval.tick() => deliver_due_alert_notifications(&state, &mut stop).await,
         }
     }
 }
 
-async fn deliver_due_alert_notifications(state: &Arc<AppState>) {
+async fn deliver_due_alert_notifications(state: &Arc<AppState>, stop: &mut watch::Receiver<bool>) {
+    if *stop.borrow() {
+        return;
+    }
     // 只领取本轮能够立即执行的数量，避免任务在并发槽外等待到租约过期。
     let claim_limit = NOTIFICATION_DELIVERY_BATCH_SIZE.min(NOTIFICATION_DELIVERY_CONCURRENCY);
     let deliveries = match state
@@ -6937,17 +6985,35 @@ async fn deliver_due_alert_notifications(state: &Arc<AppState>) {
     };
     let mut jobs = tokio::task::JoinSet::new();
     for delivery in deliveries {
+        let mut delivery_stop = stop.clone();
         jobs.spawn(async move {
-            let result = notifications::deliver(&delivery).await;
-            (delivery, result)
+            let result = tokio::select! {
+                changed = delivery_stop.changed() => {
+                    if changed.is_err() || *delivery_stop.borrow() {
+                        return None;
+                    }
+                    notifications::deliver(&delivery).await
+                }
+                result = notifications::deliver(&delivery) => result,
+            };
+            Some((delivery, result))
         });
     }
-    while let Some(result) = jobs.join_next().await {
-        let Ok((delivery, delivery_result)) = result else {
+    while let Some(result) = tokio::select! {
+        changed = stop.changed() => {
+            let _ = changed;
+            return;
+        }
+        result = jobs.join_next() => result,
+    } {
+        let Ok(Some((delivery, delivery_result))) = result else {
             // 子任务异常时保留 delivering 状态；租约到期后会使用同一幂等键重新领取。
             tracing::error!("Alert notification delivery task terminated unexpectedly");
             continue;
         };
+        if *stop.borrow() {
+            return;
+        }
         complete_alert_notification_delivery(state, &delivery, delivery_result);
     }
 }
@@ -7026,7 +7092,10 @@ fn complete_alert_notification_delivery(
     }
 }
 
-async fn run_alert_evaluator(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
+async fn run_alert_evaluator(
+    state: Arc<AppState>,
+    mut stop: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     let start = tokio::time::Instant::now() + Duration::from_secs(2);
     let mut interval = tokio::time::interval_at(
         start,
@@ -7035,17 +7104,20 @@ async fn run_alert_evaluator(state: Arc<AppState>, mut shutdown: watch::Receiver
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    break;
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    return Ok(());
                 }
             }
-            _ = interval.tick() => evaluate_alerts(&state).await,
+            _ = interval.tick() => evaluate_alerts(&state, &mut stop).await,
         }
     }
 }
 
-async fn evaluate_alerts(state: &Arc<AppState>) {
+async fn evaluate_alerts(state: &Arc<AppState>, stop: &mut watch::Receiver<bool>) {
+    if *stop.borrow() {
+        return;
+    }
     let rules = match state
         .alerts
         .lock()
@@ -7059,6 +7131,9 @@ async fn evaluate_alerts(state: &Arc<AppState>) {
         }
     };
     let signals = collect_alert_signals(state, &rules);
+    if *stop.borrow() {
+        return;
+    }
     let notifications = match state
         .alerts
         .lock()
@@ -7072,6 +7147,9 @@ async fn evaluate_alerts(state: &Arc<AppState>) {
         }
     };
     for notification in notifications {
+        if *stop.borrow() {
+            return;
+        }
         let action = if notification.resolved {
             "alert.resolved"
         } else {
@@ -8163,7 +8241,7 @@ async fn set_http_route_tls(
     Json(mut request): Json<UpdateRouteTlsPolicy>,
 ) -> Result<Json<RouteTlsPolicy>, CodedApiError> {
     authorize_management(&state, &headers).map_err(coded_management_error)?;
-    let route = http_route_policy_for_id(&state, route_id)?.ok_or(CodedApiError(
+    let route = http_route_policy_for_id(state, route_id)?.ok_or(CodedApiError(
         StatusCode::NOT_FOUND,
         "unknown_http_route",
         "HTTP route does not exist",
@@ -8485,6 +8563,24 @@ fn queue_certificate_operation(
     route_id: Uuid,
     operation: CertificateOperation,
 ) -> Result<(), CodedApiError> {
+    let prepared = prepare_certificate_operation(&state, route_id, operation)?;
+    tokio::spawn(run_certificate_operation(
+        state,
+        prepared.manager,
+        prepared.route,
+        prepared.certificate_identifier,
+        prepared.acme_config,
+        prepared.operation,
+        None,
+    ));
+    Ok(())
+}
+
+fn prepare_certificate_operation(
+    state: &Arc<AppState>,
+    route_id: Uuid,
+    operation: CertificateOperation,
+) -> Result<PreparedCertificateOperation, CodedApiError> {
     let route = http_route_policy_for_id(&state, route_id)?.ok_or(CodedApiError(
         StatusCode::NOT_FOUND,
         "unknown_http_route",
@@ -8591,7 +8687,7 @@ fn queue_certificate_operation(
             "certificate operation was attempted too recently",
         ));
     }
-    if !reserve_certificate_job(&state, &route, &certificate_identifier)? {
+    if !reserve_certificate_job(state, &route, &certificate_identifier)? {
         return Err(CodedApiError(
             StatusCode::CONFLICT,
             "certificate_operation_in_progress",
@@ -8602,8 +8698,8 @@ fn queue_certificate_operation(
         CertificateOperation::Issue => CertificateStatus::Issuing,
         CertificateOperation::Renew => CertificateStatus::Renewing,
     };
-    if let Err(error) = mark_certificate_operation_status(&state, route_id, target_status) {
-        release_certificate_job(&state, &certificate_identifier, route_id);
+    if let Err(error) = mark_certificate_operation_status(state, route_id, target_status) {
+        release_certificate_job(state, &certificate_identifier, route_id);
         return Err(error);
     }
     state
@@ -8617,7 +8713,7 @@ fn queue_certificate_operation(
             .fetch_add(1, Ordering::Relaxed);
     }
     record_audit(
-        &state,
+        state,
         match operation {
             CertificateOperation::Issue => "certificate.issue.started",
             CertificateOperation::Renew => "certificate.renew.started",
@@ -8628,15 +8724,13 @@ fn queue_certificate_operation(
             route.hostname, certificate_identifier
         ),
     );
-    tokio::spawn(run_certificate_operation(
-        state,
+    Ok(PreparedCertificateOperation {
         manager,
         route,
         certificate_identifier,
         acme_config,
         operation,
-    ));
-    Ok(())
+    })
 }
 
 fn reserve_certificate_job(
@@ -8732,16 +8826,40 @@ async fn run_certificate_operation(
     certificate_identifier: String,
     acme_config: AcmeConfig,
     operation: CertificateOperation,
+    mut stop: Option<watch::Receiver<bool>>,
 ) {
+    let _job_guard = CertificateJobGuard {
+        state: state.clone(),
+        certificate_identifier: certificate_identifier.clone(),
+        route_id: route.id,
+    };
     let issue_config = certificate_manager::AcmeIssueConfig {
         directory_url: acme_config.directory_url,
         contact_email: acme_config.contact_email,
         challenge_type: acme_config.challenge_type,
         root_ca_path: std::env::var_os("LINKLAKE_ACME_ROOT_CA_PATH").map(PathBuf::from),
     };
-    let result = manager
-        .issue_certificate(&certificate_identifier, &issue_config)
-        .await;
+    let result = if let Some(stop) = stop.as_mut() {
+        let result = tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() { None } else { None }
+            }
+            result = manager.issue_certificate(&certificate_identifier, &issue_config) => Some(result),
+        };
+        let Some(result) = result else {
+            manager.remove_certificate(&certificate_identifier);
+            return;
+        };
+        result
+    } else {
+        manager
+            .issue_certificate(&certificate_identifier, &issue_config)
+            .await
+    };
+    if stop.as_ref().is_some_and(|stop| *stop.borrow()) {
+        manager.remove_certificate(&certificate_identifier);
+        return;
+    }
     let now = unix_seconds() as i64;
     match result {
         Ok(result) => {
@@ -8845,7 +8963,6 @@ async fn run_certificate_operation(
             }
         }
     }
-    release_certificate_job(&state, &certificate_identifier, route.id);
 }
 
 fn certificate_target_matches(
@@ -9092,19 +9209,36 @@ fn restore_managed_certificates(state: &Arc<AppState>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_certificate_maintenance(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
+async fn run_certificate_maintenance(
+    state: Arc<AppState>,
+    mut stop: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     let start = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut interval = tokio::time::interval_at(start, Duration::from_secs(60));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut operations = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
-            _ = shutdown.changed() => break,
-            _ = interval.tick() => scan_certificate_maintenance(state.clone()),
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    return Ok(());
+                }
+            }
+            _ = interval.tick() => {
+                scan_certificate_maintenance(state.clone(), &mut stop, &mut operations).await;
+            }
         }
     }
 }
 
-fn scan_certificate_maintenance(state: Arc<AppState>) {
+async fn scan_certificate_maintenance(
+    state: Arc<AppState>,
+    stop: &mut watch::Receiver<bool>,
+    operations: &mut tokio::task::JoinSet<()>,
+) {
+    if *stop.borrow() {
+        return;
+    }
     let config_enabled = state
         .certificate_catalog
         .lock()
@@ -9124,6 +9258,9 @@ fn scan_certificate_maintenance(state: Arc<AppState>) {
     };
     let now = unix_seconds() as i64;
     for route in routes.into_iter().filter(|route| route.enabled) {
+        if *stop.borrow() {
+            return;
+        }
         let (tls_policy, certificate) = {
             let catalog = state
                 .certificate_catalog
@@ -9142,6 +9279,9 @@ fn scan_certificate_maintenance(state: Arc<AppState>) {
         if certificate.as_ref().is_some_and(|certificate| {
             certificate.status != CertificateStatus::Error && certificate.expired_at(now)
         }) {
+            if *stop.borrow() {
+                return;
+            }
             if let Some(manager) = &state.certificate_manager {
                 manager.remove_certificate(&certificate_identifier);
             }
@@ -9150,6 +9290,9 @@ fn scan_certificate_maintenance(state: Arc<AppState>) {
             .as_ref()
             .is_some_and(|certificate| certificate.expired_at(now))
         {
+            if *stop.borrow() {
+                return;
+            }
             if let Some(manager) = &state.certificate_manager {
                 manager.remove_certificate(&certificate_identifier);
             }
@@ -9161,7 +9304,35 @@ fn scan_certificate_maintenance(state: Arc<AppState>) {
         let operation =
             select_certificate_maintenance_operation(certificate.as_ref(), has_certificate, now);
         if let Some(operation) = operation {
-            let _ = queue_certificate_operation(state.clone(), route.id, operation);
+            if *stop.borrow() {
+                return;
+            }
+            match prepare_certificate_operation(&state, route.id, operation) {
+                Ok(prepared) => {
+                    operations.spawn(run_certificate_operation(
+                        state.clone(),
+                        prepared.manager,
+                        prepared.route,
+                        prepared.certificate_identifier,
+                        prepared.acme_config,
+                        prepared.operation,
+                        Some(stop.clone()),
+                    ));
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    while let Some(result) = tokio::select! {
+        changed = stop.changed() => {
+            let _ = changed;
+            return;
+        }
+        result = operations.join_next() => result,
+    } {
+        if let Err(error) = result {
+            tracing::warn!(%error, "certificate maintenance operation task stopped unexpectedly");
         }
     }
 }
@@ -11167,7 +11338,10 @@ fn fleet_probe_interval_seconds() -> u64 {
         .clamp(5, 3_600)
 }
 
-async fn run_fleet_health_monitor(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
+async fn run_fleet_health_monitor(
+    state: Arc<AppState>,
+    mut stop: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(8))
         .redirect(reqwest::redirect::Policy::none())
@@ -11175,21 +11349,20 @@ async fn run_fleet_health_monitor(state: Arc<AppState>, mut shutdown: watch::Rec
     {
         Ok(client) => client,
         Err(error) => {
-            tracing::error!("Could not initialize Fleet health HTTP client: {error}");
-            return;
+            return Err(error).context("Could not initialize Fleet health HTTP client");
         }
     };
     let mut interval = tokio::time::interval(Duration::from_secs(fleet_probe_interval_seconds()));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    break;
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    return Ok(());
                 }
             }
             _ = interval.tick() => {
-                if let Err(error) = run_fleet_probe_round(&state, &client).await {
+                if let Err(error) = run_fleet_probe_round(&state, &client, &mut stop).await {
                     tracing::error!("Fleet health probe round failed: {error}");
                 }
             }
@@ -11200,7 +11373,11 @@ async fn run_fleet_health_monitor(state: Arc<AppState>, mut shutdown: watch::Rec
 async fn run_fleet_probe_round(
     state: &Arc<AppState>,
     client: &reqwest::Client,
+    stop: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    if *stop.borrow() {
+        return Ok(());
+    }
     let peers = state
         .fleet
         .lock()
@@ -11214,23 +11391,38 @@ async fn run_fleet_probe_round(
     for peer in peers {
         let client = client.clone();
         let permits = permits.clone();
+        let mut peer_stop = stop.clone();
         probes.spawn(async move {
             let _permit = permits
                 .acquire_owned()
                 .await
                 .expect("Fleet probe semaphore closed unexpectedly");
             let peer_id = peer.id;
-            (peer_id, probe_fleet_peer(&client, peer).await)
+            let observation = tokio::select! {
+                _ = peer_stop.changed() => None,
+                observation = probe_fleet_peer(&client, peer) => Some(observation),
+            };
+            (peer_id, observation)
         });
     }
-    while let Some(result) = probes.join_next().await {
+    while let Some(result) = tokio::select! {
+        changed = stop.changed() => {
+            let _ = changed;
+            return Ok(());
+        }
+        result = probes.join_next() => result,
+    } {
         let (peer_id, observation) = match result {
-            Ok(result) => result,
+            Ok((peer_id, Some(observation))) => (peer_id, observation),
+            Ok((_peer_id, None)) => return Ok(()),
             Err(error) => {
                 tracing::warn!("Fleet health probe task failed: {error}");
                 continue;
             }
         };
+        if *stop.borrow() {
+            return Ok(());
+        }
         let result = state
             .fleet_health
             .lock()
@@ -11254,7 +11446,10 @@ async fn run_fleet_probe_round(
             );
         }
     }
-    if let Err(error) = execute_fleet_dns_reconciliation(state, None).await {
+    if *stop.borrow() {
+        return Ok(());
+    }
+    if let Err(error) = execute_fleet_dns_reconciliation_with_stop(state, None, stop).await {
         tracing::error!("Fleet DNS reconciliation failed: {error}");
     }
     Ok(())
@@ -11382,6 +11577,18 @@ async fn execute_fleet_dns_reconciliation(
     state: &Arc<AppState>,
     only: Option<Uuid>,
 ) -> anyhow::Result<Vec<FleetDnsChangeResult>> {
+    let (_stop_tx, mut stop) = watch::channel(false);
+    execute_fleet_dns_reconciliation_with_stop(state, only, &mut stop).await
+}
+
+async fn execute_fleet_dns_reconciliation_with_stop(
+    state: &Arc<AppState>,
+    only: Option<Uuid>,
+    stop: &mut watch::Receiver<bool>,
+) -> anyhow::Result<Vec<FleetDnsChangeResult>> {
+    if *stop.borrow() {
+        return Ok(Vec::new());
+    }
     let plans = state
         .fleet_health
         .lock()
@@ -11396,10 +11603,20 @@ async fn execute_fleet_dns_reconciliation(
         .build()?;
     let mut results = Vec::with_capacity(plans.len());
     for plan in plans {
-        let apply_error = fleet_health::apply_cloudflare_dns_change(&client, &plan)
-            .await
-            .err()
-            .map(|error| error.to_string());
+        if *stop.borrow() {
+            return Ok(results);
+        }
+        let apply_result = tokio::select! {
+            changed = stop.changed() => {
+                let _ = changed;
+                return Ok(results);
+            }
+            result = fleet_health::apply_cloudflare_dns_change(&client, &plan) => result,
+        };
+        if *stop.borrow() {
+            return Ok(results);
+        }
+        let apply_error = apply_result.err().map(|error| error.to_string());
         let completion = state
             .fleet_health
             .lock()

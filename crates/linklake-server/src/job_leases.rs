@@ -63,6 +63,11 @@ impl JobLeases {
         })
     }
 
+    /// 返回适合 supervisor 使用的续租间隔，保证在租约过期前有多次续租机会。
+    pub(crate) fn renewal_interval(&self) -> Duration {
+        Duration::from_secs((self.lease_seconds / 3).max(1))
+    }
+
     pub(crate) async fn acquire(
         &self,
         job_key: &str,
