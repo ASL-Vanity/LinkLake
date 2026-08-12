@@ -1,6 +1,7 @@
 use crate::{
     client_registry::Authentication,
     record_audit,
+    target_probe::TargetProbeSet,
     tcp_tunnel::{copy_bidirectional_with_limit, BandwidthLimiter},
     traffic_control::{TrafficDecision, TrafficPolicyKind},
     AppState,
@@ -35,6 +36,8 @@ struct SecretTunnelContext {
     provider_client_id: Uuid,
     command_tx: mpsc::Sender<ControlFrame>,
     stop: watch::Receiver<()>,
+    target_probes: TargetProbeSet,
+    target_sequence: AtomicU64,
     permits: Arc<Semaphore>,
     statistics: Arc<SecretTunnelStatistics>,
     bandwidth_limiter: Option<Arc<BandwidthLimiter>>,
@@ -79,9 +82,48 @@ pub(crate) async fn register_provider(
         .await;
         return;
     };
+    let target_probes = match TargetProbeSet::new(
+        runtime_policy.policy_id,
+        "secret",
+        &runtime_policy.target_addr,
+        linklake_core::TargetHealthProbeKind::Tcp,
+        None,
+    ) {
+        Ok(probes) => probes,
+        Err(error) => {
+            tracing::warn!(
+                policy_id = %runtime_policy.policy_id,
+                "Secret tunnel target health configuration is invalid: {error}"
+            );
+            reject(
+                &state,
+                &mut stream,
+                "secret tunnel target health configuration is invalid",
+            )
+            .await;
+            return;
+        }
+    };
 
     let (command_tx, command_rx) = mpsc::channel(64);
     let (stop_tx, stop_rx) = watch::channel(());
+    let probe_task =
+        match target_probes.spawn_scheduler(state.clone(), command_tx.clone(), stop_rx.clone()) {
+            Ok(task) => task,
+            Err(error) => {
+                tracing::warn!(
+                    policy_id = %runtime_policy.policy_id,
+                    "Secret tunnel target health scheduler unavailable: {error}"
+                );
+                reject(
+                    &state,
+                    &mut stream,
+                    "secret tunnel target health is temporarily unavailable",
+                )
+                .await;
+                return;
+            }
+        };
     let registration_id = Uuid::new_v4();
     let statistics = state
         .secret_tunnel_statistics
@@ -92,8 +134,10 @@ pub(crate) async fn register_provider(
         .clone();
     let context = Arc::new(SecretTunnelContext {
         provider_client_id: runtime_policy.provider_client_id,
-        command_tx,
+        command_tx: command_tx.clone(),
         stop: stop_rx.clone(),
+        target_probes: target_probes.clone(),
+        target_sequence: AtomicU64::new(0),
         permits: Arc::new(Semaphore::new(runtime_policy.max_connections)),
         statistics,
         bandwidth_limiter: runtime_policy
@@ -138,6 +182,7 @@ pub(crate) async fn register_provider(
     .is_err()
     {
         remove_registration(&state, runtime_policy.policy_id, registration_id);
+        probe_task.abort();
         return;
     }
     run_provider_control(
@@ -147,9 +192,11 @@ pub(crate) async fn register_provider(
         reader,
         writer,
         command_rx,
+        target_probes,
         stop_rx,
     )
     .await;
+    probe_task.abort();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -160,6 +207,7 @@ async fn run_provider_control(
     mut reader: ReadHalf<BoxedIo>,
     mut writer: WriteHalf<BoxedIo>,
     mut commands: mpsc::Receiver<ControlFrame>,
+    target_probes: TargetProbeSet,
     mut stop: watch::Receiver<()>,
 ) {
     let (frames_tx, mut frames_rx) = mpsc::channel(16);
@@ -190,6 +238,20 @@ async fn run_provider_control(
                     if write_control_frame(&mut writer, &ControlFrame::ControlHeartbeatAck { nonce }).await.is_err() {
                         break;
                     }
+                }
+                Some(ControlFrame::TargetHealthProbeResult { result }) => {
+                    if let Err(error) = target_probes.record_result(&state, result).await {
+                        state
+                            .metrics
+                            .control_protocol_errors_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            policy_id = %policy_id,
+                            "Rejected Secret target health result: {error}"
+                        );
+                        break;
+                    }
+                    idle_timeout.as_mut().reset(Instant::now() + CONTROL_IDLE_TIMEOUT);
                 }
                 Some(_) => {
                     state.metrics.control_protocol_errors_total.fetch_add(1, Ordering::Relaxed);
@@ -277,6 +339,28 @@ pub(crate) async fn connect_visitor(
         .await;
         return;
     };
+    let target_addr = match context.select_healthy_target(&state).await {
+        Ok(Some(target)) => target,
+        Ok(None) => {
+            reject(
+                &state,
+                &mut visitor_stream,
+                "secret tunnel has no healthy target",
+            )
+            .await;
+            return;
+        }
+        Err(error) => {
+            tracing::warn!("Secret target health selection failed: {error}");
+            reject(
+                &state,
+                &mut visitor_stream,
+                "secret tunnel target health is temporarily unavailable",
+            )
+            .await;
+            return;
+        }
+    };
     let Ok(_policy_permit) = context.permits.clone().try_acquire_owned() else {
         context
             .statistics
@@ -334,7 +418,10 @@ pub(crate) async fn connect_visitor(
         .insert(connection_id, (context.provider_client_id, data_tx));
     if context
         .command_tx
-        .send(ControlFrame::OpenSecretConnection { connection_id })
+        .send(ControlFrame::OpenSecretConnection {
+            connection_id,
+            target_addr: Some(target_addr),
+        })
         .await
         .is_err()
     {
@@ -508,6 +595,31 @@ fn authenticated_client(state: &AppState, client_id: Uuid, token: &str) -> bool 
         clients.authenticate_and_touch(client_id, token),
         Ok(Authentication::Authenticated)
     )
+}
+
+impl SecretTunnelContext {
+    async fn select_healthy_target(&self, state: &AppState) -> anyhow::Result<Option<String>> {
+        let sequence = self.target_sequence.fetch_add(1, Ordering::Relaxed);
+        self.target_probes
+            .select_healthy_target(state, sequence)
+            .await
+    }
+}
+
+pub(crate) async fn select_healthy_target(
+    state: &AppState,
+    policy_id: Uuid,
+) -> anyhow::Result<Option<String>> {
+    let context = state
+        .secret_tunnels
+        .lock()
+        .expect("secret tunnel registry lock poisoned")
+        .get(&policy_id)
+        .map(|registration| registration.context.clone());
+    let Some(context) = context else {
+        return Ok(None);
+    };
+    context.select_healthy_target(state).await
 }
 
 async fn reject(state: &AppState, stream: &mut BoxedIo, message: &str) {

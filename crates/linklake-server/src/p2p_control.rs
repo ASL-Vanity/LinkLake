@@ -133,12 +133,23 @@ pub(crate) async fn request_session(
         .flatten()
         .filter(|node| node_is_fresh(node.updated_unix_seconds, now))
         .map_or_else(Vec::new, |node| node.candidates);
+    let Some(target_addr) = crate::secret_tunnel::select_healthy_target(&state, policy.policy_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!("P2P Secret target health selection failed: {error}");
+        })
+        .ok()
+        .flatten()
+    else {
+        reject(&mut stream, "secret tunnel has no healthy target").await;
+        return;
+    };
     let session_id = Uuid::new_v4();
     let claims = P2pTicketClaims {
         session_id,
         provider_client_id: policy.provider_client_id,
         visitor_client_id,
-        target_addr: policy.target_addr,
+        target_addr,
         issued_unix_seconds: now,
         expires_unix_seconds: now + TICKET_LIFETIME_SECONDS,
         protocol_version: P2P_PROTOCOL_VERSION,

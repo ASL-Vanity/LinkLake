@@ -375,6 +375,8 @@ pub enum ControlFrame {
     },
     OpenSecretConnection {
         connection_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_addr: Option<String>,
     },
     RegisterSocks5Proxy {
         client_id: Uuid,
@@ -766,6 +768,30 @@ mod tests {
         let read = read_control_frame(&mut reader);
         let (_, actual) = tokio::join!(write, read);
         assert_eq!(actual.expect("frame should decode"), expected);
+    }
+
+    #[tokio::test]
+    async fn secret_target_selection_round_trips_and_legacy_frames_remain_compatible() {
+        let connection_id = Uuid::new_v4();
+        let expected = ControlFrame::OpenSecretConnection {
+            connection_id,
+            target_addr: Some("127.0.0.1:3389".to_owned()),
+        };
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        let write = write_control_frame(&mut writer, &expected);
+        let read = read_control_frame(&mut reader);
+        let (_, actual) = tokio::join!(write, read);
+        assert_eq!(actual.expect("Secret target frame should decode"), expected);
+
+        let legacy =
+            format!(r#"{{"kind":"open_secret_connection","connection_id":"{connection_id}"}}"#);
+        assert_eq!(
+            serde_json::from_str::<ControlFrame>(&legacy).expect("legacy frame should decode"),
+            ControlFrame::OpenSecretConnection {
+                connection_id,
+                target_addr: None,
+            }
+        );
     }
 
     #[tokio::test]

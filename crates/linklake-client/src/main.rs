@@ -4425,19 +4425,35 @@ async fn run_secret_target_session(
         },
     )
     .await?;
-    match read_control_frame(&mut stream).await? {
+    let policy_id = match read_control_frame(&mut stream).await? {
         ControlFrame::SecretTunnelRegistered { tunnel_id } => {
             tracing::info!("Secret tunnel target registered as {tunnel_id}.");
+            tunnel_id
         }
         ControlFrame::Error { message } => {
             anyhow::bail!("server rejected secret tunnel target: {message}")
         }
         frame => anyhow::bail!("unexpected secret tunnel registration response: {frame:?}"),
-    }
+    };
+    let probe_session = target_probe::TargetProbeSession::new(
+        policy_id,
+        target_probe::TargetProbePolicy::Secret,
+        &target,
+    )?;
     let (reader, writer) = split(stream);
-    let heartbeat = tokio::spawn(send_control_heartbeats(writer));
-    let result = read_registered_control(reader, transport, target, client_id, token, None).await;
-    heartbeat.abort();
+    let (command_tx, mut writer_task) = target_probe::spawn_control_writer(writer);
+    let result = tokio::select! {
+        result = read_registered_control(
+            reader,
+            transport,
+            target,
+            client_id,
+            token,
+            Some((probe_session, command_tx)),
+        ) => result,
+        writer = &mut writer_task => control_writer_result(writer),
+    };
+    writer_task.abort();
     result
 }
 
@@ -5062,8 +5078,7 @@ async fn read_registered_control(
             .await
             .map_err(|_| anyhow::anyhow!("control heartbeat acknowledgement timed out"))??;
         match frame {
-            ControlFrame::OpenTcpConnection { connection_id }
-            | ControlFrame::OpenSecretConnection { connection_id } => {
+            ControlFrame::OpenTcpConnection { connection_id } => {
                 let transport = transport.clone();
                 let slot = target_sequence.fetch_add(1, Ordering::Relaxed);
                 let target = match &probe_control {
@@ -5083,6 +5098,44 @@ async fn read_registered_control(
                             .await
                     {
                         tracing::warn!("TCP tunnel connection {connection_id} failed: {error}");
+                    }
+                });
+            }
+            ControlFrame::OpenSecretConnection {
+                connection_id,
+                target_addr,
+            } => {
+                let transport = transport.clone();
+                let slot = target_sequence.fetch_add(1, Ordering::Relaxed);
+                let target = match (&probe_control, target_addr) {
+                    (Some((probe_session, _)), Some(target))
+                        if probe_session.is_healthy(&target) =>
+                    {
+                        Some(target)
+                    }
+                    (Some(_), Some(_)) => None,
+                    (Some((probe_session, _)), None) => probe_session.select_target(slot),
+                    (None, Some(target))
+                        if targets.iter().any(|candidate| candidate.address == target) =>
+                    {
+                        Some(target)
+                    }
+                    (None, Some(_)) => None,
+                    (None, None) => select_weighted_target(&targets, slot).map(str::to_owned),
+                };
+                let Some(target) = target else {
+                    tracing::warn!(
+                        "Rejected secret connection {connection_id} because the selected target is not healthy or does not belong to the policy."
+                    );
+                    continue;
+                };
+                let token = token.clone();
+                tokio::spawn(async move {
+                    if let Err(error) =
+                        open_tcp_data_connection(transport, target, client_id, token, connection_id)
+                            .await
+                    {
+                        tracing::warn!("Secret tunnel connection {connection_id} failed: {error}");
                     }
                 });
             }

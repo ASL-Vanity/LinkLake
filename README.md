@@ -12,7 +12,7 @@ LinkLake 的代码实现、自动化测试与项目文档由 OpenAI GPT-5.6 完�
 
 ## 高级网络与安全
 
-- TCP、UDP、HTTP、TLS SNI 和 Secret 目标支持加权目标池，例如 `127.0.0.1:2333@2,127.0.0.1:2444@1`；权重只参与新连接或新会话的加权轮询，最多 16 个目标，不会复制展开目标列表。
+- TCP、UDP、HTTP、TLS SNI 和 Secret 目标支持加权目标池，例如 `127.0.0.1:2333@2,127.0.0.1:2444@1`；权重只参与新连接或新会话的加权轮询，最多 16 个目标，不会复制展开目标列表。所有协议都会先经过客户端实际探测并在服务端共享健康状态，首轮探测前、状态过期或全部目标不健康时默认拒绝新流量；Secret 的中继连接与 P2P 票据都会绑定到一个已验证的具体目标。
 - 每条策略可配置允许/拒绝 CIDR、每分钟新连接上限、UTC 星期/时间窗口和持久化 UTC 日流量配额。Web UI 与 Flutter Manager 均可编辑，TCP、UDP、端口组、HTTP、SNI、Secret 中继、SOCKS5 TCP/UDP 与 HTTP Proxy 均计入控制。
 - Secret 访问端推荐使用 `path_policy = "prefer_direct"`；也可设置 `direct_only` 或 `relay_only`。旧配置 `prefer_direct = true/false` 继续兼容。
 - 管理平面支持 RFC 6238 TOTP、活动会话撤销，以及只显示一次、数据库仅保存 SHA-256 摘要的 `llapi_` API Token；权限范围为 `read`、`write`、`administrator`。Fleet 写入 Token 还可绑定唯一 `fleet_source_instance_id`，接收端拒绝未绑定或来源不匹配的 reconcile。

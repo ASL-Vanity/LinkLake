@@ -12,7 +12,7 @@ The current release completes production TCP and UDP, multi-port/range forwardin
 
 ## Advanced networking and security
 
-- TCP, UDP, HTTP, TLS SNI, and Secret targets accept weighted pools such as `127.0.0.1:2333@2,127.0.0.1:2444@1`. Weights select new connections or sessions without expanding the list; one pool supports up to 16 targets.
+- TCP, UDP, HTTP, TLS SNI, and Secret targets accept weighted pools such as `127.0.0.1:2333@2,127.0.0.1:2444@1`. Weights select new connections or sessions without expanding the list; one pool supports up to 16 targets. Every protocol first uses client-side application probes and shared server-side health state, so new traffic fails closed before the first successful probe, after health expires, or when every target is unhealthy. Secret relay connections and P2P tickets are bound to one verified concrete target.
 - Every policy can define allow/deny CIDRs, new connections per minute, UTC weekday/time windows, and a persistent UTC daily byte quota. Web UI and Flutter Manager can edit these controls; TCP, UDP, port groups, HTTP, SNI, Secret relay, SOCKS5 TCP/UDP, and HTTP Proxy usage is accounted.
 - Secret visitors should use `path_policy = "prefer_direct"`; `direct_only` and `relay_only` are also supported. Legacy `prefer_direct = true/false` remains compatible.
 - The management plane supports RFC 6238 TOTP, active-session revocation, and one-time `llapi_` API tokens stored only as SHA-256 digests. Scopes are `read`, `write`, and `administrator`.

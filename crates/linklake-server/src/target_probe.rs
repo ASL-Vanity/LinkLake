@@ -236,6 +236,47 @@ impl TargetProbeSet {
         self.policy_id
     }
 
+    pub(crate) async fn select_healthy_target(
+        &self,
+        state: &AppState,
+        sequence: u64,
+    ) -> anyhow::Result<Option<String>> {
+        let mut targets = self
+            .targets
+            .iter()
+            .map(|(target_key, target)| (target_key.clone(), target.clone()))
+            .collect::<Vec<_>>();
+        targets.sort_by(|left, right| left.1.address.cmp(&right.1.address));
+
+        let mut healthy = Vec::with_capacity(targets.len());
+        let mut total_weight = 0_u64;
+        for (target_key, target) in targets {
+            let health = state.ha_runtime.target_health().get(&target_key).await?;
+            if !health
+                .is_some_and(|health| health.effective_healthy && health.weight == target.weight)
+            {
+                continue;
+            }
+            total_weight = total_weight
+                .checked_add(u64::from(target.weight))
+                .ok_or_else(|| anyhow::anyhow!("healthy target weight overflow"))?;
+            healthy.push(target);
+        }
+        if total_weight == 0 {
+            return Ok(None);
+        }
+
+        let mut slot = sequence % total_weight;
+        for target in healthy {
+            let weight = u64::from(target.weight);
+            if slot < weight {
+                return Ok(Some(target.address));
+            }
+            slot -= weight;
+        }
+        anyhow::bail!("healthy target selection invariant failed")
+    }
+
     fn track_probe(&self, probe: &TargetHealthProbeRequest, now: Instant) -> anyhow::Result<()> {
         let target = self
             .targets
@@ -318,9 +359,9 @@ fn validate_probe_semantics(
     server_name: Option<&str>,
 ) -> anyhow::Result<()> {
     let valid = match (policy_kind, kind, server_name) {
-        ("tcp", TargetHealthProbeKind::Tcp, None) | ("udp", TargetHealthProbeKind::Udp, None) => {
-            true
-        }
+        ("tcp", TargetHealthProbeKind::Tcp, None)
+        | ("secret", TargetHealthProbeKind::Tcp, None)
+        | ("udp", TargetHealthProbeKind::Udp, None) => true,
         ("http", TargetHealthProbeKind::Http, Some(name))
         | ("sni", TargetHealthProbeKind::Tls, Some(name)) => !name.trim().is_empty(),
         _ => false,
@@ -432,6 +473,22 @@ mod tests {
             "127.0.0.1:80",
             TargetHealthProbeKind::Http,
             Some("example.com".to_owned()),
+        )
+        .is_err());
+        assert!(TargetProbeSet::new(
+            policy_id,
+            "secret",
+            "127.0.0.1:3389",
+            TargetHealthProbeKind::Tcp,
+            None,
+        )
+        .is_ok());
+        assert!(TargetProbeSet::new(
+            policy_id,
+            "secret",
+            "127.0.0.1:3389",
+            TargetHealthProbeKind::Udp,
+            None,
         )
         .is_err());
         assert!(TargetProbeSet::new(

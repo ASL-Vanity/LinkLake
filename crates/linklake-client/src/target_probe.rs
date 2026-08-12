@@ -40,6 +40,7 @@ const LOCAL_HEALTH_TTL: Duration = Duration::from_secs(25);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum TargetProbePolicy {
     Tcp,
+    Secret,
     Http { server_name: String },
     Tls { server_name: String },
     Udp,
@@ -49,6 +50,7 @@ impl TargetProbePolicy {
     fn key_kind(&self) -> &'static str {
         match self {
             Self::Tcp => "tcp",
+            Self::Secret => "secret",
             Self::Http { .. } => "http",
             Self::Tls { .. } => "sni",
             Self::Udp => "udp",
@@ -57,7 +59,7 @@ impl TargetProbePolicy {
 
     fn probe_kind(&self) -> TargetHealthProbeKind {
         match self {
-            Self::Tcp => TargetHealthProbeKind::Tcp,
+            Self::Tcp | Self::Secret => TargetHealthProbeKind::Tcp,
             Self::Http { .. } => TargetHealthProbeKind::Http,
             Self::Tls { .. } => TargetHealthProbeKind::Tls,
             Self::Udp => TargetHealthProbeKind::Udp,
@@ -67,7 +69,7 @@ impl TargetProbePolicy {
     fn server_name(&self) -> Option<&str> {
         match self {
             Self::Http { server_name } | Self::Tls { server_name } => Some(server_name),
-            Self::Tcp | Self::Udp => None,
+            Self::Tcp | Self::Secret | Self::Udp => None,
         }
     }
 }
@@ -332,7 +334,7 @@ async fn run_control_writer(
 
 async fn execute_probe(policy: &TargetProbePolicy, target_addr: &str) -> Result<(), &'static str> {
     match policy {
-        TargetProbePolicy::Tcp => probe_tcp(target_addr).await,
+        TargetProbePolicy::Tcp | TargetProbePolicy::Secret => probe_tcp(target_addr).await,
         TargetProbePolicy::Http { server_name } => probe_http(target_addr, server_name).await,
         TargetProbePolicy::Tls { server_name } => probe_tls(target_addr, server_name).await,
         TargetProbePolicy::Udp => probe_udp(target_addr).await,
@@ -605,6 +607,28 @@ mod tests {
             None,
         );
         assert!(session.validate_request(&request).is_err());
+    }
+
+    #[test]
+    fn secret_probe_is_bound_to_the_secret_policy_namespace() {
+        let policy_id = Uuid::new_v4();
+        let session =
+            TargetProbeSession::new(policy_id, TargetProbePolicy::Secret, "127.0.0.1:3389")
+                .unwrap();
+        let request = request(
+            policy_id,
+            "tcp",
+            "127.0.0.1:3389",
+            TargetHealthProbeKind::Tcp,
+            None,
+        );
+        assert!(session.validate_request(&request).is_err());
+
+        let request = TargetHealthProbeRequest {
+            target_key: format!("secret:{policy_id}:127.0.0.1:3389"),
+            ..request
+        };
+        assert!(session.validate_request(&request).is_ok());
     }
 
     #[test]
