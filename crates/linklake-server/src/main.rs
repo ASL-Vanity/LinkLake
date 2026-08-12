@@ -98,6 +98,7 @@ use http_route_catalog::{
     UpdateHttpRoutePolicy,
 };
 use lifecycle::{LifecycleController, LifecyclePhase, LifecycleSnapshot, LifecycleTransitionError};
+use linklake_core::fleet_protocol::FleetBundleV2;
 use linklake_core::socks5_fragment::{Socks5FragmentConfig, Socks5FragmentGlobalBudget};
 use linklake_core::{
     agent_enrollment_message, agent_instance_id_from_public_key, managed_config_revision, BoxedIo,
@@ -105,7 +106,6 @@ use linklake_core::{
     ManagedHttpProxy, ManagedHttpRoute, ManagedSecretTunnel, ManagedSocks5Proxy, ManagedTcpTunnel,
     ManagedTlsRoute, ManagedUdpTunnel, API_VERSION, PRODUCT_NAME,
 };
-use linklake_core::fleet_protocol::FleetBundleV2;
 use linklake_update::{SignaturePolicy, UpdateChannel, UpdateProduct};
 use p2p_node_catalog::{P2pNodeCatalog, P2pNodeRecord};
 use policy_service::{
@@ -4505,10 +4505,7 @@ async fn run_server(
             "/api/v1/fleet/v2/generations",
             get(list_fleet_generations_v2),
         )
-        .route(
-            "/api/v1/fleet/v2/conflicts",
-            get(list_fleet_conflicts_v2),
-        )
+        .route("/api/v1/fleet/v2/conflicts", get(list_fleet_conflicts_v2))
         .route(
             "/api/v1/fleet/v2/conflicts/:conflict_id/resolve",
             post(resolve_fleet_conflict_v2),
@@ -10920,19 +10917,34 @@ async fn resolve_fleet_conflict_v2(
     Path(conflict_id): Path<Uuid>,
     Json(request): Json<ResolveFleetConflictRequest>,
 ) -> Result<Json<Option<fleet_coordination::FleetConflict>>, CodedApiError> {
-    require_administrator(&state, &headers)?;
+    let principal = require_operator(&state, &headers)?;
     let fencing_token = state
         .ha_runtime
         .fencing_token()
         .map_err(coded_ha_coordination_error)?;
-    state
+    let conflict = state
         .ha_runtime
         .fleet()
         .resolve_conflict(conflict_id, &request.resolution, fencing_token)
         .await
         .map(|write| write.map(|write| write.conflict))
-        .map(Json)
-        .map_err(coded_ha_coordination_error)
+        .map_err(coded_ha_coordination_error)?;
+    if let Some(conflict) = &conflict {
+        record_audit(
+            &state,
+            "fleet.v2.conflict.resolved",
+            &conflict.conflict_id.to_string(),
+            &format!(
+                "actor={}; source={}; generation={}; resource_kind={}; resource_id={}",
+                principal.username,
+                conflict.source_instance_id,
+                conflict.generation,
+                conflict.resource_kind,
+                conflict.resource_id
+            ),
+        );
+    }
+    Ok(Json(conflict))
 }
 
 async fn list_fleet_sources_v2(
@@ -15045,6 +15057,21 @@ fn require_administrator(
             StatusCode::FORBIDDEN,
             "administrator_required",
             "administrator role is required",
+        ));
+    }
+    Ok(principal)
+}
+
+fn require_operator(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<ManagementPrincipal, CodedApiError> {
+    let principal = management_principal(state, headers).map_err(coded_management_error)?;
+    if !matches!(principal.role, UserRole::Administrator | UserRole::Operator) {
+        return Err(CodedApiError(
+            StatusCode::FORBIDDEN,
+            "operator_required",
+            "operator or administrator role is required",
         ));
     }
     Ok(principal)
