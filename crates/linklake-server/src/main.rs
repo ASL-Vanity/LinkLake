@@ -5775,7 +5775,7 @@ async fn ha_overview(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<ha_management::HaOverview>, ApiError> {
-    authorize_management(&state, &headers)?;
+    authorize_management(&state, &headers).await?;
     ha_management::collect(&state.ha_runtime)
         .await
         .map(Json)
