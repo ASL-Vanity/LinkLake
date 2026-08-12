@@ -4422,6 +4422,7 @@ async fn run_secret_target_session(
             client_token: token.clone(),
             name,
             target_addr: target.clone(),
+            supports_target_binding: Some(true),
         },
     )
     .await?;

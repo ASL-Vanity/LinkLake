@@ -361,6 +361,8 @@ pub enum ControlFrame {
         client_token: String,
         name: String,
         target_addr: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        supports_target_binding: Option<bool>,
     },
     SecretTunnelRegistered {
         tunnel_id: Uuid,

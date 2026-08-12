@@ -62,6 +62,7 @@ pub(crate) async fn register_provider(
     client_token: String,
     name: String,
     target_addr: String,
+    supports_target_binding: bool,
 ) {
     if !authenticated_client(&state, provider_client_id, &client_token) {
         reject(&state, &mut stream, "invalid client credentials").await;
@@ -82,6 +83,15 @@ pub(crate) async fn register_provider(
         .await;
         return;
     };
+    if !supports_target_binding {
+        reject(
+            &state,
+            &mut stream,
+            "secret tunnel client upgrade required for health-bound target selection",
+        )
+        .await;
+        return;
+    }
     let target_probes = match TargetProbeSet::new(
         runtime_policy.policy_id,
         "secret",

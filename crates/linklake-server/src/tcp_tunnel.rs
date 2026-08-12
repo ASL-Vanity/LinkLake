@@ -247,6 +247,7 @@ pub(crate) async fn handle_connection(
             client_token,
             name,
             target_addr,
+            supports_target_binding,
         } => {
             crate::secret_tunnel::register_provider(
                 state,
@@ -255,6 +256,7 @@ pub(crate) async fn handle_connection(
                 client_token,
                 name,
                 target_addr,
+                supports_target_binding.unwrap_or(false),
             )
             .await;
         }
