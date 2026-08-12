@@ -13,9 +13,61 @@ import urllib.request
 from pathlib import Path
 
 
-BASE_URL = "https://127.0.0.1:32100/api/v1"
-PROVIDER_NAME = "vm-win-129"
+BASE_URL = os.environ.get("LINKLAKE_ACCEPTANCE_BASE_URL", "https://127.0.0.1:32100/api/v1").rstrip("/")
+PROVIDER_NAME = os.environ.get("LINKLAKE_ACCEPTANCE_PROVIDER_NAME", "vm-win-129")
 ACCEPTANCE_PREFIX = "rc-acceptance-"
+HTTP_HOSTNAME = os.environ.get("LINKLAKE_ACCEPTANCE_HTTP_HOSTNAME", "secure.link.odelake.com")
+SNI_HOSTNAME = os.environ.get("LINKLAKE_ACCEPTANCE_SNI_HOSTNAME", "sni.link.odelake.com")
+ACME_CONTACT_EMAIL = os.environ.get("LINKLAKE_ACCEPTANCE_ACME_CONTACT_EMAIL", "")
+
+
+def require_hostname(value: str, label: str) -> str:
+    import re
+
+    if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?", value):
+        raise ValueError(f"{label} is not a valid hostname")
+    return value
+
+
+def require_endpoint(value: str, label: str) -> str:
+    import ipaddress
+    import re
+
+    host, separator, port_text = value.rpartition(":")
+    if not separator or not host:
+        raise ValueError(f"{label} must be host:port")
+    if host.startswith("[") and host.endswith("]"):
+        ipaddress.IPv6Address(host[1:-1])
+    else:
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?", host):
+                raise ValueError(f"{label} host is invalid")
+    port = int(port_text)
+    if not 1 <= port <= 65535:
+        raise ValueError(f"{label} port is invalid")
+    return value
+
+
+def validate_configuration() -> None:
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(BASE_URL)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("LINKLAKE_ACCEPTANCE_BASE_URL must be an HTTP(S) URL without credentials")
+    require_hostname(HTTP_HOSTNAME, "HTTP hostname")
+    require_hostname(SNI_HOSTNAME, "SNI hostname")
+    if ACME_CONTACT_EMAIL and ("\r" in ACME_CONTACT_EMAIL or "\n" in ACME_CONTACT_EMAIL):
+        raise ValueError("ACME contact email must not contain newlines")
+    require_endpoint(os.environ.get("LINKLAKE_ACCEPTANCE_CONTROL_ENDPOINT", "control.link.odelake.com:32101"), "control endpoint")
+    if not ACME_CONTACT_EMAIL:
+        raise ValueError(
+            "LINKLAKE_ACCEPTANCE_ACME_CONTACT_EMAIL is required when ACME production is enabled"
+        )
+
+
+validate_configuration()
 
 
 def load_environment(path: Path) -> dict[str, str]:
@@ -209,7 +261,7 @@ def main() -> int:
         {
             "client_id": provider_id,
             "name": f"{ACCEPTANCE_PREFIX}https",
-            "hostname": "secure.link.odelake.com",
+            "hostname": HTTP_HOSTNAME,
             "target_addr": "127.0.0.1:18082",
             "max_connections": 16,
         },
@@ -221,7 +273,7 @@ def main() -> int:
         {
             "client_id": provider_id,
             "name": f"{ACCEPTANCE_PREFIX}sni",
-            "hostname": "sni.link.odelake.com",
+            "hostname": SNI_HOSTNAME,
             "target_addr": "127.0.0.1:18443",
             "max_connections": 16,
             "bandwidth_limit_bps": None,
@@ -286,7 +338,7 @@ def main() -> int:
             "enabled": True,
             "environment": "production",
             "directory_url": "https://acme-v02.api.letsencrypt.org/directory",
-            "contact_email": "lakerskz@outlook.com",
+            "contact_email": ACME_CONTACT_EMAIL,
             "terms_accepted": True,
             "renew_before_days": 30,
         },
