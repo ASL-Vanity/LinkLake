@@ -1489,7 +1489,7 @@ pub(crate) async fn register_route(
     hostname: String,
     target_addr: String,
 ) {
-    if !authenticated_client(&state, client_id, &client_token) {
+    if !authenticated_client(&state, client_id, &client_token).await {
         state
             .metrics
             .authentication_failures_total
@@ -1748,10 +1748,10 @@ async fn run_registered_control(
     remove_route(&state, &hostname, registration_id);
 }
 
-fn authenticated_client(state: &AppState, client_id: Uuid, token: &str) -> bool {
-    let mut clients = state.clients.lock().expect("client registry lock poisoned");
+async fn authenticated_client(state: &AppState, client_id: Uuid, token: &str) -> bool {
+    let mut clients = state.clients.lock().await;
     matches!(
-        clients.authenticate_and_touch(client_id, token),
+        clients.authenticate_and_touch(client_id, token).await,
         Ok(Authentication::Authenticated)
     )
 }

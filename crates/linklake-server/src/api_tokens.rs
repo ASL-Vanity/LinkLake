@@ -100,6 +100,25 @@ impl ApiTokenCatalog {
         Ok(Self { database })
     }
 
+    pub(crate) fn prepare_schema(database: &Database) -> anyhow::Result<()> {
+        let database = database.connect()?;
+        database.execute_batch(
+            "CREATE TABLE IF NOT EXISTS management_api_tokens (
+                id TEXT PRIMARY KEY NOT NULL,
+                name TEXT NOT NULL UNIQUE,
+                scope TEXT NOT NULL,
+                token_hash BLOB NOT NULL UNIQUE,
+                created_unix_seconds INTEGER NOT NULL,
+                expires_unix_seconds INTEGER,
+                last_used_unix_seconds INTEGER,
+                fleet_source_instance_id TEXT
+             );
+             CREATE INDEX IF NOT EXISTS management_api_tokens_expiry
+                 ON management_api_tokens(expires_unix_seconds);",
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn list(&self) -> anyhow::Result<Vec<ApiTokenRecord>> {
         let mut statement = self.database.prepare("SELECT id, name, scope, created_unix_seconds, expires_unix_seconds, last_used_unix_seconds, fleet_source_instance_id FROM management_api_tokens ORDER BY name")?;
         let records = statement
@@ -185,10 +204,10 @@ impl ApiTokenCatalog {
     }
 }
 
-fn token_hash(token: &str) -> [u8; 32] {
+pub(crate) fn token_hash(token: &str) -> [u8; 32] {
     Sha256::digest(token.as_bytes()).into()
 }
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|value| format!("{value:02x}")).collect()
 }
 

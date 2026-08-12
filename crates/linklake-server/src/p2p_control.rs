@@ -30,7 +30,7 @@ pub(crate) async fn register_node(
     client_token: String,
     candidates: Vec<linklake_core::p2p_protocol::P2pCandidate>,
 ) {
-    if !authenticated(&state, client_id, &client_token) {
+    if !authenticated(&state, client_id, &client_token).await {
         reject(&mut stream, "invalid client credentials").await;
         return;
     }
@@ -59,7 +59,7 @@ pub(crate) async fn report_fallback(
     client_token: String,
     reason: P2pFallbackReason,
 ) {
-    if !authenticated(&state, client_id, &client_token) {
+    if !authenticated(&state, client_id, &client_token).await {
         reject(&mut stream, "invalid client credentials").await;
         return;
     }
@@ -84,7 +84,7 @@ pub(crate) async fn report_direct_success(
     session_id: Uuid,
     visitor_client_id: Uuid,
 ) {
-    if !authenticated(&state, provider_client_id, &client_token) {
+    if !authenticated(&state, provider_client_id, &client_token).await {
         reject(&mut stream, "invalid client credentials").await;
         return;
     }
@@ -109,7 +109,7 @@ pub(crate) async fn request_session(
     client_token: String,
     access_key: String,
 ) {
-    if !authenticated(&state, visitor_client_id, &client_token) {
+    if !authenticated(&state, visitor_client_id, &client_token).await {
         reject(&mut stream, "invalid client credentials").await;
         return;
     }
@@ -205,7 +205,7 @@ pub(crate) async fn validate_ticket(
     client_token: String,
     ticket: String,
 ) {
-    if !authenticated(&state, provider_client_id, &client_token) {
+    if !authenticated(&state, provider_client_id, &client_token).await {
         reject(&mut stream, "invalid client credentials").await;
         return;
     }
@@ -281,13 +281,14 @@ fn fallback_reason_name(reason: P2pFallbackReason) -> &'static str {
     }
 }
 
-fn authenticated(state: &AppState, client_id: Uuid, token: &str) -> bool {
+async fn authenticated(state: &AppState, client_id: Uuid, token: &str) -> bool {
     matches!(
         state
             .clients
             .lock()
-            .expect("client registry lock poisoned")
-            .authenticate_and_touch(client_id, token),
+            .await
+            .authenticate_and_touch(client_id, token)
+            .await,
         Ok(Authentication::Authenticated)
     )
 }

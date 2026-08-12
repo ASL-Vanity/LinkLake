@@ -62,7 +62,7 @@ pub(crate) async fn claim_remote_update_task(
     headers: HeaderMap,
     Json(request): Json<RemoteUpdateClaimRequest>,
 ) -> Result<Json<RemoteUpdateClaimResponse>, CodedApiError> {
-    authenticate_worker(&state, client_id, &headers)?;
+    authenticate_worker(&state, client_id, &headers).await?;
     let claim = state
         .update_tasks
         .claim(client_id, &request, unix_seconds())
@@ -77,7 +77,7 @@ pub(crate) async fn renew_remote_update_task(
     headers: HeaderMap,
     Json(request): Json<RemoteUpdateLeaseRenewRequest>,
 ) -> Result<Json<RemoteUpdateLeaseRenewResponse>, CodedApiError> {
-    authenticate_worker(&state, client_id, &headers)?;
+    authenticate_worker(&state, client_id, &headers).await?;
     let response = state
         .update_tasks
         .renew(client_id, task_id, &request, unix_seconds())
@@ -92,7 +92,7 @@ pub(crate) async fn report_remote_update_task(
     headers: HeaderMap,
     Json(request): Json<RemoteUpdateReportRequest>,
 ) -> Result<Json<RemoteUpdateReportResponse>, CodedApiError> {
-    authenticate_worker(&state, client_id, &headers)?;
+    authenticate_worker(&state, client_id, &headers).await?;
     let task = state
         .update_tasks
         .report(client_id, task_id, &request, unix_seconds())
@@ -107,7 +107,7 @@ pub(crate) async fn reconcile_remote_update_task(
     headers: HeaderMap,
     Json(request): Json<RemoteUpdateReconcileRequest>,
 ) -> Result<Json<RemoteUpdateReconcileResponse>, CodedApiError> {
-    authenticate_worker(&state, client_id, &headers)?;
+    authenticate_worker(&state, client_id, &headers).await?;
     let response = state
         .update_tasks
         .reconcile(client_id, task_id, &request, unix_seconds())
@@ -116,7 +116,7 @@ pub(crate) async fn reconcile_remote_update_task(
     Ok(Json(response))
 }
 
-fn authenticate_worker(
+async fn authenticate_worker(
     state: &AppState,
     client_id: Uuid,
     headers: &HeaderMap,
@@ -129,8 +129,9 @@ fn authenticate_worker(
     let authentication = state
         .clients
         .lock()
-        .expect("client registry lock poisoned")
+        .await
         .authenticate_and_touch(client_id, token)
+        .await
         .map_err(|error| {
             tracing::error!(%error, "Remote update worker authentication failed");
             CodedApiError(

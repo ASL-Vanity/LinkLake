@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tokio_postgres::{Client, Transaction};
 
-pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 5;
+pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 6;
 const ADVISORY_LOCK_ID: i64 = 0x4c4c_4841_4d49_4752;
 
 const MIGRATION_V1_NAME: &str = "ha_coordination_foundation";
@@ -241,6 +241,78 @@ ALTER TABLE linklake_update_tasks
     );
 "#;
 
+// 认证、管理 API Token 与客户端身份的事实源。在 PostgreSQL 模式下这些表替代
+// 同名 SQLite 表；密码和客户端令牌仍只保存 Argon2 摘要，会话与 API Token
+// 只保存 SHA-256 摘要，明文永远不会进入数据库。
+const MIGRATION_V6_NAME: &str = "application_identity_foundation";
+const MIGRATION_V6_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS linklake_administrators (
+    username TEXT PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    created_unix_seconds BIGINT NOT NULL,
+    must_change_password BOOLEAN NOT NULL DEFAULT FALSE,
+    display_name TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('administrator', 'operator', 'auditor')),
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    last_login_unix_seconds BIGINT,
+    totp_secret TEXT,
+    totp_enabled BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+CREATE TABLE IF NOT EXISTS linklake_admin_sessions (
+    session_id TEXT PRIMARY KEY,
+    session_secret_hash TEXT NOT NULL,
+    username TEXT NOT NULL REFERENCES linklake_administrators(username) ON DELETE CASCADE,
+    created_unix_seconds BIGINT NOT NULL,
+    expires_unix_seconds BIGINT NOT NULL,
+    remote_addr TEXT,
+    user_agent TEXT
+);
+CREATE INDEX IF NOT EXISTS linklake_admin_sessions_expiry
+    ON linklake_admin_sessions(expires_unix_seconds);
+CREATE INDEX IF NOT EXISTS linklake_admin_sessions_username
+    ON linklake_admin_sessions(username, created_unix_seconds DESC);
+
+CREATE TABLE IF NOT EXISTS linklake_management_api_tokens (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    scope TEXT NOT NULL CHECK (scope IN ('read', 'write', 'administrator')),
+    token_hash BYTEA NOT NULL UNIQUE,
+    created_unix_seconds BIGINT NOT NULL,
+    expires_unix_seconds BIGINT,
+    last_used_unix_seconds BIGINT,
+    fleet_source_instance_id TEXT
+);
+CREATE INDEX IF NOT EXISTS linklake_management_api_tokens_expiry
+    ON linklake_management_api_tokens(expires_unix_seconds);
+
+CREATE TABLE IF NOT EXISTS linklake_clients (
+    client_id TEXT PRIMARY KEY,
+    agent_instance_id TEXT NOT NULL UNIQUE,
+    agent_identity_public_key TEXT UNIQUE,
+    name TEXT NOT NULL,
+    platform TEXT NOT NULL,
+    group_name TEXT,
+    tags_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    notes TEXT,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    created_unix_seconds BIGINT NOT NULL,
+    token_rotated_unix_seconds BIGINT,
+    access_token_hash TEXT NOT NULL,
+    last_seen_unix_seconds BIGINT NOT NULL,
+    config_mode TEXT NOT NULL DEFAULT 'local',
+    config_sync_status TEXT NOT NULL DEFAULT 'unknown',
+    applied_config_revision TEXT,
+    config_sync_error TEXT,
+    config_checked_unix_seconds BIGINT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS linklake_clients_agent_identity_public_key
+    ON linklake_clients(agent_identity_public_key)
+    WHERE agent_identity_public_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS linklake_clients_last_seen
+    ON linklake_clients(last_seen_unix_seconds DESC);
+"#;
+
 struct Migration {
     version: i64,
     name: &'static str,
@@ -284,6 +356,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 5,
         name: MIGRATION_V5_NAME,
         sql: MIGRATION_V5_SQL,
+    },
+    Migration {
+        version: 6,
+        name: MIGRATION_V6_NAME,
+        sql: MIGRATION_V6_SQL,
     },
 ];
 
@@ -523,6 +600,73 @@ async fn verify_schema_structure(transaction: &Transaction<'_>) -> anyhow::Resul
                 required("kind", "text"),
                 required("created_unix_seconds", "int8"),
                 required("event_json", "text"),
+            ],
+        },
+        TableExpectation {
+            name: "linklake_administrators",
+            primary_key: &["username"],
+            columns: &[
+                required("username", "text"),
+                required("password_hash", "text"),
+                required("created_unix_seconds", "int8"),
+                required("must_change_password", "bool"),
+                required("display_name", "text"),
+                required("role", "text"),
+                required("enabled", "bool"),
+                optional("last_login_unix_seconds", "int8"),
+                optional("totp_secret", "text"),
+                required("totp_enabled", "bool"),
+            ],
+        },
+        TableExpectation {
+            name: "linklake_admin_sessions",
+            primary_key: &["session_id"],
+            columns: &[
+                required("session_id", "text"),
+                required("session_secret_hash", "text"),
+                required("username", "text"),
+                required("created_unix_seconds", "int8"),
+                required("expires_unix_seconds", "int8"),
+                optional("remote_addr", "text"),
+                optional("user_agent", "text"),
+            ],
+        },
+        TableExpectation {
+            name: "linklake_management_api_tokens",
+            primary_key: &["id"],
+            columns: &[
+                required("id", "text"),
+                required("name", "text"),
+                required("scope", "text"),
+                required("token_hash", "bytea"),
+                required("created_unix_seconds", "int8"),
+                optional("expires_unix_seconds", "int8"),
+                optional("last_used_unix_seconds", "int8"),
+                optional("fleet_source_instance_id", "text"),
+            ],
+        },
+        TableExpectation {
+            name: "linklake_clients",
+            primary_key: &["client_id"],
+            columns: &[
+                required("client_id", "text"),
+                required("agent_instance_id", "text"),
+                optional("agent_identity_public_key", "text"),
+                required("name", "text"),
+                required("platform", "text"),
+                optional("group_name", "text"),
+                required("tags_json", "jsonb"),
+                optional("notes", "text"),
+                required("enabled", "bool"),
+                required("created_unix_seconds", "int8"),
+                optional("token_rotated_unix_seconds", "int8"),
+                required("access_token_hash", "text"),
+                required("last_seen_unix_seconds", "int8"),
+                required("config_mode", "text"),
+                required("config_sync_status", "text"),
+                optional("applied_config_revision", "text"),
+                optional("config_sync_error", "text"),
+                optional("config_checked_unix_seconds", "int8"),
             ],
         },
     ];

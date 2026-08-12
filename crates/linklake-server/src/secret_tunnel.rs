@@ -64,7 +64,7 @@ pub(crate) async fn register_provider(
     target_addr: String,
     supports_target_binding: bool,
 ) {
-    if !authenticated_client(&state, provider_client_id, &client_token) {
+    if !authenticated_client(&state, provider_client_id, &client_token).await {
         reject(&state, &mut stream, "invalid client credentials").await;
         return;
     }
@@ -283,7 +283,7 @@ pub(crate) async fn connect_visitor(
     access_key: String,
     source_ip: IpAddr,
 ) {
-    if !authenticated_client(&state, visitor_client_id, &client_token) {
+    if !authenticated_client(&state, visitor_client_id, &client_token).await {
         reject(&state, &mut visitor_stream, "invalid client credentials").await;
         return;
     }
@@ -599,10 +599,10 @@ fn remove_registration(state: &AppState, policy_id: Uuid, registration_id: Uuid)
     }
 }
 
-fn authenticated_client(state: &AppState, client_id: Uuid, token: &str) -> bool {
-    let mut clients = state.clients.lock().expect("client registry lock poisoned");
+async fn authenticated_client(state: &AppState, client_id: Uuid, token: &str) -> bool {
+    let mut clients = state.clients.lock().await;
     matches!(
-        clients.authenticate_and_touch(client_id, token),
+        clients.authenticate_and_touch(client_id, token).await,
         Ok(Authentication::Authenticated)
     )
 }

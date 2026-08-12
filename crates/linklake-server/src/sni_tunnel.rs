@@ -321,7 +321,7 @@ pub(crate) async fn register_route(
     hostname: String,
     target_addr: String,
 ) {
-    if !authenticated_client(&state, client_id, &client_token) {
+    if !authenticated_client(&state, client_id, &client_token).await {
         send_error(&mut stream, "invalid client credentials").await;
         return;
     }
@@ -538,10 +538,10 @@ fn remove_route(state: &AppState, hostname: &str, registration_id: Uuid) {
     }
 }
 
-fn authenticated_client(state: &AppState, client_id: Uuid, token: &str) -> bool {
-    let mut clients = state.clients.lock().expect("client registry lock poisoned");
+async fn authenticated_client(state: &AppState, client_id: Uuid, token: &str) -> bool {
+    let mut clients = state.clients.lock().await;
     matches!(
-        clients.authenticate_and_touch(client_id, token),
+        clients.authenticate_and_touch(client_id, token).await,
         Ok(Authentication::Authenticated)
     )
 }

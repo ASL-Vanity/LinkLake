@@ -460,9 +460,11 @@ async fn send_managed_config(
     error: Option<String>,
 ) {
     let authenticated = {
-        let mut clients = state.clients.lock().expect("client registry lock poisoned");
+        let mut clients = state.clients.lock().await;
         matches!(
-            clients.authenticate_and_touch(client_id, &client_token),
+            clients
+                .authenticate_and_touch(client_id, &client_token)
+                .await,
             Ok(Authentication::Authenticated)
         )
     };
@@ -505,8 +507,9 @@ async fn send_managed_config(
     if let Err(update_error) = state
         .clients
         .lock()
-        .expect("client registry lock poisoned")
+        .await
         .update_config_sync(client_id, mode, effective_status, applied_revision, error)
+        .await
     {
         tracing::warn!("Could not persist managed configuration status: {update_error}");
     }
@@ -523,7 +526,7 @@ async fn register_tunnel(
     public_port: u16,
     target_addr: String,
 ) {
-    if !authenticated_client(&state, client_id, &client_token) {
+    if !authenticated_client(&state, client_id, &client_token).await {
         state
             .metrics
             .authentication_failures_total
@@ -1109,10 +1112,10 @@ async fn pair_data_connection(
     }
 }
 
-fn authenticated_client(state: &AppState, client_id: Uuid, token: &str) -> bool {
-    let mut clients = state.clients.lock().expect("client registry lock poisoned");
+async fn authenticated_client(state: &AppState, client_id: Uuid, token: &str) -> bool {
+    let mut clients = state.clients.lock().await;
     matches!(
-        clients.authenticate_and_touch(client_id, token),
+        clients.authenticate_and_touch(client_id, token).await,
         Ok(Authentication::Authenticated)
     )
 }

@@ -177,7 +177,7 @@ pub(crate) async fn register_proxy(
     name: String,
     public_port: u16,
 ) {
-    if !authenticated_client(&state, client_id, &client_token) {
+    if !authenticated_client(&state, client_id, &client_token).await {
         reject(&state, &mut stream, "invalid client credentials").await;
         return;
     }
@@ -1765,10 +1765,10 @@ fn finish_connection(statistics: &HttpProxyStatistics) {
         .fetch_sub(1, Ordering::Relaxed);
 }
 
-fn authenticated_client(state: &AppState, client_id: Uuid, token: &str) -> bool {
-    let mut clients = state.clients.lock().expect("client registry lock poisoned");
+async fn authenticated_client(state: &AppState, client_id: Uuid, token: &str) -> bool {
+    let mut clients = state.clients.lock().await;
     matches!(
-        clients.authenticate_and_touch(client_id, token),
+        clients.authenticate_and_touch(client_id, token).await,
         Ok(Authentication::Authenticated)
     )
 }

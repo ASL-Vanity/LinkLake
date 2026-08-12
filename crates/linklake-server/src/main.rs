@@ -29,6 +29,7 @@ mod notifications;
 mod p2p_control;
 mod p2p_node_catalog;
 mod policy_service;
+mod postgres_application;
 mod postgres_migrations;
 mod public_port_lease;
 mod public_port_ownership;
@@ -51,8 +52,8 @@ mod update_tasks;
 mod update_worker;
 
 use admin_auth::{
-    AdminAuth, BootstrapCredentials, CreateUser, LoginAttempt, SessionIdentity, SessionRecord,
-    UpdateUser, UserRecord, UserRole,
+    BootstrapCredentials, CreateUser, LoginAttempt, SessionIdentity, SessionRecord, UpdateUser,
+    UserRecord, UserRole,
 };
 use alerting::{
     AlertCatalog, AlertEvent, AlertMetric, AlertRule, AlertSignal, CreateAlertRule,
@@ -61,7 +62,7 @@ use alerting::{
     UpdateAlertRule,
 };
 use anyhow::Context;
-use api_tokens::{ApiTokenCatalog, ApiTokenScope, CreateApiToken, CreatedApiToken};
+use api_tokens::{ApiTokenScope, CreateApiToken, CreatedApiToken};
 use audit_log::{AuditEvent, AuditLog};
 use axum::{
     extract::{ConnectInfo, FromRequestParts, Path, Query, Request, State},
@@ -79,7 +80,7 @@ use certificate_catalog::{
 };
 use certificate_manager::CertificateManager;
 use clap::{Args, Parser, Subcommand};
-use client_registry::{Authentication, ClientRegistry, UpdateClient};
+use client_registry::{Authentication, UpdateClient};
 use database::Database;
 use dual_stack_udp::{DualStackUdpSocket, PublicUdpBindMode};
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -112,6 +113,7 @@ use policy_service::{
     BindFleetCredential, FleetCredentialBinding, FleetPolicyKind, FleetReconcileRequest,
     FleetReconcileResult, FleetRuntimeInvalidation, FleetSourceStatus, PolicyService,
 };
+use postgres_application::{AdminAuthStore, ApiTokenStore, ClientRegistryStore};
 use public_port_policy::{
     DynamicPortLeaseProvider, HaDynamicPortLeaseProvider, PublicPortPolicy, PublicPortPolicyView,
 };
@@ -350,38 +352,13 @@ const MAX_SERVICE_ENVIRONMENT_BYTES: usize = 64 * 1024;
 const LISTENER_STARTUP_TIMEOUT_SECONDS: u64 = 10;
 
 pub(crate) fn migrate_application_schema(database: &Database) -> anyhow::Result<()> {
-    let connection = database.connect()?;
-    let administrator_table_exists: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'administrators')",
-        [],
-        |row| row.get(0),
-    )?;
-    let had_administrator = administrator_table_exists
-        && connection.query_row("SELECT COUNT(*) > 0 FROM administrators", [], |row| {
-            row.get::<_, bool>(0)
-        })?;
-    drop(connection);
-
-    let migration_username = format!("schema-migration-{}", Uuid::new_v4());
-    let bootstrap = (!had_administrator)
-        .then(|| BootstrapCredentials::schema_migration_placeholder(migration_username.clone()));
-    drop(AdminAuth::open_with_database(database, bootstrap)?);
-    if !had_administrator {
-        database.with_connection(|connection| {
-            connection.execute(
-                "DELETE FROM administrators WHERE username = ?1",
-                [&migration_username],
-            )?;
-            Ok(())
-        })?;
-    }
-
-    drop(ApiTokenCatalog::open_with_database(database)?);
+    admin_auth::AdminAuth::prepare_schema(database)?;
+    api_tokens::ApiTokenCatalog::prepare_schema(database)?;
     drop(AuditLog::open_with_database(database)?);
     drop(AlertCatalog::open_with_database(database)?);
     drop(FleetCatalog::open_with_database(database)?);
     drop(TrafficControlCatalog::open_with_database(database)?);
-    drop(ClientRegistry::open_with_database(database)?);
+    client_registry::ClientRegistry::prepare_schema(database)?;
     drop(TunnelCatalog::open_with_database(
         database,
         PublicPortPolicy::schema_migration(),
@@ -568,8 +545,8 @@ struct AppState {
     ha_runtime: Arc<HaRuntime>,
     enrollment_token: String,
     management_token: Option<String>,
-    admin_auth: Mutex<AdminAuth>,
-    api_tokens: Mutex<ApiTokenCatalog>,
+    admin_auth: AsyncMutex<AdminAuthStore>,
+    api_tokens: AsyncMutex<ApiTokenStore>,
     login_throttle: Mutex<LoginThrottle>,
     login_hash_permits: Arc<Semaphore>,
     audit: Mutex<AuditLog>,
@@ -589,7 +566,7 @@ struct AppState {
     socks5_fragment_config: Socks5FragmentConfig,
     socks5_fragment_budget: Arc<Socks5FragmentGlobalBudget>,
     udp_public_bind_mode: PublicUdpBindMode,
-    clients: Mutex<ClientRegistry>,
+    clients: AsyncMutex<ClientRegistryStore>,
     tunnel_catalog: Mutex<TunnelCatalog>,
     tunnels: Mutex<HashMap<u16, tcp_tunnel::TunnelRegistration>>,
     tunnel_statistics: Mutex<HashMap<u16, Arc<tcp_tunnel::TunnelStatistics>>>,
@@ -4271,7 +4248,7 @@ async fn run_server(
     let update_tasks: Arc<dyn UpdateTaskCoordinationStorage> = match storage_config.backend() {
         StorageBackend::Sqlite => Arc::new(UpdateTaskCatalog::open(&database)?),
         StorageBackend::Postgres => Arc::new(PostgresUpdateTaskCatalog::open(
-            coordination_storage,
+            coordination_storage.clone(),
             &database,
             ha_runtime.clone(),
         )?),
@@ -4287,8 +4264,10 @@ async fn run_server(
         ha_runtime,
         enrollment_token,
         management_token: configured_management_token,
-        admin_auth: Mutex::new(AdminAuth::open_with_database(&database, bootstrap_admin)?),
-        api_tokens: Mutex::new(ApiTokenCatalog::open_with_database(&database)?),
+        admin_auth: AsyncMutex::new(
+            AdminAuthStore::open(&coordination_storage, &database, bootstrap_admin).await?,
+        ),
+        api_tokens: AsyncMutex::new(ApiTokenStore::open(&coordination_storage, &database).await?),
         login_throttle: Mutex::new(LoginThrottle::default()),
         login_hash_permits: Arc::new(Semaphore::new(LOGIN_HASH_CONCURRENCY)),
         audit: Mutex::new(AuditLog::open_with_database(&database)?),
@@ -4310,7 +4289,9 @@ async fn run_server(
         socks5_fragment_config,
         socks5_fragment_budget,
         udp_public_bind_mode,
-        clients: Mutex::new(ClientRegistry::open_with_database(&database)?),
+        clients: AsyncMutex::new(
+            ClientRegistryStore::open(&coordination_storage, &database).await?,
+        ),
         tunnel_catalog: Mutex::new(TunnelCatalog::open_with_database(
             &database,
             public_port_policy,
@@ -5225,7 +5206,7 @@ async fn get_lifecycle(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<LifecycleResponse>, ApiError> {
-    authorize_management(&state, &headers)?;
+    authorize_management(&state, &headers).await?;
     Ok(Json(lifecycle_response(&state).await))
 }
 
@@ -5234,7 +5215,7 @@ async fn drain_lifecycle(
     headers: HeaderMap,
     request: Option<Json<DrainRequest>>,
 ) -> Result<Json<LifecycleResponse>, CodedApiError> {
-    let principal = require_administrator(&state, &headers)?;
+    let principal = require_administrator(&state, &headers).await?;
     let timeout_seconds = request
         .map(|Json(request)| request.timeout_seconds)
         .unwrap_or(DEFAULT_DRAIN_TIMEOUT_SECONDS);
@@ -5266,7 +5247,7 @@ async fn resume_lifecycle(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<LifecycleResponse>, CodedApiError> {
-    let principal = require_administrator(&state, &headers)?;
+    let principal = require_administrator(&state, &headers).await?;
     state
         .lifecycle
         .resume(unix_seconds())
@@ -5383,7 +5364,7 @@ async fn get_public_port_policy(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<PublicPortPolicyView>, ApiError> {
-    authorize_management(&state, &headers)?;
+    authorize_management(&state, &headers).await?;
     Ok(Json(state.public_port_policy.view()))
 }
 
@@ -5395,7 +5376,8 @@ async fn server_update_overview(
         &state,
         &headers,
         ServerUpdateOperation::Overview,
-    )?;
+    )
+    .await?;
     let update_state = linklake_update::default_state_directory(UpdateProduct::Server);
     let status = linklake_update::status(UpdateProduct::Server, &update_state)
         .map_err(|error| server_update_api_error("status", error))?;
@@ -5420,7 +5402,8 @@ async fn check_server_update(
 ) -> Result<Json<linklake_update::UpdateCheck>, CodedApiError> {
     let operation = ServerUpdateOperation::Check;
     let principal =
-        require_interactive_update_administrator(&state, &headers, &request_host, operation)?;
+        require_interactive_update_administrator(&state, &headers, &request_host, operation)
+            .await?;
     let _operation = state.server_update_operation_lock.try_lock().map_err(|_| {
         record_server_update_rejection(&state, operation, &principal, "operation_lock_busy");
         server_update_busy_error()
@@ -5463,7 +5446,8 @@ async fn download_server_update(
 ) -> Result<Json<ServerUpdateDownloadResponse>, CodedApiError> {
     let operation = ServerUpdateOperation::Download;
     let principal =
-        require_interactive_update_administrator(&state, &headers, &request_host, operation)?;
+        require_interactive_update_administrator(&state, &headers, &request_host, operation)
+            .await?;
     require_server_update_confirmation(&request.confirmation, UPDATE_DOWNLOAD_CONFIRMATION)
         .inspect_err(|_| {
             record_server_update_rejection(&state, operation, &principal, "confirmation_mismatch");
@@ -5519,7 +5503,8 @@ async fn apply_server_update(
 ) -> Result<Json<ServerUpdateScheduleResponse>, CodedApiError> {
     let operation = ServerUpdateOperation::Apply;
     let principal =
-        require_interactive_update_administrator(&state, &headers, &request_host, operation)?;
+        require_interactive_update_administrator(&state, &headers, &request_host, operation)
+            .await?;
     require_server_update_confirmation(&request.confirmation, UPDATE_APPLY_CONFIRMATION)
         .inspect_err(|_| {
             record_server_update_rejection(&state, operation, &principal, "confirmation_mismatch");
@@ -5701,8 +5686,14 @@ async fn status(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<StatusResponse>, ApiError> {
-    authorize_management(&state, &headers)?;
-    let clients = state.clients.lock().expect("client registry lock poisoned");
+    authorize_management(&state, &headers).await?;
+    let client_count = state
+        .clients
+        .lock()
+        .await
+        .count()
+        .await
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "could not count clients"))?;
     let tunnels = state.tunnels.lock().expect("tunnel registry lock poisoned");
     let udp_tunnels = state
         .udp_tunnels
@@ -5776,7 +5767,7 @@ async fn status(
             .certificate_manager
             .as_ref()
             .map_or(0, CertificateManager::certificate_count),
-        clients: clients.count(),
+        clients: client_count,
     }))
 }
 
@@ -5850,7 +5841,7 @@ async fn metrics(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<MetricsResponse>, ApiError> {
-    authorize_management(&state, &headers)?;
+    authorize_management(&state, &headers).await?;
     let slo = collect_slo_metrics(
         &state
             .metrics_history
@@ -6457,7 +6448,7 @@ async fn slo_status(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<SloMetrics>, ApiError> {
-    authorize_management(&state, &headers)?;
+    authorize_management(&state, &headers).await?;
     Ok(Json(collect_slo_metrics(
         &state
             .metrics_history
@@ -6648,7 +6639,9 @@ async fn metrics_history(
     headers: HeaderMap,
     Query(query): Query<MetricsHistoryQuery>,
 ) -> Result<Json<MetricsHistoryResponse>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let (range_name, range_seconds, default_step_seconds) =
         parse_metrics_history_range(query.range.as_deref()).ok_or(CodedApiError(
             StatusCode::BAD_REQUEST,
@@ -6691,7 +6684,9 @@ async fn export_metrics_history(
     headers: HeaderMap,
     Query(query): Query<MetricsExportQuery>,
 ) -> Result<Response, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let (range_name, range_seconds, default_step_seconds) =
         parse_metrics_history_range(query.range.as_deref()).ok_or(CodedApiError(
             StatusCode::BAD_REQUEST,
@@ -6775,7 +6770,9 @@ async fn policy_metrics_history(
     Path((kind, policy_id)): Path<(String, Uuid)>,
     Query(query): Query<MetricsHistoryQuery>,
 ) -> Result<Json<PolicyMetricsHistoryResponse>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let (kind, key) = policy_history_key(&kind, policy_id).ok_or(CodedApiError(
         StatusCode::BAD_REQUEST,
         "invalid_policy_kind",
@@ -7201,7 +7198,13 @@ async fn evaluate_alerts(state: &Arc<AppState>, stop: &mut watch::Receiver<bool>
             return;
         }
     };
-    let signals = collect_alert_signals(state, &rules);
+    let signals = match collect_alert_signals(state, &rules).await {
+        Ok(signals) => signals,
+        Err(error) => {
+            tracing::error!(%error, "Could not read shared client state for alert evaluation");
+            return;
+        }
+    };
     if *stop.borrow() {
         return;
     }
@@ -7242,14 +7245,14 @@ async fn evaluate_alerts(state: &Arc<AppState>, stop: &mut watch::Receiver<bool>
     }
 }
 
-fn collect_alert_signals(state: &AppState, rules: &[AlertRule]) -> Vec<AlertSignal> {
+async fn collect_alert_signals(
+    state: &AppState,
+    rules: &[AlertRule],
+) -> anyhow::Result<Vec<AlertSignal>> {
     let now = unix_seconds();
     let mut signals = Vec::new();
-    for client in state
-        .clients
-        .lock()
-        .expect("client registry lock poisoned")
-        .summaries()
+    let clients = state.clients.lock().await.summaries().await?;
+    for client in clients
         .into_iter()
         .filter(|client| client.enabled && now.saturating_sub(client.last_seen_unix_seconds) > 120)
     {
@@ -7391,7 +7394,7 @@ fn collect_alert_signals(state: &AppState, rules: &[AlertRule]) -> Vec<AlertSign
             }
         }
     }
-    signals
+    Ok(signals)
 }
 
 fn collect_unavailable_policy_signals(state: &AppState, signals: &mut Vec<AlertSignal>) {
@@ -8212,7 +8215,9 @@ async fn get_acme_config(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<AcmeConfigView>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let config = state
         .certificate_catalog
         .lock()
@@ -8227,7 +8232,9 @@ async fn update_acme_config(
     headers: HeaderMap,
     Json(mut request): Json<UpdateAcmeConfig>,
 ) -> Result<Json<AcmeConfigView>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let challenge_type = request.challenge_type.unwrap_or(
         state
             .certificate_catalog
@@ -8311,8 +8318,10 @@ async fn set_http_route_tls(
     Path(route_id): Path<Uuid>,
     Json(mut request): Json<UpdateRouteTlsPolicy>,
 ) -> Result<Json<RouteTlsPolicy>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
-    let route = http_route_policy_for_id(state, route_id)?.ok_or(CodedApiError(
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
+    let route = http_route_policy_for_id(&state, route_id)?.ok_or(CodedApiError(
         StatusCode::NOT_FOUND,
         "unknown_http_route",
         "HTTP route does not exist",
@@ -8488,7 +8497,9 @@ async fn issue_http_route_certificate(
     headers: HeaderMap,
     Path(route_id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<CertificateOperationResponse>), CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     queue_certificate_operation(state, route_id, CertificateOperation::Issue)?;
     Ok((
         StatusCode::ACCEPTED,
@@ -8505,7 +8516,9 @@ async fn renew_http_route_certificate(
     headers: HeaderMap,
     Path(route_id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<CertificateOperationResponse>), CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     queue_certificate_operation(state, route_id, CertificateOperation::Renew)?;
     Ok((
         StatusCode::ACCEPTED,
@@ -9458,9 +9471,15 @@ async fn list_clients(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<linklake_core::ClientSummary>>, ApiError> {
-    authorize_management(&state, &headers)?;
-    let clients = state.clients.lock().expect("client registry lock poisoned");
-    Ok(Json(clients.summaries()))
+    authorize_management(&state, &headers).await?;
+    let clients = state
+        .clients
+        .lock()
+        .await
+        .summaries()
+        .await
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "could not list clients"))?;
+    Ok(Json(clients))
 }
 
 async fn global_search(
@@ -9468,7 +9487,9 @@ async fn global_search(
     headers: HeaderMap,
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<Vec<SearchResult>>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let query = query.q.trim().to_lowercase();
     if query.len() < 2 {
         return Ok(Json(Vec::new()));
@@ -9490,12 +9511,14 @@ async fn global_search(
                 });
             }
         };
-    for client in state
+    let clients = state
         .clients
         .lock()
-        .expect("client registry lock poisoned")
+        .await
         .summaries()
-    {
+        .await
+        .map_err(coded_client_management_error)?;
+    for client in clients {
         add(
             "client",
             client.client_id.to_string(),
@@ -9628,12 +9651,15 @@ async fn update_client(
     Path(client_id): Path<Uuid>,
     Json(request): Json<UpdateClient>,
 ) -> Result<Json<linklake_core::ClientSummary>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let client = state
         .clients
         .lock()
-        .expect("client registry lock poisoned")
+        .await
         .update(client_id, request)
+        .await
         .map_err(coded_client_management_error)?
         .ok_or(CodedApiError(
             StatusCode::NOT_FOUND,
@@ -9660,12 +9686,15 @@ async fn rotate_client_token(
     headers: HeaderMap,
     Path(client_id): Path<Uuid>,
 ) -> Result<Json<ClientEnrollmentResponse>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let client_token = state
         .clients
         .lock()
-        .expect("client registry lock poisoned")
+        .await
         .rotate_token(client_id)
+        .await
         .map_err(coded_client_management_error)?
         .ok_or(CodedApiError(
             StatusCode::NOT_FOUND,
@@ -9675,8 +9704,10 @@ async fn rotate_client_token(
     let agent_instance_id = state
         .clients
         .lock()
-        .expect("client registry lock poisoned")
+        .await
         .summary_by_id(client_id)
+        .await
+        .map_err(coded_client_management_error)?
         .expect("rotated client still exists")
         .agent_instance_id;
     record_audit(
@@ -9697,12 +9728,16 @@ async fn delete_client(
     headers: HeaderMap,
     Path(client_id): Path<Uuid>,
 ) -> Result<StatusCode, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let client = state
         .clients
         .lock()
-        .expect("client registry lock poisoned")
+        .await
         .summary_by_id(client_id)
+        .await
+        .map_err(coded_client_management_error)?
         .ok_or(CodedApiError(
             StatusCode::NOT_FOUND,
             "unknown_client",
@@ -9726,8 +9761,9 @@ async fn delete_client(
     let deleted = state
         .clients
         .lock()
-        .expect("client registry lock poisoned")
+        .await
         .delete(client_id)
+        .await
         .map_err(coded_client_management_error)?;
     if !deleted {
         return Err(CodedApiError(
@@ -9820,7 +9856,7 @@ async fn list_p2p_nodes(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<P2pNodeView>>, ApiError> {
-    authorize_management(&state, &headers)?;
+    authorize_management(&state, &headers).await?;
     let nodes = state
         .p2p_node_catalog
         .lock()
@@ -9850,7 +9886,7 @@ async fn list_audit_events(
     headers: HeaderMap,
     Query(query): Query<AuditQuery>,
 ) -> Result<Json<Vec<AuditEvent>>, ApiError> {
-    authorize_management(&state, &headers)?;
+    authorize_management(&state, &headers).await?;
     let events = state
         .audit
         .lock()
@@ -9870,7 +9906,9 @@ async fn export_audit_events(
     headers: HeaderMap,
     Query(query): Query<AuditExportQuery>,
 ) -> Result<Response, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     if query.from.zip(query.to).is_some_and(|(from, to)| from > to) {
         return Err(CodedApiError(
             StatusCode::BAD_REQUEST,
@@ -9952,7 +9990,9 @@ async fn list_alert_rules(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<AlertRule>>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let rules = state
         .alerts
         .lock()
@@ -9967,7 +10007,9 @@ async fn create_alert_rule(
     headers: HeaderMap,
     Json(request): Json<CreateAlertRule>,
 ) -> Result<(StatusCode, Json<AlertRule>), CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let rule = state
         .alerts
         .lock()
@@ -9992,7 +10034,9 @@ async fn update_alert_rule(
     Path(rule_id): Path<Uuid>,
     Json(request): Json<UpdateAlertRule>,
 ) -> Result<Json<AlertRule>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let rule = state
         .alerts
         .lock()
@@ -10021,7 +10065,9 @@ async fn delete_alert_rule(
     headers: HeaderMap,
     Path(rule_id): Path<Uuid>,
 ) -> Result<StatusCode, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let deleted = state
         .alerts
         .lock()
@@ -10049,7 +10095,9 @@ async fn list_alert_events(
     headers: HeaderMap,
     Query(query): Query<AlertEventsQuery>,
 ) -> Result<Json<Vec<AlertEvent>>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let events = state
         .alerts
         .lock()
@@ -10063,7 +10111,9 @@ async fn alert_notification_channels(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<AlertNotificationChannelsResponse>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let deliveries = state
         .alerts
         .lock()
@@ -10081,7 +10131,9 @@ async fn list_alert_notification_deliveries(
     headers: HeaderMap,
     Query(query): Query<NotificationDeliveriesQuery>,
 ) -> Result<Json<Vec<NotificationDeliveryView>>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let deliveries = state
         .alerts
         .lock()
@@ -10096,7 +10148,9 @@ async fn retry_alert_notification_delivery(
     headers: HeaderMap,
     Path(delivery_id): Path<i64>,
 ) -> Result<Json<NotificationDeliveryView>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let outcome = state
         .alerts
         .lock()
@@ -10151,7 +10205,9 @@ async fn list_fleet_peers(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<FleetPeer>>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     require_fleet_state_leader(&state)?;
     Ok(Json(
         state
@@ -10168,7 +10224,9 @@ async fn create_fleet_peer(
     headers: HeaderMap,
     Json(request): Json<UpsertFleetPeer>,
 ) -> Result<(StatusCode, Json<FleetPeer>), CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     require_fleet_state_leader(&state)?;
     let peer = state
         .fleet
@@ -10197,7 +10255,9 @@ async fn update_fleet_peer(
     Path(peer_id): Path<Uuid>,
     Json(request): Json<UpsertFleetPeer>,
 ) -> Result<Json<FleetPeer>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     require_fleet_state_leader(&state)?;
     let peer = state
         .fleet
@@ -10224,7 +10284,9 @@ async fn delete_fleet_peer(
     headers: HeaderMap,
     Path(peer_id): Path<Uuid>,
 ) -> Result<StatusCode, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     require_fleet_state_leader(&state)?;
     if !state
         .fleet
@@ -10253,7 +10315,9 @@ async fn get_fleet_health_config(
     headers: HeaderMap,
     Path(peer_id): Path<Uuid>,
 ) -> Result<Json<FleetHealthSnapshot>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     require_fleet_state_leader(&state)?;
     if !fleet_peer_exists(&state, peer_id).map_err(coded_fleet_error)? {
         return Err(CodedApiError(
@@ -10288,7 +10352,7 @@ async fn update_fleet_health_config(
     Path(peer_id): Path<Uuid>,
     Json(request): Json<UpdateFleetHealthConfig>,
 ) -> Result<Json<FleetHealthSnapshot>, CodedApiError> {
-    let principal = require_administrator(&state, &headers)?;
+    let principal = require_administrator(&state, &headers).await?;
     require_fleet_state_leader(&state)?;
     if !fleet_peer_exists(&state, peer_id).map_err(coded_fleet_error)? {
         return Err(CodedApiError(
@@ -10327,7 +10391,9 @@ async fn list_fleet_dns_failovers(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<FleetDnsFailover>>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     require_fleet_state_leader(&state)?;
     Ok(Json(
         state
@@ -10344,7 +10410,9 @@ async fn list_fleet_dns_switch_events(
     headers: HeaderMap,
     Path(failover_id): Path<Uuid>,
 ) -> Result<Json<Vec<FleetDnsSwitchEvent>>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     require_fleet_state_leader(&state)?;
     let fleet_health = state
         .fleet_health
@@ -10373,7 +10441,7 @@ async fn create_fleet_dns_failover(
     headers: HeaderMap,
     Json(request): Json<UpsertFleetDnsFailover>,
 ) -> Result<(StatusCode, Json<FleetDnsFailover>), CodedApiError> {
-    let principal = require_administrator(&state, &headers)?;
+    let principal = require_administrator(&state, &headers).await?;
     let peers = state
         .fleet
         .lock()
@@ -10408,7 +10476,7 @@ async fn update_fleet_dns_failover(
     Path(failover_id): Path<Uuid>,
     Json(request): Json<UpsertFleetDnsFailover>,
 ) -> Result<Json<FleetDnsFailover>, CodedApiError> {
-    let principal = require_administrator(&state, &headers)?;
+    let principal = require_administrator(&state, &headers).await?;
     let peers = state
         .fleet
         .lock()
@@ -10446,7 +10514,7 @@ async fn delete_fleet_dns_failover(
     headers: HeaderMap,
     Path(failover_id): Path<Uuid>,
 ) -> Result<StatusCode, CodedApiError> {
-    let principal = require_administrator(&state, &headers)?;
+    let principal = require_administrator(&state, &headers).await?;
     if !state
         .fleet_health
         .lock()
@@ -10475,7 +10543,7 @@ async fn freeze_fleet_dns_failover(
     Path(failover_id): Path<Uuid>,
     Json(request): Json<FreezeFleetDnsFailover>,
 ) -> Result<Json<FleetDnsFailover>, CodedApiError> {
-    let principal = require_administrator(&state, &headers)?;
+    let principal = require_administrator(&state, &headers).await?;
     let failover = state
         .fleet_health
         .lock()
@@ -10505,7 +10573,7 @@ async fn resume_fleet_dns_failover(
     headers: HeaderMap,
     Path(failover_id): Path<Uuid>,
 ) -> Result<Json<FleetDnsFailover>, CodedApiError> {
-    let principal = require_administrator(&state, &headers)?;
+    let principal = require_administrator(&state, &headers).await?;
     let failover = state
         .fleet_health
         .lock()
@@ -10531,7 +10599,7 @@ async fn reconcile_fleet_dns_failover(
     headers: HeaderMap,
     Path(failover_id): Path<Uuid>,
 ) -> Result<Json<FleetDnsReconcileResponse>, CodedApiError> {
-    let principal = require_administrator(&state, &headers)?;
+    let principal = require_administrator(&state, &headers).await?;
     if state
         .fleet_health
         .lock()
@@ -10562,7 +10630,9 @@ async fn fleet_overview(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<FleetOverview>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     require_fleet_state_leader(&state)?;
     let peers = state
         .fleet
@@ -10647,7 +10717,9 @@ async fn export_fleet_bundle_v2(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<linklake_core::fleet_protocol::FleetBundleV2>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     require_fleet_state_leader(&state)?;
     state
         .policy_service
@@ -10662,7 +10734,7 @@ async fn reconcile_fleet_bundle_v2(
     Json(request): Json<FleetReconcileRequest>,
 ) -> Result<Json<FleetReconcileResult>, CodedApiError> {
     let source_instance_id = request.bundle.source_instance_id;
-    let principal = require_fleet_source(&state, &headers, source_instance_id)?;
+    let principal = require_fleet_source(&state, &headers, source_instance_id).await?;
     let fencing_token = state
         .ha_runtime
         .fencing_token()
@@ -10880,7 +10952,9 @@ async fn list_fleet_generations_v2(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<fleet_coordination::FleetGeneration>>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     state
         .ha_runtime
         .fleet()
@@ -10895,7 +10969,9 @@ async fn list_fleet_conflicts_v2(
     headers: HeaderMap,
     Query(query): Query<FleetLedgerQuery>,
 ) -> Result<Json<Vec<fleet_coordination::FleetConflict>>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let state_filter = query
         .state
         .as_deref()
@@ -10917,7 +10993,7 @@ async fn resolve_fleet_conflict_v2(
     Path(conflict_id): Path<Uuid>,
     Json(request): Json<ResolveFleetConflictRequest>,
 ) -> Result<Json<Option<fleet_coordination::FleetConflict>>, CodedApiError> {
-    let principal = require_operator(&state, &headers)?;
+    let principal = require_operator(&state, &headers).await?;
     let fencing_token = state
         .ha_runtime
         .fencing_token()
@@ -10951,7 +11027,9 @@ async fn list_fleet_sources_v2(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<FleetSourceStatus>>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     require_fleet_state_leader(&state)?;
     state
         .policy_service
@@ -10965,7 +11043,7 @@ async fn reset_fleet_source_v2(
     headers: HeaderMap,
     Path(source_instance_id): Path<Uuid>,
 ) -> Result<StatusCode, CodedApiError> {
-    let principal = require_administrator(&state, &headers)?;
+    let principal = require_administrator(&state, &headers).await?;
     if !state
         .policy_service
         .reset_source_state(source_instance_id)
@@ -10993,7 +11071,9 @@ async fn list_fleet_credential_bindings(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<FleetCredentialBinding>>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     require_fleet_state_leader(&state)?;
     state
         .policy_service
@@ -11007,7 +11087,7 @@ async fn bind_fleet_credential(
     headers: HeaderMap,
     Json(request): Json<BindFleetCredential>,
 ) -> Result<Json<FleetCredentialBinding>, CodedApiError> {
-    let principal = require_administrator(&state, &headers)?;
+    let principal = require_administrator(&state, &headers).await?;
     let binding = state
         .policy_service
         .bind_credential(request, unix_seconds())
@@ -11032,7 +11112,7 @@ async fn delete_fleet_credential_binding(
     headers: HeaderMap,
     Path((source_instance_id, kind, credential_ref)): Path<(Uuid, String, Uuid)>,
 ) -> Result<StatusCode, CodedApiError> {
-    let principal = require_administrator(&state, &headers)?;
+    let principal = require_administrator(&state, &headers).await?;
     let kind = FleetPolicyKind::parse(&kind).map_err(coded_policy_service_error)?;
     if !state
         .policy_service
@@ -11093,12 +11173,14 @@ async fn import_fleet_policies(
     headers: HeaderMap,
     Json(request): Json<FleetImportRequest>,
 ) -> Result<Json<FleetImportResult>, CodedApiError> {
-    let principal = require_administrator(&state, &headers)?;
+    let principal = require_administrator(&state, &headers).await?;
     let clients = state
         .clients
         .lock()
-        .expect("client registry lock poisoned")
-        .summaries();
+        .await
+        .summaries()
+        .await
+        .map_err(coded_client_management_error)?;
     let result = fleet::import_policy_bundle(
         &request.bundle,
         &clients,
@@ -11133,12 +11215,14 @@ async fn sync_fleet_policies(
     headers: HeaderMap,
     Json(request): Json<FleetSyncRequest>,
 ) -> Result<Json<Vec<FleetPeerSyncResult>>, CodedApiError> {
-    let principal = require_administrator(&state, &headers)?;
+    let principal = require_administrator(&state, &headers).await?;
     let clients = state
         .clients
         .lock()
-        .expect("client registry lock poisoned")
-        .summaries();
+        .await
+        .summaries()
+        .await
+        .map_err(coded_client_management_error)?;
     let legacy_bundle = fleet::export_policy_bundle(
         &clients,
         &state
@@ -11348,7 +11432,9 @@ async fn get_traffic_control(
     headers: HeaderMap,
     Path((kind, policy_id)): Path<(String, Uuid)>,
 ) -> Result<Json<traffic_control::TrafficControlRecord>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let kind = TrafficPolicyKind::parse(&kind).map_err(coded_traffic_control_error)?;
     state
         .traffic_controls
@@ -11370,7 +11456,7 @@ async fn upsert_traffic_control(
     Path((kind, policy_id)): Path<(String, Uuid)>,
     Json(request): Json<UpsertTrafficControl>,
 ) -> Result<Json<traffic_control::TrafficControlRecord>, CodedApiError> {
-    let principal = require_administrator(&state, &headers)?;
+    let principal = require_administrator(&state, &headers).await?;
     let kind = TrafficPolicyKind::parse(&kind).map_err(coded_traffic_control_error)?;
     let record = state
         .traffic_controls
@@ -11392,7 +11478,7 @@ async fn delete_traffic_control(
     headers: HeaderMap,
     Path((kind, policy_id)): Path<(String, Uuid)>,
 ) -> Result<StatusCode, CodedApiError> {
-    let principal = require_administrator(&state, &headers)?;
+    let principal = require_administrator(&state, &headers).await?;
     let kind = TrafficPolicyKind::parse(&kind).map_err(coded_traffic_control_error)?;
     if !state
         .traffic_controls
@@ -11741,7 +11827,7 @@ async fn list_tcp_tunnels(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<TcpTunnelView>>, ApiError> {
-    authorize_management(&state, &headers)?;
+    authorize_management(&state, &headers).await?;
     let policies = state
         .tunnel_catalog
         .lock()
@@ -11822,13 +11908,10 @@ async fn create_tcp_tunnel(
     headers: HeaderMap,
     Json(request): Json<CreateTcpTunnelPolicy>,
 ) -> Result<Json<TcpTunnelPolicy>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
-    if !state
-        .clients
-        .lock()
-        .expect("client registry lock poisoned")
-        .contains(request.client_id)
-    {
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
+    if !client_is_enabled(&state, request.client_id).await? {
         return Err(CodedApiError(
             StatusCode::BAD_REQUEST,
             "unknown_client",
@@ -11859,13 +11942,10 @@ async fn update_tcp_tunnel(
     Path(tunnel_id): Path<Uuid>,
     Json(request): Json<UpdateTcpTunnelPolicy>,
 ) -> Result<Json<TcpTunnelPolicy>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
-    if !state
-        .clients
-        .lock()
-        .expect("client registry lock poisoned")
-        .contains(request.client_id)
-    {
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
+    if !client_is_enabled(&state, request.client_id).await? {
         return Err(CodedApiError(
             StatusCode::BAD_REQUEST,
             "unknown_client",
@@ -11919,7 +11999,7 @@ async fn set_tcp_tunnel_enabled(
     Path(tunnel_id): Path<Uuid>,
     Json(request): Json<EnableTunnelRequest>,
 ) -> Result<StatusCode, ApiError> {
-    authorize_management(&state, &headers)?;
+    authorize_management(&state, &headers).await?;
     let public_port = state
         .tunnel_catalog
         .lock()
@@ -11971,7 +12051,7 @@ async fn delete_tcp_tunnel(
     headers: HeaderMap,
     Path(tunnel_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    authorize_management(&state, &headers)?;
+    authorize_management(&state, &headers).await?;
     let public_port = state
         .tunnel_catalog
         .lock()
@@ -12021,7 +12101,9 @@ async fn list_secret_tunnels(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<SecretTunnelView>>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let policies = state
         .secret_tunnel_catalog
         .lock()
@@ -12072,20 +12154,21 @@ async fn create_secret_tunnel(
     headers: HeaderMap,
     Json(request): Json<CreateSecretTunnelPolicy>,
 ) -> Result<(StatusCode, Json<CreatedSecretTunnelPolicy>), CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
-    let clients = state.clients.lock().expect("client registry lock poisoned");
-    if !clients.contains(request.provider_client_id)
-        || request
-            .allowed_client_id
-            .is_some_and(|client_id| !clients.contains(client_id))
-    {
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
+    let provider_known = client_is_enabled(&state, request.provider_client_id).await?;
+    let visitor_known = match request.allowed_client_id {
+        Some(client_id) => client_is_enabled(&state, client_id).await?,
+        None => true,
+    };
+    if !provider_known || !visitor_known {
         return Err(CodedApiError(
             StatusCode::BAD_REQUEST,
             "unknown_client",
             "unknown provider or allowed visitor client",
         ));
     }
-    drop(clients);
     let created = state
         .secret_tunnel_catalog
         .lock()
@@ -12115,20 +12198,21 @@ async fn update_secret_tunnel(
     Path(tunnel_id): Path<Uuid>,
     Json(request): Json<UpdateSecretTunnelPolicy>,
 ) -> Result<Json<SecretTunnelPolicy>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
-    let clients = state.clients.lock().expect("client registry lock poisoned");
-    if !clients.contains(request.provider_client_id)
-        || request
-            .allowed_client_id
-            .is_some_and(|client_id| !clients.contains(client_id))
-    {
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
+    let provider_known = client_is_enabled(&state, request.provider_client_id).await?;
+    let visitor_known = match request.allowed_client_id {
+        Some(client_id) => client_is_enabled(&state, client_id).await?,
+        None => true,
+    };
+    if !provider_known || !visitor_known {
         return Err(CodedApiError(
             StatusCode::BAD_REQUEST,
             "unknown_client",
             "unknown provider or allowed visitor client",
         ));
     }
-    drop(clients);
     let (old_policy, policy) = {
         let mut catalog = state
             .secret_tunnel_catalog
@@ -12177,7 +12261,9 @@ async fn set_secret_tunnel_enabled(
     Path(tunnel_id): Path<Uuid>,
     Json(request): Json<EnableTunnelRequest>,
 ) -> Result<StatusCode, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let updated = state
         .secret_tunnel_catalog
         .lock()
@@ -12212,7 +12298,9 @@ async fn delete_secret_tunnel(
     headers: HeaderMap,
     Path(tunnel_id): Path<Uuid>,
 ) -> Result<StatusCode, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let deleted = state
         .secret_tunnel_catalog
         .lock()
@@ -12245,7 +12333,9 @@ async fn list_socks5_proxies(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<Socks5ProxyView>>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let policies = state
         .tunnel_catalog
         .lock()
@@ -12404,13 +12494,10 @@ async fn create_socks5_proxy(
     headers: HeaderMap,
     Json(request): Json<CreateSocks5ProxyPolicy>,
 ) -> Result<(StatusCode, Json<CreatedSocks5ProxyPolicy>), CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
-    if !state
-        .clients
-        .lock()
-        .expect("client registry lock poisoned")
-        .contains(request.client_id)
-    {
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
+    if !client_is_enabled(&state, request.client_id).await? {
         return Err(CodedApiError(
             StatusCode::BAD_REQUEST,
             "unknown_client",
@@ -12444,13 +12531,10 @@ async fn update_socks5_proxy(
     Path(proxy_id): Path<Uuid>,
     Json(request): Json<UpdateSocks5ProxyPolicy>,
 ) -> Result<Json<Socks5ProxyPolicy>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
-    if !state
-        .clients
-        .lock()
-        .expect("client registry lock poisoned")
-        .contains(request.client_id)
-    {
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
+    if !client_is_enabled(&state, request.client_id).await? {
         return Err(CodedApiError(
             StatusCode::BAD_REQUEST,
             "unknown_client",
@@ -12499,7 +12583,9 @@ async fn set_socks5_proxy_enabled(
     Path(proxy_id): Path<Uuid>,
     Json(request): Json<EnableTunnelRequest>,
 ) -> Result<StatusCode, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let updated = state
         .tunnel_catalog
         .lock()
@@ -12534,7 +12620,9 @@ async fn delete_socks5_proxy(
     headers: HeaderMap,
     Path(proxy_id): Path<Uuid>,
 ) -> Result<StatusCode, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let deleted = state
         .tunnel_catalog
         .lock()
@@ -12567,7 +12655,9 @@ async fn list_http_proxies(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<HttpProxyView>>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let policies = state
         .tunnel_catalog
         .lock()
@@ -12631,13 +12721,10 @@ async fn create_http_proxy(
     headers: HeaderMap,
     Json(request): Json<CreateHttpProxyPolicy>,
 ) -> Result<(StatusCode, Json<CreatedHttpProxyPolicy>), CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
-    if !state
-        .clients
-        .lock()
-        .expect("client registry lock poisoned")
-        .contains(request.client_id)
-    {
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
+    if !client_is_enabled(&state, request.client_id).await? {
         return Err(CodedApiError(
             StatusCode::BAD_REQUEST,
             "unknown_client",
@@ -12671,13 +12758,10 @@ async fn update_http_proxy(
     Path(proxy_id): Path<Uuid>,
     Json(request): Json<UpdateHttpProxyPolicy>,
 ) -> Result<Json<HttpProxyPolicy>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
-    if !state
-        .clients
-        .lock()
-        .expect("client registry lock poisoned")
-        .contains(request.client_id)
-    {
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
+    if !client_is_enabled(&state, request.client_id).await? {
         return Err(CodedApiError(
             StatusCode::BAD_REQUEST,
             "unknown_client",
@@ -12726,7 +12810,9 @@ async fn set_http_proxy_enabled(
     Path(proxy_id): Path<Uuid>,
     Json(request): Json<EnableTunnelRequest>,
 ) -> Result<StatusCode, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let updated = state
         .tunnel_catalog
         .lock()
@@ -12761,7 +12847,9 @@ async fn delete_http_proxy(
     headers: HeaderMap,
     Path(proxy_id): Path<Uuid>,
 ) -> Result<StatusCode, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let deleted = state
         .tunnel_catalog
         .lock()
@@ -12794,7 +12882,9 @@ async fn list_udp_tunnels(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<UdpTunnelView>>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let policies = state
         .tunnel_catalog
         .lock()
@@ -12851,7 +12941,9 @@ async fn create_udp_tunnel(
     headers: HeaderMap,
     Json(request): Json<CreateUdpTunnelPolicy>,
 ) -> Result<(StatusCode, Json<UdpTunnelPolicy>), CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     if state.udp_data_plane.is_none() {
         return Err(CodedApiError(
             StatusCode::CONFLICT,
@@ -12859,12 +12951,7 @@ async fn create_udp_tunnel(
             "UDP relay is not configured on this server",
         ));
     }
-    if !state
-        .clients
-        .lock()
-        .expect("client registry lock poisoned")
-        .contains(request.client_id)
-    {
+    if !client_is_enabled(&state, request.client_id).await? {
         return Err(CodedApiError(
             StatusCode::BAD_REQUEST,
             "unknown_client",
@@ -12895,7 +12982,9 @@ async fn update_udp_tunnel(
     Path(tunnel_id): Path<Uuid>,
     Json(request): Json<UpdateUdpTunnelPolicy>,
 ) -> Result<Json<UdpTunnelPolicy>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     if state.udp_data_plane.is_none() {
         return Err(CodedApiError(
             StatusCode::CONFLICT,
@@ -12903,12 +12992,7 @@ async fn update_udp_tunnel(
             "UDP relay is not configured on this server",
         ));
     }
-    if !state
-        .clients
-        .lock()
-        .expect("client registry lock poisoned")
-        .contains(request.client_id)
-    {
+    if !client_is_enabled(&state, request.client_id).await? {
         return Err(CodedApiError(
             StatusCode::BAD_REQUEST,
             "unknown_client",
@@ -12957,7 +13041,9 @@ async fn set_udp_tunnel_enabled(
     Path(tunnel_id): Path<Uuid>,
     Json(request): Json<EnableTunnelRequest>,
 ) -> Result<StatusCode, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let policy = state
         .tunnel_catalog
         .lock()
@@ -13005,7 +13091,9 @@ async fn delete_udp_tunnel(
     headers: HeaderMap,
     Path(tunnel_id): Path<Uuid>,
 ) -> Result<StatusCode, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let policy = state
         .tunnel_catalog
         .lock()
@@ -13051,7 +13139,9 @@ async fn list_port_groups(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<PortGroupView>>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let groups = {
         let catalog = state
             .tunnel_catalog
@@ -13154,7 +13244,9 @@ async fn create_port_group(
     headers: HeaderMap,
     Json(request): Json<CreatePortGroupPolicy>,
 ) -> Result<(StatusCode, Json<PortGroupPolicy>), CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     if request.protocol == PortGroupProtocol::Udp && state.udp_data_plane.is_none() {
         return Err(CodedApiError(
             StatusCode::CONFLICT,
@@ -13162,12 +13254,7 @@ async fn create_port_group(
             "UDP relay is not configured on this server",
         ));
     }
-    if !state
-        .clients
-        .lock()
-        .expect("client registry lock poisoned")
-        .contains(request.client_id)
-    {
+    if !client_is_enabled(&state, request.client_id).await? {
         return Err(CodedApiError(
             StatusCode::BAD_REQUEST,
             "unknown_client",
@@ -13203,7 +13290,9 @@ async fn update_port_group(
     Path(group_id): Path<Uuid>,
     Json(request): Json<UpdatePortGroupPolicy>,
 ) -> Result<Json<PortGroupPolicy>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     if request.protocol == PortGroupProtocol::Udp && state.udp_data_plane.is_none() {
         return Err(CodedApiError(
             StatusCode::CONFLICT,
@@ -13211,12 +13300,7 @@ async fn update_port_group(
             "UDP relay is not configured on this server",
         ));
     }
-    if !state
-        .clients
-        .lock()
-        .expect("client registry lock poisoned")
-        .contains(request.client_id)
-    {
+    if !client_is_enabled(&state, request.client_id).await? {
         return Err(CodedApiError(
             StatusCode::BAD_REQUEST,
             "unknown_client",
@@ -13291,7 +13375,9 @@ async fn set_port_group_enabled(
     Path(group_id): Path<Uuid>,
     Json(request): Json<EnableTunnelRequest>,
 ) -> Result<StatusCode, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let (policy, mappings) = {
         let mut catalog = state
             .tunnel_catalog
@@ -13334,7 +13420,9 @@ async fn delete_port_group(
     headers: HeaderMap,
     Path(group_id): Path<Uuid>,
 ) -> Result<StatusCode, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let (policy, mappings) = {
         let mut catalog = state
             .tunnel_catalog
@@ -13398,7 +13486,7 @@ async fn list_http_routes(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<HttpRouteView>>, ApiError> {
-    authorize_management(&state, &headers)?;
+    authorize_management(&state, &headers).await?;
     let policies = state
         .http_route_catalog
         .lock()
@@ -13503,7 +13591,9 @@ async fn list_sni_routes(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<SniRouteView>>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let policies = state
         .sni_route_catalog
         .lock()
@@ -13558,13 +13648,10 @@ async fn create_sni_route(
     headers: HeaderMap,
     Json(request): Json<CreateSniRoutePolicy>,
 ) -> Result<(StatusCode, Json<SniRoutePolicy>), CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
-    if !state
-        .clients
-        .lock()
-        .expect("client registry lock poisoned")
-        .contains(request.client_id)
-    {
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
+    if !client_is_enabled(&state, request.client_id).await? {
         return Err(CodedApiError(
             StatusCode::BAD_REQUEST,
             "unknown_client",
@@ -13595,13 +13682,10 @@ async fn update_sni_route(
     Path(route_id): Path<Uuid>,
     Json(request): Json<UpdateSniRoutePolicy>,
 ) -> Result<Json<SniRoutePolicy>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
-    if !state
-        .clients
-        .lock()
-        .expect("client registry lock poisoned")
-        .contains(request.client_id)
-    {
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
+    if !client_is_enabled(&state, request.client_id).await? {
         return Err(CodedApiError(
             StatusCode::BAD_REQUEST,
             "unknown_client",
@@ -13650,7 +13734,9 @@ async fn set_sni_route_enabled(
     Path(route_id): Path<Uuid>,
     Json(request): Json<EnableTunnelRequest>,
 ) -> Result<StatusCode, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let policy = state
         .sni_route_catalog
         .lock()
@@ -13689,7 +13775,9 @@ async fn delete_sni_route(
     headers: HeaderMap,
     Path(route_id): Path<Uuid>,
 ) -> Result<StatusCode, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let policy = state
         .sni_route_catalog
         .lock()
@@ -13721,13 +13809,10 @@ async fn create_http_route(
     headers: HeaderMap,
     Json(request): Json<CreateHttpRoutePolicy>,
 ) -> Result<Json<HttpRoutePolicy>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
-    if !state
-        .clients
-        .lock()
-        .expect("client registry lock poisoned")
-        .contains(request.client_id)
-    {
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
+    if !client_is_enabled(&state, request.client_id).await? {
         return Err(CodedApiError(
             StatusCode::BAD_REQUEST,
             "unknown_client",
@@ -13763,7 +13848,9 @@ async fn update_http_route(
     Path(route_id): Path<Uuid>,
     Json(request): Json<UpdateHttpRoutePolicy>,
 ) -> Result<Json<HttpRoutePolicy>, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let requested_hostname =
         http_route_catalog::normalize_hostname(&request.hostname).map_err(|_| {
             CodedApiError(
@@ -13772,12 +13859,7 @@ async fn update_http_route(
                 "HTTP route hostname is invalid",
             )
         })?;
-    if !state
-        .clients
-        .lock()
-        .expect("client registry lock poisoned")
-        .contains(request.client_id)
-    {
+    if !client_is_enabled(&state, request.client_id).await? {
         return Err(CodedApiError(
             StatusCode::BAD_REQUEST,
             "unknown_client",
@@ -13915,7 +13997,9 @@ async fn set_http_route_enabled(
     Path(route_id): Path<Uuid>,
     Json(request): Json<EnableTunnelRequest>,
 ) -> Result<StatusCode, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let route = http_route_policy_for_id(&state, route_id)?;
     let tls_policy = state
         .certificate_catalog
@@ -14038,7 +14122,9 @@ async fn delete_http_route(
     headers: HeaderMap,
     Path(route_id): Path<Uuid>,
 ) -> Result<StatusCode, CodedApiError> {
-    authorize_management(&state, &headers).map_err(coded_management_error)?;
+    authorize_management(&state, &headers)
+        .await
+        .map_err(coded_management_error)?;
     let route = http_route_policy_for_id(&state, route_id)?;
     let tls_policy = state
         .certificate_catalog
@@ -14146,13 +14232,14 @@ async fn enroll_client(
     let (client_id, agent_instance_id, client_token) = state
         .clients
         .lock()
-        .expect("client registry lock poisoned")
+        .await
         .enroll_with_identity(
             request.name,
             request.platform,
             request.agent_instance_id,
             verified_public_key.clone(),
         )
+        .await
         .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "could not store client"))?;
     record_audit(
         &state,
@@ -14270,42 +14357,31 @@ async fn login(
     if !throttle_delay.is_zero() {
         tokio::time::sleep(throttle_delay).await;
     }
-    let auth_state = state.clone();
-    let login_username = username.clone();
     let login_remote_addr = remote_addr.ip().to_string();
     let login_user_agent = headers
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let session = tokio::task::spawn_blocking(move || {
-        let _hash_permit = hash_permit;
-        auth_state
-            .admin_auth
-            .lock()
-            .expect("administrator registry lock poisoned")
-            .login_with_context(
-                &login_username,
-                &password,
-                totp_code.as_deref(),
-                Some(&login_remote_addr),
-                login_user_agent.as_deref(),
+    let _hash_permit = hash_permit;
+    let session = state
+        .admin_auth
+        .lock()
+        .await
+        .login_with_context(
+            &username,
+            &password,
+            totp_code.as_deref(),
+            Some(&login_remote_addr),
+            login_user_agent.as_deref(),
+        )
+        .await
+        .map_err(|_| {
+            CodedApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "session_creation_failed",
+                "could not create session",
             )
-    })
-    .await
-    .map_err(|_| {
-        CodedApiError(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "login_execution_failed",
-            "could not execute administrator login",
-        )
-    })?
-    .map_err(|_| {
-        CodedApiError(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "session_creation_failed",
-            "could not create session",
-        )
-    })?;
+        })?;
     let session = match session {
         LoginAttempt::Success(session) => session,
         LoginAttempt::TotpRequired => {
@@ -14389,8 +14465,9 @@ async fn auth_me(
     let identity = state
         .admin_auth
         .lock()
-        .expect("administrator registry lock poisoned")
+        .await
         .authenticate_session(&session)
+        .await
         .map_err(|_| {
             ApiError(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -14421,12 +14498,13 @@ async fn setup_totp(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<TotpSetupResponse>, CodedApiError> {
-    let principal = require_interactive_session(&state, &headers)?;
+    let principal = require_interactive_session(&state, &headers).await?;
     let secret = state
         .admin_auth
         .lock()
-        .expect("administrator registry lock poisoned")
+        .await
         .begin_totp(&principal.username)
+        .await
         .map_err(user_management_error)?
         .ok_or(CodedApiError(
             StatusCode::NOT_FOUND,
@@ -14454,13 +14532,14 @@ async fn enable_totp(
     headers: HeaderMap,
     Json(request): Json<TotpCodeRequest>,
 ) -> Result<StatusCode, CodedApiError> {
-    let principal = require_interactive_session(&state, &headers)?;
+    let principal = require_interactive_session(&state, &headers).await?;
     let session_id = principal.session_id.expect("interactive session has an id");
     let enabled = state
         .admin_auth
         .lock()
-        .expect("administrator registry lock poisoned")
+        .await
         .enable_totp(&principal.username, session_id, &request.code)
+        .await
         .map_err(user_management_error)?;
     if !enabled {
         return Err(CodedApiError(
@@ -14483,12 +14562,13 @@ async fn disable_totp(
     headers: HeaderMap,
     Json(request): Json<TotpCodeRequest>,
 ) -> Result<StatusCode, CodedApiError> {
-    let principal = require_interactive_session(&state, &headers)?;
+    let principal = require_interactive_session(&state, &headers).await?;
     let disabled = state
         .admin_auth
         .lock()
-        .expect("administrator registry lock poisoned")
+        .await
         .disable_totp(&principal.username, &request.code)
+        .await
         .map_err(user_management_error)?;
     if !disabled {
         return Err(CodedApiError(
@@ -14510,12 +14590,13 @@ async fn list_users(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<UserRecord>>, CodedApiError> {
-    require_administrator(&state, &headers)?;
+    require_administrator(&state, &headers).await?;
     state
         .admin_auth
         .lock()
-        .expect("administrator registry lock poisoned")
+        .await
         .list_users()
+        .await
         .map(Json)
         .map_err(user_management_error)
 }
@@ -14525,14 +14606,15 @@ async fn create_user(
     headers: HeaderMap,
     Json(request): Json<CreateUser>,
 ) -> Result<(StatusCode, Json<UserRecord>), CodedApiError> {
-    let principal = require_administrator(&state, &headers)?;
+    let principal = require_administrator(&state, &headers).await?;
     let username = request.username.clone();
     let role = request.role;
     let user = state
         .admin_auth
         .lock()
-        .expect("administrator registry lock poisoned")
+        .await
         .create_user(request)
+        .await
         .map_err(user_management_error)?;
     record_audit(
         &state,
@@ -14549,12 +14631,13 @@ async fn update_user(
     headers: HeaderMap,
     Json(request): Json<UpdateUser>,
 ) -> Result<Json<UserRecord>, CodedApiError> {
-    let principal = require_administrator(&state, &headers)?;
+    let principal = require_administrator(&state, &headers).await?;
     let user = state
         .admin_auth
         .lock()
-        .expect("administrator registry lock poisoned")
+        .await
         .update_user(&principal.username, &username, request)
+        .await
         .map_err(user_management_error)?
         .ok_or(CodedApiError(
             StatusCode::NOT_FOUND,
@@ -14575,12 +14658,13 @@ async fn delete_user(
     Path(username): Path<String>,
     headers: HeaderMap,
 ) -> Result<StatusCode, CodedApiError> {
-    let principal = require_administrator(&state, &headers)?;
+    let principal = require_administrator(&state, &headers).await?;
     let deleted = state
         .admin_auth
         .lock()
-        .expect("administrator registry lock poisoned")
+        .await
         .delete_user(&principal.username, &username)
+        .await
         .map_err(user_management_error)?;
     if !deleted {
         return Err(CodedApiError(
@@ -14604,16 +14688,17 @@ async fn reset_user_password(
     headers: HeaderMap,
     Json(request): Json<ResetUserPasswordRequest>,
 ) -> Result<StatusCode, CodedApiError> {
-    let principal = require_administrator(&state, &headers)?;
+    let principal = require_administrator(&state, &headers).await?;
     let reset = state
         .admin_auth
         .lock()
-        .expect("administrator registry lock poisoned")
+        .await
         .reset_user_password(
             &username,
             &request.new_password,
             request.force_password_change,
         )
+        .await
         .map_err(user_management_error)?;
     if !reset {
         return Err(CodedApiError(
@@ -14636,12 +14721,13 @@ async fn revoke_user_sessions(
     Path(username): Path<String>,
     headers: HeaderMap,
 ) -> Result<StatusCode, CodedApiError> {
-    let principal = require_administrator(&state, &headers)?;
+    let principal = require_administrator(&state, &headers).await?;
     let revoked = state
         .admin_auth
         .lock()
-        .expect("administrator registry lock poisoned")
+        .await
         .revoke_user_sessions(&username)
+        .await
         .map_err(user_management_error)?;
     if !revoked {
         return Err(CodedApiError(
@@ -14663,12 +14749,13 @@ async fn list_sessions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<SessionRecord>>, CodedApiError> {
-    require_administrator(&state, &headers)?;
+    require_administrator(&state, &headers).await?;
     state
         .admin_auth
         .lock()
-        .expect("administrator registry lock poisoned")
+        .await
         .list_sessions()
+        .await
         .map(Json)
         .map_err(user_management_error)
 }
@@ -14677,12 +14764,13 @@ async fn list_api_tokens(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<api_tokens::ApiTokenRecord>>, CodedApiError> {
-    require_administrator(&state, &headers)?;
+    require_administrator(&state, &headers).await?;
     state
         .api_tokens
         .lock()
-        .expect("API token catalog lock poisoned")
+        .await
         .list()
+        .await
         .map(Json)
         .map_err(coded_api_token_error)
 }
@@ -14692,12 +14780,13 @@ async fn create_api_token(
     headers: HeaderMap,
     Json(request): Json<CreateApiToken>,
 ) -> Result<(StatusCode, Json<CreatedApiToken>), CodedApiError> {
-    let principal = require_administrator(&state, &headers)?;
+    let principal = require_administrator(&state, &headers).await?;
     let created = state
         .api_tokens
         .lock()
-        .expect("API token catalog lock poisoned")
+        .await
         .create(request, unix_seconds())
+        .await
         .map_err(coded_api_token_error)?;
     record_audit(
         &state,
@@ -14716,12 +14805,13 @@ async fn revoke_api_token(
     Path(token_id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<StatusCode, CodedApiError> {
-    let principal = require_administrator(&state, &headers)?;
+    let principal = require_administrator(&state, &headers).await?;
     if !state
         .api_tokens
         .lock()
-        .expect("API token catalog lock poisoned")
+        .await
         .revoke(token_id)
+        .await
         .map_err(coded_api_token_error)?
     {
         return Err(CodedApiError(
@@ -14744,7 +14834,7 @@ async fn revoke_session(
     Path(session_id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<StatusCode, CodedApiError> {
-    let principal = require_administrator(&state, &headers)?;
+    let principal = require_administrator(&state, &headers).await?;
     let current_session_id = principal.session_id.ok_or(CodedApiError(
         StatusCode::FORBIDDEN,
         "session_authentication_required",
@@ -14753,8 +14843,9 @@ async fn revoke_session(
     let revoked = state
         .admin_auth
         .lock()
-        .expect("administrator registry lock poisoned")
+        .await
         .revoke_session(current_session_id, session_id)
+        .await
         .map_err(user_management_error)?;
     if !revoked {
         return Err(CodedApiError(
@@ -14781,12 +14872,10 @@ async fn change_password(
         StatusCode::UNAUTHORIZED,
         "missing management session",
     ))?;
-    let mut admin_auth = state
-        .admin_auth
-        .lock()
-        .expect("administrator registry lock poisoned");
+    let mut admin_auth = state.admin_auth.lock().await;
     let identity = admin_auth
         .authenticate_session(&session)
+        .await
         .map_err(|_| {
             ApiError(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -14800,6 +14889,7 @@ async fn change_password(
     let username = identity.username;
     let changed = admin_auth
         .change_password(&session, &request.new_password)
+        .await
         .map_err(|error| {
             if error.to_string().contains("at least 12 characters") {
                 ApiError(
@@ -14837,16 +14927,16 @@ async fn logout(
         StatusCode::UNAUTHORIZED,
         "missing management session",
     ))?;
-    let mut admin_auth = state
-        .admin_auth
-        .lock()
-        .expect("administrator registry lock poisoned");
-    let authenticated = admin_auth.authenticate_session(&session).map_err(|_| {
-        ApiError(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "could not verify session",
-        )
-    })?;
+    let mut admin_auth = state.admin_auth.lock().await;
+    let authenticated = admin_auth
+        .authenticate_session(&session)
+        .await
+        .map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not verify session",
+            )
+        })?;
     if authenticated.is_none() {
         return Err(ApiError(
             StatusCode::UNAUTHORIZED,
@@ -14855,6 +14945,7 @@ async fn logout(
     }
     admin_auth
         .logout(&session)
+        .await
         .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "could not end session"))?;
     drop(admin_auth);
     record_audit(
@@ -14881,8 +14972,9 @@ async fn heartbeat(
     let authentication = state
         .clients
         .lock()
-        .expect("client registry lock poisoned")
+        .await
         .authenticate_and_touch(client_id, token)
+        .await
         .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "could not update client"))?;
     match authentication {
         Authentication::Authenticated => {}
@@ -14937,7 +15029,7 @@ struct ManagementPrincipal {
     fleet_source_instance_id: Option<Uuid>,
 }
 
-fn management_principal(
+async fn management_principal(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<ManagementPrincipal, ApiError> {
@@ -14957,8 +15049,9 @@ fn management_principal(
         let record = state
             .api_tokens
             .lock()
-            .expect("API token catalog lock poisoned")
+            .await
             .authenticate(token, unix_seconds())
+            .await
             .map_err(|_| {
                 ApiError(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -14979,22 +15072,22 @@ fn management_principal(
             });
         }
     }
-    let identity = management_session_cookie(headers)
-        .map(|session| {
-            state
-                .admin_auth
-                .lock()
-                .expect("administrator registry lock poisoned")
-                .authenticate_session(&session)
-        })
-        .transpose()
-        .map_err(|_| {
-            ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "could not verify session",
-            )
-        })?
-        .flatten();
+    let identity = if let Some(session) = management_session_cookie(headers) {
+        state
+            .admin_auth
+            .lock()
+            .await
+            .authenticate_session(&session)
+            .await
+            .map_err(|_| {
+                ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not verify session",
+                )
+            })?
+    } else {
+        None
+    };
     let Some(identity) = identity else {
         tracing::warn!("Management API authorization failed");
         return Err(ApiError(
@@ -15016,12 +15109,14 @@ fn management_principal(
     })
 }
 
-fn require_fleet_source(
+async fn require_fleet_source(
     state: &AppState,
     headers: &HeaderMap,
     source_instance_id: Uuid,
 ) -> Result<ManagementPrincipal, CodedApiError> {
-    let principal = management_principal(state, headers).map_err(coded_management_error)?;
+    let principal = management_principal(state, headers)
+        .await
+        .map_err(coded_management_error)?;
     validate_fleet_source_binding(&principal, source_instance_id)?;
     Ok(principal)
 }
@@ -15047,11 +15142,13 @@ fn validate_fleet_source_binding(
     Ok(())
 }
 
-fn require_administrator(
+async fn require_administrator(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<ManagementPrincipal, CodedApiError> {
-    let principal = management_principal(state, headers).map_err(coded_management_error)?;
+    let principal = management_principal(state, headers)
+        .await
+        .map_err(coded_management_error)?;
     if principal.role != UserRole::Administrator {
         return Err(CodedApiError(
             StatusCode::FORBIDDEN,
@@ -15062,11 +15159,13 @@ fn require_administrator(
     Ok(principal)
 }
 
-fn require_operator(
+async fn require_operator(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<ManagementPrincipal, CodedApiError> {
-    let principal = management_principal(state, headers).map_err(coded_management_error)?;
+    let principal = management_principal(state, headers)
+        .await
+        .map_err(coded_management_error)?;
     if !matches!(principal.role, UserRole::Administrator | UserRole::Operator) {
         return Err(CodedApiError(
             StatusCode::FORBIDDEN,
@@ -15077,7 +15176,7 @@ fn require_operator(
     Ok(principal)
 }
 
-fn require_interactive_server_update_administrator(
+async fn require_interactive_server_update_administrator(
     state: &AppState,
     headers: &HeaderMap,
     operation: ServerUpdateOperation,
@@ -15134,11 +15233,8 @@ fn require_interactive_server_update_administrator(
         ));
     };
     let authentication = {
-        let admin_auth = state
-            .admin_auth
-            .lock()
-            .expect("administrator registry lock poisoned");
-        admin_auth.authenticate_session(&session)
+        let admin_auth = state.admin_auth.lock().await;
+        admin_auth.authenticate_session(&session).await
     };
     let identity = match authentication {
         Ok(Some(identity)) => identity,
@@ -15199,13 +15295,14 @@ fn require_interactive_server_update_administrator(
     })
 }
 
-fn require_interactive_update_administrator(
+async fn require_interactive_update_administrator(
     state: &AppState,
     headers: &HeaderMap,
     request_host: &str,
     operation: ServerUpdateOperation,
 ) -> Result<ManagementPrincipal, CodedApiError> {
-    let principal = require_interactive_server_update_administrator(state, headers, operation)?;
+    let principal =
+        require_interactive_server_update_administrator(state, headers, operation).await?;
     require_same_origin_update_request(headers, request_host).inspect_err(|_| {
         record_server_update_rejection(state, operation, &principal, "same_origin_check_failed");
     })?;
@@ -15345,11 +15442,13 @@ fn strict_management_session_cookie(headers: &HeaderMap) -> Result<Option<String
     Ok(session)
 }
 
-fn require_interactive_session(
+async fn require_interactive_session(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<ManagementPrincipal, CodedApiError> {
-    let principal = management_principal(state, headers).map_err(coded_management_error)?;
+    let principal = management_principal(state, headers)
+        .await
+        .map_err(coded_management_error)?;
     if principal.session_id.is_none() {
         return Err(CodedApiError(
             StatusCode::FORBIDDEN,
@@ -15396,6 +15495,7 @@ async fn enforce_management_role(
     if let Some(operation) = server_update_operation {
         if let Err(error) =
             require_interactive_server_update_administrator(&state, request.headers(), operation)
+                .await
         {
             return error.into_response();
         }
@@ -15425,7 +15525,7 @@ async fn enforce_management_role(
         .into_response();
     }
     if server_update_operation.is_none() && (users_or_sessions || write) {
-        match management_principal(&state, request.headers()) {
+        match management_principal(&state, request.headers()).await {
             Ok(principal)
                 if principal.role == UserRole::Administrator
                     || (!users_or_sessions && principal.role == UserRole::Operator) => {}
@@ -15540,8 +15640,8 @@ fn fleet_mutation_target(method: &Method, path: &str) -> Option<(FleetPolicyKind
     Some((kind, Uuid::parse_str(segments[3]).ok()?))
 }
 
-fn authorize_management(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
-    management_principal(state, headers).map(|_| ())
+async fn authorize_management(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    management_principal(state, headers).await.map(|_| ())
 }
 
 fn user_management_error(error: anyhow::Error) -> CodedApiError {
@@ -15770,6 +15870,16 @@ fn coded_client_management_error(error: anyhow::Error) -> CodedApiError {
             "client registry operation failed",
         )
     }
+}
+
+async fn client_is_enabled(state: &AppState, client_id: Uuid) -> Result<bool, CodedApiError> {
+    state
+        .clients
+        .lock()
+        .await
+        .contains(client_id)
+        .await
+        .map_err(coded_client_management_error)
 }
 
 pub(crate) fn record_audit(state: &AppState, action: &str, subject: &str, detail: &str) {

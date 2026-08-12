@@ -13,12 +13,12 @@ use uuid::Uuid;
 
 use crate::database::Database;
 
-const SESSION_LIFETIME_SECONDS: u64 = 8 * 60 * 60;
+pub(crate) const SESSION_LIFETIME_SECONDS: u64 = 8 * 60 * 60;
 
 pub(crate) struct BootstrapCredentials {
     pub(crate) username: String,
     pub(crate) password: String,
-    force_password_change: bool,
+    pub(crate) force_password_change: bool,
 }
 
 pub(crate) struct AdminAuth {
@@ -72,7 +72,7 @@ impl UserRole {
         }
     }
 
-    fn parse(value: &str) -> anyhow::Result<Self> {
+    pub(crate) fn parse(value: &str) -> anyhow::Result<Self> {
         match value {
             "administrator" => Ok(Self::Administrator),
             "operator" => Ok(Self::Operator),
@@ -234,6 +234,42 @@ impl AdminAuth {
             // 未知用户名也执行一次与真实密码相同的 Argon2 校验，降低明显的账户枚举时序差。
             dummy_password_hash: hash_password("linklake-dummy-password-verification")?,
         })
+    }
+
+    /// 仅准备 SQLite 认证表结构，用于版本化迁移阶段。
+    ///
+    /// 迁移阶段不能创建临时管理员；首次启动时由真正的 SQLite catalog
+    /// 根据 bootstrap 凭据创建账户，PostgreSQL 模式则由对应的异步 repository
+    /// 在 PostgreSQL 事实源中完成 bootstrap。
+    pub(crate) fn prepare_schema(database: &Database) -> anyhow::Result<()> {
+        let database = database.connect()?;
+        database.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS administrators (
+                username TEXT PRIMARY KEY NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_unix_seconds INTEGER NOT NULL,
+                must_change_password INTEGER NOT NULL DEFAULT 0,
+                display_name TEXT NOT NULL DEFAULT '',
+                role TEXT NOT NULL DEFAULT 'administrator',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                last_login_unix_seconds INTEGER,
+                totp_secret TEXT,
+                totp_enabled INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS admin_sessions (
+                session_id TEXT PRIMARY KEY NOT NULL,
+                session_secret_hash TEXT NOT NULL,
+                username TEXT NOT NULL,
+                created_unix_seconds INTEGER NOT NULL DEFAULT 0,
+                expires_unix_seconds INTEGER NOT NULL,
+                remote_addr TEXT,
+                user_agent TEXT
+            );
+            CREATE INDEX IF NOT EXISTS admin_sessions_expiry ON admin_sessions(expires_unix_seconds);
+            ",
+        )?;
+        ensure_auth_columns(&database)
     }
 
     #[cfg(test)]
@@ -830,7 +866,7 @@ fn ensure_auth_columns(database: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_credentials(username: &str, password: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_credentials(username: &str, password: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         username.len() >= 3
             && username.len() <= 64
@@ -845,7 +881,7 @@ fn validate_credentials(username: &str, password: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_password(password: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_password(password: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         password.len() >= 12,
         "administrator password must contain at least 12 characters"
@@ -853,7 +889,7 @@ fn validate_password(password: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_display_name(display_name: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_display_name(display_name: &str) -> anyhow::Result<()> {
     let display_name = display_name.trim();
     anyhow::ensure!(
         !display_name.is_empty()
@@ -872,7 +908,7 @@ fn is_constraint_violation(error: &rusqlite::Error) -> bool {
     )
 }
 
-fn hash_password(password: &str) -> anyhow::Result<String> {
+pub(crate) fn hash_password(password: &str) -> anyhow::Result<String> {
     let salt = SaltString::encode_b64(Uuid::new_v4().as_bytes())
         .map_err(|error| anyhow::anyhow!("could not create credential salt: {error}"))?;
     Ok(Argon2::default()
@@ -881,7 +917,7 @@ fn hash_password(password: &str) -> anyhow::Result<String> {
         .to_string())
 }
 
-fn verify_password(password: &str, password_hash: &str) -> anyhow::Result<bool> {
+pub(crate) fn verify_password(password: &str, password_hash: &str) -> anyhow::Result<bool> {
     let parsed_hash = PasswordHash::new(password_hash)
         .map_err(|error| anyhow::anyhow!("stored credential hash is invalid: {error}"))?;
     Ok(Argon2::default()
@@ -889,18 +925,18 @@ fn verify_password(password: &str, password_hash: &str) -> anyhow::Result<bool> 
         .is_ok())
 }
 
-fn hash_session_secret(secret: &str) -> String {
+pub(crate) fn hash_session_secret(secret: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(secret.as_bytes()))
 }
 
-fn verify_session_secret(secret: &str, expected_hash: &str) -> bool {
+pub(crate) fn verify_session_secret(secret: &str, expected_hash: &str) -> bool {
     constant_time_eq(
         hash_session_secret(secret).as_bytes(),
         expected_hash.as_bytes(),
     )
 }
 
-fn base32_encode(input: &[u8]) -> String {
+pub(crate) fn base32_encode(input: &[u8]) -> String {
     const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
     let mut output = String::with_capacity((input.len() * 8).div_ceil(5));
     let mut buffer = 0_u32;
@@ -952,7 +988,7 @@ fn totp_code(secret: &[u8], unix_seconds: u64) -> Option<String> {
     Some(format!("{:06}", binary % 1_000_000))
 }
 
-fn verify_totp(encoded_secret: &str, code: &str, unix_seconds: u64) -> bool {
+pub(crate) fn verify_totp(encoded_secret: &str, code: &str, unix_seconds: u64) -> bool {
     let code = code.trim();
     if code.len() != 6 || !code.bytes().all(|value| value.is_ascii_digit()) {
         return false;

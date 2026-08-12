@@ -181,6 +181,61 @@ impl ClientRegistry {
         })
     }
 
+    pub(crate) fn prepare_schema(database: &Database) -> anyhow::Result<()> {
+        let database = database.connect()?;
+        database.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS clients (
+                client_id TEXT PRIMARY KEY NOT NULL,
+                agent_instance_id TEXT NOT NULL UNIQUE,
+                agent_identity_public_key TEXT,
+                name TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                group_name TEXT,
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                notes TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_unix_seconds INTEGER NOT NULL DEFAULT 0,
+                token_rotated_unix_seconds INTEGER,
+                access_token_hash TEXT NOT NULL,
+                last_seen_unix_seconds INTEGER NOT NULL,
+                config_mode TEXT NOT NULL DEFAULT 'local',
+                config_sync_status TEXT NOT NULL DEFAULT 'unknown',
+                applied_config_revision TEXT,
+                config_sync_error TEXT,
+                config_checked_unix_seconds INTEGER
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS clients_agent_instance_id
+                ON clients(agent_instance_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS clients_agent_identity_public_key
+                ON clients(agent_identity_public_key) WHERE agent_identity_public_key IS NOT NULL;
+            ",
+        )?;
+        for (name, definition) in [
+            ("agent_instance_id", "TEXT"),
+            ("agent_identity_public_key", "TEXT"),
+            ("config_mode", "TEXT NOT NULL DEFAULT 'local'"),
+            ("group_name", "TEXT"),
+            ("tags_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("notes", "TEXT"),
+            ("enabled", "INTEGER NOT NULL DEFAULT 1"),
+            ("created_unix_seconds", "INTEGER NOT NULL DEFAULT 0"),
+            ("token_rotated_unix_seconds", "INTEGER"),
+            ("config_sync_status", "TEXT NOT NULL DEFAULT 'unknown'"),
+            ("applied_config_revision", "TEXT"),
+            ("config_sync_error", "TEXT"),
+            ("config_checked_unix_seconds", "INTEGER"),
+        ] {
+            ensure_column(&database, name, definition)?;
+        }
+        database.execute(
+            "UPDATE clients SET agent_instance_id = client_id
+             WHERE agent_instance_id IS NULL OR TRIM(agent_instance_id) = ''",
+            [],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn count(&self) -> usize {
         self.clients.len()
     }
@@ -480,7 +535,7 @@ fn ensure_column(database: &Connection, name: &str, definition: &str) -> anyhow:
     Ok(())
 }
 
-fn validate_name(name: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_name(name: &str) -> anyhow::Result<()> {
     let name = name.trim();
     anyhow::ensure!(
         !name.is_empty() && name.chars().count() <= 80 && !name.chars().any(char::is_control),
@@ -489,7 +544,7 @@ fn validate_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn normalize_optional_text(
+pub(crate) fn normalize_optional_text(
     value: Option<String>,
     maximum: usize,
     field: &str,
@@ -506,7 +561,7 @@ fn normalize_optional_text(
     Ok(Some(value.to_owned()))
 }
 
-fn normalize_tags(tags: Vec<String>) -> anyhow::Result<Vec<String>> {
+pub(crate) fn normalize_tags(tags: Vec<String>) -> anyhow::Result<Vec<String>> {
     anyhow::ensure!(tags.len() <= 16, "client tags exceed the limit");
     let mut normalized = Vec::new();
     for tag in tags {
@@ -527,7 +582,7 @@ fn normalize_tags(tags: Vec<String>) -> anyhow::Result<Vec<String>> {
     Ok(normalized)
 }
 
-fn config_mode_name(mode: ManagedConfigMode) -> &'static str {
+pub(crate) fn config_mode_name(mode: ManagedConfigMode) -> &'static str {
     match mode {
         ManagedConfigMode::Local => "local",
         ManagedConfigMode::ReportOnly => "report_only",
@@ -535,7 +590,7 @@ fn config_mode_name(mode: ManagedConfigMode) -> &'static str {
     }
 }
 
-fn parse_config_mode(value: &str) -> ManagedConfigMode {
+pub(crate) fn parse_config_mode(value: &str) -> ManagedConfigMode {
     match value {
         "report_only" => ManagedConfigMode::ReportOnly,
         "server_managed" => ManagedConfigMode::ServerManaged,
@@ -543,7 +598,7 @@ fn parse_config_mode(value: &str) -> ManagedConfigMode {
     }
 }
 
-fn config_status_name(status: ManagedConfigStatus) -> &'static str {
+pub(crate) fn config_status_name(status: ManagedConfigStatus) -> &'static str {
     match status {
         ManagedConfigStatus::Unknown => "unknown",
         ManagedConfigStatus::Synchronized => "synchronized",
@@ -552,7 +607,7 @@ fn config_status_name(status: ManagedConfigStatus) -> &'static str {
     }
 }
 
-fn parse_config_status(value: &str) -> ManagedConfigStatus {
+pub(crate) fn parse_config_status(value: &str) -> ManagedConfigStatus {
     match value {
         "synchronized" => ManagedConfigStatus::Synchronized,
         "conflict" => ManagedConfigStatus::Conflict,
@@ -561,7 +616,7 @@ fn parse_config_status(value: &str) -> ManagedConfigStatus {
     }
 }
 
-fn hash_token(token: &str) -> anyhow::Result<String> {
+pub(crate) fn hash_token(token: &str) -> anyhow::Result<String> {
     let salt = SaltString::encode_b64(Uuid::new_v4().as_bytes())
         .map_err(|error| anyhow::anyhow!("could not create token salt: {error}"))?;
     Ok(Argon2::default()
@@ -570,7 +625,7 @@ fn hash_token(token: &str) -> anyhow::Result<String> {
         .to_string())
 }
 
-fn verify_token(token: &str, token_hash: &str) -> anyhow::Result<bool> {
+pub(crate) fn verify_token(token: &str, token_hash: &str) -> anyhow::Result<bool> {
     let parsed_hash = PasswordHash::new(token_hash)
         .map_err(|error| anyhow::anyhow!("stored client token hash is invalid: {error}"))?;
     Ok(Argon2::default()
