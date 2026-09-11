@@ -98,6 +98,7 @@ struct SharedCertificateServices {
     catalog: crate::certificate_catalog::postgres::PostgresCertificateCatalog,
     cipher: Option<Arc<crate::certificate_material::CertificateMaterialCipher>>,
     runtime: Arc<crate::ha_runtime::HaRuntime>,
+    installed_generations: Mutex<HashMap<uuid::Uuid, String>>,
 }
 
 impl CertificateManager {
@@ -151,6 +152,7 @@ impl CertificateManager {
             catalog,
             cipher,
             runtime,
+            installed_generations: Mutex::new(HashMap::new()),
         }));
         Ok(self)
     }
@@ -159,6 +161,92 @@ impl CertificateManager {
         self.shared
             .as_ref()
             .is_none_or(|shared| shared.cipher.is_some())
+    }
+
+    pub(crate) async fn commit_shared_issued_certificate(
+        &self,
+        lease: &crate::job_leases::JobLease,
+        expected_tls: &crate::certificate_catalog::RouteTlsPolicy,
+        revision: uuid::Uuid,
+        config: &crate::certificate_catalog::AcmeConfig,
+        issued: &CertificateIssueResult,
+    ) -> anyhow::Result<bool> {
+        let shared = self
+            .shared
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("shared certificate storage is unavailable"))?;
+        let cipher = shared
+            .cipher
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("cluster certificate key is not configured"))?;
+        let (certificate, key) = issued.material();
+        if !shared
+            .catalog
+            .commit_certificate_if_tls_current(
+                cipher,
+                lease,
+                expected_tls,
+                revision,
+                config,
+                issued.identifier(),
+                certificate,
+                key,
+            )
+            .await?
+        {
+            return Ok(false);
+        }
+        self.load_managed_certificate(expected_tls.route_id, issued.identifier())
+            .await?;
+        Ok(true)
+    }
+
+    pub(crate) async fn load_managed_certificate(
+        &self,
+        route_id: uuid::Uuid,
+        identifier: &str,
+    ) -> anyhow::Result<CertificateMetadata> {
+        let Some(shared) = &self.shared else {
+            return self.load_certificate(identifier);
+        };
+        let cipher = shared
+            .cipher
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("cluster certificate key is not configured"))?;
+        let material = shared
+            .catalog
+            .read_certificate_material(cipher, route_id, identifier)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("shared certificate material is missing"))?;
+        let unchanged = shared
+            .installed_generations
+            .lock()
+            .map_err(|_| anyhow::anyhow!("certificate generation cache lock poisoned"))?
+            .get(&route_id)
+            .is_some_and(|generation| generation == &material.generation);
+        if unchanged && self.has_certificate(identifier) {
+            return Ok(validate_certificate(
+                identifier,
+                &material.certificate_pem,
+                &material.private_key_pem,
+            )?
+            .1);
+        }
+        let metadata = self.install_shared_certificate(
+            identifier,
+            &material.certificate_pem,
+            &material.private_key_pem,
+        )?;
+        shared
+            .installed_generations
+            .lock()
+            .map_err(|_| anyhow::anyhow!("certificate generation cache lock poisoned"))?
+            .insert(route_id, material.generation);
+        Ok(metadata)
+    }
+
+    pub(crate) fn uses_shared_storage(&self) -> bool {
+        self.shared.is_some()
     }
 
     pub(crate) async fn account_registered_shared(

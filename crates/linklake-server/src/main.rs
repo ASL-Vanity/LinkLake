@@ -601,9 +601,10 @@ struct AppState {
     socks5_proxy_statistics: Mutex<HashMap<Uuid, Arc<socks5_tunnel::Socks5ProxyStatistics>>>,
     http_proxies: Mutex<HashMap<Uuid, http_proxy_tunnel::HttpProxyRegistration>>,
     http_proxy_statistics: Mutex<HashMap<Uuid, Arc<http_proxy_tunnel::HttpProxyStatistics>>>,
-    certificate_catalog: Mutex<CertificateCatalog>,
+    certificate_catalog: certificate_store::CertificateStore,
     certificate_manager: Option<CertificateManager>,
     certificate_jobs: Mutex<HashMap<String, Uuid>>,
+    certificate_mutations: AsyncMutex<()>,
     https_redirect_hosts: Mutex<HashSet<String>>,
     pending_connections: AsyncMutex<HashMap<Uuid, (Uuid, tokio::sync::oneshot::Sender<BoxedIo>)>>,
     global_connection_permits: Arc<Semaphore>,
@@ -1881,6 +1882,7 @@ struct PreparedCertificateOperation {
     acme_config: AcmeConfig,
     operation: CertificateOperation,
     lease: job_leases::JobLease,
+    tls_revision: Option<Uuid>,
     reservation: CertificateJobGuard,
 }
 
@@ -2166,7 +2168,7 @@ fn resolve_certificate_identifier_update(
     Ok((identifier, stored))
 }
 
-fn certificate_identifier_used_by_other_route(
+async fn certificate_identifier_used_by_other_route(
     state: &AppState,
     certificate_identifier: &str,
     excluded_route_id: Uuid,
@@ -2183,16 +2185,14 @@ fn certificate_identifier_used_by_other_route(
                 "could not read HTTP routes",
             )
         })?;
-    let catalog = state
-        .certificate_catalog
-        .lock()
-        .expect("certificate catalog lock poisoned");
+    let catalog = &state.certificate_catalog;
     for route in routes
         .into_iter()
         .filter(|route| route.id != excluded_route_id)
     {
         let policy = catalog
             .get_route_tls(route.id)
+            .await
             .map_err(coded_certificate_catalog_error)?;
         if policy.as_ref().map(|policy| policy.mode) == Some(RouteTlsMode::Acme)
             && effective_certificate_identifier(&route.hostname, policy.as_ref())
@@ -4370,9 +4370,14 @@ async fn run_server(
         socks5_proxy_statistics: Mutex::new(HashMap::new()),
         http_proxies: Mutex::new(HashMap::new()),
         http_proxy_statistics: Mutex::new(HashMap::new()),
-        certificate_catalog: Mutex::new(CertificateCatalog::open_with_database(&database)?),
+        certificate_catalog: certificate_store::CertificateStore::open(
+            &database,
+            coordination_storage.clone(),
+            ha_runtime.clone(),
+        )?,
         certificate_manager,
         certificate_jobs: Mutex::new(HashMap::new()),
+        certificate_mutations: AsyncMutex::new(()),
         https_redirect_hosts: Mutex::new(HashSet::new()),
         pending_connections: AsyncMutex::new(HashMap::new()),
         global_connection_permits: Arc::new(Semaphore::new(GLOBAL_CONNECTION_LIMIT)),
@@ -4396,7 +4401,7 @@ async fn run_server(
             },
         ),
     });
-    restore_managed_certificates(&state)?;
+    restore_managed_certificates(&state).await?;
     let _remote_update_task_sweeper = update_worker::spawn_update_task_sweeper(state.clone());
     let app = Router::new()
         .route("/", get(management_ui))
@@ -5939,6 +5944,16 @@ async fn metrics(
             "could not read fleet health metrics",
         )
     })?;
+    let certificate_states = state
+        .certificate_catalog
+        .list_certificate_states()
+        .await
+        .map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not read certificates",
+            )
+        })?;
     let statistics = state
         .tunnel_statistics
         .lock()
@@ -6014,17 +6029,6 @@ async fn metrics(
             .map(|statistics| load(statistics))
             .sum()
     };
-    let certificate_states = state
-        .certificate_catalog
-        .lock()
-        .expect("certificate catalog lock poisoned")
-        .list_certificate_states()
-        .map_err(|_| {
-            ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "could not read certificates",
-            )
-        })?;
     let now = unix_seconds() as i64;
     let expiring_boundary = now.saturating_add(30 * 86_400);
     let certificates_expired = certificate_states
@@ -7501,12 +7505,7 @@ async fn collect_alert_signals(
         .into_iter()
         .map(|route| (route.id, route.hostname))
         .collect::<HashMap<_, _>>();
-    if let Ok(certificates) = state
-        .certificate_catalog
-        .lock()
-        .expect("certificate catalog lock poisoned")
-        .list_certificate_states()
-    {
+    if let Ok(certificates) = state.certificate_catalog.list_certificate_states().await {
         for certificate in certificates {
             if let Some(not_after) = certificate.not_after {
                 let remaining_seconds = not_after.saturating_sub(now as i64);
@@ -8352,9 +8351,8 @@ async fn get_acme_config(
         .map_err(coded_management_error)?;
     let config = state
         .certificate_catalog
-        .lock()
-        .expect("certificate catalog lock poisoned")
         .get_acme_config()
+        .await
         .map_err(coded_certificate_catalog_error)?;
     Ok(Json(acme_config_view(&state, config).await?))
 }
@@ -8364,6 +8362,7 @@ async fn update_acme_config(
     headers: HeaderMap,
     Json(mut request): Json<UpdateAcmeConfig>,
 ) -> Result<Json<AcmeConfigView>, CodedApiError> {
+    let _certificate_mutation_guard = state.certificate_mutations.lock().await;
     authorize_management(&state, &headers)
         .await
         .map_err(coded_management_error)?;
@@ -8382,9 +8381,8 @@ async fn update_acme_config(
     let challenge_type = request.challenge_type.unwrap_or(
         state
             .certificate_catalog
-            .lock()
-            .expect("certificate catalog lock poisoned")
             .get_acme_config()
+            .await
             .map_err(coded_certificate_catalog_error)?
             .challenge_type,
     );
@@ -8415,21 +8413,23 @@ async fn update_acme_config(
                     "could not read HTTP routes",
                 )
             })?;
-        let catalog = state
-            .certificate_catalog
-            .lock()
-            .expect("certificate catalog lock poisoned");
-        let wildcard_configured = routes.into_iter().any(|route| {
-            catalog
+        let catalog = &state.certificate_catalog;
+        let mut wildcard_configured = false;
+        for route in routes {
+            if catalog
                 .get_route_tls(route.id)
-                .ok()
-                .flatten()
+                .await
+                .map_err(coded_certificate_catalog_error)?
                 .is_some_and(|policy| {
                     policy.mode == RouteTlsMode::Acme
                         && effective_certificate_identifier(&route.hostname, Some(&policy))
                             .starts_with("*.")
                 })
-        });
+            {
+                wildcard_configured = true;
+                break;
+            }
+        }
         if wildcard_configured {
             return Err(CodedApiError(
                 StatusCode::CONFLICT,
@@ -8440,9 +8440,8 @@ async fn update_acme_config(
     }
     let config = state
         .certificate_catalog
-        .lock()
-        .expect("certificate catalog lock poisoned")
         .update_acme_config(request, unix_seconds() as i64)
+        .await
         .map_err(coded_certificate_catalog_error)?;
     record_audit(
         &state,
@@ -8463,6 +8462,7 @@ async fn set_http_route_tls(
     Path(route_id): Path<Uuid>,
     Json(mut request): Json<UpdateRouteTlsPolicy>,
 ) -> Result<Json<RouteTlsPolicy>, CodedApiError> {
+    let _certificate_mutation_guard = state.certificate_mutations.lock().await;
     authorize_management(&state, &headers)
         .await
         .map_err(coded_management_error)?;
@@ -8472,16 +8472,15 @@ async fn set_http_route_tls(
         "HTTP route does not exist",
     ))?;
     let (old_policy, acme_config) = {
-        let catalog = state
-            .certificate_catalog
-            .lock()
-            .expect("certificate catalog lock poisoned");
+        let catalog = &state.certificate_catalog;
         (
             catalog
                 .get_route_tls(route_id)
+                .await
                 .map_err(coded_certificate_catalog_error)?,
             catalog
                 .get_acme_config()
+                .await
                 .map_err(coded_certificate_catalog_error)?,
         )
     };
@@ -8519,7 +8518,8 @@ async fn set_http_route_tls(
         ));
     }
     if request.mode == RouteTlsMode::Acme
-        && certificate_identifier_used_by_other_route(&state, &certificate_identifier, route_id)?
+        && certificate_identifier_used_by_other_route(&state, &certificate_identifier, route_id)
+            .await?
     {
         return Err(CodedApiError(
             StatusCode::CONFLICT,
@@ -8533,7 +8533,8 @@ async fn set_http_route_tls(
     let certificate_jobs = state
         .certificate_jobs
         .lock()
-        .expect("certificate jobs lock poisoned");
+        .expect("certificate jobs lock poisoned")
+        .clone();
     if (request.mode == RouteTlsMode::Disabled
         || old_certificate_identifier != certificate_identifier)
         && certificate_jobs.contains_key(&old_certificate_identifier)
@@ -8558,9 +8559,8 @@ async fn set_http_route_tls(
     let mut issue_automatically = false;
     let policy = state
         .certificate_catalog
-        .lock()
-        .expect("certificate catalog lock poisoned")
         .set_route_tls(route_id, request, unix_seconds() as i64)
+        .await
         .map_err(coded_certificate_catalog_error)?;
     let certificate_identifier = effective_certificate_identifier(&route.hostname, Some(&policy));
     {
@@ -8584,40 +8584,42 @@ async fn set_http_route_tls(
         }
         state
             .certificate_catalog
-            .lock()
-            .expect("certificate catalog lock poisoned")
             .delete_certificate_state(route_id)
+            .await
             .map_err(coded_certificate_catalog_error)?;
     }
     if mode == RouteTlsMode::Disabled {
         if let Some(manager) = &state.certificate_manager {
             manager.remove_certificate(&certificate_identifier);
         }
-        set_persisted_certificate_status(&state, route_id, CertificateStatus::Disabled)?;
+        set_persisted_certificate_status(&state, route_id, CertificateStatus::Disabled).await?;
     } else {
         let can_restore = state
             .certificate_catalog
-            .lock()
-            .expect("certificate catalog lock poisoned")
             .get_certificate_state(route_id)
+            .await
             .map_err(coded_certificate_catalog_error)?
             .is_some_and(|certificate| !certificate.expired_at(unix_seconds() as i64));
-        let restored = route.enabled
-            && can_restore
-            && state
-                .certificate_manager
-                .as_ref()
-                .is_some_and(|manager| manager.load_certificate(&certificate_identifier).is_ok());
-        if restored {
-            set_persisted_certificate_status(&state, route_id, CertificateStatus::Active)?;
+        let restored = if route.enabled && can_restore {
+            match &state.certificate_manager {
+                Some(manager) => manager
+                    .load_managed_certificate(route_id, &certificate_identifier)
+                    .await
+                    .is_ok(),
+                None => false,
+            }
         } else {
-            ensure_pending_certificate_state(&state, route_id)?;
+            false
+        };
+        if restored {
+            set_persisted_certificate_status(&state, route_id, CertificateStatus::Active).await?;
+        } else {
+            ensure_pending_certificate_state(&state, route_id).await?;
             issue_automatically = route.enabled
                 && state
                     .certificate_catalog
-                    .lock()
-                    .expect("certificate catalog lock poisoned")
                     .get_acme_config()
+                    .await
                     .is_ok_and(|config| config.enabled);
         }
     }
@@ -8632,6 +8634,7 @@ async fn set_http_route_tls(
         ),
     )
     .await;
+    drop(_certificate_mutation_guard);
     if issue_automatically {
         let _ =
             queue_certificate_operation(state.clone(), route_id, CertificateOperation::Issue).await;
@@ -8696,18 +8699,20 @@ fn http_route_policy_for_id(
         })
 }
 
-fn ensure_pending_certificate_state(state: &AppState, route_id: Uuid) -> Result<(), CodedApiError> {
-    let mut catalog = state
-        .certificate_catalog
-        .lock()
-        .expect("certificate catalog lock poisoned");
+async fn ensure_pending_certificate_state(
+    state: &AppState,
+    route_id: Uuid,
+) -> Result<(), CodedApiError> {
+    let catalog = &state.certificate_catalog;
     match catalog
         .get_certificate_state(route_id)
+        .await
         .map_err(coded_certificate_catalog_error)?
     {
         None => {
             catalog
                 .update_certificate_status(route_id, None, CertificateStatus::Pending, None)
+                .await
                 .map_err(coded_certificate_catalog_error)?;
         }
         Some(certificate)
@@ -8723,6 +8728,7 @@ fn ensure_pending_certificate_state(state: &AppState, route_id: Uuid) -> Result<
                     CertificateStatus::Pending,
                     None,
                 )
+                .await
                 .map_err(coded_certificate_catalog_error)?;
         }
         Some(_) => {}
@@ -8730,44 +8736,42 @@ fn ensure_pending_certificate_state(state: &AppState, route_id: Uuid) -> Result<
     Ok(())
 }
 
-fn set_persisted_certificate_status(
+async fn set_persisted_certificate_status(
     state: &AppState,
     route_id: Uuid,
     status: CertificateStatus,
 ) -> Result<(), CodedApiError> {
-    let mut catalog = state
-        .certificate_catalog
-        .lock()
-        .expect("certificate catalog lock poisoned");
+    let catalog = &state.certificate_catalog;
     let current = catalog
         .get_certificate_state(route_id)
+        .await
         .map_err(coded_certificate_catalog_error)?;
     match current {
         Some(current) => {
             catalog
                 .update_certificate_status(route_id, Some(current.status), status, None)
+                .await
                 .map_err(coded_certificate_catalog_error)?;
         }
         None => {
             catalog
                 .update_certificate_status(route_id, None, status, None)
+                .await
                 .map_err(coded_certificate_catalog_error)?;
         }
     }
     Ok(())
 }
 
-fn mark_certificate_operation_status(
+async fn mark_certificate_operation_status(
     state: &AppState,
     route_id: Uuid,
     status: CertificateStatus,
 ) -> Result<(), CodedApiError> {
-    let mut catalog = state
-        .certificate_catalog
-        .lock()
-        .expect("certificate catalog lock poisoned");
+    let catalog = &state.certificate_catalog;
     let current = catalog
         .get_certificate_state(route_id)
+        .await
         .map_err(coded_certificate_catalog_error)?;
     match current {
         Some(current) => {
@@ -8778,11 +8782,13 @@ fn mark_certificate_operation_status(
                     status,
                     Some(unix_seconds() as i64),
                 )
+                .await
                 .map_err(coded_certificate_catalog_error)?;
         }
         None => {
             catalog
                 .update_certificate_status(route_id, None, status, Some(unix_seconds() as i64))
+                .await
                 .map_err(coded_certificate_catalog_error)?;
         }
     }
@@ -8803,6 +8809,7 @@ async fn queue_certificate_operation(
         prepared.acme_config,
         prepared.operation,
         prepared.lease,
+        prepared.tls_revision,
         prepared.reservation,
         None,
     ));
@@ -8814,6 +8821,7 @@ async fn prepare_certificate_operation(
     route_id: Uuid,
     operation: CertificateOperation,
 ) -> Result<PreparedCertificateOperation, CodedApiError> {
+    let _certificate_mutation_guard = state.certificate_mutations.lock().await;
     let route = http_route_policy_for_id(&state, route_id)?.ok_or(CodedApiError(
         StatusCode::NOT_FOUND,
         "unknown_http_route",
@@ -8826,20 +8834,22 @@ async fn prepare_certificate_operation(
             "HTTP route is disabled",
         ));
     }
-    let (tls_policy, certificate, acme_config) = {
-        let catalog = state
-            .certificate_catalog
-            .lock()
-            .expect("certificate catalog lock poisoned");
+    let (tls_policy, tls_revision, certificate, acme_config) = {
+        let catalog = &state.certificate_catalog;
+        let (tls_policy, revision) = catalog
+            .get_route_tls_versioned(route_id)
+            .await
+            .map_err(coded_certificate_catalog_error)?;
         (
-            catalog
-                .get_route_tls(route_id)
-                .map_err(coded_certificate_catalog_error)?,
+            tls_policy,
+            revision,
             catalog
                 .get_certificate_state(route_id)
+                .await
                 .map_err(coded_certificate_catalog_error)?,
             catalog
                 .get_acme_config()
+                .await
                 .map_err(coded_certificate_catalog_error)?,
         )
     };
@@ -8927,7 +8937,7 @@ async fn prepare_certificate_operation(
             "certificate operation was attempted too recently",
         ));
     }
-    if !reserve_certificate_job(state, &route, &certificate_identifier)? {
+    if !reserve_certificate_job(state, &route, &certificate_identifier).await? {
         return Err(CodedApiError(
             StatusCode::CONFLICT,
             "certificate_operation_in_progress",
@@ -8965,7 +8975,7 @@ async fn prepare_certificate_operation(
         CertificateOperation::Issue => CertificateStatus::Issuing,
         CertificateOperation::Renew => CertificateStatus::Renewing,
     };
-    if let Err(error) = mark_certificate_operation_status(state, route_id, target_status) {
+    if let Err(error) = mark_certificate_operation_status(state, route_id, target_status).await {
         let _ = state
             .ha_runtime
             .jobs()
@@ -9009,20 +9019,22 @@ async fn prepare_certificate_operation(
         acme_config,
         operation,
         lease,
+        tls_revision,
         reservation,
     })
 }
 
-fn reserve_certificate_job(
+async fn reserve_certificate_job(
     state: &AppState,
     expected: &HttpRoutePolicy,
     expected_certificate_identifier: &str,
 ) -> Result<bool, CodedApiError> {
-    let mut jobs = state
+    if state
         .certificate_jobs
         .lock()
-        .expect("certificate jobs lock poisoned");
-    if jobs.contains_key(expected_certificate_identifier) {
+        .expect("certificate jobs lock poisoned")
+        .contains_key(expected_certificate_identifier)
+    {
         return Ok(false);
     }
     let current = http_route_policy_for_id(state, expected.id)?.ok_or(CodedApiError(
@@ -9046,9 +9058,8 @@ fn reserve_certificate_job(
     }
     let tls_policy = state
         .certificate_catalog
-        .lock()
-        .expect("certificate catalog lock poisoned")
         .get_route_tls(expected.id)
+        .await
         .map_err(coded_certificate_catalog_error)?;
     if tls_policy.as_ref().map(|policy| policy.mode) != Some(RouteTlsMode::Acme) {
         return Err(CodedApiError(
@@ -9067,7 +9078,10 @@ fn reserve_certificate_job(
         ));
     }
     Ok(reserve_certificate_job_slot(
-        &mut jobs,
+        &mut state
+            .certificate_jobs
+            .lock()
+            .expect("certificate jobs lock poisoned"),
         expected_certificate_identifier,
         expected.id,
     ))
@@ -9107,6 +9121,7 @@ async fn run_certificate_operation(
     acme_config: AcmeConfig,
     operation: CertificateOperation,
     lease: job_leases::JobLease,
+    tls_revision: Option<Uuid>,
     reservation: CertificateJobGuard,
     stop: Option<watch::Receiver<bool>>,
 ) {
@@ -9122,6 +9137,8 @@ async fn run_certificate_operation(
             certificate_identifier,
             acme_config,
             operation,
+            lease.clone(),
+            tls_revision,
             stop,
         ),
     )
@@ -9172,6 +9189,8 @@ async fn run_certificate_operation_inner(
     certificate_identifier: String,
     acme_config: AcmeConfig,
     operation: CertificateOperation,
+    lease: job_leases::JobLease,
+    tls_revision: Option<Uuid>,
     mut stop: Option<watch::Receiver<bool>>,
 ) -> bool {
     let issue_config = certificate_manager::AcmeIssueConfig {
@@ -9223,8 +9242,11 @@ async fn run_certificate_operation_inner(
                 &manager,
                 &result,
                 &acme_config,
+                &lease,
+                tls_revision,
                 now,
-            );
+            )
+            .await;
             match current {
                 Ok(true) => {
                     committed = true;
@@ -9287,8 +9309,12 @@ async fn run_certificate_operation_inner(
                 },
                 &message,
                 &acme_config,
+                &lease,
+                tls_revision,
                 now,
-            ) {
+            )
+            .await
+            {
                 Ok(true) => {
                     record_audit(
                         &state,
@@ -9343,31 +9369,31 @@ fn certificate_target_matches(
     })
 }
 
-fn record_certificate_success_if_current(
+async fn record_certificate_success_if_current(
     state: &AppState,
     expected: &HttpRoutePolicy,
     expected_certificate_identifier: &str,
     manager: &CertificateManager,
     issued: &certificate_manager::CertificateIssueResult,
     expected_config: &AcmeConfig,
+    lease: &job_leases::JobLease,
+    tls_revision: Option<Uuid>,
     completed_at: i64,
 ) -> anyhow::Result<bool> {
+    let _certificate_mutation_guard = state.certificate_mutations.lock().await;
     anyhow::ensure!(
         issued.identifier() == expected_certificate_identifier,
         "issued certificate target differs from requested target"
     );
-    let route_catalog = state
+    let routes = state
         .http_route_catalog
         .lock()
-        .expect("HTTP route catalog lock poisoned");
-    let routes = route_catalog.list()?;
+        .expect("HTTP route catalog lock poisoned")
+        .list()?;
     let current = routes.iter().find(|route| route.id == expected.id);
-    let mut certificate_catalog = state
-        .certificate_catalog
-        .lock()
-        .expect("certificate catalog lock poisoned");
-    let tls_policy = certificate_catalog.get_route_tls(expected.id)?;
-    let current_config = certificate_catalog.get_acme_config()?;
+    let certificate_catalog = &state.certificate_catalog;
+    let tls_policy = certificate_catalog.get_route_tls(expected.id).await?;
+    let current_config = certificate_catalog.get_acme_config().await?;
     if !current_config.enabled || &current_config != expected_config {
         return Ok(false);
     }
@@ -9379,42 +9405,65 @@ fn record_certificate_success_if_current(
     ) {
         return Ok(false);
     }
-    manager.commit_issued_certificate(issued, |metadata| {
-        certificate_catalog.record_certificate_success(
-            expected.id,
-            &metadata.issuer,
-            i64::try_from(metadata.not_before_unix_seconds)?,
-            i64::try_from(metadata.not_after_unix_seconds)?,
-            completed_at,
-        )?;
-        Ok(())
-    })?;
-    drop(certificate_catalog);
-    drop(route_catalog);
+    match certificate_catalog {
+        certificate_store::CertificateStore::Sqlite(catalog) => {
+            anyhow::ensure!(
+                state.ha_runtime.fencing_token()? == lease.fencing_token,
+                "certificate leadership changed"
+            );
+            let mut catalog = catalog
+                .lock()
+                .map_err(|_| anyhow::anyhow!("certificate catalog lock poisoned"))?;
+            manager.commit_issued_certificate(issued, |metadata| {
+                catalog.record_certificate_success(
+                    expected.id,
+                    &metadata.issuer,
+                    i64::try_from(metadata.not_before_unix_seconds)?,
+                    i64::try_from(metadata.not_after_unix_seconds)?,
+                    completed_at,
+                )?;
+                Ok(())
+            })?;
+        }
+        certificate_store::CertificateStore::Postgres(_) => {
+            return manager
+                .commit_shared_issued_certificate(
+                    lease,
+                    tls_policy
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("TLS policy disappeared"))?,
+                    tls_revision.ok_or_else(|| anyhow::anyhow!("TLS revision is missing"))?,
+                    expected_config,
+                    issued,
+                )
+                .await;
+        }
+    }
+
     Ok(true)
 }
 
-fn record_certificate_failure_if_current(
+async fn record_certificate_failure_if_current(
     state: &AppState,
     expected: &HttpRoutePolicy,
     expected_certificate_identifier: &str,
     error_code: &str,
     error_message: &str,
     expected_config: &AcmeConfig,
+    lease: &job_leases::JobLease,
+    tls_revision: Option<Uuid>,
     attempted_at: i64,
 ) -> anyhow::Result<bool> {
-    let route_catalog = state
+    let _certificate_mutation_guard = state.certificate_mutations.lock().await;
+    let routes = state
         .http_route_catalog
         .lock()
-        .expect("HTTP route catalog lock poisoned");
-    let routes = route_catalog.list()?;
+        .expect("HTTP route catalog lock poisoned")
+        .list()?;
     let current = routes.iter().find(|route| route.id == expected.id);
-    let mut certificate_catalog = state
-        .certificate_catalog
-        .lock()
-        .expect("certificate catalog lock poisoned");
-    let tls_policy = certificate_catalog.get_route_tls(expected.id)?;
-    let current_config = certificate_catalog.get_acme_config()?;
+    let certificate_catalog = &state.certificate_catalog;
+    let tls_policy = certificate_catalog.get_route_tls(expected.id).await?;
+    let current_config = certificate_catalog.get_acme_config().await?;
     if !current_config.enabled || &current_config != expected_config {
         return Ok(false);
     }
@@ -9426,14 +9475,34 @@ fn record_certificate_failure_if_current(
     ) {
         return Ok(false);
     }
-    certificate_catalog.record_certificate_failure(
-        expected.id,
-        error_code,
-        error_message,
-        attempted_at,
-    )?;
-    drop(certificate_catalog);
-    drop(route_catalog);
+    match certificate_catalog {
+        certificate_store::CertificateStore::Sqlite(catalog) => {
+            anyhow::ensure!(
+                state.ha_runtime.fencing_token()? == lease.fencing_token,
+                "certificate leadership changed"
+            );
+            catalog
+                .lock()
+                .map_err(|_| anyhow::anyhow!("certificate catalog lock poisoned"))?
+                .record_certificate_failure(expected.id, error_code, error_message, attempted_at)?;
+        }
+        certificate_store::CertificateStore::Postgres(catalog) => {
+            return catalog
+                .record_failure_if_tls_current(
+                    lease,
+                    tls_policy
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("TLS policy disappeared"))?,
+                    tls_revision.ok_or_else(|| anyhow::anyhow!("TLS revision is missing"))?,
+                    expected_config,
+                    expected_certificate_identifier,
+                    error_code,
+                    error_message,
+                )
+                .await;
+        }
+    }
+
     Ok(true)
 }
 
@@ -9479,7 +9548,8 @@ fn certificate_operation_cooldown_seconds() -> i64 {
         .unwrap_or(60)
 }
 
-fn restore_managed_certificates(state: &Arc<AppState>) -> anyhow::Result<()> {
+async fn restore_managed_certificates(state: &Arc<AppState>) -> anyhow::Result<()> {
+    let _restore_guard = state.certificate_mutations.lock().await;
     let Some(manager) = &state.certificate_manager else {
         return Ok(());
     };
@@ -9489,15 +9559,13 @@ fn restore_managed_certificates(state: &Arc<AppState>) -> anyhow::Result<()> {
         .expect("HTTP route catalog lock poisoned")
         .list()?;
     let now = unix_seconds() as i64;
+    let writable = state.ha_runtime.is_leader();
     for route in routes.into_iter().filter(|route| route.enabled) {
         let (tls_policy, certificate) = {
-            let catalog = state
-                .certificate_catalog
-                .lock()
-                .expect("certificate catalog lock poisoned");
+            let catalog = &state.certificate_catalog;
             (
-                catalog.get_route_tls(route.id)?,
-                catalog.get_certificate_state(route.id)?,
+                catalog.get_route_tls(route.id).await?,
+                catalog.get_certificate_state(route.id).await?,
             )
         };
         let Some(tls_policy) = tls_policy else {
@@ -9512,8 +9580,11 @@ fn restore_managed_certificates(state: &Arc<AppState>) -> anyhow::Result<()> {
             .as_ref()
             .is_some_and(|certificate| certificate.expired_at(now))
         {
-            set_persisted_certificate_status(state, route.id, CertificateStatus::Expired)
-                .map_err(|error| anyhow::anyhow!(error.2))?;
+            if writable {
+                set_persisted_certificate_status(state, route.id, CertificateStatus::Expired)
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error.2))?;
+            }
             continue;
         }
         if certificate
@@ -9521,21 +9592,27 @@ fn restore_managed_certificates(state: &Arc<AppState>) -> anyhow::Result<()> {
             .and_then(|value| value.not_after)
             .is_some()
         {
-            match manager.load_certificate(&certificate_identifier) {
+            match manager
+                .load_managed_certificate(route.id, &certificate_identifier)
+                .await
+            {
                 Ok(_) => {
-                    if certificate.as_ref().is_some_and(|certificate| {
-                        matches!(
-                            certificate.status,
-                            CertificateStatus::Issuing
-                                | CertificateStatus::Renewing
-                                | CertificateStatus::Disabled
-                        )
-                    }) {
+                    if writable
+                        && certificate.as_ref().is_some_and(|certificate| {
+                            matches!(
+                                certificate.status,
+                                CertificateStatus::Issuing
+                                    | CertificateStatus::Renewing
+                                    | CertificateStatus::Disabled
+                            )
+                        })
+                    {
                         set_persisted_certificate_status(
                             state,
                             route.id,
                             CertificateStatus::Active,
                         )
+                        .await
                         .map_err(|error| anyhow::anyhow!(error.2))?;
                     }
                     if tls_policy.redirect_http_to_https {
@@ -9548,16 +9625,17 @@ fn restore_managed_certificates(state: &Arc<AppState>) -> anyhow::Result<()> {
                 }
                 Err(error) => {
                     let message = sanitize_certificate_error(&error.to_string());
-                    let _ = state
-                        .certificate_catalog
-                        .lock()
-                        .expect("certificate catalog lock poisoned")
-                        .record_certificate_failure(
-                            route.id,
-                            "certificate_load_failed",
-                            &message,
-                            now,
-                        );
+                    if writable {
+                        let _ = state
+                            .certificate_catalog
+                            .record_certificate_failure(
+                                route.id,
+                                "certificate_load_failed",
+                                &message,
+                                now,
+                            )
+                            .await;
+                    }
                     tracing::warn!(
                         "could not restore certificate for {}: {}",
                         route.hostname,
@@ -9565,15 +9643,18 @@ fn restore_managed_certificates(state: &Arc<AppState>) -> anyhow::Result<()> {
                     );
                 }
             }
-        } else if certificate.as_ref().is_some_and(|certificate| {
-            matches!(
-                certificate.status,
-                CertificateStatus::Issuing
-                    | CertificateStatus::Renewing
-                    | CertificateStatus::Disabled
-            )
-        }) {
+        } else if writable
+            && certificate.as_ref().is_some_and(|certificate| {
+                matches!(
+                    certificate.status,
+                    CertificateStatus::Issuing
+                        | CertificateStatus::Renewing
+                        | CertificateStatus::Disabled
+                )
+            })
+        {
             set_persisted_certificate_status(state, route.id, CertificateStatus::Pending)
+                .await
                 .map_err(|error| anyhow::anyhow!(error.2))?;
         }
     }
@@ -9584,6 +9665,7 @@ async fn run_certificate_maintenance(
     state: Arc<AppState>,
     mut stop: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    restore_managed_certificates(&state).await?;
     let start = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut interval = tokio::time::interval_at(start, Duration::from_secs(60));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -9612,9 +9694,8 @@ async fn scan_certificate_maintenance(
     }
     let config_enabled = state
         .certificate_catalog
-        .lock()
-        .expect("certificate catalog lock poisoned")
         .get_acme_config()
+        .await
         .is_ok_and(|config| config.enabled);
     if !config_enabled {
         return;
@@ -9632,14 +9713,23 @@ async fn scan_certificate_maintenance(
         if *stop.borrow() {
             return;
         }
+        let certificate_scan_guard = state.certificate_mutations.lock().await;
+        if !http_route_policy_for_id(&state, route.id)
+            .ok()
+            .flatten()
+            .is_some_and(|current| {
+                current.enabled
+                    && current.hostname == route.hostname
+                    && current.client_id == route.client_id
+            })
+        {
+            continue;
+        }
         let (tls_policy, certificate) = {
-            let catalog = state
-                .certificate_catalog
-                .lock()
-                .expect("certificate catalog lock poisoned");
+            let catalog = &state.certificate_catalog;
             (
-                catalog.get_route_tls(route.id).ok().flatten(),
-                catalog.get_certificate_state(route.id).ok().flatten(),
+                catalog.get_route_tls(route.id).await.ok().flatten(),
+                catalog.get_certificate_state(route.id).await.ok().flatten(),
             )
         };
         if tls_policy.as_ref().map(|policy| policy.mode) != Some(RouteTlsMode::Acme) {
@@ -9647,6 +9737,20 @@ async fn scan_certificate_maintenance(
         }
         let certificate_identifier =
             effective_certificate_identifier(&route.hostname, tls_policy.as_ref());
+        if certificate.as_ref().is_some_and(|certificate| {
+            certificate.not_after.is_some() && !certificate.expired_at(now)
+        }) {
+            if let Some(manager) = &state.certificate_manager {
+                if manager.uses_shared_storage() {
+                    if let Err(error) = manager
+                        .load_managed_certificate(route.id, &certificate_identifier)
+                        .await
+                    {
+                        tracing::warn!(%error, route_id=%route.id, "could not refresh shared certificate generation");
+                    }
+                }
+            }
+        }
         if certificate.as_ref().is_some_and(|certificate| {
             certificate.status != CertificateStatus::Error && certificate.expired_at(now)
         }) {
@@ -9656,7 +9760,8 @@ async fn scan_certificate_maintenance(
             if let Some(manager) = &state.certificate_manager {
                 manager.remove_certificate(&certificate_identifier);
             }
-            let _ = set_persisted_certificate_status(&state, route.id, CertificateStatus::Expired);
+            let _ = set_persisted_certificate_status(&state, route.id, CertificateStatus::Expired)
+                .await;
         } else if certificate
             .as_ref()
             .is_some_and(|certificate| certificate.expired_at(now))
@@ -9674,6 +9779,7 @@ async fn scan_certificate_maintenance(
             .is_some_and(|manager| manager.has_certificate(&certificate_identifier));
         let operation =
             select_certificate_maintenance_operation(certificate.as_ref(), has_certificate, now);
+        drop(certificate_scan_guard);
         if let Some(operation) = operation {
             if *stop.borrow() {
                 return;
@@ -9688,6 +9794,7 @@ async fn scan_certificate_maintenance(
                         prepared.acme_config,
                         prepared.operation,
                         prepared.lease,
+                        prepared.tls_revision,
                         prepared.reservation,
                         Some(stop.clone()),
                     ));
@@ -11018,6 +11125,7 @@ async fn reconcile_fleet_bundle_v2(
     }
     // 与普通策略写入串行化，避免 ownership 检查和实际 CRUD 之间出现竞态窗口。
     let _mutation_guard = state.policy_mutation_lock.lock().await;
+    let _certificate_guard = state.certificate_mutations.lock().await;
     state
         .metrics
         .fleet_reconcile_attempts_total
@@ -13823,23 +13931,28 @@ async fn list_http_routes(
         .keys()
         .cloned()
         .collect::<HashSet<_>>();
+    let mut certificate_views = state
+        .certificate_catalog
+        .route_views(&policies.iter().map(|policy| policy.id).collect::<Vec<_>>())
+        .await
+        .map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not read certificate state",
+            )
+        })?;
     let statistics = state
         .http_route_statistics
         .lock()
         .expect("HTTP route statistics lock poisoned");
-    let certificate_catalog = state
-        .certificate_catalog
-        .lock()
-        .expect("certificate catalog lock poisoned");
+
     Ok(Json(
         policies
             .into_iter()
             .map(|policy| {
                 let route_statistics = statistics.get(&policy.hostname);
-                let tls_policy = certificate_catalog.get_route_tls(policy.id).unwrap_or(None);
-                let certificate = certificate_catalog
-                    .get_certificate_state(policy.id)
-                    .unwrap_or(None);
+                let (tls_policy, certificate) =
+                    certificate_views.remove(&policy.id).unwrap_or_default();
                 let http2_backend = route_statistics.map(|value| value.http2_backend.clone());
                 HttpRouteView {
                     online: online.contains(&policy.hostname),
@@ -14131,6 +14244,7 @@ async fn create_http_route(
     headers: HeaderMap,
     Json(request): Json<CreateHttpRoutePolicy>,
 ) -> Result<Json<HttpRoutePolicy>, CodedApiError> {
+    let _certificate_mutation_guard = state.certificate_mutations.lock().await;
     authorize_management(&state, &headers)
         .await
         .map_err(coded_management_error)?;
@@ -14144,7 +14258,8 @@ async fn create_http_route(
     let certificate_jobs = state
         .certificate_jobs
         .lock()
-        .expect("certificate jobs lock poisoned");
+        .expect("certificate jobs lock poisoned")
+        .clone();
     let policy = state
         .http_route_catalog
         .lock()
@@ -14171,6 +14286,7 @@ async fn update_http_route(
     Path(route_id): Path<Uuid>,
     Json(request): Json<UpdateHttpRoutePolicy>,
 ) -> Result<Json<HttpRoutePolicy>, CodedApiError> {
+    let _certificate_mutation_guard = state.certificate_mutations.lock().await;
     authorize_management(&state, &headers)
         .await
         .map_err(coded_management_error)?;
@@ -14189,7 +14305,7 @@ async fn update_http_route(
             "unknown client for HTTP route",
         ));
     }
-    let (old_policy, tls_policy) = {
+    let old_policy = {
         let catalog = state
             .http_route_catalog
             .lock()
@@ -14202,14 +14318,13 @@ async fn update_http_route(
                 "unknown_http_route",
                 "unknown HTTP route",
             ))?;
-        let tls_policy = state
-            .certificate_catalog
-            .lock()
-            .expect("certificate catalog lock poisoned")
-            .get_route_tls(route_id)
-            .map_err(coded_certificate_catalog_error)?;
-        (old, tls_policy)
+        old
     };
+    let tls_policy = state
+        .certificate_catalog
+        .get_route_tls(route_id)
+        .await
+        .map_err(coded_certificate_catalog_error)?;
     let old_certificate_identifier =
         effective_certificate_identifier(&old_policy.hostname, tls_policy.as_ref());
     let new_certificate_identifier =
@@ -14225,11 +14340,8 @@ async fn update_http_route(
     }
     if old_certificate_identifier != new_certificate_identifier
         && tls_policy.as_ref().map(|policy| policy.mode) == Some(RouteTlsMode::Acme)
-        && certificate_identifier_used_by_other_route(
-            &state,
-            &new_certificate_identifier,
-            route_id,
-        )?
+        && certificate_identifier_used_by_other_route(&state, &new_certificate_identifier, route_id)
+            .await?
     {
         return Err(CodedApiError(
             StatusCode::CONFLICT,
@@ -14240,7 +14352,8 @@ async fn update_http_route(
     let certificate_jobs = state
         .certificate_jobs
         .lock()
-        .expect("certificate jobs lock poisoned");
+        .expect("certificate jobs lock poisoned")
+        .clone();
     if certificate_jobs.contains_key(&old_certificate_identifier)
         || certificate_jobs
             .get(&new_certificate_identifier)
@@ -14284,9 +14397,8 @@ async fn update_http_route(
         }
         state
             .certificate_catalog
-            .lock()
-            .expect("certificate catalog lock poisoned")
             .delete_certificate_state(route_id)
+            .await
             .map_err(coded_certificate_catalog_error)?;
     }
     let mut redirects = state
@@ -14321,15 +14433,15 @@ async fn set_http_route_enabled(
     Path(route_id): Path<Uuid>,
     Json(request): Json<EnableTunnelRequest>,
 ) -> Result<StatusCode, CodedApiError> {
+    let _certificate_mutation_guard = state.certificate_mutations.lock().await;
     authorize_management(&state, &headers)
         .await
         .map_err(coded_management_error)?;
     let route = http_route_policy_for_id(&state, route_id)?;
     let tls_policy = state
         .certificate_catalog
-        .lock()
-        .expect("certificate catalog lock poisoned")
         .get_route_tls(route_id)
+        .await
         .map_err(coded_certificate_catalog_error)?;
     let certificate_identifier = route
         .as_ref()
@@ -14337,7 +14449,8 @@ async fn set_http_route_enabled(
     let certificate_jobs = state
         .certificate_jobs
         .lock()
-        .expect("certificate jobs lock poisoned");
+        .expect("certificate jobs lock poisoned")
+        .clone();
     if !request.enabled
         && certificate_identifier
             .as_deref()
@@ -14386,17 +14499,16 @@ async fn set_http_route_enabled(
     } else if let Some(route) = route.as_ref() {
         let hostname = &route.hostname;
         let should_load = {
-            let catalog = state
-                .certificate_catalog
-                .lock()
-                .expect("certificate catalog lock poisoned");
+            let catalog = &state.certificate_catalog;
             catalog
                 .get_route_tls(route_id)
+                .await
                 .ok()
                 .flatten()
                 .is_some_and(|policy| policy.mode == RouteTlsMode::Acme)
                 && catalog
                     .get_certificate_state(route_id)
+                    .await
                     .ok()
                     .flatten()
                     .is_some_and(|certificate| !certificate.expired_at(unix_seconds() as i64))
@@ -14404,16 +14516,15 @@ async fn set_http_route_enabled(
         if should_load {
             if let Some(manager) = &state.certificate_manager {
                 let identifier = certificate_identifier.as_deref().unwrap_or(hostname);
-                if let Err(error) = manager.load_certificate(identifier) {
+                if let Err(error) = manager.load_managed_certificate(route_id, identifier).await {
                     tracing::warn!("could not reload certificate for {hostname}: {error}");
                 }
             }
         }
         let should_redirect = state
             .certificate_catalog
-            .lock()
-            .expect("certificate catalog lock poisoned")
             .get_route_tls(route_id)
+            .await
             .ok()
             .flatten()
             .is_some_and(|policy| {
@@ -14447,15 +14558,15 @@ async fn delete_http_route(
     headers: HeaderMap,
     Path(route_id): Path<Uuid>,
 ) -> Result<StatusCode, CodedApiError> {
+    let _certificate_mutation_guard = state.certificate_mutations.lock().await;
     authorize_management(&state, &headers)
         .await
         .map_err(coded_management_error)?;
     let route = http_route_policy_for_id(&state, route_id)?;
     let tls_policy = state
         .certificate_catalog
-        .lock()
-        .expect("certificate catalog lock poisoned")
         .get_route_tls(route_id)
+        .await
         .map_err(coded_certificate_catalog_error)?;
     let certificate_identifier = route
         .as_ref()
@@ -14463,7 +14574,8 @@ async fn delete_http_route(
     let certificate_jobs = state
         .certificate_jobs
         .lock()
-        .expect("certificate jobs lock poisoned");
+        .expect("certificate jobs lock poisoned")
+        .clone();
     if certificate_identifier
         .as_deref()
         .is_some_and(|identifier| certificate_jobs.contains_key(identifier))
@@ -14514,15 +14626,14 @@ async fn delete_http_route(
         }
     }
     {
-        let mut certificate_catalog = state
-            .certificate_catalog
-            .lock()
-            .expect("certificate catalog lock poisoned");
+        let certificate_catalog = &state.certificate_catalog;
         certificate_catalog
             .delete_route_tls(route_id)
+            .await
             .map_err(coded_certificate_catalog_error)?;
         certificate_catalog
             .delete_certificate_state(route_id)
+            .await
             .map_err(coded_certificate_catalog_error)?;
     }
     drop(certificate_jobs);
@@ -15924,6 +16035,7 @@ async fn enforce_fleet_ownership(
     };
     // 持锁直到处理器完成，使 ownership 检查与随后写入成为进程内原子序列。
     let _mutation_guard = state.policy_mutation_lock.lock().await;
+
     match state.policy_service.is_policy_managed(kind, policy_id) {
         Ok(false) => next.run(request).await,
         Ok(true) => CodedApiError(

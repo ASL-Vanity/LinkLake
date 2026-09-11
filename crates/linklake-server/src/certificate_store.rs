@@ -33,6 +33,60 @@ macro_rules! delegate {
 }
 
 impl CertificateStore {
+    pub(crate) async fn route_views(
+        &self,
+        route_ids: &[Uuid],
+    ) -> Result<
+        std::collections::HashMap<Uuid, (Option<RouteTlsPolicy>, Option<CertificateState>)>,
+        CertificateCatalogError,
+    > {
+        match self {
+            Self::Sqlite(catalog) => {
+                let catalog = catalog
+                    .lock()
+                    .map_err(|_| CertificateCatalogError::InvalidStoredData("catalog_lock"))?;
+                route_ids
+                    .iter()
+                    .map(|id| {
+                        Ok((
+                            *id,
+                            (
+                                catalog.get_route_tls(*id)?,
+                                catalog.get_certificate_state(*id)?,
+                            ),
+                        ))
+                    })
+                    .collect()
+            }
+            Self::Postgres(catalog) => catalog.route_views(route_ids).await.map_err(shared_error),
+        }
+    }
+
+    pub(crate) async fn get_route_tls_versioned(
+        &self,
+        route_id: Uuid,
+    ) -> Result<(Option<RouteTlsPolicy>, Option<Uuid>), CertificateCatalogError> {
+        match self {
+            Self::Sqlite(catalog) => Ok((
+                catalog
+                    .lock()
+                    .map_err(|_| CertificateCatalogError::InvalidStoredData("catalog_lock"))?
+                    .get_route_tls(route_id)?,
+                None,
+            )),
+            Self::Postgres(catalog) => Ok(
+                match catalog
+                    .get_route_tls_snapshot(route_id)
+                    .await
+                    .map_err(shared_error)?
+                {
+                    Some(snapshot) => (Some(snapshot.policy), Some(snapshot.revision)),
+                    None => (None, None),
+                },
+            ),
+        }
+    }
+
     pub(crate) fn open(
         database: &Database,
         storage: CoordinationStorage,

@@ -46,6 +46,95 @@ pub(crate) fn acme_account_job_key(directory_url: &str) -> anyhow::Result<String
 }
 
 impl PostgresCertificateCatalog {
+    pub(crate) async fn route_views(
+        &self,
+        route_ids: &[Uuid],
+    ) -> anyhow::Result<
+        std::collections::HashMap<Uuid, (Option<RouteTlsPolicy>, Option<CertificateState>)>,
+    > {
+        let ids: Vec<_> = route_ids.iter().map(Uuid::to_string).collect();
+        let client = self.storage.postgres_client().await?;
+        client.query("SELECT wanted.route_id,tls.policy::text,cert.state::text FROM unnest($1::text[]) AS wanted(route_id)
+            LEFT JOIN linklake_route_tls AS tls ON tls.route_id=wanted.route_id
+            LEFT JOIN linklake_certificate_states AS cert ON cert.route_id=wanted.route_id", &[&ids]).await?.iter().map(|row| {
+                Ok((Uuid::parse_str(row.get(0))?,(row.get::<_,Option<&str>>(1).map(serde_json::from_str).transpose()?,row.get::<_,Option<&str>>(2).map(serde_json::from_str).transpose()?)))
+            }).collect()
+    }
+
+    pub(crate) async fn record_failure_if_tls_current(
+        &self,
+        lease: &JobLease,
+        expected_tls: &RouteTlsPolicy,
+        revision: Uuid,
+        expected_config: &AcmeConfig,
+        identifier: &str,
+        error_code: &str,
+        error_message: &str,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            lease.job_kind == "certificate" && lease.job_key == certificate_job_key(identifier)?,
+            "certificate job identity does not match failure"
+        );
+        let error_code = error_code.trim();
+        let error_message = error_message.trim();
+        anyhow::ensure!(
+            !error_code.is_empty()
+                && error_code.len() <= 80
+                && error_code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')),
+            "invalid certificate failure code"
+        );
+        anyhow::ensure!(
+            !error_message.is_empty() && error_message.len() <= 2000,
+            "invalid certificate failure message"
+        );
+        let mut client = self.storage.postgres_client().await?;
+        let transaction = client.transaction().await?;
+        self.fence(&transaction).await?;
+        self.runtime
+            .jobs()
+            .assert_postgres_transaction_lease(&transaction, lease)
+            .await?;
+        let current = transaction
+            .query_opt(
+                "SELECT policy::text,revision FROM linklake_route_tls WHERE route_id=$1 FOR UPDATE",
+                &[&expected_tls.route_id.to_string()],
+            )
+            .await?
+            .map(|row| -> anyhow::Result<_> {
+                Ok((
+                    serde_json::from_str::<RouteTlsPolicy>(row.get(0))?,
+                    Uuid::parse_str(row.get(1))?,
+                ))
+            })
+            .transpose()?;
+        let config = read_acme_config(&transaction).await?;
+        if !current.as_ref().is_some_and(|(policy, current_revision)| {
+            policy == expected_tls && *current_revision == revision
+        }) || expected_tls.mode != RouteTlsMode::Acme
+            || !config.enabled
+            || &config != expected_config
+        {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+        let mut state = read_state(&transaction, expected_tls.route_id)
+            .await?
+            .unwrap_or_else(|| empty_state(expected_tls.route_id, CertificateStatus::Error));
+        state.status = CertificateStatus::Error;
+        state.last_attempt = Some(database_now(&transaction).await?);
+        state.failure_count = state
+            .failure_count
+            .checked_add(1)
+            .ok_or(CertificateCatalogError::InvalidStoredData("failure_count"))?;
+        state.last_error_code = Some(error_code.to_owned());
+        state.last_error_message = Some(error_message.to_owned());
+        save_state(&transaction, &state).await?;
+        transaction.commit().await?;
+        Ok(true)
+    }
+
     pub(crate) async fn material_key_fingerprint(&self) -> anyhow::Result<Option<String>> {
         let client = self.storage.postgres_client().await?;
         Ok(client
