@@ -1,4 +1,4 @@
-//! 单次证书任务的续租和取消边界，手动签发与维护任务使用同一保护。
+//! 单次外部任务的续租和取消边界，手动操作与后台任务使用同一保护。
 
 use crate::{ha_runtime::HaRuntime, job_leases::JobLease};
 use std::{future::Future, sync::Arc, time::Duration};
@@ -23,45 +23,45 @@ pub(crate) async fn run<T>(
     loop {
         anyhow::ensure!(
             !stop.as_ref().is_some_and(|stop| *stop.borrow()),
-            "certificate operation stopped"
+            "leased operation stopped"
         );
         anyhow::ensure!(
             runtime.fencing_token().ok() == Some(lease.fencing_token),
-            "certificate leadership changed"
+            "operation leadership changed"
         );
         if deadline.is_none() {
             let started = Instant::now();
             let renewed = tokio::select! {
                 biased;
-                _ = cancelled(&mut stop) => anyhow::bail!("certificate operation stopped"),
+                _ = cancelled(&mut stop) => anyhow::bail!("leased operation stopped"),
                 changed = leadership.changed() => {
-                    anyhow::ensure!(changed.is_ok(), "certificate leadership channel closed");
+                    anyhow::ensure!(changed.is_ok(), "operation leadership channel closed");
                     continue;
                 },
                 result = jobs.renew(&lease.job_key, &lease.job_kind, lease.lease_id, lease.fencing_token) => result?,
-            }.ok_or_else(|| anyhow::anyhow!("certificate job lease expired"))?;
+            }.ok_or_else(|| anyhow::anyhow!("operation job lease expired"))?;
             deadline = Some(started + remaining_lease_duration(&renewed));
         }
         let expires = deadline.expect("lease was renewed");
         tokio::select! {
             biased;
-            _ = cancelled(&mut stop) => anyhow::bail!("certificate operation stopped"),
-            _ = tokio::time::sleep_until(expires) => anyhow::bail!("certificate job lease expired"),
+            _ = cancelled(&mut stop) => anyhow::bail!("leased operation stopped"),
+            _ = tokio::time::sleep_until(expires) => anyhow::bail!("operation job lease expired"),
             changed = leadership.changed() => {
-                anyhow::ensure!(changed.is_ok(), "certificate leadership channel closed");
+                anyhow::ensure!(changed.is_ok(), "operation leadership channel closed");
             }
             _ = renew_tick.tick() => {
                 let started = Instant::now();
                 let renewed = tokio::select! {
                     biased;
-                    _ = cancelled(&mut stop) => anyhow::bail!("certificate operation stopped"),
-                    _ = tokio::time::sleep_until(expires) => anyhow::bail!("certificate job lease expired"),
+                    _ = cancelled(&mut stop) => anyhow::bail!("leased operation stopped"),
+                    _ = tokio::time::sleep_until(expires) => anyhow::bail!("operation job lease expired"),
                     changed = leadership.changed() => {
-                        anyhow::ensure!(changed.is_ok(), "certificate leadership channel closed");
+                        anyhow::ensure!(changed.is_ok(), "operation leadership channel closed");
                         continue;
                     }
                     result = jobs.renew(&lease.job_key, &lease.job_kind, lease.lease_id, lease.fencing_token) => result?,
-                }.ok_or_else(|| anyhow::anyhow!("certificate job lease expired"))?;
+                }.ok_or_else(|| anyhow::anyhow!("operation job lease expired"))?;
                 deadline = Some(started + remaining_lease_duration(&renewed));
             }
             result = &mut operation => return Ok(result),

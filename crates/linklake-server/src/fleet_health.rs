@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::database::Database;
 use crate::fleet::FleetPeer;
+use crate::job_leases::{JobLease, JobLeases};
 
 #[path = "fleet_health_postgres.rs"]
 pub(crate) mod postgres;
@@ -21,6 +22,7 @@ const DEFAULT_FAILURE_THRESHOLD: u16 = 3;
 const DEFAULT_HEALTH_COOLDOWN_SECONDS: u32 = 30;
 const DEFAULT_DNS_COOLDOWN_SECONDS: u32 = 60;
 const DNS_OPERATION_LEASE_SECONDS: u64 = 30;
+const DNS_PROVIDER_DRIFT: &str = "provider DNS record differs from the committed target";
 const MAX_ERROR_SUMMARY_CHARS: usize = 320;
 const MAX_PROBE_EVENTS_PER_PEER: u64 = 16_384;
 
@@ -258,6 +260,7 @@ pub(crate) struct FreezeFleetDnsFailover {
 #[derive(Clone, Debug)]
 pub(crate) struct FleetDnsChangePlan {
     pub(crate) operation_id: Uuid,
+    pub(crate) lease_until_unix_seconds: u64,
     pub(crate) failover_id: Uuid,
     pub(crate) failover_name: String,
     pub(crate) hostname: String,
@@ -697,6 +700,7 @@ impl FleetHealthCatalog {
         let transaction = self
             .database
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_dns_record_unassigned(&transaction, id, &request.zone_id, &request.record_id)?;
         transaction.execute(
             "INSERT INTO fleet_dns_failovers (
                 id, name, hostname, record_type, zone_id, record_id, token_env, ttl,
@@ -753,6 +757,7 @@ impl FleetHealthCatalog {
             return Ok(None);
         };
         anyhow::ensure!(pending.is_none(), "fleet DNS failover operation is pending");
+        ensure_dns_record_unassigned(&transaction, id, &request.zone_id, &request.record_id)?;
         transaction.execute(
             "UPDATE fleet_dns_failovers SET
                 name = ?2, hostname = ?3, record_type = ?4, zone_id = ?5,
@@ -995,6 +1000,7 @@ impl FleetHealthCatalog {
                         peer_name,
                         target,
                         reason,
+                        now.saturating_add(DNS_OPERATION_LEASE_SECONDS),
                     ));
                     continue;
                 }
@@ -1078,21 +1084,111 @@ impl FleetHealthCatalog {
                 candidate.peer_name.clone(),
                 candidate.target.clone(),
                 reason.to_owned(),
+                now.saturating_add(DNS_OPERATION_LEASE_SECONDS),
             ));
         }
         transaction.commit()?;
         Ok(plans)
     }
 
+    #[cfg(test)]
     pub(crate) fn complete_dns_change(
         &mut self,
         plan: &FleetDnsChangePlan,
         result: Result<(), &str>,
         now: u64,
     ) -> anyhow::Result<FleetDnsChangeResult> {
+        self.complete_dns_change_inner(plan, result, now, None)
+    }
+
+    pub(crate) fn validate_dns_execution(
+        &mut self,
+        plan: &FleetDnsChangePlan,
+        jobs: &JobLeases,
+        lease: &JobLease,
+    ) -> anyhow::Result<u64> {
         let transaction = self
             .database
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_dns_job(plan, lease)?;
+        jobs.assert_sqlite_transaction_lease(&transaction, lease)?;
+        let now: u64 = transaction.query_row("SELECT unixepoch('now')", [], |row| row.get(0))?;
+        let mut current = read_dns_failover(&transaction, plan.failover_id)?
+            .ok_or_else(|| anyhow::anyhow!("fleet DNS failover does not exist"))?;
+        current.targets = read_dns_targets(&transaction, plan.failover_id)?;
+        assert_dns_plan_current(&current, plan, now)?;
+        ensure_dns_record_unassigned(
+            &transaction,
+            plan.failover_id,
+            &plan.zone_id,
+            &plan.record_id,
+        )?;
+        let remaining = dns_execution_seconds(plan, now)?;
+        anyhow::ensure!(
+            read_dns_candidates(&transaction, &current, now)?
+                .iter()
+                .any(|candidate| candidate.peer_id == plan.peer_id
+                    && candidate.target == plan.target),
+            "fleet DNS target no longer satisfies health and cooldown"
+        );
+        transaction.commit()?;
+        Ok(remaining)
+    }
+
+    pub(crate) fn complete_dns_change_with_lease(
+        &mut self,
+        plan: &FleetDnsChangePlan,
+        result: Result<(), &str>,
+        jobs: &JobLeases,
+        lease: &JobLease,
+    ) -> anyhow::Result<FleetDnsChangeResult> {
+        self.complete_dns_change_inner(plan, result, 0, Some((jobs, lease)))
+    }
+
+    pub(crate) fn mark_dns_drift(
+        &mut self,
+        plan: &FleetDnsChangePlan,
+        jobs: &JobLeases,
+        lease: &JobLease,
+    ) -> anyhow::Result<bool> {
+        let transaction = self
+            .database
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_dns_job(plan, lease)?;
+        jobs.assert_sqlite_transaction_lease(&transaction, lease)?;
+        let Some(current) = read_dns_failover(&transaction, plan.failover_id)? else {
+            return Ok(false);
+        };
+        if !dns_verification_is_current(&current, plan) {
+            return Ok(false);
+        }
+        transaction.execute(
+            "UPDATE fleet_dns_failovers SET reconcile_required=1,
+            last_error_summary=?2,
+            updated_unix_seconds=unixepoch('now') WHERE id=?1",
+            params![plan.failover_id.to_string(), DNS_PROVIDER_DRIFT],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    fn complete_dns_change_inner(
+        &mut self,
+        plan: &FleetDnsChangePlan,
+        result: Result<(), &str>,
+        now: u64,
+        execution: Option<(&JobLeases, &JobLease)>,
+    ) -> anyhow::Result<FleetDnsChangeResult> {
+        let transaction = self
+            .database
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = if let Some((jobs, lease)) = execution {
+            assert_dns_job(plan, lease)?;
+            jobs.assert_sqlite_transaction_lease(&transaction, lease)?;
+            transaction.query_row("SELECT unixepoch('now')", [], |row| row.get::<_, u64>(0))?
+        } else {
+            now
+        };
         let existing = transaction
             .query_row(
                 "SELECT failover_id, peer_id, target_value, reason, applied, error_summary
@@ -1130,31 +1226,9 @@ impl FleetHealthCatalog {
                 error_summary,
             });
         }
-        let pending = transaction
-            .query_row(
-                "SELECT pending_operation_id, pending_peer_id, pending_target,
-                        pending_reason, cooldown_seconds
-                 FROM fleet_dns_failovers WHERE id = ?1",
-                [plan.failover_id.to_string()],
-                |row| {
-                    Ok((
-                        row.get::<_, Option<String>>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, u32>(4)?,
-                    ))
-                },
-            )
-            .optional()?
+        let current = read_dns_failover(&transaction, plan.failover_id)?
             .ok_or_else(|| anyhow::anyhow!("fleet DNS failover does not exist"))?;
-        anyhow::ensure!(
-            pending.0.as_deref() == Some(plan.operation_id.to_string().as_str())
-                && pending.1.as_deref() == Some(plan.peer_id.to_string().as_str())
-                && pending.2.as_deref() == Some(plan.target.as_str())
-                && pending.3.as_deref() == Some(plan.reason.as_str()),
-            "fleet DNS operation is stale"
-        );
+        assert_dns_plan_current(&current, plan, now)?;
         let (applied, error_summary) = match result {
             Ok(()) => (true, None),
             Err(error) => (false, Some(summarize_error(error))),
@@ -1202,7 +1276,7 @@ impl FleetHealthCatalog {
                     plan.peer_id.to_string(),
                     plan.target,
                     now as i64,
-                    now.saturating_add(pending.4 as u64) as i64,
+                    now.saturating_add(u64::from(current.cooldown_seconds)) as i64,
                     plan.reason,
                 ],
             )?;
@@ -1219,7 +1293,7 @@ impl FleetHealthCatalog {
                  WHERE id = ?1",
                 params![
                     plan.failover_id.to_string(),
-                    now.saturating_add(pending.4 as u64) as i64,
+                    now.saturating_add(u64::from(current.cooldown_seconds)) as i64,
                     error_summary,
                     now as i64,
                 ],
@@ -1291,20 +1365,7 @@ pub(crate) async fn apply_cloudflare_dns_change(
     client: &reqwest::Client,
     plan: &FleetDnsChangePlan,
 ) -> anyhow::Result<()> {
-    let token = std::env::var(&plan.token_env)
-        .with_context(|| format!("{} is not configured", plan.token_env))?;
-    anyhow::ensure!(
-        !token.trim().is_empty(),
-        "{} is not configured",
-        plan.token_env
-    );
-    let endpoint = format!(
-        "https://api.cloudflare.com/client/v4/zones/{}/dns_records/{}",
-        plan.zone_id, plan.record_id
-    );
-    let response = client
-        .put(endpoint)
-        .bearer_auth(token)
+    let response = cloudflare_record_request(client, reqwest::Method::PUT, plan)?
         .json(&serde_json::json!({
             "type": plan.record_type.as_str(),
             "name": plan.hostname,
@@ -1315,23 +1376,128 @@ pub(crate) async fn apply_cloudflare_dns_change(
         .send()
         .await
         .context("Cloudflare DNS request failed")?;
-    let status = response.status();
-    let body = response
-        .json::<CloudflareResponse>()
+    let record = decode_cloudflare_record(response).await?;
+    anyhow::ensure!(
+        record.matches(plan),
+        "Cloudflare returned a different DNS record after update"
+    );
+    Ok(())
+}
+
+pub(crate) async fn cloudflare_dns_matches(
+    client: &reqwest::Client,
+    plan: &FleetDnsChangePlan,
+) -> anyhow::Result<bool> {
+    let response = cloudflare_record_request(client, reqwest::Method::GET, plan)?
+        .send()
         .await
-        .context("Cloudflare DNS response was invalid")?;
+        .context("Cloudflare DNS verification request failed")?;
+    Ok(decode_cloudflare_record(response).await?.matches(plan))
+}
+
+fn cloudflare_record_request(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    plan: &FleetDnsChangePlan,
+) -> anyhow::Result<reqwest::RequestBuilder> {
+    let token = zeroize::Zeroizing::new(
+        std::env::var(&plan.token_env)
+            .with_context(|| format!("{} is not configured", plan.token_env))?,
+    );
+    anyhow::ensure!(
+        !token.trim().is_empty(),
+        "{} is not configured",
+        plan.token_env
+    );
+    Ok(client
+        .request(
+            method,
+            format!(
+                "https://api.cloudflare.com/client/v4/zones/{}/dns_records/{}",
+                plan.zone_id, plan.record_id
+            ),
+        )
+        .bearer_auth(token.trim()))
+}
+
+async fn decode_cloudflare_record(
+    mut response: reqwest::Response,
+) -> anyhow::Result<CloudflareRecord> {
+    let status = response.status();
+    let mut bytes = Vec::new();
+    const MAX_BYTES: usize = 1024 * 1024;
+    anyhow::ensure!(
+        response
+            .content_length()
+            .is_none_or(|length| length <= MAX_BYTES as u64),
+        "Cloudflare DNS response is too large"
+    );
+    while let Some(chunk) = response.chunk().await? {
+        anyhow::ensure!(
+            bytes.len().saturating_add(chunk.len()) <= MAX_BYTES,
+            "Cloudflare DNS response is too large"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    let body: CloudflareResponse =
+        serde_json::from_slice(&bytes).context("Cloudflare DNS response was invalid")?;
     anyhow::ensure!(
         status.is_success() && body.success,
-        "Cloudflare DNS update failed with HTTP {}{}",
+        "Cloudflare DNS request failed with HTTP {}{}",
         status.as_u16(),
         body.error_suffix()
     );
-    Ok(())
+    body.result
+        .ok_or_else(|| anyhow::anyhow!("Cloudflare DNS response has no record"))
+}
+
+#[derive(Deserialize)]
+struct CloudflareRecord {
+    id: String,
+    name: String,
+    #[serde(rename = "type")]
+    record_type: String,
+    content: String,
+    ttl: u32,
+    proxied: bool,
+}
+
+impl CloudflareRecord {
+    fn matches(&self, plan: &FleetDnsChangePlan) -> bool {
+        let content_matches = match plan.record_type {
+            FleetDnsRecordType::A => self
+                .content
+                .parse::<Ipv4Addr>()
+                .ok()
+                .zip(plan.target.parse::<Ipv4Addr>().ok())
+                .is_some_and(|(a, b)| a == b),
+            FleetDnsRecordType::Aaaa => self
+                .content
+                .parse::<Ipv6Addr>()
+                .ok()
+                .zip(plan.target.parse::<Ipv6Addr>().ok())
+                .is_some_and(|(a, b)| a == b),
+            FleetDnsRecordType::Cname => self
+                .content
+                .trim_end_matches('.')
+                .eq_ignore_ascii_case(plan.target.trim_end_matches('.')),
+        };
+        self.id.eq_ignore_ascii_case(&plan.record_id)
+            && self
+                .name
+                .trim_end_matches('.')
+                .eq_ignore_ascii_case(&plan.hostname)
+            && self.record_type == plan.record_type.as_str()
+            && content_matches
+            && self.proxied == plan.proxied
+            && (self.proxied || self.ttl == plan.ttl)
+    }
 }
 
 #[derive(Deserialize)]
 struct CloudflareResponse {
     success: bool,
+    result: Option<CloudflareRecord>,
     #[serde(default)]
     errors: Vec<CloudflareError>,
 }
@@ -1339,7 +1505,7 @@ struct CloudflareResponse {
 impl CloudflareResponse {
     fn error_suffix(&self) -> String {
         self.errors.first().map_or_else(String::new, |error| {
-            format!(" ({}: {})", error.code, summarize_error(&error.message))
+            format!(" (provider error code {})", error.code)
         })
     }
 }
@@ -1347,7 +1513,6 @@ impl CloudflareResponse {
 #[derive(Deserialize)]
 struct CloudflareError {
     code: u64,
-    message: String,
 }
 
 fn initialize_persistent_counters(connection: &Connection) -> anyhow::Result<()> {
@@ -1656,8 +1821,8 @@ fn validate_dns_failover(
         .trim()
         .trim_end_matches('.')
         .to_ascii_lowercase();
-    request.zone_id = request.zone_id.trim().to_owned();
-    request.record_id = request.record_id.trim().to_owned();
+    request.zone_id = request.zone_id.trim().to_ascii_lowercase();
+    request.record_id = request.record_id.trim().to_ascii_lowercase();
     request.token_env = request.token_env.trim().to_owned();
     anyhow::ensure!(
         !request.name.is_empty() && request.name.chars().count() <= 80,
@@ -1965,7 +2130,11 @@ fn dns_switch_reason(
             if failover.current_target.as_deref() == Some(candidate_target)
                 && failover.reconcile_required
             {
-                "configuration_updated"
+                if failover.last_error_summary.as_deref() == Some(DNS_PROVIDER_DRIFT) {
+                    "provider_drift"
+                } else {
+                    "configuration_updated"
+                }
             } else {
                 "target_value_changed"
             },
@@ -2023,9 +2192,11 @@ fn change_plan(
     peer_name: String,
     target: String,
     reason: String,
+    lease_until_unix_seconds: u64,
 ) -> FleetDnsChangePlan {
     FleetDnsChangePlan {
         operation_id,
+        lease_until_unix_seconds,
         failover_id: failover.id,
         failover_name: failover.name.clone(),
         hostname: failover.hostname.clone(),
@@ -2040,6 +2211,116 @@ fn change_plan(
         target,
         reason,
     }
+}
+
+pub(crate) fn dns_execution_job_key(plan: &FleetDnsChangePlan) -> String {
+    use sha2::{Digest, Sha256};
+    format!(
+        "fleet_dns:{:x}",
+        Sha256::digest(
+            format!(
+                "{}:{}",
+                plan.zone_id.to_ascii_lowercase(),
+                plan.record_id.to_ascii_lowercase()
+            )
+            .as_bytes()
+        )
+    )
+}
+
+pub(crate) fn dns_verification_plan(current: &FleetDnsFailover) -> Option<FleetDnsChangePlan> {
+    if !current.enabled
+        || current.frozen
+        || current.pending_operation_id.is_some()
+        || current.reconcile_required
+    {
+        return None;
+    }
+    Some(change_plan(
+        current,
+        Uuid::new_v4(),
+        current.current_peer_id?,
+        String::new(),
+        current.current_target.clone()?,
+        "provider_verification".to_owned(),
+        0,
+    ))
+}
+
+fn dns_verification_is_current(current: &FleetDnsFailover, plan: &FleetDnsChangePlan) -> bool {
+    current.enabled
+        && !current.frozen
+        && current.pending_operation_id.is_none()
+        && !current.reconcile_required
+        && current.current_peer_id == Some(plan.peer_id)
+        && current.current_target.as_deref() == Some(plan.target.as_str())
+        && dns_record_settings_match(current, plan)
+}
+
+fn dns_record_settings_match(current: &FleetDnsFailover, plan: &FleetDnsChangePlan) -> bool {
+    current.hostname == plan.hostname
+        && current.record_type == plan.record_type
+        && current.zone_id == plan.zone_id
+        && current.record_id == plan.record_id
+        && current.token_env == plan.token_env
+        && current.ttl == plan.ttl
+        && current.proxied == plan.proxied
+}
+
+fn assert_dns_job(plan: &FleetDnsChangePlan, lease: &JobLease) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        lease.job_kind == "fleet_dns" && lease.job_key == dns_execution_job_key(plan),
+        "fleet DNS execution lease does not match record"
+    );
+    Ok(())
+}
+
+fn ensure_dns_record_unassigned(
+    connection: &Connection,
+    id: Uuid,
+    zone_id: &str,
+    record_id: &str,
+) -> anyhow::Result<()> {
+    let conflict: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM fleet_dns_failovers WHERE id<>?1 AND lower(zone_id)=lower(?2) AND lower(record_id)=lower(?3))",
+        params![id.to_string(),zone_id,record_id], |row| row.get(0))?;
+    anyhow::ensure!(
+        !conflict,
+        "Cloudflare DNS record is already managed by another failover"
+    );
+    Ok(())
+}
+
+fn dns_execution_seconds(plan: &FleetDnsChangePlan, now: u64) -> anyhow::Result<u64> {
+    let remaining = plan
+        .lease_until_unix_seconds
+        .saturating_sub(now)
+        .saturating_sub(1);
+    // 请求最多 10 秒，再留一秒提交余量；不要在计划即将过期时发出不可撤销的请求。
+    anyhow::ensure!(
+        remaining > 11,
+        "fleet DNS plan has insufficient time remaining; replan after expiry"
+    );
+    Ok(remaining)
+}
+
+fn assert_dns_plan_current(
+    current: &FleetDnsFailover,
+    plan: &FleetDnsChangePlan,
+    now: u64,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        current.enabled
+            && !current.frozen
+            && current.pending_operation_id == Some(plan.operation_id)
+            && current.pending_peer_id == Some(plan.peer_id)
+            && current.pending_target.as_deref() == Some(plan.target.as_str())
+            && current.pending_reason.as_deref() == Some(plan.reason.as_str())
+            && current.pending_lease_until_unix_seconds == Some(plan.lease_until_unix_seconds)
+            && plan.lease_until_unix_seconds > now
+            && dns_record_settings_match(current, plan),
+        "fleet DNS operation is stale"
+    );
+    Ok(())
 }
 
 fn read_peer_name(connection: &Connection, peer_id: Uuid) -> anyhow::Result<Option<String>> {
@@ -2558,11 +2839,17 @@ mod tests {
             .to_string()
             .contains("operation is pending"));
         assert!(catalog.plan_dns_changes(31, None).unwrap().is_empty());
+        assert!(catalog.complete_dns_change(&first, Ok(()), 32).is_err());
         drop(catalog);
         let mut reopened = FleetHealthCatalog::open_with_database(&database).unwrap();
         let retried = reopened.plan_dns_changes(32, None).unwrap().remove(0);
         assert_eq!(retried.operation_id, first.operation_id);
         assert_eq!(retried.peer_id, first.peer_id);
+        assert_ne!(
+            retried.lease_until_unix_seconds,
+            first.lease_until_unix_seconds
+        );
+        assert!(reopened.complete_dns_change(&first, Ok(()), 32).is_err());
         let mut tampered = retried.clone();
         tampered.target = "203.0.113.99".to_owned();
         assert!(reopened
@@ -2931,5 +3218,111 @@ mod tests {
         ));
         assert!(!valid_secret_env("LINKLAKE_MANAGEMENT_TOKEN"));
         assert!(!valid_secret_env("LINKLAKE_ENROLLMENT_TOKEN"));
+    }
+
+    #[test]
+    fn dns_execution_rejects_freeze_and_changed_provider_settings() {
+        let (_database, fleet, mut catalog, primary, secondary) = setup();
+        let mut current = catalog
+            .create_dns_failover(
+                dns_request(primary.id, secondary.id),
+                &fleet.list().unwrap(),
+                2,
+            )
+            .unwrap();
+        let plan = change_plan(
+            &current,
+            Uuid::new_v4(),
+            primary.id,
+            primary.name.clone(),
+            "203.0.113.10".to_owned(),
+            "initial_activation".to_owned(),
+            32,
+        );
+        current.pending_operation_id = Some(plan.operation_id);
+        current.pending_peer_id = Some(plan.peer_id);
+        current.pending_target = Some(plan.target.clone());
+        current.pending_reason = Some(plan.reason.clone());
+        current.pending_lease_until_unix_seconds = Some(32);
+        assert!(assert_dns_plan_current(&current, &plan, 31).is_ok());
+        assert!(assert_dns_plan_current(&current, &plan, 32).is_err());
+        assert!(dns_execution_seconds(&plan, 2).is_ok());
+        assert!(dns_execution_seconds(&plan, 20).is_err());
+        current.frozen = true;
+        assert!(assert_dns_plan_current(&current, &plan, 3).is_err());
+        current.frozen = false;
+        current.ttl += 1;
+        assert!(assert_dns_plan_current(&current, &plan, 3).is_err());
+    }
+
+    #[test]
+    fn provider_record_match_checks_identity_and_normalizes_dns_values() {
+        let (_database, fleet, mut catalog, primary, secondary) = setup();
+        let current = catalog
+            .create_dns_failover(
+                dns_request(primary.id, secondary.id),
+                &fleet.list().unwrap(),
+                2,
+            )
+            .unwrap();
+        let mut plan = change_plan(
+            &current,
+            Uuid::new_v4(),
+            primary.id,
+            primary.name.clone(),
+            "2001:db8::1".to_owned(),
+            "initial_activation".to_owned(),
+            32,
+        );
+        plan.record_type = FleetDnsRecordType::Aaaa;
+        let mut record = CloudflareRecord {
+            id: plan.record_id.clone(),
+            name: format!("{}.", plan.hostname.to_uppercase()),
+            record_type: "AAAA".to_owned(),
+            content: "2001:db8:0:0:0:0:0:1".to_owned(),
+            ttl: plan.ttl,
+            proxied: plan.proxied,
+        };
+        assert!(record.matches(&plan));
+        record.content = "2001:db8::2".to_owned();
+        assert!(!record.matches(&plan));
+        plan.record_type = FleetDnsRecordType::Cname;
+        plan.target = "target.example.com".to_owned();
+        record.record_type = "CNAME".to_owned();
+        record.content = "TARGET.EXAMPLE.COM.".to_owned();
+        assert!(record.matches(&plan));
+        record.id = "different-record".to_owned();
+        assert!(!record.matches(&plan));
+    }
+
+    #[test]
+    fn provider_record_cannot_have_two_failover_owners_with_different_id_case() {
+        let (_database, fleet, mut catalog, primary, secondary) = setup();
+        let peers = fleet.list().unwrap();
+        let first = catalog
+            .create_dns_failover(dns_request(primary.id, secondary.id), &peers, 2)
+            .unwrap();
+        let mut duplicate = dns_request(primary.id, secondary.id);
+        duplicate.name = "Another failover".to_owned();
+        duplicate.zone_id.make_ascii_uppercase();
+        duplicate.record_id.make_ascii_uppercase();
+        assert!(catalog
+            .create_dns_failover(duplicate, &peers, 3)
+            .unwrap_err()
+            .to_string()
+            .contains("already managed"));
+        let mut plan = change_plan(
+            &first,
+            Uuid::new_v4(),
+            primary.id,
+            primary.name,
+            "203.0.113.10".to_owned(),
+            "initial_activation".to_owned(),
+            32,
+        );
+        let key = dns_execution_job_key(&plan);
+        plan.zone_id.make_ascii_uppercase();
+        plan.record_id.make_ascii_uppercase();
+        assert_eq!(key, dns_execution_job_key(&plan));
     }
 }

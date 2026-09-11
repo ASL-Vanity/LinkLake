@@ -14,7 +14,7 @@ use std::{
 use uuid::Uuid;
 
 pub(crate) enum FleetHealthStore {
-    Sqlite(Mutex<FleetHealthCatalog>),
+    Sqlite(Mutex<FleetHealthCatalog>, Arc<HaRuntime>),
     Postgres(PostgresFleetHealthCatalog),
 }
 
@@ -23,7 +23,7 @@ macro_rules! delegate {
     ($name:ident ($($arg:ident : $kind:ty),*) -> $result:ty) => {
         pub(crate) async fn $name(&self, $($arg: $kind),*) -> anyhow::Result<$result> {
             match self {
-                Self::Sqlite(catalog) => catalog.lock().map_err(|_| anyhow::anyhow!("Fleet health catalog lock poisoned"))?.$name($($arg),*),
+                Self::Sqlite(catalog, _) => catalog.lock().map_err(|_| anyhow::anyhow!("Fleet health catalog lock poisoned"))?.$name($($arg),*),
                 Self::Postgres(catalog) => catalog.$name($($arg),*).await,
             }
         }
@@ -37,9 +37,10 @@ impl FleetHealthStore {
         runtime: Arc<HaRuntime>,
     ) -> anyhow::Result<Self> {
         Ok(match storage.backend() {
-            StorageBackend::Sqlite => Self::Sqlite(Mutex::new(
-                FleetHealthCatalog::open_with_database(database)?,
-            )),
+            StorageBackend::Sqlite => Self::Sqlite(
+                Mutex::new(FleetHealthCatalog::open_with_database(database)?),
+                runtime,
+            ),
             StorageBackend::Postgres => {
                 Self::Postgres(PostgresFleetHealthCatalog { storage, runtime })
             }
@@ -59,6 +60,47 @@ impl FleetHealthStore {
     delegate!(list_dns_switch_events(id: Uuid, limit: usize) -> Vec<FleetDnsSwitchEvent>);
     delegate!(set_dns_frozen(id: Uuid, frozen: bool, reason: Option<&str>, now: u64) -> Option<FleetDnsFailover>);
     delegate!(plan_dns_changes(now: u64, only: Option<Uuid>) -> Vec<FleetDnsChangePlan>);
-    delegate!(complete_dns_change(plan: &FleetDnsChangePlan, result: Result<(), &str>, now: u64) -> FleetDnsChangeResult);
+    pub(crate) async fn validate_dns_execution(
+        &self,
+        plan: &FleetDnsChangePlan,
+        lease: &crate::job_leases::JobLease,
+    ) -> anyhow::Result<u64> {
+        match self {
+            Self::Sqlite(catalog, runtime) => catalog
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Fleet health catalog lock poisoned"))?
+                .validate_dns_execution(plan, runtime.jobs(), lease),
+            Self::Postgres(catalog) => catalog.validate_dns_execution(plan, lease).await,
+        }
+    }
+
+    pub(crate) async fn complete_dns_change(
+        &self,
+        plan: &FleetDnsChangePlan,
+        result: Result<(), &str>,
+        lease: &crate::job_leases::JobLease,
+    ) -> anyhow::Result<FleetDnsChangeResult> {
+        match self {
+            Self::Sqlite(catalog, runtime) => catalog
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Fleet health catalog lock poisoned"))?
+                .complete_dns_change_with_lease(plan, result, runtime.jobs(), lease),
+            Self::Postgres(catalog) => catalog.complete_dns_change(plan, result, lease).await,
+        }
+    }
     delegate!(metrics() -> FleetHealthMetrics);
+
+    pub(crate) async fn mark_dns_drift(
+        &self,
+        plan: &FleetDnsChangePlan,
+        lease: &crate::job_leases::JobLease,
+    ) -> anyhow::Result<bool> {
+        match self {
+            Self::Sqlite(catalog, runtime) => catalog
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Fleet health catalog lock poisoned"))?
+                .mark_dns_drift(plan, runtime.jobs(), lease),
+            Self::Postgres(catalog) => catalog.mark_dns_drift(plan, lease).await,
+        }
+    }
 }

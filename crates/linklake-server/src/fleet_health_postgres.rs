@@ -319,6 +319,13 @@ impl PostgresFleetHealthCatalog {
         let mut client = self.storage.postgres_client().await?;
         let transaction = client.transaction().await?;
         self.fence(&transaction).await?;
+        ensure_shared_dns_record_unassigned(
+            &transaction,
+            Uuid::nil(),
+            &request.zone_id,
+            &request.record_id,
+        )
+        .await?;
         validate_shared_targets(&transaction, &request.targets).await?;
         let value = FleetDnsFailover {
             id: Uuid::new_v4(),
@@ -377,6 +384,8 @@ impl PostgresFleetHealthCatalog {
             value.pending_operation_id.is_none(),
             "fleet DNS failover operation is pending"
         );
+        ensure_shared_dns_record_unassigned(&transaction, id, &request.zone_id, &request.record_id)
+            .await?;
         validate_shared_targets(&transaction, &request.targets).await?;
         value.name = request.name;
         value.hostname = request.hostname;
@@ -459,15 +468,86 @@ impl PostgresFleetHealthCatalog {
             .collect()
     }
 
+    pub(crate) async fn validate_dns_execution(
+        &self,
+        plan: &FleetDnsChangePlan,
+        lease: &JobLease,
+    ) -> anyhow::Result<u64> {
+        let mut client = self.storage.postgres_client().await?;
+        let transaction = client.transaction().await?;
+        self.fence(&transaction).await?;
+        assert_dns_job(plan, lease)?;
+        self.runtime
+            .jobs()
+            .assert_postgres_transaction_lease(&transaction, lease)
+            .await?;
+        let now = dns_database_now(&transaction).await?;
+        let current = locked_dns(&transaction, plan.failover_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("fleet DNS failover does not exist"))?;
+        assert_dns_plan_current(&current, plan, now)?;
+        ensure_shared_dns_record_unassigned(
+            &transaction,
+            plan.failover_id,
+            &plan.zone_id,
+            &plan.record_id,
+        )
+        .await?;
+        let remaining = dns_execution_seconds(plan, now)?;
+        let peers = shared_peers(&transaction).await?;
+        anyhow::ensure!(
+            candidates(&current, &peers, now)
+                .iter()
+                .any(|candidate| candidate.peer_id == plan.peer_id
+                    && candidate.target == plan.target),
+            "fleet DNS target no longer satisfies health and cooldown"
+        );
+        transaction.commit().await?;
+        Ok(remaining)
+    }
+
+    pub(crate) async fn mark_dns_drift(
+        &self,
+        plan: &FleetDnsChangePlan,
+        lease: &JobLease,
+    ) -> anyhow::Result<bool> {
+        let mut client = self.storage.postgres_client().await?;
+        let transaction = client.transaction().await?;
+        self.fence(&transaction).await?;
+        assert_dns_job(plan, lease)?;
+        self.runtime
+            .jobs()
+            .assert_postgres_transaction_lease(&transaction, lease)
+            .await?;
+        let Some(mut current) = locked_dns(&transaction, plan.failover_id).await? else {
+            return Ok(false);
+        };
+        if !dns_verification_is_current(&current, plan) {
+            return Ok(false);
+        }
+        current.reconcile_required = true;
+        current.last_error_summary = Some(DNS_PROVIDER_DRIFT.to_owned());
+        current.updated_unix_seconds = dns_database_now(&transaction).await?;
+        save_dns(&transaction, &current).await?;
+        transaction.commit().await?;
+        Ok(true)
+    }
+
     pub(crate) async fn complete_dns_change(
         &self,
         plan: &FleetDnsChangePlan,
         result: Result<(), &str>,
-        now: u64,
+        lease: &JobLease,
     ) -> anyhow::Result<FleetDnsChangeResult> {
         let mut client = self.storage.postgres_client().await?;
         let transaction = client.transaction().await?;
         self.fence(&transaction).await?;
+        assert_dns_job(plan, lease)?;
+        self.runtime
+            .jobs()
+            .assert_postgres_transaction_lease(&transaction, lease)
+            .await?;
+        let now = dns_database_now(&transaction).await?;
         if let Some(row) = transaction
             .query_opt(
                 "SELECT snapshot::text FROM linklake_fleet_dns_events WHERE operation_id=$1",
@@ -498,13 +578,7 @@ impl PostgresFleetHealthCatalog {
         let mut value = locked_dns(&transaction, plan.failover_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("fleet DNS failover does not exist"))?;
-        anyhow::ensure!(
-            value.pending_operation_id == Some(plan.operation_id)
-                && value.pending_peer_id == Some(plan.peer_id)
-                && value.pending_target.as_deref() == Some(plan.target.as_str())
-                && value.pending_reason.as_deref() == Some(plan.reason.as_str()),
-            "fleet DNS operation is stale"
-        );
+        assert_dns_plan_current(&value, plan, now)?;
         let applied = result.is_ok();
         let error_summary = result.err().map(summarize_error);
         record_dns_event(&transaction, plan, applied, error_summary.clone(), now).await?;
@@ -622,12 +696,13 @@ async fn record_dns_event(
 impl PostgresFleetHealthCatalog {
     pub(crate) async fn plan_dns_changes(
         &self,
-        now: u64,
+        _now: u64,
         only: Option<Uuid>,
     ) -> anyhow::Result<Vec<FleetDnsChangePlan>> {
         let mut client = self.storage.postgres_client().await?;
         let transaction = client.transaction().await?;
         self.fence(&transaction).await?;
+        let now = dns_database_now(&transaction).await?;
         let peers = shared_peers(&transaction).await?;
         let only_text = only.map(|id| id.to_string());
         let rows = transaction.query("SELECT snapshot::text FROM linklake_fleet_dns_failovers WHERE ($1::text IS NULL OR id=$1) ORDER BY name FOR UPDATE", &[&only_text]).await?;
@@ -678,6 +753,7 @@ impl PostgresFleetHealthCatalog {
                     peer_name,
                     target.clone(),
                     reason,
+                    now.saturating_add(DNS_OPERATION_LEASE_SECONDS),
                 );
                 if candidates
                     .iter()
@@ -728,6 +804,7 @@ impl PostgresFleetHealthCatalog {
                 candidate.peer_name.clone(),
                 candidate.target.clone(),
                 reason,
+                now.saturating_add(DNS_OPERATION_LEASE_SECONDS),
             ));
         }
         transaction.commit().await?;
@@ -790,6 +867,32 @@ impl PostgresFleetHealthCatalog {
         transaction.commit().await?;
         Ok(result)
     }
+}
+
+async fn dns_database_now(transaction: &PgTransaction<'_>) -> anyhow::Result<u64> {
+    let now: i64 = transaction
+        .query_one(
+            "SELECT floor(EXTRACT(EPOCH FROM clock_timestamp()))::bigint",
+            &[],
+        )
+        .await?
+        .get(0);
+    Ok(now.try_into()?)
+}
+
+async fn ensure_shared_dns_record_unassigned(
+    transaction: &PgTransaction<'_>,
+    id: Uuid,
+    zone_id: &str,
+    record_id: &str,
+) -> anyhow::Result<()> {
+    let conflict: bool = transaction.query_one("SELECT EXISTS(SELECT 1 FROM linklake_fleet_dns_failovers WHERE id<>$1 AND lower(zone_id)=lower($2) AND lower(record_id)=lower($3))",
+        &[&id.to_string(), &zone_id, &record_id]).await?.get(0);
+    anyhow::ensure!(
+        !conflict,
+        "Cloudflare DNS record is already managed by another failover"
+    );
+    Ok(())
 }
 
 type SharedPeers = Vec<(FleetPeer, Option<FleetHealthSnapshot>)>;
@@ -871,7 +974,11 @@ fn switch_reason(
         return if value.current_target.as_deref() == Some(candidate.target.as_str())
             && value.reconcile_required
         {
-            "configuration_updated"
+            if value.last_error_summary.as_deref() == Some(DNS_PROVIDER_DRIFT) {
+                "provider_drift"
+            } else {
+                "configuration_updated"
+            }
         } else {
             "target_value_changed"
         };

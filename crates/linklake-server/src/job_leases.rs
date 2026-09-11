@@ -68,6 +68,29 @@ impl JobLeases {
         Duration::from_secs((self.lease_seconds / 3).max(1))
     }
 
+    pub(crate) fn assert_sqlite_transaction_lease(
+        &self,
+        transaction: &SqliteTransaction<'_>,
+        lease: &JobLease,
+    ) -> anyhow::Result<()> {
+        self.coordinator
+            .assert_sqlite_transaction_fence(transaction, lease.fencing_token)?;
+        let current = read_sqlite_job(transaction, &lease.job_key)?;
+        let now = sqlite_now(transaction)?;
+        anyhow::ensure!(
+            current.is_some_and(|current| {
+                current.lease_id == lease.lease_id
+                    && current.job_kind == lease.job_kind
+                    && current.owner_instance_id == self.coordinator.instance_id()
+                    && current.owner_incarnation_id == self.coordinator.incarnation_id()
+                    && current.fencing_token == lease.fencing_token
+                    && current.lease_until_unix_seconds > now
+            }),
+            "job lease is stale; refusing business state write"
+        );
+        Ok(())
+    }
+
     /// 在业务提交事务中核对精确任务身份，防止旧 worker 提交新租约的结果。
     pub(crate) async fn assert_postgres_transaction_lease(
         &self,

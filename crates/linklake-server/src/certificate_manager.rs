@@ -623,7 +623,7 @@ impl CertificateManager {
             }
         };
         let result =
-            crate::certificate_job::run(shared.runtime.clone(), lease.clone(), None, async {
+            crate::job_execution::run(shared.runtime.clone(), lease.clone(), None, async {
                 shared.catalog.bind_material_key(cipher).await?;
                 // 取得目录租约后再次读取，避免重复创建账户。
                 if let Some(serialized) = shared

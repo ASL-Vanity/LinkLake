@@ -6,7 +6,6 @@ mod audit_log;
 mod audit_store;
 mod certificate_catalog;
 mod certificate_http01;
-mod certificate_job;
 mod certificate_manager;
 mod certificate_material;
 mod certificate_store;
@@ -30,6 +29,7 @@ pub mod http_backend_pool;
 mod http_proxy_tunnel;
 mod http_route_catalog;
 mod http_tunnel;
+mod job_execution;
 mod job_leases;
 mod job_supervisor;
 mod lifecycle;
@@ -9127,7 +9127,7 @@ async fn run_certificate_operation(
     stop: Option<watch::Receiver<bool>>,
 ) {
     // guard 在准备阶段创建并移入 future；即使 future 从未被轮询也能释放本地占位。
-    let result = certificate_job::run(
+    let result = job_execution::run(
         state.ha_runtime.clone(),
         lease.clone(),
         stop.clone(),
@@ -12175,6 +12175,14 @@ async fn execute_fleet_dns_reconciliation_with_stop(
     if *stop.borrow() {
         return Ok(Vec::new());
     }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    verify_fleet_dns_records(state, &client, only, stop).await?;
+    if *stop.borrow() {
+        return Ok(Vec::new());
+    }
     let plans = state
         .fleet_health
         .plan_dns_changes(unix_seconds(), only)
@@ -12182,34 +12190,92 @@ async fn execute_fleet_dns_reconciliation_with_stop(
     if plans.is_empty() {
         return Ok(Vec::new());
     }
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
     let mut results = Vec::with_capacity(plans.len());
     for plan in plans {
         if *stop.borrow() {
             return Ok(results);
         }
-        let apply_result = tokio::select! {
-            changed = stop.changed() => {
-                let _ = changed;
-                return Ok(results);
-            }
-            result = fleet_health::apply_cloudflare_dns_change(&client, &plan) => result,
-        };
-        if *stop.borrow() {
-            return Ok(results);
-        }
-        let apply_error = apply_result.err().map(|error| error.to_string());
-        let completion = state
-            .fleet_health
-            .complete_dns_change(
-                &plan,
-                apply_error.as_deref().map_or(Ok(()), Err),
-                unix_seconds(),
+        let jobs = state.ha_runtime.jobs();
+        let Some(lease) = jobs
+            .acquire(
+                &fleet_health::dns_execution_job_key(&plan),
+                "fleet_dns",
+                state.ha_runtime.fencing_token()?,
             )
-            .await?;
+            .await?
+        else {
+            continue;
+        };
+        let execution = job_execution::run(
+            state.ha_runtime.clone(),
+            lease.clone(),
+            Some(stop.clone()),
+            async {
+                // 排队后的计划可能过期、冻结或已被替代；发起外部请求前必须重新核对。
+                let started = tokio::time::Instant::now();
+                let remaining = state
+                    .fleet_health
+                    .validate_dns_execution(&plan, &lease)
+                    .await?;
+                tokio::time::timeout_at(started + Duration::from_secs(remaining), async {
+                    let apply_result =
+                        fleet_health::apply_cloudflare_dns_change(&client, &plan).await;
+                    let apply_error = apply_result.err().map(|error| error.to_string());
+                    state
+                        .fleet_health
+                        .complete_dns_change(
+                            &plan,
+                            apply_error.as_deref().map_or(Ok(()), Err),
+                            &lease,
+                        )
+                        .await
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("Fleet DNS execution exceeded the plan deadline"))?
+            },
+        )
+        .await;
+        let completion = match execution {
+            Ok(Ok(completion)) => completion,
+            Ok(Err(error)) => {
+                let _ = jobs
+                    .fail(
+                        &lease.job_key,
+                        &lease.job_kind,
+                        lease.lease_id,
+                        lease.fencing_token,
+                        "fleet_dns_execution_rejected",
+                    )
+                    .await;
+                tracing::warn!(%error, operation_id=%plan.operation_id, "Fleet DNS plan rejected; pending state will be reconciled");
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(%error, operation_id=%plan.operation_id, "Fleet DNS operation abandoned after cancellation or lease loss");
+                continue;
+            }
+        };
+        let finished = if completion.applied {
+            jobs.complete(
+                &lease.job_key,
+                &lease.job_kind,
+                lease.lease_id,
+                lease.fencing_token,
+            )
+            .await
+        } else {
+            jobs.fail(
+                &lease.job_key,
+                &lease.job_kind,
+                lease.lease_id,
+                lease.fencing_token,
+                "fleet_dns_provider_failed",
+            )
+            .await
+        };
+        if let Err(error) = finished {
+            tracing::warn!(%error, operation_id=%plan.operation_id, "could not finish Fleet DNS execution lease");
+        }
         record_audit(
             state,
             if completion.applied {
@@ -12233,6 +12299,109 @@ async fn execute_fleet_dns_reconciliation_with_stop(
         results.push(completion);
     }
     Ok(results)
+}
+
+async fn verify_fleet_dns_records(
+    state: &Arc<AppState>,
+    client: &reqwest::Client,
+    only: Option<Uuid>,
+    stop: &watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let failovers = state.fleet_health.list_dns_failovers().await?;
+    let mut tasks = tokio::task::JoinSet::new();
+    for current in failovers {
+        if *stop.borrow() {
+            return Ok(());
+        }
+        if only.is_some_and(|id| id != current.id) {
+            continue;
+        }
+        let Some(plan) = fleet_health::dns_verification_plan(&current) else {
+            continue;
+        };
+        // 限制并发，不让一条慢记录阻塞所有独立记录的复核。
+        while tasks.len() >= 8 {
+            if let Some(Err(error)) = tasks.join_next().await {
+                tracing::warn!(%error, "Fleet DNS verification task failed");
+            }
+        }
+        let state = state.clone();
+        let client = client.clone();
+        let stop = stop.clone();
+        tasks.spawn(async move {
+            if let Err(error) = verify_fleet_dns_record(&state, &client, &plan, stop).await {
+                tracing::warn!(%error, failover_id=%plan.failover_id, "could not verify Fleet DNS provider state");
+            }
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result {
+            tracing::warn!(%error, "Fleet DNS verification task failed");
+        }
+    }
+    Ok(())
+}
+
+async fn verify_fleet_dns_record(
+    state: &Arc<AppState>,
+    client: &reqwest::Client,
+    plan: &fleet_health::FleetDnsChangePlan,
+    stop: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    if *stop.borrow() {
+        return Ok(());
+    }
+    let jobs = state.ha_runtime.jobs();
+    let Some(lease) = jobs
+        .acquire(
+            &fleet_health::dns_execution_job_key(plan),
+            "fleet_dns",
+            state.ha_runtime.fencing_token()?,
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let observed = job_execution::run(state.ha_runtime.clone(), lease.clone(), Some(stop), async {
+        if fleet_health::cloudflare_dns_matches(client, plan).await? {
+            return Ok(false);
+        }
+        state.fleet_health.mark_dns_drift(plan, &lease).await
+    })
+    .await?;
+    match observed {
+        Ok(drifted) => {
+            jobs.complete(
+                &lease.job_key,
+                &lease.job_kind,
+                lease.lease_id,
+                lease.fencing_token,
+            )
+            .await?;
+            if drifted {
+                record_audit(
+                    state,
+                    "fleet.dns_failover.drift_detected",
+                    &plan.failover_id.to_string(),
+                    "provider record differs from the committed target; reconciliation requested",
+                )
+                .await;
+            }
+        }
+        Err(error) => {
+            let _ = jobs
+                .fail(
+                    &lease.job_key,
+                    &lease.job_kind,
+                    lease.lease_id,
+                    lease.fencing_token,
+                    "fleet_dns_verification_failed",
+                )
+                .await;
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 async fn list_tcp_tunnels(
