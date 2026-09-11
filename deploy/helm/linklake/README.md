@@ -81,6 +81,39 @@ Kubernetes Service 不支持端口范围。每个公网 TCP/UDP 端口必须分�
 
 ## English
 
+### Shared certificate material key
+
+Set `certificateMaterial.existingSecret` to a pre-created Secret and
+`certificateMaterial.key` to its data key (default `certificate-key`). The decoded
+value must be exactly 32 raw bytes, not a hex or base64 text file. Use the same
+key on every PostgreSQL replica and keep an encrypted backup separate from the
+database backup. The chart never generates or embeds key contents.
+
+The non-root init container uses the server image, copies the Secret into a
+memory-backed volume and sets mode `0600`. The server receives that volume
+read-only through `LINKLAKE_CERTIFICATE_KEY_FILE`. Keep `podSecurityContext.fsGroup`
+configured (default `10001`), and keep the init and server user IDs identical.
+Custom server images must provide `/bin/sh`, `cat`, `wc`, `chmod`, `mv` and `rm`.
+Existing-Secret changes are not a supported key-rotation procedure: the key is
+copied at Pod initialization, and existing PostgreSQL material is bound to the
+original key. Do not replace the key without an explicit material re-encryption
+and rollback procedure. Those operations are not provided by this chart.
+
+### 共享证书材料密钥
+
+设置 `certificateMaterial.existingSecret` 为预先创建的 Secret，
+`certificateMaterial.key` 指定其中的数据项（默认 `certificate-key`）。
+解码后必须是 32 字节原始二进制，不能使用十六进制或 base64 文本文件。
+所有 PostgreSQL 副本使用同一密钥，并在数据库备份之外单独加密备份。
+Chart 不生成或渲染密钥正文。
+
+非 root init 使用服务端镜像，将 Secret 复制到内存卷并设为 `0600`；
+服务进程只读挂载，通过 `LINKLAKE_CERTIFICATE_KEY_FILE` 使用该文件。
+保留 `podSecurityContext.fsGroup`（默认 `10001`），并保持 init 和服务端 UID 一致。
+自定义镜像需提供 `/bin/sh`、`cat`、`wc`、`chmod`、`mv` 和 `rm`。
+Secret 内容变更只会在 Pod 初始化时复制，不能当作密钥轮换：PG 已有材料绑定原密钥。
+没有明确的材料重新加密和回滚流程前，请勿更换密钥；Chart 不提供这些操作。
+
 The default installation is a single SQLite writer rendered as a
 `Deployment` with the `Recreate` strategy. Credentials and TLS keys must come from pre-created
 Kubernetes Secrets. Generated PVCs are retained when the Helm release is removed unless

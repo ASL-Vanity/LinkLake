@@ -6,6 +6,7 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 
 import 'api_client.dart';
+import 'acme_settings.dart';
 import 'desktop_lifecycle.dart';
 import 'manager_settings.dart';
 import 'manager_identity.dart';
@@ -1183,6 +1184,7 @@ class _DashboardPageState extends State<DashboardPage> {
       'udp': (Icons.bolt_outlined, 'UDP'),
       'group': (Icons.view_week_outlined, t('端口组', 'Port Groups')),
       'http': (Icons.http, 'HTTP/HTTPS'),
+      'acme': (Icons.verified_user_outlined, 'ACME'),
       'sni': (Icons.lock_outline, 'TLS SNI'),
       'secret': (Icons.key_outlined, 'Secret'),
       'socks5': (Icons.route_outlined, 'SOCKS5'),
@@ -1213,6 +1215,7 @@ class _DashboardPageState extends State<DashboardPage> {
     'udp' => _policyPage(PolicyKind.udp),
     'group' => _policyPage(PolicyKind.group),
     'http' => _policyPage(PolicyKind.http),
+    'acme' => AcmeSettingsPage(api: widget.api, chinese: zh, editable: _capabilities.canWritePolicies),
     'sni' => _policyPage(PolicyKind.sni),
     'secret' => _policyPage(PolicyKind.secret),
     'socks5' => _policyPage(PolicyKind.socks5),

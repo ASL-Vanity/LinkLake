@@ -53,6 +53,11 @@ tls:
   managementSecret: ""
   controlSecret: ""
 
+certificateMaterial:
+  # 引用已有 Secret 中的 32 字节二进制密钥；所有 PostgreSQL 副本必须相同。
+  existingSecret: ""
+  key: certificate-key
+
 server:
   managementPort: 32100
   controlPort: 32101

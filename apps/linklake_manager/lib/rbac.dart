@@ -86,6 +86,7 @@ List<String> visibleDestinationIds(ManagementRole role) => [
   'udp',
   'group',
   'http',
+  'acme',
   'sni',
   'secret',
   'socks5',

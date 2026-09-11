@@ -1853,6 +1853,7 @@
           preserved = form.dataset.dirty === 'true' ? {
             enabled: form.elements.enabled.checked,
             environment: form.elements.environment.value,
+            challenge_type: form.elements.challenge_type.value,
             directory_url: form.elements.directory_url.value,
             contact_email: form.elements.contact_email.value,
             renew_before_days: form.elements.renew_before_days.value,
@@ -1866,11 +1867,18 @@
           card.className = 'acme-card';
           const status = document.createElement('p');
           status.id = 'acme-status';
+          const keyStatus = document.createElement('p');
+          keyStatus.id = 'acme-key-status';
+          keyStatus.setAttribute('role', 'status');
+          const dnsStatus = document.createElement('p');
+          dnsStatus.id = 'acme-dns-status';
           form = document.createElement('form');
           form.innerHTML = `
             <label class="check-label full"><input name="enabled" type="checkbox" /><span>${t('acmeEnabled')}</span></label>
             <label><span>${t('acmeEnvironment')}</span><select name="environment"><option value="staging">${t('acmeStaging')}</option><option value="production">${t('acmeProduction')}</option><option value="custom">${t('acmeCustom')}</option></select></label>
             <label><span>${t('renewBefore')}</span><input name="renew_before_days" type="number" min="7" max="60" required /></label>
+            <label class="full"><span>${state.language === 'zh' ? '验证方式' : 'Validation method'}</span><select name="challenge_type"><option value="http-01">HTTP-01</option><option value="dns-01">DNS-01</option></select></label>
+            <p class="full">${state.language === 'zh' ? 'HTTP-01 需要公网 80 端口；DNS-01 支持通配符证书，需要服务端配置 Cloudflare 凭据。' : 'HTTP-01 requires public port 80. DNS-01 supports wildcard certificates and requires a configured Cloudflare token.'}</p>
             <label class="full"><span>${t('acmeDirectory')}</span><input name="directory_url" type="url" required /></label>
             <label class="full"><span>${t('acmeEmail')}</span><input name="contact_email" type="email" /></label>
             <label class="check-label full"><input name="terms_accepted" type="checkbox" /><span>${t('acmeTerms')}</span></label>
@@ -1878,15 +1886,25 @@
           form.addEventListener('input', () => { form.dataset.dirty = 'true'; updateAcmeDirectory(form); });
           form.addEventListener('submit', saveAcme);
           form.dataset.language = state.language;
-          card.append(status, form);
+          card.append(status, keyStatus, dnsStatus, form);
           elements.acme_page.replaceChildren(card);
         }
         const status = elements.acme_page.querySelector('#acme-status');
         status.textContent = !config.enabled ? t('acmeOff') : config.account_registered ? t('acmeReady') : t('acmePending');
+        const zh = state.language === 'zh';
+        const keyState = config.material_key_configured;
+        elements.acme_page.querySelector('#acme-key-status').textContent = keyState === true
+          ? (zh ? '证书材料密钥：就绪或当前后端无需配置' : 'Certificate material key: ready or not required by this backend')
+          : keyState === false ? (zh ? '证书材料密钥：未配置' : 'Certificate material key: not configured')
+          : (zh ? '证书材料密钥：服务器未提供状态' : 'Certificate material key: status unavailable from this server');
+        elements.acme_page.querySelector('#acme-dns-status').textContent = config.cloudflare_token_configured
+          ? (zh ? 'Cloudflare 凭据：已配置' : 'Cloudflare token: configured')
+          : (zh ? 'Cloudflare 凭据：未配置或状态未知' : 'Cloudflare token: not configured or status unavailable');
         if (preserved) {
           form.dataset.dirty = 'true';
           form.elements.enabled.checked = preserved.enabled;
           form.elements.environment.value = preserved.environment;
+          form.elements.challenge_type.value = preserved.challenge_type;
           form.elements.directory_url.value = preserved.directory_url;
           form.elements.contact_email.value = preserved.contact_email;
           form.elements.renew_before_days.value = preserved.renew_before_days;
@@ -1894,11 +1912,13 @@
         } else if (form.dataset.dirty !== 'true' && !form.contains(document.activeElement)) {
           form.elements.enabled.checked = Boolean(config.enabled);
           form.elements.environment.value = config.environment || 'staging';
+          form.elements.challenge_type.value = config.challenge_type || 'http-01';
           form.elements.directory_url.value = config.directory_url || acmeDirectories[config.environment] || '';
           form.elements.contact_email.value = config.contact_email || '';
           form.elements.renew_before_days.value = config.renew_before_days || 30;
           form.elements.terms_accepted.checked = Boolean(config.terms_accepted);
         }
+        for (const control of form.elements) control.disabled = !['administrator', 'operator'].includes(state.identity?.role);
         updateAcmeDirectory(form);
       }
 
@@ -3771,11 +3791,12 @@
 
       async function saveAcme(event) {
         event.preventDefault();
+        if (!['administrator', 'operator'].includes(state.identity?.role)) return;
         const form = event.currentTarget;
         const submit = event.submitter;
         setBusy(submit, true);
         try {
-          const response = await apiFetch('/api/v1/acme/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: form.elements.enabled.checked, environment: form.elements.environment.value, directory_url: form.elements.directory_url.value, contact_email: form.elements.contact_email.value, terms_accepted: form.elements.terms_accepted.checked, renew_before_days: Number(form.elements.renew_before_days.value) }) });
+          const response = await apiFetch('/api/v1/acme/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: form.elements.enabled.checked, challenge_type: form.elements.challenge_type.value, environment: form.elements.environment.value, directory_url: form.elements.directory_url.value, contact_email: form.elements.contact_email.value, terms_accepted: form.elements.terms_accepted.checked, renew_before_days: Number(form.elements.renew_before_days.value) }) });
           if (response.status === 401) return;
           if (!response.ok) return showToast(await responseError(response, 'errorAcme'), true);
           delete form.dataset.dirty;

@@ -3,6 +3,16 @@
 {{- $controlSecret := required "tls.controlSecret is required" .Values.tls.controlSecret -}}
 {{- $backend := lower .Values.storage.backend -}}
 {{- $haEnabled := .Values.ha.enabled -}}
+{{- if .Values.certificateMaterial.existingSecret -}}
+{{- if not .Values.podSecurityContext.fsGroup -}}
+{{- fail "certificateMaterial requires podSecurityContext.fsGroup so the non-root init container can read the Secret" -}}
+{{- end -}}
+{{- range .Values.server.extraEnv -}}
+{{- if eq .name "LINKLAKE_CERTIFICATE_KEY_FILE" -}}
+{{- fail "Do not override LINKLAKE_CERTIFICATE_KEY_FILE in extraEnv when certificateMaterial.existingSecret is configured" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- if and (eq $backend "sqlite") (ne (int .Values.replicaCount) 1) -}}
 {{- fail "replicaCount must be 1 when storage.backend=sqlite" -}}
 {{- end -}}
@@ -77,6 +87,30 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- if .Values.certificateMaterial.existingSecret }}
+      initContainers:
+        - name: prepare-certificate-material
+          image: "{{ .Values.image.repository }}:{{ default .Chart.AppVersion .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              umask 077
+              cat /certificate-source/key > /certificate-material/key.pending
+              test "$(wc -c < /certificate-material/key.pending)" -eq 32 || { rm -f /certificate-material/key.pending; echo 'Certificate material key must contain exactly 32 bytes' >&2; exit 1; }
+              chmod 0600 /certificate-material/key.pending
+              mv /certificate-material/key.pending /certificate-material/key
+          volumeMounts:
+            - name: certificate-material-source
+              mountPath: /certificate-source
+              readOnly: true
+            - name: certificate-material
+              mountPath: /certificate-material
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- end }}
       containers:
         - name: linklake-server
           image: "{{ .Values.image.repository }}:{{ default .Chart.AppVersion .Values.image.tag }}"
@@ -84,6 +118,10 @@ spec:
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           env:
+            {{- if .Values.certificateMaterial.existingSecret }}
+            - name: LINKLAKE_CERTIFICATE_KEY_FILE
+              value: /etc/linklake/certificate-material/key
+            {{- end }}
             - name: LINKLAKE_BIND
               value: "0.0.0.0:{{ .Values.server.managementPort }}"
             - name: LINKLAKE_CONTROL_BIND
@@ -235,6 +273,11 @@ spec:
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
+            {{- if .Values.certificateMaterial.existingSecret }}
+            - name: certificate-material
+              mountPath: /etc/linklake/certificate-material
+              readOnly: true
+            {{- end }}
             - name: data
               mountPath: /var/lib/linklake
             - name: logs
@@ -248,6 +291,19 @@ spec:
               mountPath: /etc/linklake/control
               readOnly: true
       volumes:
+        {{- if .Values.certificateMaterial.existingSecret }}
+        - name: certificate-material-source
+          secret:
+            secretName: {{ .Values.certificateMaterial.existingSecret | quote }}
+            defaultMode: 0440
+            items:
+              - key: {{ .Values.certificateMaterial.key | quote }}
+                path: key
+        - name: certificate-material
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        {{- end }}
         {{- if or (not $haEnabled) (not .Values.persistence.data.enabled) }}
         - name: data
           {{- if .Values.persistence.data.enabled }}
