@@ -1998,6 +1998,11 @@ fn coded_tcp_policy_error(error: anyhow::Error) -> CodedApiError {
 
 fn coded_http_route_creation_error(error: CreateHttpRouteError) -> CodedApiError {
     match error {
+        CreateHttpRouteError::ManagedPolicy => CodedApiError(
+            StatusCode::CONFLICT,
+            "fleet_managed_policy",
+            "Fleet-managed policies must be changed by their owning source bundle",
+        ),
         CreateHttpRouteError::InvalidName => CodedApiError(
             StatusCode::BAD_REQUEST,
             "invalid_name",
@@ -2063,6 +2068,17 @@ fn coded_socks5_policy_error(error: Socks5PolicyError) -> CodedApiError {
         _ => StatusCode::BAD_REQUEST,
     };
     CodedApiError(status, error.code(), "SOCKS5 proxy policy is invalid")
+}
+
+fn coded_http_route_mutation_error(error: anyhow::Error) -> CodedApiError {
+    match error.downcast::<CreateHttpRouteError>() {
+        Ok(error) => coded_http_route_creation_error(error),
+        Err(_) => CodedApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "could not modify HTTP route policy",
+        ),
+    }
 }
 
 fn coded_http_proxy_policy_error(error: HttpProxyPolicyError) -> CodedApiError {
@@ -14679,13 +14695,7 @@ async fn set_http_route_enabled(
         .http_route_catalog
         .set_enabled(route_id, request.enabled)
         .await
-        .map_err(|_| {
-            CodedApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                "could not update HTTP route policy",
-            )
-        })?;
+        .map_err(coded_http_route_mutation_error)?;
     if !updated {
         return Err(CodedApiError(
             StatusCode::NOT_FOUND,
@@ -14802,13 +14812,7 @@ async fn delete_http_route(
         .http_route_catalog
         .delete(route_id)
         .await
-        .map_err(|_| {
-            CodedApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                "could not delete HTTP route policy",
-            )
-        })?;
+        .map_err(coded_http_route_mutation_error)?;
     if !deleted {
         return Err(CodedApiError(
             StatusCode::NOT_FOUND,
@@ -18071,6 +18075,11 @@ mod tests {
                 CreateHttpRouteError::DuplicateHostname,
                 StatusCode::CONFLICT,
                 "duplicate_hostname",
+            ),
+            (
+                CreateHttpRouteError::ManagedPolicy,
+                StatusCode::CONFLICT,
+                "fleet_managed_policy",
             ),
             (
                 CreateHttpRouteError::InvalidTarget,

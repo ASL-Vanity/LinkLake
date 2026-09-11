@@ -19,6 +19,9 @@ use std::{
 };
 use uuid::Uuid;
 
+#[path = "policy_service_postgres.rs"]
+pub(crate) mod postgres;
+
 const MAX_FLEET_GENERATION_ADVANCE: u64 = 1_000_000;
 
 const FLEET_SCHEMA_SQL: &str = r#"
@@ -543,50 +546,10 @@ impl PolicyService {
         let revision = request.bundle.revision.clone();
         let public_port_policy = self.public_port_policy.clone();
         self.database.with_transaction(|transaction| {
-            anyhow::ensure!(
-                generation <= i64::MAX as u64,
-                "Fleet bundle generation exceeds the persistent database range"
-            );
             let current = read_source_status(transaction, source_instance_id)?;
             let previous_generation = current.as_ref().map_or(0, |state| state.generation);
             let previous_revision = current.as_ref().map(|state| state.revision.clone());
-            if let Some(expected) = request.expected_generation {
-                anyhow::ensure!(
-                    expected == previous_generation,
-                    "Fleet expected generation does not match current state"
-                );
-            }
-            if let Some(expected) = request.expected_revision.as_deref() {
-                anyhow::ensure!(
-                    previous_revision.as_deref() == Some(expected),
-                    "Fleet expected revision does not match current state"
-                );
-            }
-            let same_revision_replay = if let Some(current) = &current {
-                anyhow::ensure!(
-                    generation >= current.generation,
-                    "Fleet bundle generation is stale"
-                );
-                anyhow::ensure!(
-                    generation.saturating_sub(current.generation)
-                        <= MAX_FLEET_GENERATION_ADVANCE,
-                    "Fleet bundle generation advances too far"
-                );
-                if generation == current.generation {
-                    anyhow::ensure!(
-                        revision == current.revision,
-                        "Fleet generation was already used by another revision"
-                    );
-                }
-                generation == current.generation
-            } else {
-                anyhow::ensure!(
-                    generation <= MAX_FLEET_GENERATION_ADVANCE,
-                    "Fleet bundle initial generation is unreasonably high"
-                );
-                false
-            };
-
+            let same_revision_replay = validate_reconcile_precondition(&request, current.as_ref())?;
             let clients = resolve_bundle_clients(transaction, &request.bundle, clients)?;
             let existing = load_owned_resources(transaction, source_instance_id)?;
             let mut plan = Vec::with_capacity(request.bundle.resources.len());
@@ -772,6 +735,61 @@ impl PolicyService {
                 runtime_invalidations,
             })
         })
+    }
+}
+
+// 两种存储共用代际规则；调用方必须在读取当前状态的同一事务内使用。
+fn validate_reconcile_precondition(
+    request: &FleetReconcileRequest,
+    current: Option<&FleetSourceStatus>,
+) -> anyhow::Result<bool> {
+    let generation = request.bundle.generation;
+    anyhow::ensure!(
+        generation <= i64::MAX as u64,
+        "Fleet bundle generation exceeds the persistent database range"
+    );
+    let previous_generation = current.map_or(0, |state| state.generation);
+    if let Some(expected) = request.expected_generation {
+        anyhow::ensure!(
+            expected == previous_generation,
+            "Fleet expected generation does not match current state"
+        );
+    }
+    if let Some(expected) = request.expected_revision.as_deref() {
+        anyhow::ensure!(
+            current.map(|state| state.revision.as_str()) == Some(expected),
+            "Fleet expected revision does not match current state"
+        );
+    }
+    match current {
+        Some(current) => {
+            anyhow::ensure!(
+                current.source_instance_id == request.bundle.source_instance_id,
+                "Fleet source state belongs to another source"
+            );
+            anyhow::ensure!(
+                generation >= current.generation,
+                "Fleet bundle generation is stale"
+            );
+            anyhow::ensure!(
+                generation.saturating_sub(current.generation) <= MAX_FLEET_GENERATION_ADVANCE,
+                "Fleet bundle generation advances too far"
+            );
+            if generation == current.generation {
+                anyhow::ensure!(
+                    request.bundle.revision == current.revision,
+                    "Fleet generation was already used by another revision"
+                );
+            }
+            Ok(generation == current.generation)
+        }
+        None => {
+            anyhow::ensure!(
+                generation <= MAX_FLEET_GENERATION_ADVANCE,
+                "Fleet bundle initial generation is unreasonably high"
+            );
+            Ok(false)
+        }
     }
 }
 
@@ -2653,6 +2671,38 @@ mod tests {
         },
     };
     use linklake_core::fleet_protocol::FleetClientRef;
+
+    #[test]
+    fn shared_generation_preconditions_reject_wrong_source_and_same_generation_replacement() {
+        let source = Uuid::new_v4();
+        let bundle = FleetBundleV2::new(source, 1, 1, Vec::new(), Vec::new(), Vec::new()).unwrap();
+        let current = FleetSourceStatus {
+            source_instance_id: source,
+            generation: 1,
+            revision: bundle.revision.clone(),
+            applied_unix_seconds: 1,
+            resource_count: 0,
+        };
+        let mut request = FleetReconcileRequest {
+            bundle,
+            dry_run: false,
+            expected_generation: Some(1),
+            expected_revision: Some(current.revision.clone()),
+        };
+        assert!(validate_reconcile_precondition(&request, Some(&current)).unwrap());
+        let mut wrong_source = current.clone();
+        wrong_source.source_instance_id = Uuid::new_v4();
+        assert!(validate_reconcile_precondition(&request, Some(&wrong_source)).is_err());
+        request.expected_generation = Some(0);
+        assert!(validate_reconcile_precondition(&request, Some(&current)).is_err());
+        request.expected_generation = Some(1);
+        request.bundle =
+            FleetBundleV2::new(source, 1, 2, Vec::new(), Vec::new(), Vec::new()).unwrap();
+        assert!(validate_reconcile_precondition(&request, Some(&current)).is_err());
+        request.bundle =
+            FleetBundleV2::new(source, 2, 2, Vec::new(), Vec::new(), Vec::new()).unwrap();
+        assert!(!validate_reconcile_precondition(&request, Some(&current)).unwrap());
+    }
 
     struct TestState {
         database: Database,

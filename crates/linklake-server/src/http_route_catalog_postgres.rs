@@ -116,6 +116,7 @@ impl PostgresHttpRouteCatalog {
             .map_err(storage_error)?;
         let transaction = client.transaction().await.map_err(storage_error)?;
         self.fence(&transaction).await.map_err(storage_error)?;
+        ensure_not_fleet_managed(&transaction, policy.id).await?;
         ensure_hostname_available(&transaction, &policy).await?;
         transaction.execute(
             "INSERT INTO linklake_http_route_policies(id,hostname,revision,policy) VALUES($1,$2,$3,$4::text::jsonb)",
@@ -140,6 +141,7 @@ impl PostgresHttpRouteCatalog {
             .map_err(storage_error)?;
         let transaction = client.transaction().await.map_err(storage_error)?;
         self.fence(&transaction).await.map_err(storage_error)?;
+        ensure_not_fleet_managed(&transaction, id).await?;
         let Some(current) = transaction_snapshot(&transaction, id)
             .await
             .map_err(storage_error)?
@@ -160,6 +162,7 @@ impl PostgresHttpRouteCatalog {
         let mut client = self.storage.postgres_client().await?;
         let transaction = client.transaction().await?;
         self.fence(&transaction).await?;
+        ensure_not_fleet_managed(&transaction, id).await?;
         let Some(mut current) = transaction_snapshot(&transaction, id).await? else {
             transaction.commit().await?;
             return Ok(false);
@@ -174,6 +177,7 @@ impl PostgresHttpRouteCatalog {
         let mut client = self.storage.postgres_client().await?;
         let transaction = client.transaction().await?;
         self.fence(&transaction).await?;
+        ensure_not_fleet_managed(&transaction, id).await?;
         let deleted = transaction
             .execute(
                 "DELETE FROM linklake_http_route_policies WHERE id=$1",
@@ -229,6 +233,19 @@ impl PostgresHttpRouteCatalog {
             )?,
         }))
     }
+}
+
+async fn ensure_not_fleet_managed(
+    transaction: &Transaction<'_>,
+    id: Uuid,
+) -> Result<(), CreateHttpRouteError> {
+    let managed: bool = transaction.query_one(
+        "SELECT EXISTS(SELECT 1 FROM linklake_fleet_resource_ownership WHERE kind='http_route' AND policy_id=$1)", &[&id.to_string()],
+    ).await.map_err(storage_error)?.get(0);
+    if managed {
+        return Err(CreateHttpRouteError::ManagedPolicy);
+    }
+    Ok(())
 }
 
 async fn ensure_hostname_available(

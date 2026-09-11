@@ -4,8 +4,44 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tokio_postgres::{Client, Transaction};
 
-pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 16;
+pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 17;
 const ADVISORY_LOCK_ID: i64 = 0x4c4c_4841_4d49_4752;
+
+const MIGRATION_V17_NAME: &str = "shared_fleet_policy_ledger";
+const MIGRATION_V17_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS linklake_fleet_local_state (
+    singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1),
+    source_instance_id TEXT NOT NULL UNIQUE,
+    generation BIGINT NOT NULL CHECK(generation>=0)
+);
+CREATE TABLE IF NOT EXISTS linklake_fleet_source_states (
+    source_instance_id TEXT PRIMARY KEY,
+    generation BIGINT NOT NULL CHECK(generation>0),
+    revision TEXT NOT NULL CHECK(revision ~ '^sha256:[0-9a-f]{64}$'),
+    applied_unix_seconds BIGINT NOT NULL CHECK(applied_unix_seconds>=0),
+    resource_count BIGINT NOT NULL CHECK(resource_count BETWEEN 0 AND 65535)
+);
+CREATE TABLE IF NOT EXISTS linklake_fleet_resource_ownership (
+    source_instance_id TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('tcp','udp','port_group','http_route','sni_route','secret_tunnel','socks5_proxy','http_proxy')),
+    policy_id TEXT NOT NULL,
+    resource_sha256 TEXT NOT NULL CHECK(resource_sha256 ~ '^[0-9a-f]{64}$'),
+    credential_ref TEXT,
+    PRIMARY KEY(source_instance_id,resource_id),
+    UNIQUE(kind,policy_id)
+);
+CREATE INDEX IF NOT EXISTS linklake_fleet_resource_ownership_policy ON linklake_fleet_resource_ownership(kind,policy_id);
+CREATE TABLE IF NOT EXISTS linklake_fleet_credential_bindings (
+    source_instance_id TEXT NOT NULL,
+    credential_ref TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('secret_tunnel','socks5_proxy','http_proxy')),
+    policy_id TEXT NOT NULL,
+    created_unix_seconds BIGINT NOT NULL CHECK(created_unix_seconds>=0),
+    PRIMARY KEY(source_instance_id,credential_ref,kind),
+    UNIQUE(kind,policy_id)
+);
+"#;
 
 const MIGRATION_V16_NAME: &str = "shared_http_route_catalog";
 const MIGRATION_V16_SQL: &str = r#"
@@ -632,6 +668,11 @@ const MIGRATIONS: &[Migration] = &[
         name: MIGRATION_V16_NAME,
         sql: MIGRATION_V16_SQL,
     },
+    Migration {
+        version: 17,
+        name: MIGRATION_V17_NAME,
+        sql: MIGRATION_V17_SQL,
+    },
 ];
 
 pub(crate) async fn apply(client: &mut Client) -> anyhow::Result<()> {
@@ -723,6 +764,49 @@ pub(crate) async fn apply(client: &mut Client) -> anyhow::Result<()> {
 
 async fn verify_schema_structure(transaction: &Transaction<'_>) -> anyhow::Result<()> {
     const TABLES: &[TableExpectation] = &[
+        TableExpectation {
+            name: "linklake_fleet_local_state",
+            primary_key: &["singleton_id"],
+            columns: &[
+                required("singleton_id", "int4"),
+                required("source_instance_id", "text"),
+                required("generation", "int8"),
+            ],
+        },
+        TableExpectation {
+            name: "linklake_fleet_source_states",
+            primary_key: &["source_instance_id"],
+            columns: &[
+                required("source_instance_id", "text"),
+                required("generation", "int8"),
+                required("revision", "text"),
+                required("applied_unix_seconds", "int8"),
+                required("resource_count", "int8"),
+            ],
+        },
+        TableExpectation {
+            name: "linklake_fleet_resource_ownership",
+            primary_key: &["source_instance_id", "resource_id"],
+            columns: &[
+                required("source_instance_id", "text"),
+                required("resource_id", "text"),
+                required("kind", "text"),
+                required("policy_id", "text"),
+                required("resource_sha256", "text"),
+                optional("credential_ref", "text"),
+            ],
+        },
+        TableExpectation {
+            name: "linklake_fleet_credential_bindings",
+            primary_key: &["source_instance_id", "credential_ref", "kind"],
+            columns: &[
+                required("source_instance_id", "text"),
+                required("credential_ref", "text"),
+                required("kind", "text"),
+                required("policy_id", "text"),
+                required("created_unix_seconds", "int8"),
+            ],
+        },
         TableExpectation {
             name: "linklake_http_route_policies",
             primary_key: &["id"],

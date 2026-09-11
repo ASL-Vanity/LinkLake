@@ -83,6 +83,7 @@ pub(crate) enum CreateHttpRouteError {
     InvalidName,
     InvalidHostname,
     DuplicateHostname,
+    ManagedPolicy,
     InvalidTarget,
     InvalidConnectionLimit,
     InvalidGrpcBackend,
@@ -96,6 +97,9 @@ impl fmt::Display for CreateHttpRouteError {
             Self::InvalidName => "route name is invalid",
             Self::InvalidHostname => "hostname is invalid",
             Self::DuplicateHostname => "hostname is already assigned to another route",
+            Self::ManagedPolicy => {
+                "Fleet-managed policies must be changed by their owning source bundle"
+            }
             Self::InvalidTarget => "target address is invalid",
             Self::InvalidConnectionLimit => "connection limit is invalid",
             Self::InvalidGrpcBackend => "gRPC backend TLS policy is invalid",
