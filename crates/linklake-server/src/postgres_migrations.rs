@@ -4,8 +4,23 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tokio_postgres::{Client, Transaction};
 
-pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 13;
+pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 14;
 const ADVISORY_LOCK_ID: i64 = 0x4c4c_4841_4d49_4752;
+
+const MIGRATION_V14_NAME: &str = "shared_http01_challenges";
+const MIGRATION_V14_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS linklake_http01_challenges (
+    hostname TEXT NOT NULL CHECK(octet_length(hostname) BETWEEN 1 AND 253),
+    token TEXT NOT NULL CHECK(octet_length(token) BETWEEN 1 AND 256),
+    publication_id TEXT NOT NULL,
+    job_key TEXT NOT NULL,
+    lease_id TEXT NOT NULL,
+    key_authorization TEXT NOT NULL CHECK(octet_length(key_authorization) BETWEEN 45 AND 300),
+    expires_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY(hostname,token)
+);
+CREATE INDEX IF NOT EXISTS linklake_http01_challenges_expiry ON linklake_http01_challenges(expires_at);
+"#;
 
 const MIGRATION_V13_NAME: &str = "certificate_cluster_key_binding";
 const MIGRATION_V13_SQL: &str = r#"
@@ -579,6 +594,11 @@ const MIGRATIONS: &[Migration] = &[
         name: MIGRATION_V13_NAME,
         sql: MIGRATION_V13_SQL,
     },
+    Migration {
+        version: 14,
+        name: MIGRATION_V14_NAME,
+        sql: MIGRATION_V14_SQL,
+    },
 ];
 
 pub(crate) async fn apply(client: &mut Client) -> anyhow::Result<()> {
@@ -670,6 +690,19 @@ pub(crate) async fn apply(client: &mut Client) -> anyhow::Result<()> {
 
 async fn verify_schema_structure(transaction: &Transaction<'_>) -> anyhow::Result<()> {
     const TABLES: &[TableExpectation] = &[
+        TableExpectation {
+            name: "linklake_http01_challenges",
+            primary_key: &["hostname", "token"],
+            columns: &[
+                required("hostname", "text"),
+                required("token", "text"),
+                required("publication_id", "text"),
+                required("job_key", "text"),
+                required("lease_id", "text"),
+                required("key_authorization", "text"),
+                required("expires_at", "timestamptz"),
+            ],
+        },
         TableExpectation {
             name: "linklake_certificate_key_binding",
             primary_key: &["singleton_id"],

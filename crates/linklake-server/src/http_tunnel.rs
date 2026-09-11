@@ -628,7 +628,14 @@ pub(crate) async fn run_http_listener(
         };
         match accepted {
             Ok((stream, peer)) => {
-                if !state.accepts_public_work() {
+                // PostgreSQL Follower 也接收 HTTP-01 验证；业务转发在请求层再次校验 Leader。
+                if !state.lifecycle.accepts_new_work()
+                    || (!state.accepts_public_work()
+                        && !state
+                            .certificate_manager
+                            .as_ref()
+                            .is_some_and(|manager| manager.uses_shared_storage()))
+                {
                     drop(stream);
                     continue;
                 }
@@ -819,6 +826,9 @@ async fn proxy_request(
     tls_hostname: Option<String>,
     mut request: Request<Incoming>,
 ) -> Response<TrackedBody> {
+    if !state.lifecycle.accepts_new_work() {
+        return TrackedBody::plain(StatusCode::SERVICE_UNAVAILABLE, "server is draining");
+    }
     let public_version = request.version();
     let public_http2 = public_version == Version::HTTP_2;
     if scheme == PublicScheme::Https {
@@ -894,9 +904,17 @@ async fn proxy_request(
         }
     }
     if scheme == PublicScheme::Http {
-        if let Some(response) = acme_challenge_response(&state, &hostname, &request) {
+        if let Some(response) =
+            acme_challenge_response(&state, &hostname, request.method(), request.uri().path()).await
+        {
             return response;
         }
+    }
+    if !state.accepts_public_work() {
+        return TrackedBody::plain(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "HTTP forwarding requires the HA leader",
+        );
     }
     if request.method() == hyper::Method::CONNECT {
         return TrackedBody::plain(StatusCode::METHOD_NOT_ALLOWED, "CONNECT is not supported");
@@ -1799,16 +1817,14 @@ pub(crate) fn stop_all(state: &AppState) {
     }
 }
 
-fn acme_challenge_response(
+async fn acme_challenge_response(
     state: &AppState,
     hostname: &str,
-    request: &Request<Incoming>,
+    method: &hyper::Method,
+    path: &str,
 ) -> Option<Response<TrackedBody>> {
-    let token = request
-        .uri()
-        .path()
-        .strip_prefix("/.well-known/acme-challenge/")?;
-    if request.method() != hyper::Method::GET && request.method() != hyper::Method::HEAD {
+    let token = path.strip_prefix("/.well-known/acme-challenge/")?;
+    if method != hyper::Method::GET && method != hyper::Method::HEAD {
         return Some(TrackedBody::plain(
             StatusCode::METHOD_NOT_ALLOWED,
             "ACME challenge only supports GET and HEAD",
@@ -1820,20 +1836,35 @@ fn acme_challenge_response(
             "unknown ACME challenge",
         ));
     }
-    let key_authorization = state
-        .certificate_manager
-        .as_ref()
-        .and_then(|manager| manager.challenges().lookup(hostname, token));
-    match key_authorization {
-        Some(_) if request.method() == hyper::Method::HEAD => {
-            Some(TrackedBody::text(StatusCode::OK, String::new()))
+    let key_authorization = match &state.certificate_manager {
+        Some(manager) => match tokio::time::timeout(
+            Duration::from_secs(5),
+            manager.lookup_http01(hostname, token),
+        )
+        .await
+        {
+            Ok(Ok(value)) => value,
+            _ => {
+                return Some(TrackedBody::plain(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ACME challenge storage is unavailable",
+                ))
+            }
+        },
+        None => None,
+    };
+    let mut response = match key_authorization {
+        Some(_) if method == hyper::Method::HEAD => {
+            TrackedBody::text(StatusCode::OK, String::new())
         }
-        Some(value) => Some(TrackedBody::text(StatusCode::OK, value)),
-        None => Some(TrackedBody::plain(
-            StatusCode::NOT_FOUND,
-            "unknown ACME challenge",
-        )),
-    }
+        Some(value) => TrackedBody::text(StatusCode::OK, value),
+        None => TrackedBody::plain(StatusCode::NOT_FOUND, "unknown ACME challenge"),
+    };
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        hyper::header::HeaderValue::from_static("no-store"),
+    );
+    Some(response)
 }
 
 fn prepare_forward_headers<B>(

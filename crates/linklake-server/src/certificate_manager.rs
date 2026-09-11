@@ -268,8 +268,15 @@ impl CertificateManager {
         }
     }
 
-    pub(crate) fn challenges(&self) -> Arc<Http01ChallengeStore> {
-        self.challenges.clone()
+    pub(crate) async fn lookup_http01(
+        &self,
+        hostname: &str,
+        token: &str,
+    ) -> anyhow::Result<Option<String>> {
+        match &self.shared {
+            Some(shared) => shared.catalog.lookup_http01(hostname, token).await,
+            None => Ok(self.challenges.lookup(hostname, token)),
+        }
     }
 
     pub(crate) fn tls_config(&self) -> Arc<ServerConfig> {
@@ -343,6 +350,7 @@ impl CertificateManager {
         &self,
         hostname: &str,
         config: &AcmeIssueConfig,
+        lease: &crate::job_leases::JobLease,
     ) -> anyhow::Result<CertificateIssueResult> {
         let hostname = normalize_certificate_identifier(hostname)?;
         anyhow::ensure!(
@@ -353,7 +361,7 @@ impl CertificateManager {
             config.challenge_type != AcmeChallengeType::Dns01 || self.cloudflare_dns.is_some(),
             "Cloudflare DNS-01 credentials are not configured"
         );
-        self.issue_certificate_with_timeout(&hostname, config, ACME_OPERATION_TIMEOUT)
+        self.issue_certificate_with_timeout(&hostname, config, ACME_OPERATION_TIMEOUT, Some(lease))
             .await
     }
 
@@ -362,10 +370,11 @@ impl CertificateManager {
         hostname: &str,
         config: &AcmeIssueConfig,
         operation_timeout: Duration,
+        lease: Option<&crate::job_leases::JobLease>,
     ) -> anyhow::Result<CertificateIssueResult> {
         tokio::time::timeout(
             operation_timeout,
-            self.issue_certificate_inner(hostname, config),
+            self.issue_certificate_inner(hostname, config, lease),
         )
         .await
         .map_err(|_| {
@@ -380,12 +389,18 @@ impl CertificateManager {
         &self,
         hostname: &str,
         config: &AcmeIssueConfig,
+        lease: Option<&crate::job_leases::JobLease>,
     ) -> anyhow::Result<CertificateIssueResult> {
+        anyhow::ensure!(
+            self.shared.is_none() || lease.is_some(),
+            "shared certificate issuance requires a job lease"
+        );
         let _permit = self.order_permits.clone().acquire_owned().await?;
         let account = self.load_or_create_account(config).await?;
         let identifiers = [Identifier::Dns(hostname.to_owned())];
         let mut order = account.new_order(&NewOrder::new(&identifiers)).await?;
         let mut http01_guards = Vec::new();
+        let mut shared_http01_publications = Vec::new();
         let mut dns01_guards = Vec::new();
         let mut http01_challenges_completed = 0_u64;
         let mut dns01_challenges_completed = 0_u64;
@@ -407,10 +422,25 @@ impl CertificateManager {
                             .ok_or_else(|| anyhow::anyhow!("ACME server did not offer HTTP-01"))?;
                         let token = challenge.token.clone();
                         let key_authorization = challenge.key_authorization().as_str().to_owned();
-                        let guard = self
-                            .challenges
-                            .publish(hostname, &token, key_authorization)?;
-                        http01_guards.push(guard);
+                        if let Some(shared) = &self.shared {
+                            let publication = shared
+                                .catalog
+                                .publish_http01(
+                                    lease.ok_or_else(|| {
+                                        anyhow::anyhow!("missing certificate job lease")
+                                    })?,
+                                    hostname,
+                                    &token,
+                                    &key_authorization,
+                                )
+                                .await?;
+                            shared_http01_publications.push(publication);
+                        } else {
+                            let guard =
+                                self.challenges
+                                    .publish(hostname, &token, key_authorization)?;
+                            http01_guards.push(guard);
+                        }
                         challenge.set_ready().await?;
                         http01_challenges_completed = http01_challenges_completed.saturating_add(1);
                     }
@@ -445,6 +475,13 @@ impl CertificateManager {
         }
         .await;
         drop(http01_guards);
+        if let Some(shared) = &self.shared {
+            for publication in shared_http01_publications {
+                if let Err(error) = shared.catalog.cleanup_http01(publication).await {
+                    tracing::warn!(%error, "could not clean up a shared HTTP-01 challenge; lease expiry will hide it");
+                }
+            }
+        }
         for guard in dns01_guards {
             if let Err(error) = guard.cleanup().await {
                 tracing::warn!("could not clean up a Cloudflare DNS-01 TXT record: {error}");
@@ -887,6 +924,7 @@ pub(crate) struct Http01ChallengeStore {
 }
 
 struct Http01ChallengeEntry {
+    publication_id: uuid::Uuid,
     key_authorization: String,
     expires_at: Instant,
 }
@@ -900,17 +938,20 @@ impl Http01ChallengeStore {
     ) -> anyhow::Result<Http01ChallengeGuard> {
         let hostname = normalize_hostname(hostname)?;
         validate_challenge_token(token)?;
+        let publication_id = uuid::Uuid::new_v4();
         self.entries
             .lock()
             .expect("HTTP-01 challenge store lock poisoned")
             .insert(
                 (hostname.clone(), token.to_owned()),
                 Http01ChallengeEntry {
+                    publication_id,
                     key_authorization,
                     expires_at: Instant::now() + CHALLENGE_TTL,
                 },
             );
         Ok(Http01ChallengeGuard {
+            publication_id,
             store: self.clone(),
             hostname,
             token: token.to_owned(),
@@ -930,15 +971,23 @@ impl Http01ChallengeStore {
             .map(|entry| entry.key_authorization.clone())
     }
 
-    fn remove(&self, hostname: &str, token: &str) {
-        self.entries
+    fn remove(&self, hostname: &str, token: &str, publication_id: uuid::Uuid) {
+        let mut entries = self
+            .entries
             .lock()
-            .expect("HTTP-01 challenge store lock poisoned")
-            .remove(&(hostname.to_owned(), token.to_owned()));
+            .expect("HTTP-01 challenge store lock poisoned");
+        let key = (hostname.to_owned(), token.to_owned());
+        if entries
+            .get(&key)
+            .is_some_and(|entry| entry.publication_id == publication_id)
+        {
+            entries.remove(&key);
+        }
     }
 }
 
 struct Http01ChallengeGuard {
+    publication_id: uuid::Uuid,
     store: Arc<Http01ChallengeStore>,
     hostname: String,
     token: String,
@@ -946,11 +995,12 @@ struct Http01ChallengeGuard {
 
 impl Drop for Http01ChallengeGuard {
     fn drop(&mut self) {
-        self.store.remove(&self.hostname, &self.token);
+        self.store
+            .remove(&self.hostname, &self.token, self.publication_id);
     }
 }
 
-fn validate_challenge_token(token: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_challenge_token(token: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         (1..=256).contains(&token.len())
             && token
@@ -1292,6 +1342,24 @@ mod tests {
         );
         assert!(store.lookup("other.example.com", "token_1").is_none());
         drop(guard);
+        assert!(store.lookup("site.example.com", "token_1").is_none());
+    }
+
+    #[test]
+    fn old_challenge_guard_cannot_remove_replacement() {
+        let store = Arc::new(Http01ChallengeStore::default());
+        let old = store
+            .publish("site.example.com", "token_1", "old".to_owned())
+            .unwrap();
+        let current = store
+            .publish("site.example.com", "token_1", "current".to_owned())
+            .unwrap();
+        drop(old);
+        assert_eq!(
+            store.lookup("site.example.com", "token_1").as_deref(),
+            Some("current")
+        );
+        drop(current);
         assert!(store.lookup("site.example.com", "token_1").is_none());
     }
 
@@ -1692,6 +1760,7 @@ mod tests {
                 "timeout.example.com",
                 &config,
                 Duration::from_millis(25),
+                None,
             )
             .await
             .expect_err("waiting for an order permit should time out");
@@ -1710,6 +1779,7 @@ mod tests {
                 "timeout.example.com",
                 &config,
                 Duration::from_millis(25),
+                None,
             )
             .await
             .expect_err("waiting for the account lock should time out");

@@ -5,6 +5,7 @@ mod api_tokens;
 mod audit_log;
 mod audit_store;
 mod certificate_catalog;
+mod certificate_http01;
 mod certificate_job;
 mod certificate_manager;
 mod certificate_material;
@@ -9209,7 +9210,7 @@ async fn run_certificate_operation_inner(
                 let _ = changed;
                 None
             }
-            result = manager.issue_certificate(&certificate_identifier, &issue_config) => Some(result),
+            result = manager.issue_certificate(&certificate_identifier, &issue_config, &lease) => Some(result),
         };
         let Some(result) = result else {
             return false;
@@ -9217,7 +9218,7 @@ async fn run_certificate_operation_inner(
         result
     } else {
         manager
-            .issue_certificate(&certificate_identifier, &issue_config)
+            .issue_certificate(&certificate_identifier, &issue_config, &lease)
             .await
     };
     if stop.as_ref().is_some_and(|stop| *stop.borrow()) {
@@ -9560,6 +9561,21 @@ async fn restore_managed_certificates(state: &Arc<AppState>) -> anyhow::Result<(
         .list()?;
     let now = unix_seconds() as i64;
     let writable = state.ha_runtime.is_leader();
+    // 在本机证书变更门内读取；准备任务同样持有此门，不能在检查与恢复之间插入新任务。
+    // 共享查询还排除了已失效的 Leader，接管后可以恢复旧实例留下的状态。
+    let active_jobs: HashSet<String> = if writable {
+        state
+            .ha_runtime
+            .jobs()
+            .active()
+            .await?
+            .into_iter()
+            .filter(|lease| lease.job_kind == "certificate")
+            .map(|lease| lease.job_key)
+            .collect()
+    } else {
+        HashSet::new()
+    };
     for route in routes.into_iter().filter(|route| route.enabled) {
         let (tls_policy, certificate) = {
             let catalog = &state.certificate_catalog;
@@ -9576,6 +9592,10 @@ async fn restore_managed_certificates(state: &Arc<AppState>) -> anyhow::Result<(
         }
         let certificate_identifier =
             effective_certificate_identifier(&route.hostname, Some(&tls_policy));
+        let writable = writable
+            && !active_jobs.contains(&certificate_catalog::postgres::certificate_job_key(
+                &certificate_identifier,
+            )?);
         if certificate
             .as_ref()
             .is_some_and(|certificate| certificate.expired_at(now))
