@@ -185,6 +185,8 @@ impl CertificateManager {
         lease: &crate::job_leases::JobLease,
         expected_tls: &crate::certificate_catalog::RouteTlsPolicy,
         revision: uuid::Uuid,
+        expected_route: &crate::http_route_catalog::HttpRoutePolicy,
+        route_revision: uuid::Uuid,
         config: &crate::certificate_catalog::AcmeConfig,
         issued: &CertificateIssueResult,
     ) -> anyhow::Result<bool> {
@@ -204,6 +206,8 @@ impl CertificateManager {
                 lease,
                 expected_tls,
                 revision,
+                expected_route,
+                route_revision,
                 config,
                 issued.identifier(),
                 certificate,

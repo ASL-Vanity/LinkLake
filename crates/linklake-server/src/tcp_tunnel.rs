@@ -507,7 +507,7 @@ async fn send_managed_config(
         return;
     }
 
-    let config = match crate::managed_config_for_client(&state, client_id) {
+    let config = match crate::managed_config_for_client(&state, client_id).await {
         Ok(config) => config,
         Err(error) => {
             tracing::error!("Could not build managed configuration for {client_id}: {error}");

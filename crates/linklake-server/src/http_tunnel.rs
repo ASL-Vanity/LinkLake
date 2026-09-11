@@ -964,12 +964,20 @@ async fn proxy_request(
         .get(&hostname)
         .map(|registration| registration.context.clone());
     let Some(context) = context else {
-        let configured = state
+        let configured = match state
             .http_route_catalog
-            .lock()
-            .expect("HTTP route catalog lock poisoned")
             .enabled_hostname_exists(&hostname)
-            .unwrap_or(false);
+            .await
+        {
+            Ok(configured) => configured,
+            Err(error) => {
+                tracing::warn!("Could not read HTTP route configuration: {error}");
+                return TrackedBody::plain(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "HTTP route configuration is unavailable",
+                );
+            }
+        };
         return if configured {
             TrackedBody::plain(StatusCode::SERVICE_UNAVAILABLE, "HTTP route is offline")
         } else {
@@ -1523,11 +1531,23 @@ pub(crate) async fn register_route(
         send_error(&mut stream, "invalid HTTP route hostname").await;
         return;
     };
+    // 与本机 HTTP/Fleet 策略变更共用门，防止共享查询等待期间禁用后又注册旧配置。
+    let route_mutation_guard = state.certificate_mutations.lock().await;
+    let fencing_token = match state.ha_runtime.fencing_token() {
+        Ok(token) if state.accepts_public_work() => token,
+        _ => {
+            send_error(
+                &mut stream,
+                "HTTP route registration requires the HA leader",
+            )
+            .await;
+            return;
+        }
+    };
     let runtime_policy = state
         .http_route_catalog
-        .lock()
-        .expect("HTTP route catalog lock poisoned")
         .runtime_policy(client_id, &name, &hostname, &target_addr)
+        .await
         .unwrap_or(None);
     let Some(runtime_policy) = runtime_policy else {
         state
@@ -1615,6 +1635,15 @@ pub(crate) async fn register_route(
         http2_backend,
         grpc_backend,
     });
+    if !state.accepts_public_work() || state.ha_runtime.fencing_token().ok() != Some(fencing_token)
+    {
+        send_error(
+            &mut stream,
+            "HTTP route leadership changed during registration",
+        )
+        .await;
+        return;
+    }
     if let Some(previous) = state
         .http_routes
         .lock()
@@ -1631,6 +1660,7 @@ pub(crate) async fn register_route(
         previous.context.http2_backend.invalidate();
         let _ = previous.stop_tx.send(());
     }
+    drop(route_mutation_guard);
     state
         .metrics
         .tunnel_registrations_total

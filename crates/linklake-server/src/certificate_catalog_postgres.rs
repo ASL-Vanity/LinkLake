@@ -13,6 +13,46 @@ use zeroize::Zeroizing;
 
 pub(crate) const CERTIFICATE_STATE_LOCK: i64 = 0x4c4c_4345_5254_5354;
 
+async fn http_route_is_current(
+    transaction: &PgTransaction<'_>,
+    expected: &crate::http_route_catalog::HttpRoutePolicy,
+    revision: Uuid,
+    tls: &RouteTlsPolicy,
+    identifier: &str,
+) -> anyhow::Result<bool> {
+    let current =
+        crate::http_route_catalog::postgres::transaction_snapshot(transaction, expected.id).await?;
+    Ok(http_route_snapshot_matches(
+        current.as_ref(),
+        expected,
+        revision,
+        tls,
+        identifier,
+    ))
+}
+
+fn http_route_snapshot_matches(
+    current: Option<&crate::http_route_catalog::postgres::HttpRouteSnapshot>,
+    expected: &crate::http_route_catalog::HttpRoutePolicy,
+    revision: Uuid,
+    tls: &RouteTlsPolicy,
+    identifier: &str,
+) -> bool {
+    current.is_some_and(|current| {
+        current.revision == revision
+            && current.policy == *expected
+            && current.policy.enabled
+            && tls.route_id == expected.id
+            && tls.mode == RouteTlsMode::Acme
+            && tls
+                .certificate_identifier
+                .as_deref()
+                .unwrap_or(&current.policy.hostname)
+                == identifier
+            && certificate_identifier_covers_hostname(identifier, &current.policy.hostname)
+    })
+}
+
 pub(crate) struct PostgresCertificateCatalog {
     pub(crate) storage: CoordinationStorage,
     pub(crate) runtime: Arc<HaRuntime>,
@@ -66,6 +106,8 @@ impl PostgresCertificateCatalog {
         lease: &JobLease,
         expected_tls: &RouteTlsPolicy,
         revision: Uuid,
+        expected_route: &crate::http_route_catalog::HttpRoutePolicy,
+        route_revision: Uuid,
         expected_config: &AcmeConfig,
         identifier: &str,
         error_code: &str,
@@ -110,6 +152,18 @@ impl PostgresCertificateCatalog {
             })
             .transpose()?;
         let config = read_acme_config(&transaction).await?;
+        if !http_route_is_current(
+            &transaction,
+            expected_route,
+            route_revision,
+            expected_tls,
+            identifier,
+        )
+        .await?
+        {
+            transaction.commit().await?;
+            return Ok(false);
+        }
         if !current.as_ref().is_some_and(|(policy, current_revision)| {
             policy == expected_tls && *current_revision == revision
         }) || expected_tls.mode != RouteTlsMode::Acme
@@ -165,6 +219,8 @@ impl PostgresCertificateCatalog {
         lease: &JobLease,
         expected_tls: &RouteTlsPolicy,
         expected_tls_revision: Uuid,
+        expected_route: &crate::http_route_catalog::HttpRoutePolicy,
+        route_revision: Uuid,
         expected_config: &AcmeConfig,
         identifier: &str,
         certificate_pem: &[u8],
@@ -225,6 +281,18 @@ impl PostgresCertificateCatalog {
         }
         let config = read_acme_config(&transaction).await?;
         if !config.enabled || &config != expected_config {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+        if !http_route_is_current(
+            &transaction,
+            expected_route,
+            route_revision,
+            expected_tls,
+            &identifier,
+        )
+        .await?
+        {
             transaction.commit().await?;
             return Ok(false);
         }
@@ -751,6 +819,78 @@ fn private_key_context(route_id: Uuid, identifier: &str, certificate_pem: &[u8])
         "certificate-key:{route_id}:{identifier}:{:x}",
         Sha256::digest(certificate_pem)
     )
+}
+
+#[cfg(test)]
+mod route_commit_tests {
+    use super::*;
+    use crate::http_route_catalog::{
+        postgres::HttpRouteSnapshot, GrpcBackendTransport, HttpRoutePolicy,
+    };
+
+    #[test]
+    fn certificate_commit_rejects_reverted_routes_and_ownership_changes() {
+        let expected = HttpRoutePolicy {
+            id: Uuid::new_v4(),
+            client_id: Uuid::new_v4(),
+            name: "site".to_owned(),
+            hostname: "site.example.com".to_owned(),
+            target_addr: "127.0.0.1:8080".to_owned(),
+            max_connections: 64,
+            grpc_backend_transport: GrpcBackendTransport::H2c,
+            grpc_backend_server_name: None,
+            grpc_backend_trust_profile: None,
+            enabled: true,
+        };
+        let tls = RouteTlsPolicy {
+            route_id: expected.id,
+            mode: RouteTlsMode::Acme,
+            redirect_http_to_https: false,
+            certificate_identifier: None,
+            updated_at: 1,
+        };
+        let revision = Uuid::new_v4();
+        let mut current = HttpRouteSnapshot {
+            policy: expected.clone(),
+            revision,
+        };
+        let matches = |snapshot: Option<&HttpRouteSnapshot>| {
+            http_route_snapshot_matches(snapshot, &expected, revision, &tls, &expected.hostname)
+        };
+        assert!(matches(Some(&current)));
+        assert!(!matches(None));
+        // 配置即使完全改回原值，新的版本也不能接收旧任务结果。
+        current.revision = Uuid::new_v4();
+        assert!(!matches(Some(&current)));
+        current.revision = revision;
+        current.policy.client_id = Uuid::new_v4();
+        assert!(!matches(Some(&current)));
+        current.policy = expected.clone();
+        current.policy.enabled = false;
+        assert!(!matches(Some(&current)));
+        current.policy = expected.clone();
+        current.policy.target_addr = "127.0.0.1:9090".to_owned();
+        assert!(!matches(Some(&current)));
+        current.policy = expected.clone();
+        assert!(!http_route_snapshot_matches(
+            Some(&current),
+            &expected,
+            revision,
+            &tls,
+            "other.example.com"
+        ));
+        let wildcard = RouteTlsPolicy {
+            certificate_identifier: Some("*.example.com".to_owned()),
+            ..tls
+        };
+        assert!(http_route_snapshot_matches(
+            Some(&current),
+            &expected,
+            revision,
+            &wildcard,
+            "*.example.com"
+        ));
+    }
 }
 
 async fn bind_key(

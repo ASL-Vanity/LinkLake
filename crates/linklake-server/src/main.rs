@@ -29,6 +29,7 @@ mod http2_backend;
 pub mod http_backend_pool;
 mod http_proxy_tunnel;
 mod http_route_catalog;
+mod http_route_store;
 mod http_tunnel;
 mod job_execution;
 mod job_leases;
@@ -386,7 +387,7 @@ pub(crate) fn migrate_application_schema(database: &Database) -> anyhow::Result<
     Ok(())
 }
 
-pub(crate) fn managed_config_for_client(
+pub(crate) async fn managed_config_for_client(
     state: &AppState,
     client_id: Uuid,
 ) -> anyhow::Result<ManagedClientConfig> {
@@ -461,9 +462,8 @@ pub(crate) fn managed_config_for_client(
     udp_tunnels.sort_by_key(|tunnel| tunnel.public_port);
     let http_routes = state
         .http_route_catalog
-        .lock()
-        .expect("HTTP route catalog lock poisoned")
-        .list()?
+        .list()
+        .await?
         .into_iter()
         .filter(|policy| policy.client_id == client_id)
         .map(|policy| ManagedHttpRoute {
@@ -587,7 +587,7 @@ struct AppState {
     udp_tunnels: Mutex<HashMap<u16, udp_tunnel::UdpTunnelRegistration>>,
     udp_tunnel_statistics: Mutex<HashMap<Uuid, Arc<udp_tunnel::UdpTunnelStatistics>>>,
     seen_udp_tunnel_registrations: Mutex<HashSet<(Uuid, u16)>>,
-    http_route_catalog: Mutex<HttpRouteCatalog>,
+    http_route_catalog: http_route_store::HttpRouteStore,
     http_routes: Mutex<HashMap<String, http_tunnel::HttpRouteRegistration>>,
     http_route_statistics: Mutex<HashMap<String, Arc<http_tunnel::HttpRouteStatistics>>>,
     seen_http_route_registrations: Mutex<HashSet<(Uuid, String)>>,
@@ -1885,6 +1885,7 @@ struct PreparedCertificateOperation {
     operation: CertificateOperation,
     lease: job_leases::JobLease,
     tls_revision: Option<Uuid>,
+    route_revision: Option<Uuid>,
     reservation: CertificateJobGuard,
 }
 
@@ -2175,18 +2176,13 @@ async fn certificate_identifier_used_by_other_route(
     certificate_identifier: &str,
     excluded_route_id: Uuid,
 ) -> Result<bool, CodedApiError> {
-    let routes = state
-        .http_route_catalog
-        .lock()
-        .expect("HTTP route catalog lock poisoned")
-        .list()
-        .map_err(|_| {
-            CodedApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                "could not read HTTP routes",
-            )
-        })?;
+    let routes = state.http_route_catalog.list().await.map_err(|_| {
+        CodedApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "could not read HTTP routes",
+        )
+    })?;
     let catalog = &state.certificate_catalog;
     for route in routes
         .into_iter()
@@ -4356,7 +4352,11 @@ async fn run_server(
         udp_tunnels: Mutex::new(HashMap::new()),
         udp_tunnel_statistics: Mutex::new(HashMap::new()),
         seen_udp_tunnel_registrations: Mutex::new(HashSet::new()),
-        http_route_catalog: Mutex::new(HttpRouteCatalog::open_with_database(&database)?),
+        http_route_catalog: http_route_store::HttpRouteStore::open(
+            &database,
+            coordination_storage.clone(),
+            ha_runtime.clone(),
+        )?,
         http_routes: Mutex::new(HashMap::new()),
         http_route_statistics: Mutex::new(HashMap::new()),
         seen_http_route_registrations: Mutex::new(HashSet::new()),
@@ -7117,7 +7117,7 @@ async fn read_metrics_history_range(
 }
 
 async fn record_metrics_history_sample(state: &AppState) -> anyhow::Result<()> {
-    let sample = collect_metrics_history_sample(state, unix_seconds());
+    let sample = collect_metrics_history_sample(state, unix_seconds()).await;
     let sample = match &state.shared_metrics_history {
         Some(shared) => shared.record(sample).await?,
         None => sample,
@@ -7409,107 +7409,109 @@ async fn collect_alert_signals(
             window_seconds: None,
         });
     }
-    collect_unavailable_policy_signals(state, &mut signals);
+    collect_unavailable_policy_signals(state, &mut signals).await;
 
-    let history = state
-        .metrics_history
-        .lock()
-        .expect("metrics history lock poisoned");
-    if let Some(current) = history.samples.back() {
-        let total = current.counters(MetricsHistoryProtocol::Total);
-        signals.push(AlertSignal {
-            metric: AlertMetric::ActiveConnections,
-            subject: "global".to_owned(),
-            value: total
-                .active_connections
-                .saturating_add(total.active_sessions) as f64,
-            message: format!(
-                "{} active connections and sessions",
-                total
+    {
+        let history = state
+            .metrics_history
+            .lock()
+            .expect("metrics history lock poisoned");
+        if let Some(current) = history.samples.back() {
+            let total = current.counters(MetricsHistoryProtocol::Total);
+            signals.push(AlertSignal {
+                metric: AlertMetric::ActiveConnections,
+                subject: "global".to_owned(),
+                value: total
                     .active_connections
-                    .saturating_add(total.active_sessions)
-            ),
-            window_seconds: None,
-        });
-        let windows = rules
-            .iter()
-            .filter(|rule| {
-                matches!(
-                    rule.metric,
-                    AlertMetric::AuthenticationFailures | AlertMetric::TrafficBytesPerSecond
-                )
-            })
-            .map(|rule| rule.evaluation_window_seconds)
-            .collect::<HashSet<_>>();
-        for window in windows {
-            let target = current.timestamp_unix_seconds.saturating_sub(window);
-            let baseline = history
-                .samples
+                    .saturating_add(total.active_sessions) as f64,
+                message: format!(
+                    "{} active connections and sessions",
+                    total
+                        .active_connections
+                        .saturating_add(total.active_sessions)
+                ),
+                window_seconds: None,
+            });
+            let windows = rules
                 .iter()
-                .rev()
-                .find(|sample| sample.timestamp_unix_seconds <= target)
-                .or_else(|| history.samples.front());
-            if let Some(baseline) = baseline {
-                let elapsed = current
-                    .timestamp_unix_seconds
-                    .saturating_sub(baseline.timestamp_unix_seconds)
-                    .max(1);
-                let authentication_failures = current
-                    .authentication_failures_total
-                    .saturating_sub(baseline.authentication_failures_total);
-                signals.push(AlertSignal {
-                    metric: AlertMetric::AuthenticationFailures,
-                    subject: "global".to_owned(),
-                    value: authentication_failures as f64,
-                    message: format!(
+                .filter(|rule| {
+                    matches!(
+                        rule.metric,
+                        AlertMetric::AuthenticationFailures | AlertMetric::TrafficBytesPerSecond
+                    )
+                })
+                .map(|rule| rule.evaluation_window_seconds)
+                .collect::<HashSet<_>>();
+            for window in windows {
+                let target = current.timestamp_unix_seconds.saturating_sub(window);
+                let baseline = history
+                    .samples
+                    .iter()
+                    .rev()
+                    .find(|sample| sample.timestamp_unix_seconds <= target)
+                    .or_else(|| history.samples.front());
+                if let Some(baseline) = baseline {
+                    let elapsed = current
+                        .timestamp_unix_seconds
+                        .saturating_sub(baseline.timestamp_unix_seconds)
+                        .max(1);
+                    let authentication_failures = current
+                        .authentication_failures_total
+                        .saturating_sub(baseline.authentication_failures_total);
+                    signals.push(AlertSignal {
+                        metric: AlertMetric::AuthenticationFailures,
+                        subject: "global".to_owned(),
+                        value: authentication_failures as f64,
+                        message: format!(
                         "{authentication_failures} authentication failures in {elapsed} seconds"
                     ),
-                    window_seconds: Some(window),
-                });
-                let base = baseline.counters(MetricsHistoryProtocol::Total);
-                let bytes = total
-                    .bytes_from_public
-                    .saturating_add(total.bytes_to_public)
-                    .saturating_sub(base.bytes_from_public.saturating_add(base.bytes_to_public));
-                let rate = bytes as f64 / elapsed as f64;
-                signals.push(AlertSignal {
-                    metric: AlertMetric::TrafficBytesPerSecond,
-                    subject: "global".to_owned(),
-                    value: rate,
-                    message: format!("{rate:.2} bytes per second over {elapsed} seconds"),
-                    window_seconds: Some(window),
-                });
+                        window_seconds: Some(window),
+                    });
+                    let base = baseline.counters(MetricsHistoryProtocol::Total);
+                    let bytes = total
+                        .bytes_from_public
+                        .saturating_add(total.bytes_to_public)
+                        .saturating_sub(
+                            base.bytes_from_public.saturating_add(base.bytes_to_public),
+                        );
+                    let rate = bytes as f64 / elapsed as f64;
+                    signals.push(AlertSignal {
+                        metric: AlertMetric::TrafficBytesPerSecond,
+                        subject: "global".to_owned(),
+                        value: rate,
+                        message: format!("{rate:.2} bytes per second over {elapsed} seconds"),
+                        window_seconds: Some(window),
+                    });
+                }
             }
         }
+        let slo = collect_slo_metrics(&history, now, configured_slo_availability_target());
+        signals.push(AlertSignal {
+            metric: AlertMetric::SloFastBurnRate,
+            subject: "global".to_owned(),
+            value: slo.slo_burn_rate_5m.min(slo.slo_burn_rate_1h),
+            message: format!(
+                "SLO fast burn: 5m={:.2}x, 1h={:.2}x",
+                slo.slo_burn_rate_5m, slo.slo_burn_rate_1h
+            ),
+            window_seconds: Some(5 * 60),
+        });
+        signals.push(AlertSignal {
+            metric: AlertMetric::SloSlowBurnRate,
+            subject: "global".to_owned(),
+            value: slo.slo_burn_rate_6h.min(slo.slo_burn_rate_24h),
+            message: format!(
+                "SLO slow burn: 6h={:.2}x, 24h={:.2}x",
+                slo.slo_burn_rate_6h, slo.slo_burn_rate_24h
+            ),
+            window_seconds: Some(6 * 60 * 60),
+        });
     }
-    let slo = collect_slo_metrics(&history, now, configured_slo_availability_target());
-    signals.push(AlertSignal {
-        metric: AlertMetric::SloFastBurnRate,
-        subject: "global".to_owned(),
-        value: slo.slo_burn_rate_5m.min(slo.slo_burn_rate_1h),
-        message: format!(
-            "SLO fast burn: 5m={:.2}x, 1h={:.2}x",
-            slo.slo_burn_rate_5m, slo.slo_burn_rate_1h
-        ),
-        window_seconds: Some(5 * 60),
-    });
-    signals.push(AlertSignal {
-        metric: AlertMetric::SloSlowBurnRate,
-        subject: "global".to_owned(),
-        value: slo.slo_burn_rate_6h.min(slo.slo_burn_rate_24h),
-        message: format!(
-            "SLO slow burn: 6h={:.2}x, 24h={:.2}x",
-            slo.slo_burn_rate_6h, slo.slo_burn_rate_24h
-        ),
-        window_seconds: Some(6 * 60 * 60),
-    });
-    drop(history);
 
     let route_names = state
         .http_route_catalog
-        .lock()
-        .expect("HTTP route catalog lock poisoned")
         .list()
+        .await
         .unwrap_or_default()
         .into_iter()
         .map(|route| (route.id, route.hostname))
@@ -7536,7 +7538,7 @@ async fn collect_alert_signals(
     Ok(signals)
 }
 
-fn collect_unavailable_policy_signals(state: &AppState, signals: &mut Vec<AlertSignal>) {
+async fn collect_unavailable_policy_signals(state: &AppState, signals: &mut Vec<AlertSignal>) {
     let online_tcp = state
         .tunnels
         .lock()
@@ -7618,9 +7620,8 @@ fn collect_unavailable_policy_signals(state: &AppState, signals: &mut Vec<AlertS
         .collect::<HashSet<_>>();
     for policy in state
         .http_route_catalog
-        .lock()
-        .expect("HTTP route catalog lock poisoned")
         .list()
+        .await
         .unwrap_or_default()
         .into_iter()
         .filter(|policy| policy.enabled && !online_http.contains(&policy.hostname))
@@ -7715,7 +7716,7 @@ fn push_policy_unavailable(
     });
 }
 
-fn collect_metrics_history_sample(
+async fn collect_metrics_history_sample(
     state: &AppState,
     timestamp_unix_seconds: u64,
 ) -> MetricsHistorySample {
@@ -7974,7 +7975,7 @@ fn collect_metrics_history_sample(
         }
     };
     let proxy = socks5.saturating_add(http_proxy);
-    let policies = collect_policy_history_counters(state);
+    let policies = collect_policy_history_counters(state).await;
 
     MetricsHistorySample {
         timestamp_unix_seconds,
@@ -7992,7 +7993,7 @@ fn collect_metrics_history_sample(
     }
 }
 
-fn collect_policy_history_counters(state: &AppState) -> HashMap<String, HistoryCounters> {
+async fn collect_policy_history_counters(state: &AppState) -> HashMap<String, HistoryCounters> {
     let mut policies = HashMap::new();
     let (tcp_policies, udp_policies, port_groups) = {
         let catalog = state
@@ -8101,9 +8102,8 @@ fn collect_policy_history_counters(state: &AppState) -> HashMap<String, HistoryC
 
     let http_policies = state
         .http_route_catalog
-        .lock()
-        .expect("HTTP route catalog lock poisoned")
         .list()
+        .await
         .unwrap_or_else(|error| {
             tracing::warn!("Could not list HTTP policies for metrics history: {error}");
             Vec::new()
@@ -8410,18 +8410,13 @@ async fn update_acme_config(
         ));
     }
     if challenge_type == AcmeChallengeType::Http01 {
-        let routes = state
-            .http_route_catalog
-            .lock()
-            .expect("HTTP route catalog lock poisoned")
-            .list()
-            .map_err(|_| {
-                CodedApiError(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal_error",
-                    "could not read HTTP routes",
-                )
-            })?;
+        let routes = state.http_route_catalog.list().await.map_err(|_| {
+            CodedApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "could not read HTTP routes",
+            )
+        })?;
         let catalog = &state.certificate_catalog;
         let mut wildcard_configured = false;
         for route in routes {
@@ -8475,11 +8470,13 @@ async fn set_http_route_tls(
     authorize_management(&state, &headers)
         .await
         .map_err(coded_management_error)?;
-    let route = http_route_policy_for_id(&state, route_id)?.ok_or(CodedApiError(
-        StatusCode::NOT_FOUND,
-        "unknown_http_route",
-        "HTTP route does not exist",
-    ))?;
+    let route = http_route_policy_for_id(&state, route_id)
+        .await?
+        .ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_http_route",
+            "HTTP route does not exist",
+        ))?;
     let (old_policy, acme_config) = {
         let catalog = &state.certificate_catalog;
         (
@@ -8689,16 +8686,14 @@ async fn renew_http_route_certificate(
     ))
 }
 
-fn http_route_policy_for_id(
+async fn http_route_policy_for_id(
     state: &AppState,
     route_id: Uuid,
 ) -> Result<Option<HttpRoutePolicy>, CodedApiError> {
     state
         .http_route_catalog
-        .lock()
-        .expect("HTTP route catalog lock poisoned")
-        .list()
-        .map(|routes| routes.into_iter().find(|route| route.id == route_id))
+        .policy_by_id(route_id)
+        .await
         .map_err(|_| {
             CodedApiError(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -8819,6 +8814,7 @@ async fn queue_certificate_operation(
         prepared.operation,
         prepared.lease,
         prepared.tls_revision,
+        prepared.route_revision,
         prepared.reservation,
         None,
     ));
@@ -8831,7 +8827,12 @@ async fn prepare_certificate_operation(
     operation: CertificateOperation,
 ) -> Result<PreparedCertificateOperation, CodedApiError> {
     let _certificate_mutation_guard = state.certificate_mutations.lock().await;
-    let route = http_route_policy_for_id(&state, route_id)?.ok_or(CodedApiError(
+    let (route, route_revision) = state
+        .http_route_catalog
+        .policy_versioned(route_id)
+        .await
+        .map_err(coded_client_management_error)?;
+    let route = route.ok_or(CodedApiError(
         StatusCode::NOT_FOUND,
         "unknown_http_route",
         "HTTP route does not exist",
@@ -9029,6 +9030,7 @@ async fn prepare_certificate_operation(
         operation,
         lease,
         tls_revision,
+        route_revision,
         reservation,
     })
 }
@@ -9046,11 +9048,13 @@ async fn reserve_certificate_job(
     {
         return Ok(false);
     }
-    let current = http_route_policy_for_id(state, expected.id)?.ok_or(CodedApiError(
-        StatusCode::NOT_FOUND,
-        "unknown_http_route",
-        "HTTP route does not exist",
-    ))?;
+    let current = http_route_policy_for_id(state, expected.id)
+        .await?
+        .ok_or(CodedApiError(
+            StatusCode::NOT_FOUND,
+            "unknown_http_route",
+            "HTTP route does not exist",
+        ))?;
     if !current.enabled {
         return Err(CodedApiError(
             StatusCode::CONFLICT,
@@ -9131,6 +9135,7 @@ async fn run_certificate_operation(
     operation: CertificateOperation,
     lease: job_leases::JobLease,
     tls_revision: Option<Uuid>,
+    route_revision: Option<Uuid>,
     reservation: CertificateJobGuard,
     stop: Option<watch::Receiver<bool>>,
 ) {
@@ -9148,6 +9153,7 @@ async fn run_certificate_operation(
             operation,
             lease.clone(),
             tls_revision,
+            route_revision,
             stop,
         ),
     )
@@ -9200,6 +9206,7 @@ async fn run_certificate_operation_inner(
     operation: CertificateOperation,
     lease: job_leases::JobLease,
     tls_revision: Option<Uuid>,
+    route_revision: Option<Uuid>,
     mut stop: Option<watch::Receiver<bool>>,
 ) -> bool {
     let issue_config = certificate_manager::AcmeIssueConfig {
@@ -9253,6 +9260,7 @@ async fn run_certificate_operation_inner(
                 &acme_config,
                 &lease,
                 tls_revision,
+                route_revision,
                 now,
             )
             .await;
@@ -9320,6 +9328,7 @@ async fn run_certificate_operation_inner(
                 &acme_config,
                 &lease,
                 tls_revision,
+                route_revision,
                 now,
             )
             .await
@@ -9366,8 +9375,7 @@ fn certificate_target_matches(
     tls_policy: Option<&RouteTlsPolicy>,
 ) -> bool {
     current.is_some_and(|current| {
-        current.id == expected.id
-            && current.hostname == expected.hostname
+        current == expected
             && current.enabled
             && tls_policy.is_some_and(|policy| {
                 policy.route_id == expected.id
@@ -9387,6 +9395,7 @@ async fn record_certificate_success_if_current(
     expected_config: &AcmeConfig,
     lease: &job_leases::JobLease,
     tls_revision: Option<Uuid>,
+    route_revision: Option<Uuid>,
     completed_at: i64,
 ) -> anyhow::Result<bool> {
     let _certificate_mutation_guard = state.certificate_mutations.lock().await;
@@ -9394,11 +9403,7 @@ async fn record_certificate_success_if_current(
         issued.identifier() == expected_certificate_identifier,
         "issued certificate target differs from requested target"
     );
-    let routes = state
-        .http_route_catalog
-        .lock()
-        .expect("HTTP route catalog lock poisoned")
-        .list()?;
+    let routes = state.http_route_catalog.list().await?;
     let current = routes.iter().find(|route| route.id == expected.id);
     let certificate_catalog = &state.certificate_catalog;
     let tls_policy = certificate_catalog.get_route_tls(expected.id).await?;
@@ -9442,6 +9447,9 @@ async fn record_certificate_success_if_current(
                         .as_ref()
                         .ok_or_else(|| anyhow::anyhow!("TLS policy disappeared"))?,
                     tls_revision.ok_or_else(|| anyhow::anyhow!("TLS revision is missing"))?,
+                    expected,
+                    route_revision
+                        .ok_or_else(|| anyhow::anyhow!("HTTP route revision is missing"))?,
                     expected_config,
                     issued,
                 )
@@ -9461,14 +9469,11 @@ async fn record_certificate_failure_if_current(
     expected_config: &AcmeConfig,
     lease: &job_leases::JobLease,
     tls_revision: Option<Uuid>,
+    route_revision: Option<Uuid>,
     attempted_at: i64,
 ) -> anyhow::Result<bool> {
     let _certificate_mutation_guard = state.certificate_mutations.lock().await;
-    let routes = state
-        .http_route_catalog
-        .lock()
-        .expect("HTTP route catalog lock poisoned")
-        .list()?;
+    let routes = state.http_route_catalog.list().await?;
     let current = routes.iter().find(|route| route.id == expected.id);
     let certificate_catalog = &state.certificate_catalog;
     let tls_policy = certificate_catalog.get_route_tls(expected.id).await?;
@@ -9503,6 +9508,9 @@ async fn record_certificate_failure_if_current(
                         .as_ref()
                         .ok_or_else(|| anyhow::anyhow!("TLS policy disappeared"))?,
                     tls_revision.ok_or_else(|| anyhow::anyhow!("TLS revision is missing"))?,
+                    expected,
+                    route_revision
+                        .ok_or_else(|| anyhow::anyhow!("HTTP route revision is missing"))?,
                     expected_config,
                     expected_certificate_identifier,
                     error_code,
@@ -9562,11 +9570,7 @@ async fn restore_managed_certificates(state: &Arc<AppState>) -> anyhow::Result<(
     let Some(manager) = &state.certificate_manager else {
         return Ok(());
     };
-    let routes = state
-        .http_route_catalog
-        .lock()
-        .expect("HTTP route catalog lock poisoned")
-        .list()?;
+    let routes = state.http_route_catalog.list().await?;
     let now = unix_seconds() as i64;
     let writable = state.ha_runtime.is_leader();
     // 在本机证书变更门内读取；准备任务同样持有此门，不能在检查与恢复之间插入新任务。
@@ -9751,12 +9755,7 @@ async fn scan_certificate_maintenance(
     if !config_enabled {
         return;
     }
-    let Ok(routes) = state
-        .http_route_catalog
-        .lock()
-        .expect("HTTP route catalog lock poisoned")
-        .list()
-    else {
+    let Ok(routes) = state.http_route_catalog.list().await else {
         return;
     };
     let now = unix_seconds() as i64;
@@ -9766,6 +9765,7 @@ async fn scan_certificate_maintenance(
         }
         let certificate_scan_guard = state.certificate_mutations.lock().await;
         if !http_route_policy_for_id(&state, route.id)
+            .await
             .ok()
             .flatten()
             .is_some_and(|current| {
@@ -9846,6 +9846,7 @@ async fn scan_certificate_maintenance(
                         prepared.operation,
                         prepared.lease,
                         prepared.tls_revision,
+                        prepared.route_revision,
                         prepared.reservation,
                         Some(stop.clone()),
                     ));
@@ -9979,76 +9980,76 @@ async fn global_search(
             "#/clients",
         );
     }
-    let catalog = state
-        .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned");
-    for policy in catalog.list().map_err(coded_client_management_error)? {
-        add(
-            "tcp",
-            policy.id.to_string(),
-            policy.name,
-            format!("{} → {}", policy.public_port, policy.target_addr),
-            "#/services/tcp",
-        );
-    }
-    for policy in catalog
-        .list_udp()
-        .map_err(|error| coded_client_management_error(error.into()))?
     {
-        add(
-            "udp",
-            policy.id.to_string(),
-            policy.name,
-            format!("{} → {}", policy.public_port, policy.target_addr),
-            "#/services/udp",
-        );
+        let catalog = state
+            .tunnel_catalog
+            .lock()
+            .expect("tunnel catalog lock poisoned");
+        for policy in catalog.list().map_err(coded_client_management_error)? {
+            add(
+                "tcp",
+                policy.id.to_string(),
+                policy.name,
+                format!("{} → {}", policy.public_port, policy.target_addr),
+                "#/services/tcp",
+            );
+        }
+        for policy in catalog
+            .list_udp()
+            .map_err(|error| coded_client_management_error(error.into()))?
+        {
+            add(
+                "udp",
+                policy.id.to_string(),
+                policy.name,
+                format!("{} → {}", policy.public_port, policy.target_addr),
+                "#/services/udp",
+            );
+        }
+        for policy in catalog
+            .list_port_groups()
+            .map_err(|error| coded_client_management_error(error.into()))?
+        {
+            add(
+                "ports",
+                policy.id.to_string(),
+                policy.name,
+                format!(
+                    "{} → {}:{}",
+                    policy.public_ports, policy.target_host, policy.target_ports
+                ),
+                "#/services/ports",
+            );
+        }
+        for policy in catalog
+            .list_socks5()
+            .map_err(|error| coded_client_management_error(error.into()))?
+        {
+            add(
+                "socks5",
+                policy.id.to_string(),
+                policy.name,
+                format!("{} · {}", policy.public_port, policy.username),
+                "#/services/socks5",
+            );
+        }
+        for policy in catalog
+            .list_http_proxies()
+            .map_err(|error| coded_client_management_error(error.into()))?
+        {
+            add(
+                "http_proxy",
+                policy.id.to_string(),
+                policy.name,
+                format!("{} · {}", policy.public_port, policy.username),
+                "#/services/http-proxy",
+            );
+        }
     }
-    for policy in catalog
-        .list_port_groups()
-        .map_err(|error| coded_client_management_error(error.into()))?
-    {
-        add(
-            "ports",
-            policy.id.to_string(),
-            policy.name,
-            format!(
-                "{} → {}:{}",
-                policy.public_ports, policy.target_host, policy.target_ports
-            ),
-            "#/services/ports",
-        );
-    }
-    for policy in catalog
-        .list_socks5()
-        .map_err(|error| coded_client_management_error(error.into()))?
-    {
-        add(
-            "socks5",
-            policy.id.to_string(),
-            policy.name,
-            format!("{} · {}", policy.public_port, policy.username),
-            "#/services/socks5",
-        );
-    }
-    for policy in catalog
-        .list_http_proxies()
-        .map_err(|error| coded_client_management_error(error.into()))?
-    {
-        add(
-            "http_proxy",
-            policy.id.to_string(),
-            policy.name,
-            format!("{} · {}", policy.public_port, policy.username),
-            "#/services/http-proxy",
-        );
-    }
-    drop(catalog);
     for policy in state
         .http_route_catalog
-        .lock()
-        .expect("HTTP route catalog lock poisoned")
         .list()
+        .await
         .map_err(coded_client_management_error)?
     {
         add(
@@ -10199,7 +10200,7 @@ async fn delete_client(
             "disable the client identity and wait for it to disconnect before deletion",
         ));
     }
-    let references = client_policy_reference_count(&state, client_id)?;
+    let references = client_policy_reference_count(&state, client_id).await?;
     if references > 0 {
         return Err(CodedApiError(
             StatusCode::CONFLICT,
@@ -10231,50 +10232,51 @@ async fn delete_client(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn client_policy_reference_count(
+async fn client_policy_reference_count(
     state: &AppState,
     client_id: Uuid,
 ) -> Result<usize, CodedApiError> {
-    let tunnel_catalog = state
-        .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned");
-    let mut count = tunnel_catalog
-        .list()
-        .map_err(coded_client_management_error)?
-        .into_iter()
-        .filter(|policy| policy.client_id == client_id)
-        .count();
-    count += tunnel_catalog
-        .list_udp()
-        .map_err(|error| coded_client_management_error(error.into()))?
-        .into_iter()
-        .filter(|policy| policy.client_id == client_id)
-        .count();
-    count += tunnel_catalog
-        .list_port_groups()
-        .map_err(|error| coded_client_management_error(error.into()))?
-        .into_iter()
-        .filter(|policy| policy.client_id == client_id)
-        .count();
-    count += tunnel_catalog
-        .list_socks5()
-        .map_err(|error| coded_client_management_error(error.into()))?
-        .into_iter()
-        .filter(|policy| policy.client_id == client_id)
-        .count();
-    count += tunnel_catalog
-        .list_http_proxies()
-        .map_err(|error| coded_client_management_error(error.into()))?
-        .into_iter()
-        .filter(|policy| policy.client_id == client_id)
-        .count();
-    drop(tunnel_catalog);
+    let mut count = {
+        let tunnel_catalog = state
+            .tunnel_catalog
+            .lock()
+            .expect("tunnel catalog lock poisoned");
+        let mut count = tunnel_catalog
+            .list()
+            .map_err(coded_client_management_error)?
+            .into_iter()
+            .filter(|policy| policy.client_id == client_id)
+            .count();
+        count += tunnel_catalog
+            .list_udp()
+            .map_err(|error| coded_client_management_error(error.into()))?
+            .into_iter()
+            .filter(|policy| policy.client_id == client_id)
+            .count();
+        count += tunnel_catalog
+            .list_port_groups()
+            .map_err(|error| coded_client_management_error(error.into()))?
+            .into_iter()
+            .filter(|policy| policy.client_id == client_id)
+            .count();
+        count += tunnel_catalog
+            .list_socks5()
+            .map_err(|error| coded_client_management_error(error.into()))?
+            .into_iter()
+            .filter(|policy| policy.client_id == client_id)
+            .count();
+        count += tunnel_catalog
+            .list_http_proxies()
+            .map_err(|error| coded_client_management_error(error.into()))?
+            .into_iter()
+            .filter(|policy| policy.client_id == client_id)
+            .count();
+        count
+    };
     count += state
         .http_route_catalog
-        .lock()
-        .expect("HTTP route catalog lock poisoned")
         .list()
+        .await
         .map_err(coded_client_management_error)?
         .into_iter()
         .filter(|policy| policy.client_id == client_id)
@@ -14133,17 +14135,12 @@ async fn list_http_routes(
     headers: HeaderMap,
 ) -> Result<Json<Vec<HttpRouteView>>, ApiError> {
     authorize_management(&state, &headers).await?;
-    let policies = state
-        .http_route_catalog
-        .lock()
-        .expect("HTTP route catalog lock poisoned")
-        .list()
-        .map_err(|_| {
-            ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "could not read HTTP route policies",
-            )
-        })?;
+    let policies = state.http_route_catalog.list().await.map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not read HTTP route policies",
+        )
+    })?;
     let online = state
         .http_routes
         .lock()
@@ -14482,9 +14479,8 @@ async fn create_http_route(
         .clone();
     let policy = state
         .http_route_catalog
-        .lock()
-        .expect("HTTP route catalog lock poisoned")
         .create(request)
+        .await
         .map_err(coded_http_route_creation_error)?;
     drop(certificate_jobs);
     record_audit(
@@ -14526,12 +14522,10 @@ async fn update_http_route(
         ));
     }
     let old_policy = {
-        let catalog = state
-            .http_route_catalog
-            .lock()
-            .expect("HTTP route catalog lock poisoned");
+        let catalog = &state.http_route_catalog;
         let old = catalog
             .policy_by_id(route_id)
+            .await
             .map_err(coded_http_route_creation_error)?
             .ok_or(CodedApiError(
                 StatusCode::NOT_FOUND,
@@ -14587,9 +14581,8 @@ async fn update_http_route(
     }
     let policy = state
         .http_route_catalog
-        .lock()
-        .expect("HTTP route catalog lock poisoned")
         .update(route_id, request)
+        .await
         .map_err(coded_http_route_creation_error)?
         .ok_or(CodedApiError(
             StatusCode::NOT_FOUND,
@@ -14657,7 +14650,7 @@ async fn set_http_route_enabled(
     authorize_management(&state, &headers)
         .await
         .map_err(coded_management_error)?;
-    let route = http_route_policy_for_id(&state, route_id)?;
+    let route = http_route_policy_for_id(&state, route_id).await?;
     let tls_policy = state
         .certificate_catalog
         .get_route_tls(route_id)
@@ -14684,9 +14677,8 @@ async fn set_http_route_enabled(
     }
     let updated = state
         .http_route_catalog
-        .lock()
-        .expect("HTTP route catalog lock poisoned")
         .set_enabled(route_id, request.enabled)
+        .await
         .map_err(|_| {
             CodedApiError(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -14782,7 +14774,7 @@ async fn delete_http_route(
     authorize_management(&state, &headers)
         .await
         .map_err(coded_management_error)?;
-    let route = http_route_policy_for_id(&state, route_id)?;
+    let route = http_route_policy_for_id(&state, route_id).await?;
     let tls_policy = state
         .certificate_catalog
         .get_route_tls(route_id)
@@ -14808,9 +14800,8 @@ async fn delete_http_route(
     }
     let deleted = state
         .http_route_catalog
-        .lock()
-        .expect("HTTP route catalog lock poisoned")
         .delete(route_id)
+        .await
         .map_err(|_| {
             CodedApiError(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -18198,6 +18189,15 @@ mod tests {
             &expected,
             "secure.example.com",
             Some(&replacement),
+            Some(&policy)
+        ));
+
+        let mut reassigned = expected.clone();
+        reassigned.client_id = Uuid::new_v4();
+        assert!(!certificate_target_matches(
+            &expected,
+            "secure.example.com",
+            Some(&reassigned),
             Some(&policy)
         ));
 
