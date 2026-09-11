@@ -2,6 +2,7 @@ mod admin_auth;
 mod alerting;
 mod api_tokens;
 mod audit_log;
+mod audit_store;
 mod certificate_catalog;
 mod certificate_manager;
 mod client_registry;
@@ -27,6 +28,7 @@ mod http_tunnel;
 mod job_leases;
 mod job_supervisor;
 mod lifecycle;
+mod metrics_history_store;
 mod notifications;
 mod p2p_control;
 mod p2p_node_catalog;
@@ -553,7 +555,7 @@ struct AppState {
     api_tokens: AsyncMutex<ApiTokenStore>,
     login_throttle: Mutex<LoginThrottle>,
     login_hash_permits: Arc<Semaphore>,
-    audit: Mutex<AuditLog>,
+    audit: audit_store::AuditStore,
     server_update_authentication_audit_limiter: Mutex<ServerUpdateAuthenticationAuditLimiter>,
     alerts: Mutex<AlertCatalog>,
     fleet: fleet_store::FleetStore,
@@ -605,6 +607,7 @@ struct AppState {
     global_udp_session_permits: Arc<Semaphore>,
     metrics: ServerCounters,
     metrics_history: Mutex<MetricsHistory>,
+    shared_metrics_history: Option<metrics_history_store::PostgresMetricsHistory>,
 }
 
 impl AppState {
@@ -769,6 +772,8 @@ impl HistoryCounters {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct MetricsHistorySample {
     timestamp_unix_seconds: u64,
+    #[serde(default)]
+    counter_epoch: Option<String>,
     #[serde(default)]
     authentication_failures_total: u64,
     tcp: HistoryCounters,
@@ -4273,7 +4278,7 @@ async fn run_server(
         api_tokens: AsyncMutex::new(ApiTokenStore::open(&coordination_storage, &database).await?),
         login_throttle: Mutex::new(LoginThrottle::default()),
         login_hash_permits: Arc::new(Semaphore::new(LOGIN_HASH_CONCURRENCY)),
-        audit: Mutex::new(AuditLog::open_with_database(&database)?),
+        audit: audit_store::AuditStore::open(&database, coordination_storage.clone())?,
         server_update_authentication_audit_limiter: Mutex::new(
             ServerUpdateAuthenticationAuditLimiter::default(),
         ),
@@ -4339,11 +4344,22 @@ async fn run_server(
         pending_connection_permits: Arc::new(Semaphore::new(PENDING_CONNECTION_LIMIT)),
         global_udp_session_permits: Arc::new(Semaphore::new(GLOBAL_UDP_SESSION_LIMIT)),
         metrics: ServerCounters::default(),
-        metrics_history: Mutex::new(MetricsHistory::open_with_database(
-            &database,
-            METRICS_HISTORY_CAPACITY,
-            METRICS_HISTORY_ARCHIVE_CAPACITY,
-        )?),
+        metrics_history: Mutex::new(match coordination_storage.backend() {
+            StorageBackend::Sqlite => MetricsHistory::open_with_database(
+                &database,
+                METRICS_HISTORY_CAPACITY,
+                METRICS_HISTORY_ARCHIVE_CAPACITY,
+            )?,
+            StorageBackend::Postgres => {
+                MetricsHistory::new(METRICS_HISTORY_CAPACITY, METRICS_HISTORY_ARCHIVE_CAPACITY)
+            }
+        }),
+        shared_metrics_history: (coordination_storage.backend() == StorageBackend::Postgres).then(
+            || metrics_history_store::PostgresMetricsHistory {
+                storage: coordination_storage.clone(),
+                runtime: ha_runtime.clone(),
+            },
+        ),
     });
     restore_managed_certificates(&state)?;
     let _remote_update_task_sweeper = update_worker::spawn_update_task_sweeper(state.clone());
@@ -5250,7 +5266,8 @@ async fn drain_lifecycle(
             "timeout_seconds={timeout_seconds}; deadline_unix_seconds={}",
             now.saturating_add(timeout_seconds)
         ),
-    );
+    )
+    .await;
     Ok(Json(lifecycle_response(&state).await))
 }
 
@@ -5268,7 +5285,8 @@ async fn resume_lifecycle(
         "lifecycle.resume",
         &principal.username,
         "new work admission resumed",
-    );
+    )
+    .await;
     Ok(Json(lifecycle_response(&state).await))
 }
 
@@ -5416,12 +5434,12 @@ async fn check_server_update(
         require_interactive_update_administrator(&state, &headers, &request_host, operation)
             .await?;
     let _operation = state.server_update_operation_lock.try_lock().map_err(|_| {
-        record_server_update_rejection(&state, operation, &principal, "operation_lock_busy");
+        record_server_update_rejection(&state, operation, &principal, "operation_lock_busy").await;
         server_update_busy_error()
     })?;
     let update_state = linklake_update::default_state_directory(UpdateProduct::Server);
     ensure_server_update_idle(&update_state).inspect_err(|_| {
-        record_server_update_rejection(&state, operation, &principal, "active_update");
+        record_server_update_rejection(&state, operation, &principal, "active_update").await;
     })?;
     let result = match linklake_update::check(
         UpdateProduct::Server,
@@ -5433,7 +5451,7 @@ async fn check_server_update(
     {
         Ok(result) => result,
         Err(error) => {
-            record_server_update_failure(&state, operation, &principal);
+            record_server_update_failure(&state, operation, &principal).await;
             return Err(server_update_api_error("check", error));
         }
     };
@@ -5445,7 +5463,8 @@ async fn check_server_update(
             "actor={}; available={}; channel=stable; signature_policy=production",
             principal.username, result.update_available
         ),
-    );
+    )
+    .await;
     Ok(Json(result))
 }
 
@@ -5461,15 +5480,16 @@ async fn download_server_update(
             .await?;
     require_server_update_confirmation(&request.confirmation, UPDATE_DOWNLOAD_CONFIRMATION)
         .inspect_err(|_| {
-            record_server_update_rejection(&state, operation, &principal, "confirmation_mismatch");
+            record_server_update_rejection(&state, operation, &principal, "confirmation_mismatch")
+                .await;
         })?;
     let _operation = state.server_update_operation_lock.try_lock().map_err(|_| {
-        record_server_update_rejection(&state, operation, &principal, "operation_lock_busy");
+        record_server_update_rejection(&state, operation, &principal, "operation_lock_busy").await;
         server_update_busy_error()
     })?;
     let update_state = linklake_update::default_state_directory(UpdateProduct::Server);
     ensure_server_update_idle(&update_state).inspect_err(|_| {
-        record_server_update_rejection(&state, operation, &principal, "active_update");
+        record_server_update_rejection(&state, operation, &principal, "active_update").await;
     })?;
     let staged = match linklake_update::download(
         UpdateProduct::Server,
@@ -5483,7 +5503,7 @@ async fn download_server_update(
     {
         Ok(staged) => staged,
         Err(error) => {
-            record_server_update_failure(&state, operation, &principal);
+            record_server_update_failure(&state, operation, &principal).await;
             return Err(server_update_api_error("download", error));
         }
     };
@@ -5495,7 +5515,8 @@ async fn download_server_update(
             "actor={}; channel=stable; signature_policy=production; key_id={}",
             principal.username, staged.signature_key_id
         ),
-    );
+    )
+    .await;
     Ok(Json(ServerUpdateDownloadResponse {
         version: staged.version,
         archive_name: staged.archive_name,
@@ -5518,7 +5539,8 @@ async fn apply_server_update(
             .await?;
     require_server_update_confirmation(&request.confirmation, UPDATE_APPLY_CONFIRMATION)
         .inspect_err(|_| {
-            record_server_update_rejection(&state, operation, &principal, "confirmation_mismatch");
+            record_server_update_rejection(&state, operation, &principal, "confirmation_mismatch")
+                .await;
         })?;
     let Some(data_directory) = state.server_update_data_directory.as_deref() else {
         record_server_update_rejection(
@@ -5526,7 +5548,8 @@ async fn apply_server_update(
             operation,
             &principal,
             "persistent_data_directory_required",
-        );
+        )
+        .await;
         return Err(CodedApiError(
             StatusCode::CONFLICT,
             "server_update_unavailable",
@@ -5534,12 +5557,12 @@ async fn apply_server_update(
         ));
     };
     let _operation = state.server_update_operation_lock.try_lock().map_err(|_| {
-        record_server_update_rejection(&state, operation, &principal, "operation_lock_busy");
+        record_server_update_rejection(&state, operation, &principal, "operation_lock_busy").await;
         server_update_busy_error()
     })?;
     let update_state = linklake_update::default_state_directory(UpdateProduct::Server);
     ensure_server_update_idle(&update_state).inspect_err(|_| {
-        record_server_update_rejection(&state, operation, &principal, "active_update");
+        record_server_update_rejection(&state, operation, &principal, "active_update").await;
     })?;
     let scheduled = match linklake_update::server_apply(
         UPDATE_REPOSITORY,
@@ -5554,7 +5577,7 @@ async fn apply_server_update(
     {
         Ok(scheduled) => scheduled,
         Err(error) => {
-            record_server_update_failure(&state, operation, &principal);
+            record_server_update_failure(&state, operation, &principal).await;
             return Err(server_update_api_error("apply", error));
         }
     };
@@ -5566,7 +5589,8 @@ async fn apply_server_update(
             "actor={}; from={}; to={}; channel=stable; signature_policy=production",
             principal.username, scheduled.from_version, scheduled.to_version
         ),
-    );
+    )
+    .await;
     Ok(Json(ServerUpdateScheduleResponse {
         state: scheduled.state,
         operation_id: scheduled.operation_id,
@@ -5622,7 +5646,7 @@ fn ensure_server_update_idle(update_state: &FsPath) -> Result<(), CodedApiError>
     }
 }
 
-fn record_server_update_rejection(
+async fn record_server_update_rejection(
     state: &AppState,
     operation: ServerUpdateOperation,
     principal: &ManagementPrincipal,
@@ -5636,10 +5660,11 @@ fn record_server_update_rejection(
             "actor={}; reason={reason}; channel=stable; signature_policy=production",
             principal.username
         ),
-    );
+    )
+    .await;
 }
 
-fn record_server_update_authentication_rejection(
+async fn record_server_update_authentication_rejection(
     state: &AppState,
     operation: ServerUpdateOperation,
     reason: ServerUpdateAuthenticationRejectionReason,
@@ -5665,10 +5690,10 @@ fn record_server_update_authentication_rejection(
             reason.as_str(),
             SERVER_UPDATE_AUTH_AUDIT_WINDOW.as_secs()
         ),
-    );
+    ).await;
 }
 
-fn record_server_update_failure(
+async fn record_server_update_failure(
     state: &AppState,
     operation: ServerUpdateOperation,
     principal: &ManagementPrincipal,
@@ -5681,7 +5706,7 @@ fn record_server_update_failure(
             "actor={}; reason=secure_update_operation_failed; channel=stable; signature_policy=production",
             principal.username
         ),
-    );
+    ).await;
 }
 
 fn server_update_api_error(operation: &'static str, error: anyhow::Error) -> CodedApiError {
@@ -5854,10 +5879,12 @@ async fn metrics(
 ) -> Result<Json<MetricsResponse>, ApiError> {
     authorize_management(&state, &headers).await?;
     let slo = collect_slo_metrics(
-        &state
-            .metrics_history
-            .lock()
-            .expect("metrics history lock poisoned"),
+        &read_metrics_history(&state).await.map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not read metrics history",
+            )
+        })?,
         unix_seconds(),
         configured_slo_availability_target(),
     );
@@ -6456,10 +6483,12 @@ async fn slo_status(
 ) -> Result<Json<SloMetrics>, ApiError> {
     authorize_management(&state, &headers).await?;
     Ok(Json(collect_slo_metrics(
-        &state
-            .metrics_history
-            .lock()
-            .expect("metrics history lock poisoned"),
+        &read_metrics_history(&state).await.map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not read metrics history",
+            )
+        })?,
         unix_seconds(),
         configured_slo_availability_target(),
     )))
@@ -6501,44 +6530,37 @@ impl SloWindowDelta {
 
 fn slo_window_delta(history: &MetricsHistory, now: u64, window_seconds: u64) -> SloWindowDelta {
     let (samples, _) = history.tier(window_seconds);
-    let Some(end) = samples
-        .iter()
-        .rev()
-        .find(|sample| sample.timestamp_unix_seconds <= now)
-    else {
-        return SloWindowDelta::default();
-    };
     let cutoff = now.saturating_sub(window_seconds);
-    let start = samples
+    let mut result = SloWindowDelta::default();
+    let mut previous: Option<&MetricsHistorySample> = None;
+    for sample in samples
         .iter()
-        .rev()
-        .find(|sample| sample.timestamp_unix_seconds <= cutoff)
-        .or_else(|| samples.front())
-        .unwrap_or(end);
-    let start = start.counters(MetricsHistoryProtocol::Total);
-    let end_counters = end.counters(MetricsHistoryProtocol::Total);
-    let counter_delta = |end: u64, start: u64| {
-        if end >= start {
-            end - start
-        } else {
-            end
+        .filter(|sample| sample.timestamp_unix_seconds <= now)
+    {
+        if let Some(base) = previous {
+            // 切换实例或进程重启后的累计计数不能跨 epoch 相减。
+            if sample.timestamp_unix_seconds > cutoff && sample.counter_epoch == base.counter_epoch
+            {
+                let from = base.counters(MetricsHistoryProtocol::Total);
+                let to = sample.counters(MetricsHistoryProtocol::Total);
+                let delta = |end: u64, start: u64| if end >= start { end - start } else { end };
+                result.observed_seconds = result.observed_seconds.saturating_add(
+                    sample
+                        .timestamp_unix_seconds
+                        .saturating_sub(base.timestamp_unix_seconds),
+                );
+                result.requests = result
+                    .requests
+                    .saturating_add(delta(to.requests_total, from.requests_total));
+                result.errors = result
+                    .errors
+                    .saturating_add(delta(to.errors_total, from.errors_total));
+            }
         }
-    };
-    SloWindowDelta {
-        observed_seconds: end.timestamp_unix_seconds.saturating_sub(
-            samples
-                .iter()
-                .rev()
-                .find(|sample| sample.timestamp_unix_seconds <= cutoff)
-                .or_else(|| samples.front())
-                .unwrap_or(end)
-                .timestamp_unix_seconds,
-        ),
-        requests: counter_delta(end_counters.requests_total, start.requests_total),
-        errors: counter_delta(end_counters.errors_total, start.errors_total),
+        previous = Some(sample);
     }
+    result
 }
-
 fn collect_slo_metrics(history: &MetricsHistory, now: u64, availability_target: f64) -> SloMetrics {
     let period = slo_window_delta(history, now, SLO_PERIOD_SECONDS);
     let five_minutes = slo_window_delta(history, now, 5 * 60);
@@ -6672,10 +6694,15 @@ async fn metrics_history(
     ))?;
     let protocol = query.protocol.unwrap_or_default();
     let response = build_metrics_history_response(
-        &state
-            .metrics_history
-            .lock()
-            .expect("metrics history lock poisoned"),
+        &read_metrics_history_range(&state, range_seconds, None)
+            .await
+            .map_err(|_| {
+                CodedApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "metrics_history_storage_error",
+                    "could not read metrics history",
+                )
+            })?,
         unix_seconds(),
         range_name,
         range_seconds,
@@ -6716,10 +6743,15 @@ async fn export_metrics_history(
         "metrics history step must be between the sample interval and selected range",
     ))?;
     let response = build_metrics_history_response(
-        &state
-            .metrics_history
-            .lock()
-            .expect("metrics history lock poisoned"),
+        &read_metrics_history_range(&state, range_seconds, None)
+            .await
+            .map_err(|_| {
+                CodedApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "metrics_history_storage_error",
+                    "could not read metrics history",
+                )
+            })?,
         unix_seconds(),
         range_name,
         range_seconds,
@@ -6806,10 +6838,15 @@ async fn policy_metrics_history(
         "invalid_metrics_step",
         "metrics history step must be between the sample interval and selected range",
     ))?;
-    let history = state
-        .metrics_history
-        .lock()
-        .expect("metrics history lock poisoned");
+    let history = read_metrics_history_range(&state, range_seconds, Some(&key))
+        .await
+        .map_err(|_| {
+            CodedApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "metrics_history_storage_error",
+                "could not read metrics history",
+            )
+        })?;
     let (sample_interval_seconds, series_started_unix_seconds, points) =
         build_metrics_history_points(
             &history,
@@ -6925,7 +6962,13 @@ where
     let selected = tier
         .iter()
         .filter_map(|sample| {
-            select(sample).map(|counters| (sample.timestamp_unix_seconds, counters))
+            select(sample).map(|counters| {
+                (
+                    sample.timestamp_unix_seconds,
+                    counters,
+                    sample.counter_epoch.as_deref(),
+                )
+            })
         })
         .collect::<Vec<_>>();
     let series_started_unix_seconds = selected.first().map(|sample| sample.0);
@@ -6938,44 +6981,58 @@ where
     let mut bucket_start = from;
     while bucket_start < now {
         let bucket_end = bucket_start.saturating_add(step_seconds).min(now);
-        let mut first = None;
         let mut last = None;
         let mut count = 0_u128;
         let mut active_connections = 0_u128;
         let mut active_sessions = 0_u128;
+        let mut elapsed = 0_u64;
+        let mut inbound = 0_u64;
+        let mut outbound = 0_u64;
+        let mut requests = 0_u64;
+        let mut errors = 0_u64;
         while samples.peek().is_some_and(|sample| sample.0 <= bucket_end) {
             let sample = *samples.next().expect("peeked metrics history sample");
-            first.get_or_insert(sample);
+            if let Some(base) = previous {
+                if base.2 == sample.2 {
+                    elapsed = elapsed.saturating_add(sample.0.saturating_sub(base.0));
+                    inbound = inbound.saturating_add(
+                        sample
+                            .1
+                            .bytes_from_public
+                            .saturating_sub(base.1.bytes_from_public),
+                    );
+                    outbound = outbound.saturating_add(
+                        sample
+                            .1
+                            .bytes_to_public
+                            .saturating_sub(base.1.bytes_to_public),
+                    );
+                    requests = requests.saturating_add(
+                        sample
+                            .1
+                            .requests_total
+                            .saturating_sub(base.1.requests_total),
+                    );
+                    errors = errors
+                        .saturating_add(sample.1.errors_total.saturating_sub(base.1.errors_total));
+                }
+            }
+            previous = Some(sample);
             last = Some(sample);
             count += 1;
             active_connections += sample.1.active_connections as u128;
             active_sessions += sample.1.active_sessions as u128;
         }
         if let Some(last) = last {
-            let base = previous
-                .or(first)
-                .expect("history bucket has a base sample");
-            let elapsed = last.0.saturating_sub(base.0);
             let divisor = elapsed.max(1) as f64;
             points.push(MetricsHistoryPoint {
                 timestamp_unix_seconds: last.0,
-                inbound_bps: last
-                    .1
-                    .bytes_from_public
-                    .saturating_sub(base.1.bytes_from_public) as f64
-                    / divisor,
-                outbound_bps: last
-                    .1
-                    .bytes_to_public
-                    .saturating_sub(base.1.bytes_to_public) as f64
-                    / divisor,
+                inbound_bps: inbound as f64 / divisor,
+                outbound_bps: outbound as f64 / divisor,
                 active_connections: (active_connections / count) as u64,
                 active_sessions: (active_sessions / count) as u64,
-                requests_per_second: last.1.requests_total.saturating_sub(base.1.requests_total)
-                    as f64
-                    / divisor,
-                errors_per_second: last.1.errors_total.saturating_sub(base.1.errors_total) as f64
-                    / divisor,
+                requests_per_second: requests as f64 / divisor,
+                errors_per_second: errors as f64 / divisor,
                 requests_total: last.1.requests_total,
                 errors_total: last.1.errors_total,
             });
@@ -6987,20 +7044,57 @@ where
     (sample_interval_seconds, series_started_unix_seconds, points)
 }
 
-fn record_metrics_history_sample(state: &AppState) {
+async fn read_metrics_history(state: &AppState) -> anyhow::Result<MetricsHistory> {
+    read_metrics_history_range(state, METRICS_HISTORY_RETENTION_SECONDS, None).await
+}
+
+async fn read_metrics_history_range(
+    state: &AppState,
+    range_seconds: u64,
+    policy_key: Option<&str>,
+) -> anyhow::Result<MetricsHistory> {
+    if let Some(shared) = &state.shared_metrics_history {
+        return shared.load_range(range_seconds, policy_key).await;
+    }
+    let current = state
+        .metrics_history
+        .lock()
+        .expect("metrics history lock poisoned");
+    Ok(MetricsHistory {
+        samples: current.samples.clone(),
+        archive_samples: current.archive_samples.clone(),
+        capacity: current.capacity,
+        archive_capacity: current.archive_capacity,
+        database: None,
+    })
+}
+
+async fn record_metrics_history_sample(state: &AppState) -> anyhow::Result<()> {
     let sample = collect_metrics_history_sample(state, unix_seconds());
+    let sample = match &state.shared_metrics_history {
+        Some(shared) => shared.record(sample).await?,
+        None => sample,
+    };
     state
         .metrics_history
         .lock()
         .expect("metrics history lock poisoned")
         .push(sample);
+    Ok(())
 }
 
 async fn run_metrics_history_sampler(
     state: Arc<AppState>,
     mut stop: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    record_metrics_history_sample(&state);
+    if let Some(shared) = &state.shared_metrics_history {
+        let restored = shared.load().await?;
+        *state
+            .metrics_history
+            .lock()
+            .expect("metrics history lock poisoned") = restored;
+    }
+    record_metrics_history_sample(&state).await?;
     let start =
         tokio::time::Instant::now() + Duration::from_secs(METRICS_HISTORY_SAMPLE_INTERVAL_SECONDS);
     let mut interval = tokio::time::interval_at(
@@ -7015,7 +7109,7 @@ async fn run_metrics_history_sampler(
                     return Ok(());
                 }
             }
-            _ = interval.tick() => record_metrics_history_sample(&state),
+            _ = interval.tick() => record_metrics_history_sample(&state).await?,
         }
     }
 }
@@ -7088,11 +7182,11 @@ async fn deliver_due_alert_notifications(state: &Arc<AppState>, stop: &mut watch
         if *stop.borrow() {
             return;
         }
-        complete_alert_notification_delivery(state, &delivery, delivery_result);
+        complete_alert_notification_delivery(state, &delivery, delivery_result).await;
     }
 }
 
-fn complete_alert_notification_delivery(
+async fn complete_alert_notification_delivery(
     state: &AppState,
     delivery: &NotificationDelivery,
     result: Result<(), notifications::NotificationDeliveryError>,
@@ -7139,7 +7233,8 @@ fn complete_alert_notification_delivery(
                             "channel={}; attempts={}",
                             delivery.channel, delivery.attempts
                         ),
-                    );
+                    )
+                    .await;
                 }
                 Ok(Some(NotificationDeliveryState::Pending)) => tracing::warn!(
                     delivery_id = delivery.id,
@@ -7247,7 +7342,8 @@ async fn evaluate_alerts(state: &Arc<AppState>, stop: &mut watch::Receiver<bool>
                 notification.event.threshold,
                 notification.event.message
             ),
-        );
+        )
+        .await;
     }
 }
 
@@ -7845,6 +7941,7 @@ fn collect_metrics_history_sample(
 
     MetricsHistorySample {
         timestamp_unix_seconds,
+        counter_epoch: Some(state.ha_runtime.coordinator().incarnation_id().to_owned()),
         authentication_failures_total: state
             .metrics
             .authentication_failures_total
@@ -8314,7 +8411,8 @@ async fn update_acme_config(
             "enabled={}; environment={:?}; challenge_type={:?}; renew_before_days={}",
             config.enabled, config.environment, config.challenge_type, config.renew_before_days
         ),
-    );
+    )
+    .await;
     Ok(Json(acme_config_view(&state, config)))
 }
 
@@ -8491,9 +8589,11 @@ async fn set_http_route_tls(
             "hostname={}; certificate_identifier={}; mode={:?}; redirect={}",
             route.hostname, certificate_identifier, policy.mode, policy.redirect_http_to_https
         ),
-    );
+    )
+    .await;
     if issue_automatically {
-        let _ = queue_certificate_operation(state.clone(), route_id, CertificateOperation::Issue);
+        let _ =
+            queue_certificate_operation(state.clone(), route_id, CertificateOperation::Issue).await;
     }
     Ok(Json(policy))
 }
@@ -8506,7 +8606,7 @@ async fn issue_http_route_certificate(
     authorize_management(&state, &headers)
         .await
         .map_err(coded_management_error)?;
-    queue_certificate_operation(state, route_id, CertificateOperation::Issue)?;
+    queue_certificate_operation(state, route_id, CertificateOperation::Issue).await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(CertificateOperationResponse {
@@ -8525,7 +8625,7 @@ async fn renew_http_route_certificate(
     authorize_management(&state, &headers)
         .await
         .map_err(coded_management_error)?;
-    queue_certificate_operation(state, route_id, CertificateOperation::Renew)?;
+    queue_certificate_operation(state, route_id, CertificateOperation::Renew).await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(CertificateOperationResponse {
@@ -8648,12 +8748,12 @@ fn mark_certificate_operation_status(
     Ok(())
 }
 
-fn queue_certificate_operation(
+async fn queue_certificate_operation(
     state: Arc<AppState>,
     route_id: Uuid,
     operation: CertificateOperation,
 ) -> Result<(), CodedApiError> {
-    let prepared = prepare_certificate_operation(&state, route_id, operation)?;
+    let prepared = prepare_certificate_operation(&state, route_id, operation).await?;
     tokio::spawn(run_certificate_operation(
         state,
         prepared.manager,
@@ -8666,7 +8766,7 @@ fn queue_certificate_operation(
     Ok(())
 }
 
-fn prepare_certificate_operation(
+async fn prepare_certificate_operation(
     state: &Arc<AppState>,
     route_id: Uuid,
     operation: CertificateOperation,
@@ -8813,7 +8913,8 @@ fn prepare_certificate_operation(
             "hostname={}; certificate_identifier={}",
             route.hostname, certificate_identifier
         ),
-    );
+    )
+    .await;
     Ok(PreparedCertificateOperation {
         manager,
         route,
@@ -8971,22 +9072,28 @@ async fn run_certificate_operation(
                 now,
             );
             match current {
-                Ok(true) => record_audit(
-                    &state,
-                    match operation {
-                        CertificateOperation::Issue => "certificate.issue.succeeded",
-                        CertificateOperation::Renew => "certificate.renew.succeeded",
-                    },
-                    &route.id.to_string(),
-                    &format!("hostname={}", route.hostname),
-                ),
-                Ok(false) => discard_stale_certificate_result(
-                    &state,
-                    &manager,
-                    &route,
-                    &certificate_identifier,
-                    operation,
-                ),
+                Ok(true) => {
+                    record_audit(
+                        &state,
+                        match operation {
+                            CertificateOperation::Issue => "certificate.issue.succeeded",
+                            CertificateOperation::Renew => "certificate.renew.succeeded",
+                        },
+                        &route.id.to_string(),
+                        &format!("hostname={}", route.hostname),
+                    )
+                    .await
+                }
+                Ok(false) => {
+                    discard_stale_certificate_result(
+                        &state,
+                        &manager,
+                        &route,
+                        &certificate_identifier,
+                        operation,
+                    )
+                    .await
+                }
                 Err(error) => {
                     tracing::error!(
                         "could not verify or persist certificate metadata for {}: {error}",
@@ -8998,7 +9105,8 @@ async fn run_certificate_operation(
                         &route,
                         &certificate_identifier,
                         operation,
-                    );
+                    )
+                    .await;
                 }
             }
         }
@@ -9034,18 +9142,22 @@ async fn run_certificate_operation(
                         },
                         &route.id.to_string(),
                         &format!("hostname={}; code=acme_operation_failed", route.hostname),
-                    );
+                    )
+                    .await;
                     tracing::warn!("ACME operation failed for {}: {}", route.hostname, message);
                 }
-                Ok(false) => record_audit(
-                    &state,
-                    match operation {
-                        CertificateOperation::Issue => "certificate.issue.discarded",
-                        CertificateOperation::Renew => "certificate.renew.discarded",
-                    },
-                    &route.id.to_string(),
-                    &format!("hostname={}; reason=route_state_changed", route.hostname),
-                ),
+                Ok(false) => {
+                    record_audit(
+                        &state,
+                        match operation {
+                            CertificateOperation::Issue => "certificate.issue.discarded",
+                            CertificateOperation::Renew => "certificate.renew.discarded",
+                        },
+                        &route.id.to_string(),
+                        &format!("hostname={}; reason=route_state_changed", route.hostname),
+                    )
+                    .await
+                }
                 Err(store_error) => tracing::error!(
                     "could not verify or persist certificate failure for {}: {store_error}",
                     route.hostname
@@ -9152,7 +9264,7 @@ fn record_certificate_failure_if_current(
     Ok(true)
 }
 
-fn discard_stale_certificate_result(
+async fn discard_stale_certificate_result(
     state: &AppState,
     manager: &CertificateManager,
     route: &HttpRoutePolicy,
@@ -9173,7 +9285,8 @@ fn discard_stale_certificate_result(
         },
         &route.id.to_string(),
         &format!("hostname={}; reason=route_state_changed", route.hostname),
-    );
+    )
+    .await;
 }
 
 fn sanitize_certificate_error(value: &str) -> String {
@@ -9397,7 +9510,7 @@ async fn scan_certificate_maintenance(
             if *stop.borrow() {
                 return;
             }
-            match prepare_certificate_operation(&state, route.id, operation) {
+            match prepare_certificate_operation(&state, route.id, operation).await {
                 Ok(prepared) => {
                     operations.spawn(run_certificate_operation(
                         state.clone(),
@@ -9683,7 +9796,8 @@ async fn update_client(
             client.enabled,
             client.tags.join(",")
         ),
-    );
+    )
+    .await;
     Ok(Json(client))
 }
 
@@ -9721,7 +9835,8 @@ async fn rotate_client_token(
         "client.token.rotated",
         &client_id.to_string(),
         "client token rotated; existing control sessions will fail on their next authentication",
-    );
+    )
+    .await;
     Ok(Json(ClientEnrollmentResponse {
         client_id,
         agent_instance_id: Some(agent_instance_id),
@@ -9783,7 +9898,8 @@ async fn delete_client(
         "client.deleted",
         &client_id.to_string(),
         "client identity deleted",
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -9895,9 +10011,8 @@ async fn list_audit_events(
     authorize_management(&state, &headers).await?;
     let events = state
         .audit
-        .lock()
-        .expect("audit log lock poisoned")
         .recent(query.limit.unwrap_or(20))
+        .await
         .map_err(|_| {
             ApiError(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -9924,9 +10039,8 @@ async fn export_audit_events(
     }
     let events = state
         .audit
-        .lock()
-        .expect("audit log lock poisoned")
         .export(query.from, query.to, query.limit.unwrap_or(100_000))
+        .await
         .map_err(|_| {
             CodedApiError(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -10030,7 +10144,8 @@ async fn create_alert_rule(
             "name={}; metric={:?}; enabled={}",
             rule.name, rule.metric, rule.enabled
         ),
-    );
+    )
+    .await;
     Ok((StatusCode::CREATED, Json(rule)))
 }
 
@@ -10062,7 +10177,8 @@ async fn update_alert_rule(
             "name={}; metric={:?}; enabled={}",
             rule.name, rule.metric, rule.enabled
         ),
-    );
+    )
+    .await;
     Ok(Json(rule))
 }
 
@@ -10092,7 +10208,8 @@ async fn delete_alert_rule(
         "alert.rule.deleted",
         &rule_id.to_string(),
         "alert rule deleted",
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -10170,7 +10287,8 @@ async fn retry_alert_notification_delivery(
                 "alert.delivery.retried",
                 &delivery_id.to_string(),
                 &format!("channel={}; previous_attempts_reset=true", delivery.channel),
-            );
+            )
+            .await;
             Ok(Json(delivery))
         }
         NotificationDeliveryRetryOutcome::NotFound => Err(CodedApiError(
@@ -10241,7 +10359,8 @@ async fn create_fleet_peer(
         "fleet.peer.created",
         &peer.id.to_string(),
         &peer.name,
-    );
+    )
+    .await;
     Ok((StatusCode::CREATED, Json(peer)))
 }
 
@@ -10270,7 +10389,8 @@ async fn update_fleet_peer(
         "fleet.peer.updated",
         &peer_id.to_string(),
         &peer.name,
-    );
+    )
+    .await;
     Ok(Json(peer))
 }
 
@@ -10300,7 +10420,8 @@ async fn delete_fleet_peer(
         "fleet.peer.deleted",
         &peer_id.to_string(),
         "peer deleted",
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -10380,7 +10501,8 @@ async fn update_fleet_health_config(
             snapshot.config.failure_threshold,
             snapshot.config.cooldown_seconds
         ),
-    );
+    )
+    .await;
     Ok(Json(snapshot))
 }
 
@@ -10455,7 +10577,8 @@ async fn create_fleet_dns_failover(
             failover.targets.len(),
             failover.token_env
         ),
-    );
+    )
+    .await;
     Ok((StatusCode::CREATED, Json(failover)))
 }
 
@@ -10488,7 +10611,8 @@ async fn update_fleet_dns_failover(
             failover.targets.len(),
             failover.token_env
         ),
-    );
+    )
+    .await;
     Ok(Json(failover))
 }
 
@@ -10515,7 +10639,8 @@ async fn delete_fleet_dns_failover(
         "fleet.dns_failover.deleted",
         &failover_id.to_string(),
         &format!("actor={}", principal.username),
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -10545,7 +10670,8 @@ async fn freeze_fleet_dns_failover(
             principal.username,
             failover.freeze_reason.as_deref().unwrap_or("manual freeze")
         ),
-    );
+    )
+    .await;
     Ok(Json(failover))
 }
 
@@ -10570,7 +10696,8 @@ async fn resume_fleet_dns_failover(
         "fleet.dns_failover.resumed",
         &failover_id.to_string(),
         &format!("actor={}", principal.username),
-    );
+    )
+    .await;
     Ok(Json(failover))
 }
 
@@ -10601,7 +10728,8 @@ async fn reconcile_fleet_dns_failover(
         "fleet.dns_failover.reconciled",
         &failover_id.to_string(),
         &format!("actor={}; operations={}", principal.username, results.len()),
-    );
+    )
+    .await;
     Ok(Json(FleetDnsReconcileResponse { results }))
 }
 
@@ -10769,7 +10897,8 @@ async fn reconcile_fleet_bundle_v2(
                     "fleet.v2.reconcile.failed",
                     &source_instance_id.to_string(),
                     &format!("actor={}; {}", principal.username, error),
-                );
+                )
+                .await;
                 return Err(coded_policy_service_error(error));
             }
         };
@@ -10800,7 +10929,8 @@ async fn reconcile_fleet_bundle_v2(
                 result.conflicts.len(),
                 result.dry_run
             ),
-        );
+        )
+        .await;
     } else if result.idempotent {
         state
             .metrics
@@ -10830,7 +10960,8 @@ async fn reconcile_fleet_bundle_v2(
                 result.deleted,
                 result.unchanged
             ),
-        );
+        )
+        .await;
     }
     if track_generation && result.conflicts.is_empty() {
         record_fleet_generation(
@@ -11009,7 +11140,8 @@ async fn resolve_fleet_conflict_v2(
                 conflict.resource_kind,
                 conflict.resource_id
             ),
-        );
+        )
+        .await;
     }
     Ok(Json(conflict))
 }
@@ -11054,7 +11186,8 @@ async fn reset_fleet_source_v2(
             "actor={}; ownership retained; the next authorized bundle establishes generation again",
             principal.username
         ),
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -11094,7 +11227,8 @@ async fn bind_fleet_credential(
             binding.kind.as_str(),
             binding.policy_id
         ),
-    );
+    )
+    .await;
     Ok(Json(binding))
 }
 
@@ -11126,7 +11260,8 @@ async fn delete_fleet_credential_binding(
             source_instance_id,
             kind.as_str()
         ),
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -11197,7 +11332,8 @@ async fn import_fleet_policies(
             result.unchanged,
             result.conflicts.len()
         ),
-    );
+    )
+    .await;
     Ok(Json(result))
 }
 
@@ -11413,7 +11549,8 @@ async fn sync_fleet_policies(
         },
         "fleet",
         &format!("actor={}; peers={}", principal.username, results.len()),
-    );
+    )
+    .await;
     Ok(Json(results))
 }
 
@@ -11459,7 +11596,8 @@ async fn upsert_traffic_control(
         "traffic_control.updated",
         &policy_id.to_string(),
         &format!("actor={}; kind={}", principal.username, kind.as_str()),
-    );
+    )
+    .await;
     Ok(Json(record))
 }
 
@@ -11488,7 +11626,8 @@ async fn delete_traffic_control(
         "traffic_control.deleted",
         &policy_id.to_string(),
         &format!("actor={}; kind={}", principal.username, kind.as_str()),
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -11603,7 +11742,8 @@ async fn run_fleet_probe_round(
                     result.transition_reason,
                     result.health.revision
                 ),
-            );
+            )
+            .await;
         }
     }
     if *stop.borrow() {
@@ -11803,7 +11943,7 @@ async fn execute_fleet_dns_reconciliation_with_stop(
                 completion.applied,
                 completion.error_summary.as_deref().unwrap_or("")
             ),
-        );
+        ).await;
         results.push(completion);
     }
     Ok(results)
@@ -11918,7 +12058,8 @@ async fn create_tcp_tunnel(
             "client={}; port={}; name={}",
             policy.client_id, policy.public_port, policy.name
         ),
-    );
+    )
+    .await;
     Ok(Json(policy))
 }
 
@@ -11975,7 +12116,8 @@ async fn update_tcp_tunnel(
             "client={}; port={}; target={}; name={}",
             policy.client_id, policy.public_port, policy.target_addr, policy.name
         ),
-    );
+    )
+    .await;
     Ok(Json(policy))
 }
 
@@ -12028,7 +12170,8 @@ async fn set_tcp_tunnel_enabled(
         } else {
             "disabled"
         },
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -12079,7 +12222,8 @@ async fn delete_tcp_tunnel(
         "tcp_tunnel.policy.deleted",
         &tunnel_id.to_string(),
         "policy deleted",
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -12174,7 +12318,8 @@ async fn create_secret_tunnel(
             ),
             created.policy.name
         ),
-    );
+    )
+    .await;
     Ok((StatusCode::CREATED, Json(created)))
 }
 
@@ -12237,7 +12382,8 @@ async fn update_secret_tunnel(
             policy.target_addr,
             policy.name
         ),
-    );
+    )
+    .await;
     Ok(Json(policy))
 }
 
@@ -12275,7 +12421,8 @@ async fn set_secret_tunnel_enabled(
         } else {
             "disabled"
         },
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -12311,7 +12458,8 @@ async fn delete_secret_tunnel(
         "secret_tunnel.policy.deleted",
         &tunnel_id.to_string(),
         "policy deleted",
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -12508,7 +12656,8 @@ async fn create_socks5_proxy(
             created.policy.username,
             created.policy.allow_private_networks
         ),
-    );
+    )
+    .await;
     Ok((StatusCode::CREATED, Json(created)))
 }
 
@@ -12564,7 +12713,8 @@ async fn update_socks5_proxy(
             policy.username,
             policy.allow_private_networks
         ),
-    );
+    )
+    .await;
     Ok(Json(policy))
 }
 
@@ -12602,7 +12752,8 @@ async fn set_socks5_proxy_enabled(
         } else {
             "disabled"
         },
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -12638,7 +12789,8 @@ async fn delete_socks5_proxy(
         "socks5_proxy.policy.deleted",
         &proxy_id.to_string(),
         "policy deleted",
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -12740,7 +12892,8 @@ async fn create_http_proxy(
             created.policy.username,
             created.policy.allow_private_networks
         ),
-    );
+    )
+    .await;
     Ok((StatusCode::CREATED, Json(created)))
 }
 
@@ -12796,7 +12949,8 @@ async fn update_http_proxy(
             policy.username,
             policy.allow_private_networks
         ),
-    );
+    )
+    .await;
     Ok(Json(policy))
 }
 
@@ -12834,7 +12988,8 @@ async fn set_http_proxy_enabled(
         } else {
             "disabled"
         },
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -12870,7 +13025,8 @@ async fn delete_http_proxy(
         "http_proxy.policy.deleted",
         &proxy_id.to_string(),
         "policy deleted",
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -12968,7 +13124,8 @@ async fn create_udp_tunnel(
             "client={}; port={}; name={}",
             policy.client_id, policy.public_port, policy.name
         ),
-    );
+    )
+    .await;
     Ok((StatusCode::CREATED, Json(policy)))
 }
 
@@ -13027,7 +13184,8 @@ async fn update_udp_tunnel(
             "client={}; port={}; target={}; name={}",
             policy.client_id, policy.public_port, policy.target_addr, policy.name
         ),
-    );
+    )
+    .await;
     Ok(Json(policy))
 }
 
@@ -13078,7 +13236,8 @@ async fn set_udp_tunnel_enabled(
         } else {
             "disabled"
         },
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -13127,7 +13286,8 @@ async fn delete_udp_tunnel(
         "udp_tunnel.policy.deleted",
         &tunnel_id.to_string(),
         "policy deleted",
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -13276,7 +13436,8 @@ async fn create_port_group(
             policy.target_ports,
             policy.name
         ),
-    );
+    )
+    .await;
     Ok((StatusCode::CREATED, Json(policy)))
 }
 
@@ -13361,7 +13522,8 @@ async fn update_port_group(
             policy.target_ports,
             policy.name
         ),
-    );
+    )
+    .await;
     Ok(Json(policy))
 }
 
@@ -13407,7 +13569,8 @@ async fn set_port_group_enabled(
         } else {
             "disabled"
         },
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -13461,7 +13624,8 @@ async fn delete_port_group(
         "port_group.policy.deleted",
         &group_id.to_string(),
         "policy deleted",
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -13668,7 +13832,8 @@ async fn create_sni_route(
             "client={}; hostname={}; target={}; name={}",
             policy.client_id, policy.hostname, policy.target_addr, policy.name
         ),
-    );
+    )
+    .await;
     Ok((StatusCode::CREATED, Json(policy)))
 }
 
@@ -13720,7 +13885,8 @@ async fn update_sni_route(
             "client={}; hostname={}; target={}; name={}",
             policy.client_id, policy.hostname, policy.target_addr, policy.name
         ),
-    );
+    )
+    .await;
     Ok(Json(policy))
 }
 
@@ -13762,7 +13928,8 @@ async fn set_sni_route_enabled(
         } else {
             "disabled"
         },
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -13796,7 +13963,8 @@ async fn delete_sni_route(
         "sni_route.policy.deleted",
         &route_id.to_string(),
         "policy deleted",
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -13834,7 +14002,8 @@ async fn create_http_route(
             "client={}; hostname={}; name={}",
             policy.client_id, policy.hostname, policy.name
         ),
-    );
+    )
+    .await;
     Ok(Json(policy))
 }
 
@@ -13983,7 +14152,8 @@ async fn update_http_route(
             "client={}; hostname={}; target={}; name={}",
             policy.client_id, policy.hostname, policy.target_addr, policy.name
         ),
-    );
+    )
+    .await;
     Ok(Json(policy))
 }
 
@@ -14109,7 +14279,8 @@ async fn set_http_route_enabled(
         } else {
             "disabled"
         },
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -14202,7 +14373,8 @@ async fn delete_http_route(
         "http_route.policy.deleted",
         &route_id.to_string(),
         "policy deleted",
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -14245,7 +14417,8 @@ async fn enroll_client(
             "name={client_name}; platform={platform}; identity_verified={}",
             verified_public_key.is_some()
         ),
-    );
+    )
+    .await;
     Ok(Json(ClientEnrollmentResponse {
         client_id,
         agent_instance_id: Some(agent_instance_id),
@@ -14402,7 +14575,8 @@ async fn login(
                 "management.login.failed",
                 "unknown",
                 "invalid credentials",
-            );
+            )
+            .await;
             return Err(CodedApiError(
                 StatusCode::UNAUTHORIZED,
                 "invalid_credentials",
@@ -14415,7 +14589,7 @@ async fn login(
         .lock()
         .expect("login throttle lock poisoned")
         .record_success(&throttle_identity);
-    record_audit(&state, "management.login", &username, "session created");
+    record_audit(&state, "management.login", &username, "session created").await;
     let mut response = Json(LoginResponse {
         session_id: session.session_id,
         username,
@@ -14516,7 +14690,8 @@ async fn setup_totp(
         "management.totp.setup_started",
         &principal.username,
         "TOTP setup secret generated",
-    );
+    )
+    .await;
     Ok(Json(TotpSetupResponse {
         secret,
         provisioning_uri,
@@ -14549,7 +14724,8 @@ async fn enable_totp(
         "management.totp.enabled",
         &principal.username,
         "TOTP enabled",
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -14578,7 +14754,8 @@ async fn disable_totp(
         "management.totp.disabled",
         &principal.username,
         "TOTP disabled",
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -14617,7 +14794,8 @@ async fn create_user(
         "management.user.created",
         &username,
         &format!("actor={}; role={}", principal.username, role.as_str()),
-    );
+    )
+    .await;
     Ok((StatusCode::CREATED, Json(user)))
 }
 
@@ -14645,7 +14823,8 @@ async fn update_user(
         "management.user.updated",
         &username,
         &format!("actor={}", principal.username),
-    );
+    )
+    .await;
     Ok(Json(user))
 }
 
@@ -14674,7 +14853,8 @@ async fn delete_user(
         "management.user.deleted",
         &username,
         &format!("actor={}", principal.username),
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -14708,7 +14888,8 @@ async fn reset_user_password(
         "management.user.password_reset",
         &username,
         &format!("actor={}", principal.username),
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -14737,7 +14918,8 @@ async fn revoke_user_sessions(
         "management.user.sessions_revoked",
         &username,
         &format!("actor={}", principal.username),
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -14792,7 +14974,8 @@ async fn create_api_token(
             "actor={}; scope={}",
             principal.username, created.record.scope
         ),
-    );
+    )
+    .await;
     Ok((StatusCode::CREATED, Json(created)))
 }
 
@@ -14821,7 +15004,8 @@ async fn revoke_api_token(
         "management.api_token.revoked",
         &token_id.to_string(),
         &format!("actor={}", principal.username),
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -14855,7 +15039,8 @@ async fn revoke_session(
         "management.session.revoked",
         &session_id.to_string(),
         &format!("actor={}", principal.username),
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -14911,7 +15096,8 @@ async fn change_password(
         "management.password.changed",
         &username,
         "password updated",
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -14949,7 +15135,8 @@ async fn logout(
         "management.logout",
         "administrator",
         "session ended",
-    );
+    )
+    .await;
     let mut response = StatusCode::NO_CONTENT.into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
@@ -15184,7 +15371,8 @@ async fn require_interactive_server_update_administrator(
                 state,
                 operation,
                 ServerUpdateAuthenticationRejectionReason::InvalidSessionCookie,
-            );
+            )
+            .await;
             return Err(CodedApiError(
                 StatusCode::UNAUTHORIZED,
                 "session_authentication_required",
@@ -15197,7 +15385,8 @@ async fn require_interactive_server_update_administrator(
             state,
             operation,
             ServerUpdateAuthenticationRejectionReason::MixedAuthorizationAndSession,
-        );
+        )
+        .await;
         return Err(CodedApiError(
             StatusCode::FORBIDDEN,
             "session_authentication_required",
@@ -15209,7 +15398,8 @@ async fn require_interactive_server_update_administrator(
             state,
             operation,
             ServerUpdateAuthenticationRejectionReason::BearerAuthenticationForbidden,
-        );
+        )
+        .await;
         return Err(CodedApiError(
             StatusCode::FORBIDDEN,
             "session_authentication_required",
@@ -15221,7 +15411,8 @@ async fn require_interactive_server_update_administrator(
             state,
             operation,
             ServerUpdateAuthenticationRejectionReason::InteractiveSessionMissing,
-        );
+        )
+        .await;
         return Err(CodedApiError(
             StatusCode::UNAUTHORIZED,
             "session_authentication_required",
@@ -15239,7 +15430,8 @@ async fn require_interactive_server_update_administrator(
                 state,
                 operation,
                 ServerUpdateAuthenticationRejectionReason::InvalidOrExpiredSession,
-            );
+            )
+            .await;
             return Err(CodedApiError(
                 StatusCode::UNAUTHORIZED,
                 "session_authentication_required",
@@ -15251,7 +15443,8 @@ async fn require_interactive_server_update_administrator(
                 state,
                 operation,
                 ServerUpdateAuthenticationRejectionReason::SessionVerificationFailed,
-            );
+            )
+            .await;
             return Err(CodedApiError(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "management_authorization_failed",
@@ -15264,7 +15457,8 @@ async fn require_interactive_server_update_administrator(
             state,
             operation,
             ServerUpdateAuthenticationRejectionReason::PasswordChangeRequired,
-        );
+        )
+        .await;
         return Err(CodedApiError(
             StatusCode::FORBIDDEN,
             "password_change_required",
@@ -15276,7 +15470,8 @@ async fn require_interactive_server_update_administrator(
             state,
             operation,
             ServerUpdateAuthenticationRejectionReason::AdministratorRoleRequired,
-        );
+        )
+        .await;
         return Err(CodedApiError(
             StatusCode::FORBIDDEN,
             "administrator_required",
@@ -15300,7 +15495,8 @@ async fn require_interactive_update_administrator(
     let principal =
         require_interactive_server_update_administrator(state, headers, operation).await?;
     require_same_origin_update_request(headers, request_host).inspect_err(|_| {
-        record_server_update_rejection(state, operation, &principal, "same_origin_check_failed");
+        record_server_update_rejection(state, operation, &principal, "same_origin_check_failed")
+            .await;
     })?;
     Ok(principal)
 }
@@ -15878,13 +16074,8 @@ async fn client_is_enabled(state: &AppState, client_id: Uuid) -> Result<bool, Co
         .map_err(coded_client_management_error)
 }
 
-pub(crate) fn record_audit(state: &AppState, action: &str, subject: &str, detail: &str) {
-    if let Err(error) = state
-        .audit
-        .lock()
-        .expect("audit log lock poisoned")
-        .record(action, subject, detail)
-    {
+pub(crate) async fn record_audit(state: &AppState, action: &str, subject: &str, detail: &str) {
+    if let Err(error) = state.audit.record(action, subject, detail).await {
         tracing::error!("Could not record audit event: {error}");
     }
 }
@@ -16268,6 +16459,7 @@ mod tests {
     ) -> MetricsHistorySample {
         MetricsHistorySample {
             timestamp_unix_seconds,
+            counter_epoch: None,
             authentication_failures_total: 0,
             tcp,
             udp: HistoryCounters::default(),
@@ -16474,6 +16666,47 @@ mod tests {
         assert_eq!(tcp_and_udp["udp_associate"], true);
         assert_eq!(tcp_and_udp["bind"], true);
         assert_eq!(tcp_and_udp["udp_fragmentation"], true);
+    }
+
+    #[test]
+    fn shared_history_does_not_count_leader_counter_jumps_as_traffic() {
+        let mut history = MetricsHistory::new(8, 8);
+        for (timestamp, epoch, requests, bytes) in [
+            (0, "leader-a", 100, 1_000),
+            (10, "leader-a", 200, 2_000),
+            (20, "leader-b", 5_000, 100_000),
+            (30, "leader-b", 5_100, 101_000),
+        ] {
+            let mut sample = history_sample(
+                timestamp,
+                HistoryCounters {
+                    requests_total: requests,
+                    bytes_from_public: bytes,
+                    ..HistoryCounters::default()
+                },
+                HistoryCounters::default(),
+            );
+            sample.counter_epoch = Some(epoch.to_owned());
+            history.push(sample);
+        }
+        let (_, _, points) = super::build_metrics_history_points(&history, 30, 30, 30, |sample| {
+            Some(sample.counters(MetricsHistoryProtocol::Total))
+        });
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].requests_per_second, 10.0);
+        assert_eq!(points[0].inbound_bps, 100.0);
+        let slo = super::slo_window_delta(&history, 30, 30);
+        assert_eq!(slo.requests, 200);
+        assert_eq!(slo.observed_seconds, 20);
+    }
+
+    #[test]
+    fn legacy_metrics_samples_remain_readable_without_counter_epoch() {
+        let sample = history_sample(10, HistoryCounters::default(), HistoryCounters::default());
+        let mut json = serde_json::to_value(&sample).unwrap();
+        json.as_object_mut().unwrap().remove("counter_epoch");
+        let restored: MetricsHistorySample = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, sample);
     }
 
     #[test]

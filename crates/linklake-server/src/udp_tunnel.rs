@@ -636,7 +636,8 @@ pub(crate) async fn register_tunnel(
         "udp_tunnel.registered",
         &client_id.to_string(),
         &format!("name={name}; public_port={public_port}; target={target_addr}"),
-    );
+    )
+    .await;
     run_tunnel(RegisteredTunnelRuntime {
         state,
         public_port,

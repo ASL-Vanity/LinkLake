@@ -289,7 +289,8 @@ pub(crate) async fn handle_connection(
                     &ControlFrame::Error {
                         message: "proxy egress policy support required; upgrade client".to_owned(),
                     },
-                ).await;
+                )
+                .await;
                 return;
             }
             crate::socks5_tunnel::register_proxy(
@@ -316,7 +317,8 @@ pub(crate) async fn handle_connection(
                     &ControlFrame::Error {
                         message: "proxy egress policy support required; upgrade client".to_owned(),
                     },
-                ).await;
+                )
+                .await;
                 return;
             }
             crate::http_proxy_tunnel::register_proxy(
@@ -704,7 +706,8 @@ async fn register_tunnel(
         "tcp_tunnel.registered",
         &client_id.to_string(),
         &format!("name={name}; public_port={public_port}; target={target_addr}"),
-    );
+    )
+    .await;
     let public_connections = PublicConnectionContext {
         state: state.clone(),
         command_tx,

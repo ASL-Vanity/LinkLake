@@ -283,7 +283,8 @@ pub(crate) async fn register_proxy(
         "http_proxy.registered",
         &runtime_policy.policy_id.to_string(),
         &format!("client={client_id}; name={name}; public_port={public_port}"),
-    );
+    )
+    .await;
     let context = PublicConnectionContext {
         state: state.clone(),
         policy_id: runtime_policy.policy_id,

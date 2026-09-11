@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tokio_postgres::{Client, Transaction};
 
-pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 8;
+pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 10;
 const ADVISORY_LOCK_ID: i64 = 0x4c4c_4841_4d49_4752;
 
 const MIGRATION_V1_NAME: &str = "ha_coordination_foundation";
@@ -367,6 +367,38 @@ CREATE TABLE IF NOT EXISTS linklake_fleet_dns_events (
 CREATE INDEX IF NOT EXISTS linklake_fleet_dns_events_failover ON linklake_fleet_dns_events(failover_id, completed_unix_seconds DESC, operation_id DESC);
 "#;
 
+const MIGRATION_V9_NAME: &str = "shared_audit_log";
+const MIGRATION_V9_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS linklake_audit_events (
+    id BIGSERIAL PRIMARY KEY,
+    occurred_unix_seconds BIGINT NOT NULL,
+    action TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    detail TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS linklake_audit_events_occurred ON linklake_audit_events(occurred_unix_seconds DESC);
+CREATE TABLE IF NOT EXISTS linklake_audit_retention (
+    singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1),
+    retained_events BIGINT NOT NULL CHECK(retained_events>=0)
+);
+INSERT INTO linklake_audit_retention(singleton_id,retained_events)
+    SELECT 1,COUNT(*) FROM linklake_audit_events ON CONFLICT(singleton_id) DO NOTHING;
+"#;
+
+const MIGRATION_V10_NAME: &str = "shared_metrics_history";
+const MIGRATION_V10_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS linklake_metrics_history_recent (
+    timestamp_unix_seconds BIGINT PRIMARY KEY,
+    sample JSONB NOT NULL CHECK(jsonb_typeof(sample)='object')
+);
+CREATE TABLE IF NOT EXISTS linklake_metrics_history_archive (
+    minute_bucket BIGINT PRIMARY KEY,
+    timestamp_unix_seconds BIGINT NOT NULL,
+    sample JSONB NOT NULL CHECK(jsonb_typeof(sample)='object')
+);
+CREATE INDEX IF NOT EXISTS linklake_metrics_history_archive_timestamp ON linklake_metrics_history_archive(timestamp_unix_seconds);
+"#;
+
 struct Migration {
     version: i64,
     name: &'static str,
@@ -425,6 +457,16 @@ const MIGRATIONS: &[Migration] = &[
         version: 8,
         name: MIGRATION_V8_NAME,
         sql: MIGRATION_V8_SQL,
+    },
+    Migration {
+        version: 9,
+        name: MIGRATION_V9_NAME,
+        sql: MIGRATION_V9_SQL,
+    },
+    Migration {
+        version: 10,
+        name: MIGRATION_V10_NAME,
+        sql: MIGRATION_V10_SQL,
     },
 ];
 
@@ -517,6 +559,42 @@ pub(crate) async fn apply(client: &mut Client) -> anyhow::Result<()> {
 
 async fn verify_schema_structure(transaction: &Transaction<'_>) -> anyhow::Result<()> {
     const TABLES: &[TableExpectation] = &[
+        TableExpectation {
+            name: "linklake_metrics_history_recent",
+            primary_key: &["timestamp_unix_seconds"],
+            columns: &[
+                required("timestamp_unix_seconds", "int8"),
+                required("sample", "jsonb"),
+            ],
+        },
+        TableExpectation {
+            name: "linklake_metrics_history_archive",
+            primary_key: &["minute_bucket"],
+            columns: &[
+                required("minute_bucket", "int8"),
+                required("timestamp_unix_seconds", "int8"),
+                required("sample", "jsonb"),
+            ],
+        },
+        TableExpectation {
+            name: "linklake_audit_events",
+            primary_key: &["id"],
+            columns: &[
+                required("id", "int8"),
+                required("occurred_unix_seconds", "int8"),
+                required("action", "text"),
+                required("subject", "text"),
+                required("detail", "text"),
+            ],
+        },
+        TableExpectation {
+            name: "linklake_audit_retention",
+            primary_key: &["singleton_id"],
+            columns: &[
+                required("singleton_id", "int4"),
+                required("retained_events", "int8"),
+            ],
+        },
         TableExpectation {
             name: "linklake_fleet_health",
             primary_key: &["peer_id"],

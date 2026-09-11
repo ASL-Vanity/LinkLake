@@ -45,7 +45,8 @@ pub(crate) async fn list_remote_update_tasks(
         &state,
         &headers,
         ServerUpdateOperation::RemoteList,
-    )?;
+    )
+    .await?;
     let tasks = state
         .update_tasks
         .list(query.target_client_id, query.limit, unix_seconds())
@@ -65,7 +66,8 @@ pub(crate) async fn create_remote_update_task(
         &headers,
         &request_host,
         ServerUpdateOperation::RemoteCreate,
-    )?;
+    )
+    .await?;
     let now = unix_seconds();
     let task = state
         .update_tasks
@@ -82,7 +84,8 @@ pub(crate) async fn create_remote_update_task(
             task.target_client_id,
             action_name(task.action)
         ),
-    );
+    )
+    .await;
     let status = if task.created_unix_seconds == now {
         StatusCode::CREATED
     } else {
@@ -100,7 +103,8 @@ pub(crate) async fn get_remote_update_task(
         &state,
         &headers,
         ServerUpdateOperation::RemoteDetail,
-    )?;
+    )
+    .await?;
     let detail = state
         .update_tasks
         .detail(task_id, unix_seconds())
@@ -121,7 +125,8 @@ pub(crate) async fn cancel_remote_update_task(
         &headers,
         &request_host,
         ServerUpdateOperation::RemoteCancel,
-    )?;
+    )
+    .await?;
     let task = state
         .update_tasks
         .cancel(task_id, &request, unix_seconds())
@@ -138,7 +143,8 @@ pub(crate) async fn cancel_remote_update_task(
             action_name(task.action),
             task.state
         ),
-    );
+    )
+    .await;
     Ok(Json(task))
 }
 

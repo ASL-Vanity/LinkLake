@@ -48,7 +48,8 @@ pub(crate) async fn register_node(
         "p2p_node.registered",
         &client_id.to_string(),
         "direct candidates updated",
-    );
+    )
+    .await;
     let _ = write_control_frame_and_shutdown(&mut stream, &ControlFrame::P2pNodeRegistered).await;
 }
 
@@ -72,7 +73,8 @@ pub(crate) async fn report_fallback(
         "p2p.relay_fallback",
         &client_id.to_string(),
         &format!("reason={}", fallback_reason_name(reason)),
-    );
+    )
+    .await;
     let _ = write_control_frame_and_shutdown(&mut stream, &ControlFrame::P2pFallbackRecorded).await;
 }
 
@@ -97,7 +99,8 @@ pub(crate) async fn report_direct_success(
         "p2p.direct_connected",
         &provider_client_id.to_string(),
         &format!("session={session_id}; visitor={visitor_client_id}"),
-    );
+    )
+    .await;
     let _ = write_control_frame_and_shutdown(&mut stream, &ControlFrame::P2pDirectSuccessRecorded)
         .await;
 }

@@ -410,7 +410,8 @@ pub(crate) async fn register_proxy(
         "socks5_proxy.registered",
         &runtime_policy.policy_id.to_string(),
         &format!("client={client_id}; name={name}; public_port={public_port}"),
-    );
+    )
+    .await;
     tcp_port_lease.spawn_supervisor(stop_rx.clone(), stop_tx.clone());
     if let Some(lease) = udp_port_lease {
         lease.spawn_supervisor(stop_rx.clone(), stop_tx.clone());

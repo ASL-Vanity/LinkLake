@@ -1636,7 +1636,8 @@ pub(crate) async fn register_route(
             "name={name}; hostname={hostname}; target={target_addr}; grpc_backend={}",
             grpc_backend_transport
         ),
-    );
+    )
+    .await;
     let (reader, mut writer) = split(stream);
     if write_control_frame(
         &mut writer,

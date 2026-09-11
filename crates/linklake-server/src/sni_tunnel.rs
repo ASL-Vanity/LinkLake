@@ -411,7 +411,8 @@ pub(crate) async fn register_route(
         "sni_route.registered",
         &client_id.to_string(),
         &format!("name={name}; hostname={hostname}; target={target_addr}"),
-    );
+    )
+    .await;
     let (reader, mut writer) = split(stream);
     if write_control_frame(
         &mut writer,

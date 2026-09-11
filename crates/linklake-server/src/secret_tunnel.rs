@@ -179,7 +179,8 @@ pub(crate) async fn register_provider(
         "secret_tunnel.registered",
         &runtime_policy.policy_id.to_string(),
         &format!("provider={provider_client_id}; name={name}; target={target_addr}"),
-    );
+    )
+    .await;
 
     let (reader, mut writer) = split(stream);
     if write_control_frame(
