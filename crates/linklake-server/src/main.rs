@@ -2027,7 +2027,7 @@ fn coded_http_route_creation_error(error: CreateHttpRouteError) -> CodedApiError
             "invalid_grpc_backend",
             "gRPC backend TLS policy is invalid",
         ),
-        CreateHttpRouteError::Database(_) => CodedApiError(
+        CreateHttpRouteError::Database(_) | CreateHttpRouteError::Storage(_) => CodedApiError(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
             "could not create HTTP route",

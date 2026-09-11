@@ -4,8 +4,20 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tokio_postgres::{Client, Transaction};
 
-pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 15;
+pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 16;
 const ADVISORY_LOCK_ID: i64 = 0x4c4c_4841_4d49_4752;
+
+const MIGRATION_V16_NAME: &str = "shared_http_route_catalog";
+const MIGRATION_V16_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS linklake_http_route_policies (
+    id TEXT PRIMARY KEY,
+    hostname TEXT NOT NULL UNIQUE,
+    revision TEXT NOT NULL,
+    policy JSONB NOT NULL CHECK(octet_length(policy::text)<=16384),
+    CHECK (policy->>'id' IS NOT NULL AND policy->>'id'=id),
+    CHECK (policy->>'hostname' IS NOT NULL AND policy->>'hostname'=hostname)
+);
+"#;
 
 const MIGRATION_V15_NAME: &str = "durable_dns01_publication_intents";
 const MIGRATION_V15_SQL: &str = r#"
@@ -615,6 +627,11 @@ const MIGRATIONS: &[Migration] = &[
         name: MIGRATION_V15_NAME,
         sql: MIGRATION_V15_SQL,
     },
+    Migration {
+        version: 16,
+        name: MIGRATION_V16_NAME,
+        sql: MIGRATION_V16_SQL,
+    },
 ];
 
 pub(crate) async fn apply(client: &mut Client) -> anyhow::Result<()> {
@@ -706,6 +723,16 @@ pub(crate) async fn apply(client: &mut Client) -> anyhow::Result<()> {
 
 async fn verify_schema_structure(transaction: &Transaction<'_>) -> anyhow::Result<()> {
     const TABLES: &[TableExpectation] = &[
+        TableExpectation {
+            name: "linklake_http_route_policies",
+            primary_key: &["id"],
+            columns: &[
+                required("id", "text"),
+                required("hostname", "text"),
+                required("revision", "text"),
+                required("policy", "jsonb"),
+            ],
+        },
         TableExpectation {
             name: "linklake_dns01_intents",
             primary_key: &["id"],

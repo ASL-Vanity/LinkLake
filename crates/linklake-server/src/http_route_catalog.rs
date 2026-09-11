@@ -6,6 +6,9 @@ use uuid::Uuid;
 
 use crate::database::Database;
 
+#[path = "http_route_catalog_postgres.rs"]
+pub(crate) mod postgres;
+
 const DEFAULT_MAX_CONNECTIONS: u16 = 64;
 type RuntimePolicyRow = (String, i64, String, Option<String>, Option<String>);
 
@@ -27,7 +30,8 @@ pub(crate) struct CreateHttpRoutePolicy {
 // 更新接口采用完整替换语义，字段格式与创建接口一致。
 pub(crate) type UpdateHttpRoutePolicy = CreateHttpRoutePolicy;
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct HttpRoutePolicy {
     pub(crate) id: Uuid,
     pub(crate) client_id: Uuid,
@@ -83,6 +87,7 @@ pub(crate) enum CreateHttpRouteError {
     InvalidConnectionLimit,
     InvalidGrpcBackend,
     Database(rusqlite::Error),
+    Storage(anyhow::Error),
 }
 
 impl fmt::Display for CreateHttpRouteError {
@@ -94,7 +99,7 @@ impl fmt::Display for CreateHttpRouteError {
             Self::InvalidTarget => "target address is invalid",
             Self::InvalidConnectionLimit => "connection limit is invalid",
             Self::InvalidGrpcBackend => "gRPC backend TLS policy is invalid",
-            Self::Database(_) => "HTTP route database operation failed",
+            Self::Database(_) | Self::Storage(_) => "HTTP route database operation failed",
         };
         formatter.write_str(message)
     }
@@ -104,6 +109,7 @@ impl Error for CreateHttpRouteError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Database(error) => Some(error),
+            Self::Storage(error) => Some(error.as_ref()),
             _ => None,
         }
     }
@@ -158,31 +164,15 @@ impl HttpRouteCatalog {
         &mut self,
         request: CreateHttpRoutePolicy,
     ) -> Result<HttpRoutePolicy, CreateHttpRouteError> {
-        let hostname = normalize_hostname(&request.hostname)
-            .map_err(|_| CreateHttpRouteError::InvalidHostname)?;
-        validate_policy(&request, &hostname)?;
+        let policy = requested_policy(Uuid::new_v4(), true, request)?;
         let duplicate_count: i64 = self.database.query_row(
             "SELECT COUNT(*) FROM http_route_policies WHERE hostname = ?1",
-            [&hostname],
+            [&policy.hostname],
             |row| row.get(0),
         )?;
         if duplicate_count != 0 {
             return Err(CreateHttpRouteError::DuplicateHostname);
         }
-        let (grpc_backend_server_name, grpc_backend_trust_profile) =
-            normalize_grpc_backend(&request)?;
-        let policy = HttpRoutePolicy {
-            id: Uuid::new_v4(),
-            client_id: request.client_id,
-            name: request.name.trim().to_owned(),
-            hostname,
-            target_addr: request.target_addr.trim().to_owned(),
-            max_connections: request.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
-            grpc_backend_transport: request.grpc_backend_transport,
-            grpc_backend_server_name,
-            grpc_backend_trust_profile,
-            enabled: true,
-        };
         self.database.execute(
             "INSERT INTO http_route_policies (id, client_id, name, hostname, target_addr, max_connections, grpc_backend_transport, grpc_backend_server_name, grpc_backend_trust_profile, enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)",
             params![policy.id.to_string(), policy.client_id.to_string(), policy.name, policy.hostname, policy.target_addr, policy.max_connections, grpc_backend_transport_name(policy.grpc_backend_transport), policy.grpc_backend_server_name, policy.grpc_backend_trust_profile],
@@ -217,34 +207,19 @@ impl HttpRouteCatalog {
         id: Uuid,
         request: UpdateHttpRoutePolicy,
     ) -> Result<Option<HttpRoutePolicy>, CreateHttpRouteError> {
-        let hostname = normalize_hostname(&request.hostname)
-            .map_err(|_| CreateHttpRouteError::InvalidHostname)?;
-        validate_policy(&request, &hostname)?;
+        let mut policy = requested_policy(id, true, request)?;
         let Some(current) = self.policy_by_id(id)? else {
             return Ok(None);
         };
         let duplicate_count: i64 = self.database.query_row(
             "SELECT COUNT(*) FROM http_route_policies WHERE hostname = ?1 AND id <> ?2",
-            params![hostname, id.to_string()],
+            params![policy.hostname, id.to_string()],
             |row| row.get(0),
         )?;
         if duplicate_count != 0 {
             return Err(CreateHttpRouteError::DuplicateHostname);
         }
-        let (grpc_backend_server_name, grpc_backend_trust_profile) =
-            normalize_grpc_backend(&request)?;
-        let policy = HttpRoutePolicy {
-            id,
-            client_id: request.client_id,
-            name: request.name.trim().to_owned(),
-            hostname,
-            target_addr: request.target_addr.trim().to_owned(),
-            max_connections: request.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
-            grpc_backend_transport: request.grpc_backend_transport,
-            grpc_backend_server_name,
-            grpc_backend_trust_profile,
-            enabled: current.enabled,
-        };
+        policy.enabled = current.enabled;
         self.database.execute(
             "UPDATE http_route_policies SET client_id = ?1, name = ?2, hostname = ?3, target_addr = ?4, max_connections = ?5, grpc_backend_transport = ?6, grpc_backend_server_name = ?7, grpc_backend_trust_profile = ?8 WHERE id = ?9",
             params![
@@ -318,6 +293,29 @@ impl HttpRouteCatalog {
             )
             .transpose()
     }
+}
+
+fn requested_policy(
+    id: Uuid,
+    enabled: bool,
+    request: CreateHttpRoutePolicy,
+) -> Result<HttpRoutePolicy, CreateHttpRouteError> {
+    let hostname =
+        normalize_hostname(&request.hostname).map_err(|_| CreateHttpRouteError::InvalidHostname)?;
+    validate_policy(&request, &hostname)?;
+    let (grpc_backend_server_name, grpc_backend_trust_profile) = normalize_grpc_backend(&request)?;
+    Ok(HttpRoutePolicy {
+        id,
+        client_id: request.client_id,
+        name: request.name.trim().to_owned(),
+        hostname,
+        target_addr: request.target_addr.trim().to_owned(),
+        max_connections: request.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
+        grpc_backend_transport: request.grpc_backend_transport,
+        grpc_backend_server_name,
+        grpc_backend_trust_profile,
+        enabled,
+    })
 }
 
 fn read_http_route_policy(row: &rusqlite::Row<'_>) -> rusqlite::Result<HttpRoutePolicy> {
