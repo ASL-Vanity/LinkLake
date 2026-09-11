@@ -46,6 +46,29 @@ pub(crate) fn acme_account_job_key(directory_url: &str) -> anyhow::Result<String
 }
 
 impl PostgresCertificateCatalog {
+    pub(crate) async fn material_key_fingerprint(&self) -> anyhow::Result<Option<String>> {
+        let client = self.storage.postgres_client().await?;
+        Ok(client
+            .query_opt(
+                "SELECT fingerprint FROM linklake_certificate_key_binding WHERE singleton_id=1",
+                &[],
+            )
+            .await?
+            .map(|row| row.get(0)))
+    }
+
+    pub(crate) async fn bind_material_key(
+        &self,
+        cipher: &CertificateMaterialCipher,
+    ) -> anyhow::Result<()> {
+        let mut client = self.storage.postgres_client().await?;
+        let transaction = client.transaction().await?;
+        self.fence(&transaction).await?;
+        bind_key(&transaction, cipher).await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
     /// 证书、私钥密文和成功状态必须共同提交，不能留下只有 active 状态的空证书。
     pub(crate) async fn commit_certificate_if_tls_current(
         &self,
@@ -86,6 +109,7 @@ impl PostgresCertificateCatalog {
         let mut client = self.storage.postgres_client().await?;
         let transaction = client.transaction().await?;
         self.fence(&transaction).await?;
+        bind_key(&transaction, cipher).await?;
         self.runtime
             .jobs()
             .assert_postgres_transaction_lease(&transaction, lease)
@@ -246,6 +270,7 @@ impl PostgresCertificateCatalog {
         let mut client = self.storage.postgres_client().await?;
         let transaction = client.transaction().await?;
         self.fence(&transaction).await?;
+        bind_key(&transaction, cipher).await?;
         self.runtime
             .jobs()
             .assert_postgres_transaction_lease(&transaction, lease)
@@ -637,4 +662,24 @@ fn private_key_context(route_id: Uuid, identifier: &str, certificate_pem: &[u8])
         "certificate-key:{route_id}:{identifier}:{:x}",
         Sha256::digest(certificate_pem)
     )
+}
+
+async fn bind_key(
+    transaction: &PgTransaction<'_>,
+    cipher: &CertificateMaterialCipher,
+) -> anyhow::Result<()> {
+    let fingerprint = cipher.fingerprint();
+    transaction.execute("INSERT INTO linklake_certificate_key_binding(singleton_id,fingerprint) VALUES(1,$1) ON CONFLICT(singleton_id) DO NOTHING", &[&fingerprint]).await?;
+    let stored: String = transaction
+        .query_one(
+            "SELECT fingerprint FROM linklake_certificate_key_binding WHERE singleton_id=1",
+            &[],
+        )
+        .await?
+        .get(0);
+    anyhow::ensure!(
+        stored == fingerprint,
+        "certificate material key differs from the configured cluster key"
+    );
+    Ok(())
 }

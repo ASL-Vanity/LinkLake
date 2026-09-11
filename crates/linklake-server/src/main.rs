@@ -1855,6 +1855,7 @@ struct AcmeConfigView {
     terms_accepted: bool,
     challenge_type: AcmeChallengeType,
     cloudflare_token_configured: bool,
+    material_key_configured: bool,
     renew_before_days: u8,
     account_registered: bool,
     updated_at_unix_seconds: Option<i64>,
@@ -2104,12 +2105,24 @@ fn coded_certificate_catalog_error(error: CertificateCatalogError) -> CodedApiEr
     CodedApiError(status, error.code(), "certificate configuration is invalid")
 }
 
-fn acme_config_view(state: &AppState, config: AcmeConfig) -> AcmeConfigView {
-    let account_registered = state
-        .certificate_manager
-        .as_ref()
-        .is_some_and(|manager| manager.account_registered(&config.directory_url));
-    AcmeConfigView {
+async fn acme_config_view(
+    state: &AppState,
+    config: AcmeConfig,
+) -> Result<AcmeConfigView, CodedApiError> {
+    let account_registered = match &state.certificate_manager {
+        Some(manager) => manager
+            .account_registered_shared(&config.directory_url)
+            .await
+            .map_err(|_| {
+                CodedApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "certificate_account_unavailable",
+                    "could not read ACME account state",
+                )
+            })?,
+        None => false,
+    };
+    Ok(AcmeConfigView {
         enabled: config.enabled,
         environment: config.environment,
         directory_url: config.directory_url,
@@ -2120,10 +2133,14 @@ fn acme_config_view(state: &AppState, config: AcmeConfig) -> AcmeConfigView {
             .certificate_manager
             .as_ref()
             .is_some_and(CertificateManager::cloudflare_token_configured),
+        material_key_configured: state
+            .certificate_manager
+            .as_ref()
+            .is_some_and(CertificateManager::material_key_configured),
         renew_before_days: config.renew_before_days,
         account_registered,
         updated_at_unix_seconds: (config.updated_at > 0).then_some(config.updated_at),
-    }
+    })
 }
 
 fn effective_certificate_identifier(hostname: &str, policy: Option<&RouteTlsPolicy>) -> String {
@@ -4236,6 +4253,14 @@ async fn run_server(
         coordination_storage.clone(),
         HaRuntimeConfig::from_environment(&instance_id)?,
     )?);
+    let certificate_manager = match certificate_manager {
+        Some(manager) => Some(
+            manager
+                .with_shared_storage(coordination_storage.clone(), ha_runtime.clone())
+                .await?,
+        ),
+        None => None,
+    };
     let bootstrap_timeout = ha_runtime
         .heartbeat()
         .saturating_mul(2)
@@ -8331,7 +8356,7 @@ async fn get_acme_config(
         .expect("certificate catalog lock poisoned")
         .get_acme_config()
         .map_err(coded_certificate_catalog_error)?;
-    Ok(Json(acme_config_view(&state, config)))
+    Ok(Json(acme_config_view(&state, config).await?))
 }
 
 async fn update_acme_config(
@@ -8342,6 +8367,18 @@ async fn update_acme_config(
     authorize_management(&state, &headers)
         .await
         .map_err(coded_management_error)?;
+    if request.enabled
+        && state
+            .certificate_manager
+            .as_ref()
+            .is_some_and(|manager| !manager.material_key_configured())
+    {
+        return Err(CodedApiError(
+            StatusCode::CONFLICT,
+            "certificate_key_not_configured",
+            "LINKLAKE_CERTIFICATE_KEY_FILE is required for PostgreSQL ACME",
+        ));
+    }
     let challenge_type = request.challenge_type.unwrap_or(
         state
             .certificate_catalog
@@ -8417,7 +8454,7 @@ async fn update_acme_config(
         ),
     )
     .await;
-    Ok(Json(acme_config_view(&state, config)))
+    Ok(Json(acme_config_view(&state, config).await?))
 }
 
 async fn set_http_route_tls(
@@ -8827,6 +8864,13 @@ async fn prepare_certificate_operation(
             "certificate storage is unavailable",
         ));
     };
+    if !manager.material_key_configured() {
+        return Err(CodedApiError(
+            StatusCode::CONFLICT,
+            "certificate_key_not_configured",
+            "LINKLAKE_CERTIFICATE_KEY_FILE is required for PostgreSQL ACME",
+        ));
+    }
     let certificate_identifier =
         effective_certificate_identifier(&route.hostname, tls_policy.as_ref());
     if certificate_identifier.starts_with("*.")

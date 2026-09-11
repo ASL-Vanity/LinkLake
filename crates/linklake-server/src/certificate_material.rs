@@ -17,6 +17,14 @@ pub(crate) struct CertificateMaterialCipher {
 }
 
 impl CertificateMaterialCipher {
+    pub(crate) fn fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        digest.update(b"linklake-certificate-key-id-v1\0");
+        digest.update(self.key.as_ref());
+        format!("{:x}", digest.finalize())
+    }
+
     /// 文件必须恰好包含 32 字节随机密钥；所有 HA 成员使用同一密钥。
     pub(crate) fn from_key_file(path: &Path) -> anyhow::Result<Self> {
         let file = File::open(path)?;

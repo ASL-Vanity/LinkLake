@@ -35,6 +35,7 @@ const ACME_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_PARALLEL_ORDERS: usize = 2;
 pub(crate) const CERTIFICATE_GENERATIONS_DIRECTORY: &str = "generations";
 pub(crate) const CERTIFICATE_COMMIT_MARKER: &[u8] = b"linklake-certificate-generation-v1\n";
+pub(crate) const CERTIFICATE_KEY_FILE_ENV: &str = "LINKLAKE_CERTIFICATE_KEY_FILE";
 const RETAINED_CERTIFICATE_GENERATIONS: usize = 3;
 
 #[derive(Clone, Debug)]
@@ -90,6 +91,13 @@ pub(crate) struct CertificateManager {
     cloudflare_dns: Option<CloudflareDnsClient>,
     account_lock: Arc<AsyncMutex<()>>,
     order_permits: Arc<Semaphore>,
+    shared: Option<Arc<SharedCertificateServices>>,
+}
+
+struct SharedCertificateServices {
+    catalog: crate::certificate_catalog::postgres::PostgresCertificateCatalog,
+    cipher: Option<Arc<crate::certificate_material::CertificateMaterialCipher>>,
+    runtime: Arc<crate::ha_runtime::HaRuntime>,
 }
 
 impl CertificateManager {
@@ -106,7 +114,70 @@ impl CertificateManager {
             cloudflare_dns,
             account_lock: Arc::new(AsyncMutex::new(())),
             order_permits: Arc::new(Semaphore::new(MAX_PARALLEL_ORDERS)),
+            shared: None,
         })
+    }
+
+    pub(crate) async fn with_shared_storage(
+        mut self,
+        storage: crate::storage::CoordinationStorage,
+        runtime: Arc<crate::ha_runtime::HaRuntime>,
+    ) -> anyhow::Result<Self> {
+        if storage.backend() != crate::storage::StorageBackend::Postgres {
+            return Ok(self);
+        }
+        let cipher = std::env::var_os(CERTIFICATE_KEY_FILE_ENV)
+            .filter(|value| !value.is_empty())
+            .map(|path| {
+                crate::certificate_material::CertificateMaterialCipher::from_key_file(Path::new(
+                    &path,
+                ))
+                .map(Arc::new)
+            })
+            .transpose()?;
+        let catalog = crate::certificate_catalog::postgres::PostgresCertificateCatalog {
+            storage,
+            runtime: runtime.clone(),
+        };
+        if let Some(expected) = catalog.material_key_fingerprint().await? {
+            anyhow::ensure!(
+                cipher
+                    .as_ref()
+                    .is_some_and(|cipher| cipher.fingerprint() == expected),
+                "LINKLAKE_CERTIFICATE_KEY_FILE is missing or differs from the cluster key"
+            );
+        }
+        self.shared = Some(Arc::new(SharedCertificateServices {
+            catalog,
+            cipher,
+            runtime,
+        }));
+        Ok(self)
+    }
+
+    pub(crate) fn material_key_configured(&self) -> bool {
+        self.shared
+            .as_ref()
+            .is_none_or(|shared| shared.cipher.is_some())
+    }
+
+    pub(crate) async fn account_registered_shared(
+        &self,
+        directory_url: &str,
+    ) -> anyhow::Result<bool> {
+        match &self.shared {
+            None => Ok(self.account_registered(directory_url)),
+            Some(shared) => {
+                let Some(cipher) = &shared.cipher else {
+                    return Ok(false);
+                };
+                Ok(shared
+                    .catalog
+                    .read_account_credentials(cipher, directory_url)
+                    .await?
+                    .is_some())
+            }
+        }
     }
 
     pub(crate) fn challenges(&self) -> Arc<Http01ChallengeStore> {
@@ -358,6 +429,9 @@ impl CertificateManager {
 
     async fn load_or_create_account(&self, config: &AcmeIssueConfig) -> anyhow::Result<Account> {
         let _guard = self.account_lock.lock().await;
+        if let Some(shared) = &self.shared {
+            return self.load_or_create_shared_account(shared, config).await;
+        }
         let credentials_path = self.account_credentials_path(&config.directory_url);
         if let Some(serialized) = self.read_account_credentials(&config.directory_url)? {
             let credentials: AccountCredentials = serde_json::from_slice(&serialized)?;
@@ -380,6 +454,140 @@ impl CertificateManager {
             .await?;
         write_secret_file(&credentials_path, &serde_json::to_vec(&credentials)?)?;
         Ok(account)
+    }
+
+    async fn load_or_create_shared_account(
+        &self,
+        shared: &SharedCertificateServices,
+        config: &AcmeIssueConfig,
+    ) -> anyhow::Result<Account> {
+        let cipher = shared.cipher.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("LINKLAKE_CERTIFICATE_KEY_FILE is required for PostgreSQL ACME")
+        })?;
+        if let Some(serialized) = shared
+            .catalog
+            .read_account_credentials(cipher, &config.directory_url)
+            .await?
+        {
+            return Ok(account_builder(config)?
+                .from_credentials(serde_json::from_slice(&serialized)?)
+                .await?);
+        }
+        let key =
+            crate::certificate_catalog::postgres::acme_account_job_key(&config.directory_url)?;
+        // 其他证书任务可能正在创建同一目录账户；等待受外层 ACME 总超时约束。
+        let lease = loop {
+            let token = shared.runtime.fencing_token()?;
+            if let Some(lease) = shared
+                .runtime
+                .jobs()
+                .acquire(&key, "acme_account", token)
+                .await?
+            {
+                break lease;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            if let Some(serialized) = shared
+                .catalog
+                .read_account_credentials(cipher, &config.directory_url)
+                .await?
+            {
+                return Ok(account_builder(config)?
+                    .from_credentials(serde_json::from_slice(&serialized)?)
+                    .await?);
+            }
+        };
+        let result =
+            crate::certificate_job::run(shared.runtime.clone(), lease.clone(), None, async {
+                shared.catalog.bind_material_key(cipher).await?;
+                // 取得目录租约后再次读取，避免重复创建账户。
+                if let Some(serialized) = shared
+                    .catalog
+                    .read_account_credentials(cipher, &config.directory_url)
+                    .await?
+                {
+                    return Ok::<_, anyhow::Error>(
+                        account_builder(config)?
+                            .from_credentials(serde_json::from_slice(&serialized)?)
+                            .await?,
+                    );
+                }
+                // 仅共享库确认缺失时迁移旧本地账户；数据库故障不能降级为本地账户。
+                let serialized =
+                    if let Some(local) = self.read_account_credentials(&config.directory_url)? {
+                        let serialized = Zeroizing::new(local);
+                        let credentials: AccountCredentials = serde_json::from_slice(&serialized)?;
+                        account_builder(config)?
+                            .from_credentials(credentials)
+                            .await?;
+                        serialized
+                    } else {
+                        let contact = format!("mailto:{}", config.contact_email);
+                        let contacts = [contact.as_str()];
+                        let (_, credentials) = account_builder(config)?
+                            .create(
+                                &NewAccount {
+                                    contact: &contacts,
+                                    terms_of_service_agreed: true,
+                                    only_return_existing: false,
+                                },
+                                config.directory_url.clone(),
+                                None,
+                            )
+                            .await?;
+                        let serialized = Zeroizing::new(serde_json::to_vec(&credentials)?);
+                        // 共享提交失败时保留可恢复的同一账户，重试不会重新注册。
+                        write_secret_file(
+                            &self.account_credentials_path(&config.directory_url),
+                            &serialized,
+                        )?;
+                        serialized
+                    };
+                shared
+                    .catalog
+                    .store_account_if_absent(cipher, &lease, &config.directory_url, &serialized)
+                    .await?;
+                let authoritative = shared
+                    .catalog
+                    .read_account_credentials(cipher, &config.directory_url)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("shared ACME account disappeared after commit")
+                    })?;
+                Ok(account_builder(config)?
+                    .from_credentials(serde_json::from_slice(&authoritative)?)
+                    .await?)
+            })
+            .await
+            .and_then(|result| result);
+        let finished = if result.is_ok() {
+            shared
+                .runtime
+                .jobs()
+                .complete(
+                    &lease.job_key,
+                    &lease.job_kind,
+                    lease.lease_id,
+                    lease.fencing_token,
+                )
+                .await
+        } else {
+            shared
+                .runtime
+                .jobs()
+                .fail(
+                    &lease.job_key,
+                    &lease.job_kind,
+                    lease.lease_id,
+                    lease.fencing_token,
+                    "acme_account_failed",
+                )
+                .await
+        };
+        if let Err(error) = finished {
+            tracing::warn!(%error, "could not finish ACME account lease");
+        }
+        result
     }
 
     fn persist_certificate(

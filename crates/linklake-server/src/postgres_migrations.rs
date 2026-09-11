@@ -4,8 +4,16 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tokio_postgres::{Client, Transaction};
 
-pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 12;
+pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 13;
 const ADVISORY_LOCK_ID: i64 = 0x4c4c_4841_4d49_4752;
+
+const MIGRATION_V13_NAME: &str = "certificate_cluster_key_binding";
+const MIGRATION_V13_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS linklake_certificate_key_binding (
+    singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1),
+    fingerprint TEXT NOT NULL
+);
+"#;
 
 const MIGRATION_V12_NAME: &str = "shared_certificate_catalog";
 const MIGRATION_V12_SQL: &str = r#"
@@ -566,6 +574,11 @@ const MIGRATIONS: &[Migration] = &[
         name: MIGRATION_V12_NAME,
         sql: MIGRATION_V12_SQL,
     },
+    Migration {
+        version: 13,
+        name: MIGRATION_V13_NAME,
+        sql: MIGRATION_V13_SQL,
+    },
 ];
 
 pub(crate) async fn apply(client: &mut Client) -> anyhow::Result<()> {
@@ -657,6 +670,14 @@ pub(crate) async fn apply(client: &mut Client) -> anyhow::Result<()> {
 
 async fn verify_schema_structure(transaction: &Transaction<'_>) -> anyhow::Result<()> {
     const TABLES: &[TableExpectation] = &[
+        TableExpectation {
+            name: "linklake_certificate_key_binding",
+            primary_key: &["singleton_id"],
+            columns: &[
+                required("singleton_id", "int4"),
+                required("fingerprint", "text"),
+            ],
+        },
         TableExpectation {
             name: "linklake_acme_config",
             primary_key: &["singleton_id"],
