@@ -319,7 +319,38 @@
         eventFollowerStarted: 'Follower started',
         eventLeaderLost: 'Leadership lost',
         eventHeartbeatFailed: 'Heartbeat failed',
-        eventHeartbeatTimeout: 'Heartbeat timed out'
+        eventHeartbeatTimeout: 'Heartbeat timed out',
+        allowPrivateNetworks: 'Allow private networks (loopback, link-local and cloud metadata remain blocked)',
+        fleetLedger: 'Fleet ledger',
+        fleetLedgerSubtitle: 'Inspect shared generation progress, ownership and conflict history.',
+        fleetGenerations: 'Shared generations',
+        fleetGenerationsHelp: 'Track generation, progress, owner and fencing state for every Fleet source.',
+        openConflicts: 'Open conflicts',
+        openConflictsHelp: 'Operators and administrators may record a bounded manual resolution.',
+        resolvedConflicts: 'Resolved conflicts',
+        resolvedConflictsHelp: 'Resolved entries remain visible as an immutable operational history.',
+        source: 'Source',
+        generation: 'Generation',
+        progress: 'Progress',
+        resources: 'Resources',
+        averageProgress: 'Average progress',
+        readyGenerations: 'Ready generations',
+        syncPending: 'Pending',
+        syncApplying: 'Applying',
+        syncReady: 'Ready',
+        syncConflicted: 'Conflicted',
+        syncFailed: 'Failed',
+        resolveConflict: 'Resolve',
+        resolutionPrompt: 'Describe the manual resolution (1-512 characters).',
+        resolutionRequired: 'A non-empty resolution of at most 512 characters is required.',
+        conflictResolved: 'Fleet conflict resolved.',
+        noFleetGenerations: 'No Fleet generations have been recorded.',
+        noOpenConflicts: 'No open Fleet conflicts.',
+        noResolvedConflicts: 'No resolved Fleet conflicts.',
+        conflictCode: 'Conflict code',
+        detectedAt: 'Detected',
+        resolvedAt: 'Resolved',
+        resolution: 'Resolution'
       });
       Object.assign(WORDS.zh, {
         haManagement: 'HA 管理',
@@ -365,7 +396,38 @@
         eventFollowerStarted: '已作为 Follower 启动',
         eventLeaderLost: 'Leader 已丢失',
         eventHeartbeatFailed: '心跳失败',
-        eventHeartbeatTimeout: '心跳超时'
+        eventHeartbeatTimeout: '心跳超时',
+        allowPrivateNetworks: '允许访问私有网络（仍禁止回环、链路本地和云元数据地址）',
+        fleetLedger: 'Fleet 共享账本',
+        fleetLedgerSubtitle: '查看共享 generation 进度、所有者和冲突历史。',
+        fleetGenerations: '共享 generation',
+        fleetGenerationsHelp: '跟踪每个 Fleet 来源的 generation、进度、所有者和 fencing 状态。',
+        openConflicts: '未解决冲突',
+        openConflictsHelp: '操作员和管理员可以记录有边界的人工处理结果。',
+        resolvedConflicts: '已解决冲突',
+        resolvedConflictsHelp: '已解决条目继续保留为不可变的运维历史。',
+        source: '来源',
+        generation: 'Generation',
+        progress: '进度',
+        resources: '资源',
+        averageProgress: '平均进度',
+        readyGenerations: '就绪 generation',
+        syncPending: '等待中',
+        syncApplying: '应用中',
+        syncReady: '已就绪',
+        syncConflicted: '有冲突',
+        syncFailed: '失败',
+        resolveConflict: '解决冲突',
+        resolutionPrompt: '请输入人工处理结果（1-512 个字符）。',
+        resolutionRequired: '处理结果不能为空且不能超过 512 个字符。',
+        conflictResolved: 'Fleet 冲突已解决。',
+        noFleetGenerations: '暂无 Fleet generation 记录。',
+        noOpenConflicts: '没有未解决的 Fleet 冲突。',
+        noResolvedConflicts: '没有已解决的 Fleet 冲突。',
+        conflictCode: '冲突代码',
+        detectedAt: '检测时间',
+        resolvedAt: '解决时间',
+        resolution: '处理结果'
       });
 
       const POLICY_TYPES = {
@@ -451,6 +513,7 @@
             { name: 'name', label: 'proxyName', type: 'text', required: true, full: true },
             { name: 'public_port', label: 'publicPort', type: 'number', min: 1, max: 65535, required: true, portProtocol: 'tcp' },
             { name: 'username', label: 'proxyUsername', type: 'text', required: true },
+            { name: 'allow_private_networks', label: 'allowPrivateNetworks', type: 'checkbox', full: true, default: false },
             { name: 'max_connections', label: 'maxConnections', type: 'number', min: 1, max: 1024, required: true, default: 64 },
             { name: 'bandwidth_limit_bps', label: 'bandwidthLimit', type: 'number', min: 1024, max: 1000000000 }
           ]
@@ -462,6 +525,7 @@
             { name: 'name', label: 'proxyName', type: 'text', required: true, full: true },
             { name: 'public_port', label: 'publicPort', type: 'number', min: 1, max: 65535, required: true, portProtocol: 'tcp' },
             { name: 'username', label: 'proxyUsername', type: 'text', required: true },
+            { name: 'allow_private_networks', label: 'allowPrivateNetworks', type: 'checkbox', full: true, default: false },
             { name: 'max_connections', label: 'maxConnections', type: 'number', min: 1, max: 1024, required: true, default: 64 },
             { name: 'bandwidth_limit_bps', label: 'bandwidthLimit', type: 'number', min: 1024, max: 1000000000 }
           ]
@@ -524,7 +588,7 @@
         'overview-view', 'overview-kpis', 'traffic-chart', 'traffic-tooltip', 'traffic-chart-summary', 'export-metrics', 'service-health-summary', 'overview-alert-panel', 'overview-alerts', 'overview-alert-more',
         'metrics-view', 'metrics-kpis', 'activity-chart', 'failure-chart', 'tcp-metric-panel', 'udp-metric-panel', 'proxy-metric-panel', 'web-metric-panel', 'network-health-panel', 'system-metric-panel',
         'services-view', 'service-insights', 'service-trend-title', 'service-insight-kpis', 'service-trend-chart', 'service-status-chart', 'new-policy', 'export-policies', 'import-policies', 'import-policies-file', 'service-toolbar', 'service-search', 'service-status-filter', 'service-count', 'service-bulk-toolbar', 'select-visible-policies', 'selected-policy-count', 'bulk-enable-policies', 'bulk-disable-policies', 'bulk-client-target', 'bulk-migrate-policies', 'bulk-delete-policies', 'service-list', 'acme-page',
-        'p2p-view', 'p2p-list', 'ha-view', 'ha-kpis', 'ha-members-list', 'ha-events-list', 'ha-jobs-list', 'ha-ports-list', 'ha-target-kpis', 'ha-targets-list', 'fleet-view', 'new-fleet-peer', 'preview-fleet-sync', 'apply-fleet-sync', 'fleet-summary', 'fleet-conflicts', 'fleet-list', 'clients-view', 'client-insight-kpis', 'client-status-chart', 'client-platform-chart', 'client-search', 'client-status-filter', 'client-count', 'clients-list', 'users-view', 'new-user', 'user-search', 'user-role-filter', 'user-count', 'users-list', 'sessions-view', 'totp-status', 'totp-action', 'new-api-token', 'api-tokens-list', 'sessions-list', 'updates-view', 'update-kpis', 'server-update-state', 'server-update-details', 'server-update-security', 'check-server-update', 'download-server-update', 'apply-server-update', 'server-update-release', 'client-update-availability', 'client-update-target', 'client-update-action', 'create-client-update', 'client-update-task-count', 'client-update-tasks', 'alerts-view', 'new-alert-rule', 'alert-channels', 'alert-events', 'alert-rules', 'activity-view', 'audit-search', 'audit-category', 'audit-count', 'audit-list', 'audit-load-more', 'export-audit',
+        'p2p-view', 'p2p-list', 'ha-view', 'ha-kpis', 'ha-members-list', 'ha-events-list', 'ha-jobs-list', 'ha-ports-list', 'ha-target-kpis', 'ha-targets-list', 'fleet-ledger-view', 'fleet-ledger-kpis', 'fleet-generation-list', 'fleet-open-conflicts', 'fleet-resolved-conflicts', 'fleet-view', 'new-fleet-peer', 'preview-fleet-sync', 'apply-fleet-sync', 'fleet-summary', 'fleet-conflicts', 'fleet-list', 'clients-view', 'client-insight-kpis', 'client-status-chart', 'client-platform-chart', 'client-search', 'client-status-filter', 'client-count', 'clients-list', 'users-view', 'new-user', 'user-search', 'user-role-filter', 'user-count', 'users-list', 'sessions-view', 'totp-status', 'totp-action', 'new-api-token', 'api-tokens-list', 'sessions-list', 'updates-view', 'update-kpis', 'server-update-state', 'server-update-details', 'server-update-security', 'check-server-update', 'download-server-update', 'apply-server-update', 'server-update-release', 'client-update-availability', 'client-update-target', 'client-update-action', 'create-client-update', 'client-update-task-count', 'client-update-tasks', 'alerts-view', 'new-alert-rule', 'alert-channels', 'alert-events', 'alert-rules', 'activity-view', 'audit-search', 'audit-category', 'audit-count', 'audit-list', 'audit-load-more', 'export-audit',
         'drawer-backdrop', 'policy-drawer', 'drawer-title', 'drawer-subtitle', 'drawer-close', 'drawer-cancel', 'policy-form', 'policy-fields', 'drawer-submit',
         'password-modal', 'password-modal-close', 'password-form', 'account-new-password', 'account-confirm-password', 'password-cancel',
         'user-modal', 'user-modal-title', 'user-modal-help', 'user-modal-close', 'user-form', 'user-username', 'user-display-name', 'user-role', 'user-password-label', 'user-password', 'user-enabled-label', 'user-enabled', 'user-force-change-label', 'user-force-change', 'user-cancel',
@@ -704,7 +768,7 @@
           history.replaceState(null, '', '#/overview');
           return { view: 'overview', service: state.route.service || 'tcp' };
         }
-        if (['overview', 'metrics', 'clients', 'p2p', 'ha', 'fleet', 'users', 'sessions', 'updates', 'alerts', 'activity'].includes(parts[0])) return { view: parts[0], service: state.route.service || 'tcp' };
+        if (['overview', 'metrics', 'clients', 'p2p', 'ha', 'fleet-ledger', 'fleet', 'users', 'sessions', 'updates', 'alerts', 'activity'].includes(parts[0])) return { view: parts[0], service: state.route.service || 'tcp' };
         history.replaceState(null, '', '#/overview');
         return { view: 'overview', service: state.route.service || 'tcp' };
       }
@@ -721,6 +785,7 @@
           clients: [t('clientManagement'), t('clientManagementHelp')],
           p2p: [t('p2p'), t('p2pSubtitle')],
           ha: [t('haManagement'), t('haSubtitle')],
+          'fleet-ledger': [t('fleetLedger'), t('fleetLedgerSubtitle')],
           fleet: [t('fleet'), t('fleetHelp')],
           users: [t('userManagement'), t('userManagementHelp')],
           sessions: [t('securitySessions'), t('securitySessionsHelp')],
@@ -736,7 +801,7 @@
         const [title, subtitle] = routeCopy();
         elements.workspace_title.textContent = title;
         elements.workspace_subtitle.textContent = subtitle;
-        const views = { overview: elements.overview_view, metrics: elements.metrics_view, services: elements.services_view, clients: elements.clients_view, p2p: elements.p2p_view, ha: elements.ha_view, fleet: elements.fleet_view, users: elements.users_view, sessions: elements.sessions_view, updates: elements.updates_view, alerts: elements.alerts_view, activity: elements.activity_view };
+        const views = { overview: elements.overview_view, metrics: elements.metrics_view, services: elements.services_view, clients: elements.clients_view, p2p: elements.p2p_view, ha: elements.ha_view, 'fleet-ledger': elements.fleet_ledger_view, fleet: elements.fleet_view, users: elements.users_view, sessions: elements.sessions_view, updates: elements.updates_view, alerts: elements.alerts_view, activity: elements.activity_view };
         Object.entries(views).forEach(([name, element]) => element.classList.toggle('hidden', name !== state.route.view));
         elements.workspace_service_actions.classList.toggle('hidden', state.route.view !== 'services' || state.route.service === 'acme');
         elements.workspace_fleet_actions.classList.toggle('hidden', state.route.view !== 'fleet');
@@ -754,6 +819,7 @@
         else if (state.route.view === 'clients') renderClients();
         else if (state.route.view === 'p2p') renderP2p();
         else if (state.route.view === 'ha') renderHa();
+        else if (state.route.view === 'fleet-ledger') renderFleetLedger();
         else if (state.route.view === 'fleet') renderFleet();
         else if (state.route.view === 'users') renderUsers();
         else if (state.route.view === 'sessions') renderSessions();
@@ -2250,6 +2316,160 @@
           row.append(name, member, control, application, effective, probe);
           elements.ha_targets_list.append(row);
         });
+      }
+
+      function fleetSyncStateText(value) {
+        const keys = {
+          pending: 'syncPending',
+          applying: 'syncApplying',
+          ready: 'syncReady',
+          conflicted: 'syncConflicted',
+          failed: 'syncFailed'
+        };
+        return t(keys[value] || value || 'unknown');
+      }
+
+      function fleetSyncStateBadge(value) {
+        const badge = document.createElement('span');
+        const className = value === 'ready' ? 'online' : ['conflicted', 'failed'].includes(value) ? 'warning' : '';
+        badge.className = `badge ${className}`;
+        badge.textContent = fleetSyncStateText(value);
+        return badge;
+      }
+
+      function fleetConflictCard(conflict, canResolve) {
+        const card = document.createElement('article');
+        card.className = `fleet-ledger-conflict ${conflict.state === 'resolved' ? 'resolved' : 'open'}`;
+        const heading = document.createElement('div');
+        heading.className = 'fleet-ledger-conflict-heading';
+        const title = document.createElement('strong');
+        title.textContent = `${conflict.resource_kind} · ${haShortId(conflict.resource_id)}`;
+        title.title = conflict.resource_id || '';
+        const stateBadge = document.createElement('span');
+        stateBadge.className = `badge ${conflict.state === 'resolved' ? 'online' : 'warning'}`;
+        stateBadge.textContent = conflict.state === 'resolved' ? t('resolvedConflicts') : t('openConflicts');
+        heading.append(title, stateBadge);
+        const summary = document.createElement('p');
+        summary.textContent = conflict.detail_summary || conflict.conflict_code || '—';
+        const metadata = document.createElement('dl');
+        metadata.className = 'fleet-ledger-metadata';
+        const entries = [
+          [t('conflictCode'), conflict.conflict_code],
+          [t('source'), haShortId(conflict.source_instance_id)],
+          [t('generation'), conflict.generation],
+          [t('owner'), haShortId(conflict.owner_instance_id)],
+          [t('detectedAt'), formatTimestamp(conflict.detected_unix_seconds)]
+        ];
+        if (conflict.state === 'resolved') {
+          entries.push([t('resolvedAt'), formatTimestamp(conflict.resolved_unix_seconds)]);
+          entries.push([t('resolution'), conflict.resolution || '—']);
+        }
+        entries.forEach(([label, value]) => {
+          const dt = document.createElement('dt'); dt.textContent = label;
+          const dd = document.createElement('dd'); dd.textContent = String(value ?? '—');
+          metadata.append(dt, dd);
+        });
+        card.append(heading, summary, metadata);
+        if (canResolve && conflict.state === 'open') {
+          const actions = document.createElement('div');
+          actions.className = 'inline-actions';
+          const resolve = document.createElement('button');
+          resolve.type = 'button';
+          resolve.className = 'primary-button';
+          resolve.textContent = t('resolveConflict');
+          resolve.addEventListener('click', () => resolveFleetConflict(conflict, resolve));
+          actions.append(resolve);
+          card.append(actions);
+        }
+        return card;
+      }
+
+      async function resolveFleetConflict(conflict, button) {
+        const entered = window.prompt(t('resolutionPrompt'), '');
+        if (entered == null) return;
+        const resolution = entered.trim();
+        if (!resolution || resolution.length > 512) return showToast(t('resolutionRequired'), true);
+        setBusy(button, true);
+        try {
+          const response = await apiFetch(`/api/v1/fleet/v2/conflicts/${encodeURIComponent(conflict.conflict_id)}/resolve`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ resolution })
+          });
+          if (response.status === 401) return;
+          if (!response.ok) return showToast(await responseError(response), true);
+          showToast(t('conflictResolved'));
+          await loadManagementData({ forceHistory: false });
+        } catch (_) {
+          showToast(t('requestFailed'), true);
+        } finally {
+          setBusy(button, false);
+        }
+      }
+
+      function renderFleetLedger() {
+        const generations = Array.isArray(state.dashboard.fleetGenerations) ? state.dashboard.fleetGenerations : [];
+        const conflicts = Array.isArray(state.dashboard.fleetConflicts) ? state.dashboard.fleetConflicts : [];
+        const open = conflicts.filter(conflict => conflict.state === 'open');
+        const resolved = conflicts.filter(conflict => conflict.state === 'resolved');
+        const ready = generations.filter(generation => generation.sync_state === 'ready').length;
+        const averageProgress = generations.length
+          ? Math.round(generations.reduce((total, generation) => total + Math.max(0, Math.min(100, Number(generation.sync_progress) || 0)), 0) / generations.length)
+          : 0;
+        elements.fleet_ledger_kpis.replaceChildren(
+          createKpi(String(generations.length), t('fleetGenerations')),
+          createKpi(`${averageProgress}%`, t('averageProgress')),
+          createKpi(String(ready), t('readyGenerations')),
+          createKpi(String(open.length), t('openConflicts')),
+          createKpi(String(resolved.length), t('resolvedConflicts'))
+        );
+
+        elements.fleet_generation_list.replaceChildren();
+        if (!generations.length) haEmptyRow(elements.fleet_generation_list, 6, t('noFleetGenerations'));
+        generations.forEach(generation => {
+          const row = document.createElement('tr');
+          const source = document.createElement('td');
+          source.textContent = haShortId(generation.source_instance_id);
+          source.title = generation.source_instance_id || '';
+          const identity = document.createElement('td');
+          const primary = document.createElement('strong');
+          primary.textContent = `#${generation.generation}`;
+          const revision = document.createElement('small');
+          revision.textContent = ` · ${haShortId(generation.revision)}`;
+          revision.title = generation.revision || '';
+          identity.append(primary, revision);
+          const progress = document.createElement('td');
+          const progressValue = Math.max(0, Math.min(100, Number(generation.sync_progress) || 0));
+          const progressLabel = document.createElement('div');
+          progressLabel.className = 'fleet-progress-label';
+          progressLabel.append(fleetSyncStateBadge(generation.sync_state), document.createTextNode(`${progressValue}%`));
+          const track = document.createElement('div');
+          track.className = 'fleet-progress-track';
+          const fill = document.createElement('span');
+          fill.style.width = `${progressValue}%`;
+          track.append(fill);
+          progress.append(progressLabel, track);
+          const owner = document.createElement('td');
+          owner.textContent = haShortId(generation.owner_instance_id);
+          owner.title = `${generation.owner_instance_id} / ${generation.owner_incarnation_id}`;
+          const fence = document.createElement('small');
+          fence.textContent = ` · ${t('fencingToken')} ${generation.fencing_token}`;
+          owner.append(fence);
+          const resources = document.createElement('td'); resources.textContent = String(generation.resource_count ?? 0);
+          const updated = document.createElement('td'); updated.textContent = formatTimestamp(generation.updated_unix_seconds);
+          row.append(source, identity, progress, owner, resources, updated);
+          elements.fleet_generation_list.append(row);
+        });
+
+        const canResolve = state.identity?.role === 'operator' || state.identity?.role === 'administrator';
+        elements.fleet_open_conflicts.replaceChildren();
+        if (!open.length) {
+          const empty = document.createElement('div'); empty.className = 'empty-state'; empty.textContent = t('noOpenConflicts'); elements.fleet_open_conflicts.append(empty);
+        } else open.forEach(conflict => elements.fleet_open_conflicts.append(fleetConflictCard(conflict, canResolve)));
+        elements.fleet_resolved_conflicts.replaceChildren();
+        if (!resolved.length) {
+          const empty = document.createElement('div'); empty.className = 'empty-state'; empty.textContent = t('noResolvedConflicts'); elements.fleet_resolved_conflicts.append(empty);
+        } else resolved.forEach(conflict => elements.fleet_resolved_conflicts.append(fleetConflictCard(conflict, false)));
       }
 
       function renderFleet() {
@@ -3830,7 +4050,7 @@
 
       function emptyDashboard() {
         const metrics = new Proxy({}, { get(target, key) { return key in target ? target[key] : 0; } });
-        return { status: {}, metrics, events: [], users: [], sessions: [], apiTokens: [], updateOverview: null, clientUpdateTasks: { tasks: [] }, fleetOverview: { peers: [], conflicts: [], failover_order: [] }, haOverview: { mode: 'sqlite_single_instance', backend: 'sqlite', members: [], job_leases: [], port_ownership: [], target_health: { total: 0, healthy: 0, unhealthy: 0, with_errors: 0, targets: [] }, recent_events: [] }, alertRules: [], alertEvents: [], alertChannels: {}, tcpPolicies: [], udpPolicies: [], portGroups: [], httpRoutes: [], sniRoutes: [], secretPolicies: [], socks5Policies: [], httpProxyPolicies: [], clients: [], p2pNodes: [], publicPortPolicy: { tcp_allowed: '32000-32999', udp_allowed: '32000-32999', tcp_reserved: '', udp_reserved: '' }, acme: { enabled: false, environment: 'staging', directory_url: acmeDirectories.staging, contact_email: '', terms_accepted: false, renew_before_days: 30, account_registered: false } };
+        return { status: {}, metrics, events: [], users: [], sessions: [], apiTokens: [], updateOverview: null, clientUpdateTasks: { tasks: [] }, fleetOverview: { peers: [], conflicts: [], failover_order: [] }, fleetGenerations: [], fleetConflicts: [], haOverview: { mode: 'sqlite_single_instance', backend: 'sqlite', members: [], job_leases: [], port_ownership: [], target_health: { total: 0, healthy: 0, unhealthy: 0, with_errors: 0, targets: [] }, recent_events: [] }, alertRules: [], alertEvents: [], alertChannels: {}, tcpPolicies: [], udpPolicies: [], portGroups: [], httpRoutes: [], sniRoutes: [], secretPolicies: [], socks5Policies: [], httpProxyPolicies: [], clients: [], p2pNodes: [], publicPortPolicy: { tcp_allowed: '32000-32999', udp_allowed: '32000-32999', tcp_reserved: '', udp_reserved: '' }, acme: { enabled: false, environment: 'staging', directory_url: acmeDirectories.staging, contact_email: '', terms_accepted: false, renew_before_days: 30, account_registered: false } };
       }
 
       function managementRequestPlan({ includeHistory = false } = {}) {
@@ -3844,6 +4064,7 @@
         if (state.route.view === 'metrics') return [...common, { key: 'metrics', url: '/api/v1/metrics' }];
         if (state.route.view === 'p2p') return [...common, { key: 'clients', url: '/api/v1/clients' }, { key: 'p2pNodes', url: '/api/v1/p2p/nodes' }];
         if (state.route.view === 'ha') return [...common, { key: 'haOverview', url: '/api/v1/ha/overview' }];
+        if (state.route.view === 'fleet-ledger') return [...common, { key: 'fleetGenerations', url: '/api/v1/fleet/v2/generations' }, { key: 'fleetConflicts', url: '/api/v1/fleet/v2/conflicts' }];
         if (state.route.view === 'fleet') return [...common, { key: 'fleetOverview', url: '/api/v1/fleet/overview' }];
         if (state.route.view === 'clients') return [...common, { key: 'clients', url: '/api/v1/clients' }];
         if (state.route.view === 'users') return [...common, { key: 'users', url: '/api/v1/users' }];

@@ -449,10 +449,43 @@ impl PolicyService {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn export_bundle(&self, now: u64) -> anyhow::Result<FleetBundleV2> {
+        self.export_bundle_inner(now, None)
+    }
+
+    pub(crate) fn export_bundle_with_clients(
+        &self,
+        now: u64,
+        clients: &[linklake_core::ClientSummary],
+    ) -> anyhow::Result<FleetBundleV2> {
+        self.export_bundle_inner(now, Some(clients))
+    }
+
+    fn export_bundle_inner(
+        &self,
+        now: u64,
+        clients: Option<&[linklake_core::ClientSummary]>,
+    ) -> anyhow::Result<FleetBundleV2> {
         self.database.with_transaction(|transaction| {
             let (source_instance_id, generation) = reserve_generation(transaction)?;
-            let clients = load_fleet_clients(transaction)?;
+            let clients = match clients {
+                Some(clients) => clients
+                    .iter()
+                    .filter(|client| client.enabled && client.agent_identity_public_key.is_some())
+                    .map(|client| {
+                        (
+                            client.client_id,
+                            linklake_core::fleet_protocol::FleetClientRef {
+                                agent_instance_id: client.agent_instance_id,
+                                name: client.name.clone(),
+                                agent_identity_public_key: client.agent_identity_public_key.clone(),
+                            },
+                        )
+                    })
+                    .collect(),
+                None => load_fleet_clients(transaction)?,
+            };
             let agent_by_client = clients
                 .iter()
                 .map(|client| (client.0, client.1.agent_instance_id))
@@ -480,10 +513,29 @@ impl PolicyService {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn reconcile(
         &self,
         request: FleetReconcileRequest,
         now: u64,
+    ) -> anyhow::Result<FleetReconcileResult> {
+        self.reconcile_inner(request, now, None)
+    }
+
+    pub(crate) fn reconcile_with_clients(
+        &self,
+        request: FleetReconcileRequest,
+        now: u64,
+        clients: &[linklake_core::ClientSummary],
+    ) -> anyhow::Result<FleetReconcileResult> {
+        self.reconcile_inner(request, now, Some(clients))
+    }
+
+    fn reconcile_inner(
+        &self,
+        request: FleetReconcileRequest,
+        now: u64,
+        clients: Option<&[linklake_core::ClientSummary]>,
     ) -> anyhow::Result<FleetReconcileResult> {
         request.bundle.validate()?;
         let source_instance_id = request.bundle.source_instance_id;
@@ -535,7 +587,7 @@ impl PolicyService {
                 false
             };
 
-            let clients = resolve_bundle_clients(transaction, &request.bundle)?;
+            let clients = resolve_bundle_clients(transaction, &request.bundle, clients)?;
             let existing = load_owned_resources(transaction, source_instance_id)?;
             let mut plan = Vec::with_capacity(request.bundle.resources.len());
             let mut conflicts = Vec::new();
@@ -748,6 +800,7 @@ fn read_source_status(
 fn resolve_bundle_clients(
     transaction: &Transaction<'_>,
     bundle: &FleetBundleV2,
+    registered_clients: Option<&[linklake_core::ClientSummary]>,
 ) -> anyhow::Result<HashMap<Uuid, Uuid>> {
     let referenced = bundle
         .resources
@@ -768,13 +821,18 @@ fn resolve_bundle_clients(
         let expected_public_key = client.agent_identity_public_key.as_deref().ok_or_else(|| {
             anyhow::anyhow!("Fleet client identity is not cryptographically verified")
         })?;
-        let local: Option<(String, i64, Option<String>)> = transaction
+        let local: Option<(String, i64, Option<String>)> = match registered_clients {
+            Some(registered) => registered.iter()
+                .find(|local| local.agent_instance_id == agent_instance_id)
+                .map(|local| (local.client_id.to_string(), i64::from(local.enabled), local.agent_identity_public_key.clone())),
+            None => transaction
             .query_row(
                 "SELECT client_id, enabled, agent_identity_public_key FROM clients WHERE agent_instance_id = ?1",
                 [agent_instance_id.to_string()],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .optional()?;
+            .optional()?,
+        };
         let Some((local_client_id, enabled, local_public_key)) = local else {
             anyhow::bail!(
                 "Fleet client {} ({}) is not enrolled on this server",
@@ -1116,7 +1174,7 @@ fn policy_matches_planned(
             let client_id = local_client_id(clients, value.agent_instance_id)?.to_string();
             transaction
             .query_row(
-                "SELECT client_id, name, public_port, username, password_hash, max_connections, bandwidth_limit_bps, enabled FROM socks5_proxy_policies WHERE id = ?1",
+                "SELECT client_id, name, public_port, username, password_hash, max_connections, bandwidth_limit_bps, allow_private_networks, enabled FROM socks5_proxy_policies WHERE id = ?1",
                 [&id],
                 |row| {
                     Ok(row.get::<_, String>(0)? == client_id
@@ -1126,7 +1184,8 @@ fn policy_matches_planned(
                         && row.get::<_, String>(4)? == planned.credential_hash.clone().unwrap_or_default()
                         && row.get::<_, u16>(5)? == value.max_connections
                         && row.get::<_, Option<u64>>(6)? == value.bandwidth_limit_bps
-                        && (row.get::<_, i64>(7)? != 0) == planned.resource.enabled)
+                        && (row.get::<_, i64>(7)? != 0) == value.allow_private_networks
+                        && (row.get::<_, i64>(8)? != 0) == planned.resource.enabled)
                 },
             )
             .optional()?
@@ -1136,7 +1195,7 @@ fn policy_matches_planned(
             let client_id = local_client_id(clients, value.agent_instance_id)?.to_string();
             transaction
             .query_row(
-                "SELECT client_id, name, public_port, username, password_hash, max_connections, bandwidth_limit_bps, enabled FROM http_proxy_policies WHERE id = ?1",
+                "SELECT client_id, name, public_port, username, password_hash, max_connections, bandwidth_limit_bps, allow_private_networks, enabled FROM http_proxy_policies WHERE id = ?1",
                 [&id],
                 |row| {
                     Ok(row.get::<_, String>(0)? == client_id
@@ -1146,7 +1205,8 @@ fn policy_matches_planned(
                         && row.get::<_, String>(4)? == planned.credential_hash.clone().unwrap_or_default()
                         && row.get::<_, u16>(5)? == value.max_connections
                         && row.get::<_, Option<u64>>(6)? == value.bandwidth_limit_bps
-                        && (row.get::<_, i64>(7)? != 0) == planned.resource.enabled)
+                        && (row.get::<_, i64>(7)? != 0) == value.allow_private_networks
+                        && (row.get::<_, i64>(8)? != 0) == planned.resource.enabled)
                 },
             )
             .optional()?
@@ -1890,7 +1950,7 @@ fn upsert_planned_resource(
         }
         FleetResourceSpec::Socks5Proxy(value) => {
             transaction.execute(
-                "INSERT INTO socks5_proxy_policies (id, client_id, name, public_port, username, password_hash, max_connections, bandwidth_limit_bps, enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO socks5_proxy_policies (id, client_id, name, public_port, username, password_hash, max_connections, bandwidth_limit_bps, allow_private_networks, enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     id,
                     local_client_id(clients, value.agent_instance_id)?.to_string(),
@@ -1903,13 +1963,14 @@ fn upsert_planned_resource(
                         .ok_or_else(|| anyhow::anyhow!("Fleet SOCKS5 credential is unavailable"))?,
                     value.max_connections,
                     value.bandwidth_limit_bps,
+                    value.allow_private_networks,
                     planned.resource.enabled,
                 ],
             )?;
         }
         FleetResourceSpec::HttpProxy(value) => {
             transaction.execute(
-                "INSERT INTO http_proxy_policies (id, client_id, name, public_port, username, password_hash, max_connections, bandwidth_limit_bps, enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO http_proxy_policies (id, client_id, name, public_port, username, password_hash, max_connections, bandwidth_limit_bps, allow_private_networks, enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     id,
                     local_client_id(clients, value.agent_instance_id)?.to_string(),
@@ -1922,6 +1983,7 @@ fn upsert_planned_resource(
                         .ok_or_else(|| anyhow::anyhow!("Fleet HTTP proxy credential is unavailable"))?,
                     value.max_connections,
                     value.bandwidth_limit_bps,
+                    value.allow_private_networks,
                     planned.resource.enabled,
                 ],
             )?;
@@ -2390,7 +2452,7 @@ fn export_resources(
         (FleetPolicyKind::HttpProxy, "http_proxy_policies"),
     ] {
         let mut statement = transaction.prepare(&format!(
-            "SELECT id, client_id, name, public_port, username, max_connections, bandwidth_limit_bps, enabled FROM {table}"
+            "SELECT id, client_id, name, public_port, username, max_connections, bandwidth_limit_bps, allow_private_networks, enabled FROM {table}"
         ))?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -2402,10 +2464,21 @@ fn export_resources(
                 row.get::<_, u16>(5)?,
                 row.get::<_, Option<u64>>(6)?,
                 row.get::<_, i64>(7)? != 0,
+                row.get::<_, i64>(8)? != 0,
             ))
         })?;
         for row in rows {
-            let (id, client, name, port, username, limit, bandwidth, enabled) = row?;
+            let (
+                id,
+                client,
+                name,
+                port,
+                username,
+                limit,
+                bandwidth,
+                allow_private_networks,
+                enabled,
+            ) = row?;
             let id = Uuid::parse_str(&id)?;
             if excluded.contains(&(kind, id)) {
                 continue;
@@ -2422,6 +2495,7 @@ fn export_resources(
                     username,
                     max_connections: limit,
                     bandwidth_limit_bps: bandwidth,
+                    allow_private_networks,
                 })
             } else {
                 FleetResourceSpec::HttpProxy(FleetHttpProxyResource {
@@ -2432,6 +2506,7 @@ fn export_resources(
                     username,
                     max_connections: limit,
                     bandwidth_limit_bps: bandwidth,
+                    allow_private_networks,
                 })
             };
             resources.push(FleetResource {
@@ -2633,6 +2708,7 @@ mod tests {
                 username: "fleet".into(),
                 max_connections: Some(64),
                 bandwidth_limit_bps: None,
+                allow_private_networks: false,
             })
             .unwrap();
         let http_proxy = tunnels
@@ -2643,6 +2719,7 @@ mod tests {
                 username: "fleet".into(),
                 max_connections: Some(64),
                 bandwidth_limit_bps: None,
+                allow_private_networks: false,
             })
             .unwrap();
         for request in [
@@ -2770,6 +2847,7 @@ mod tests {
                     username: "fleet".into(),
                     max_connections: 64,
                     bandwidth_limit_bps: None,
+                    allow_private_networks: false,
                 }),
             },
             FleetResource {
@@ -2783,6 +2861,7 @@ mod tests {
                     username: "fleet".into(),
                     max_connections: 64,
                     bandwidth_limit_bps: None,
+                    allow_private_networks: false,
                 }),
             },
         ];

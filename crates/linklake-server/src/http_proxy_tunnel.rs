@@ -310,6 +310,7 @@ pub(crate) async fn register_proxy(
         &ControlFrame::HttpProxyRegistered {
             proxy_id: runtime_policy.policy_id,
             public_port,
+            allow_private_networks: runtime_policy.allow_private_networks,
         },
     )
     .await

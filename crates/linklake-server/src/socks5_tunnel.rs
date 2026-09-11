@@ -13,6 +13,7 @@ use crate::{
 };
 use bytes::Bytes;
 use linklake_core::{
+    egress_policy::EgressPolicy,
     read_control_frame, read_udp_data_plane_control_frame,
     socks5_fragment::{Socks5FragmentError, Socks5FragmentOutcome, Socks5FragmentReassembler},
     socks5_udp::{
@@ -113,6 +114,7 @@ struct PublicConnectionContext {
     permits: Arc<Semaphore>,
     statistics: Arc<Socks5ProxyStatistics>,
     bandwidth_limiter: Option<Arc<BandwidthLimiter>>,
+    egress_policy: EgressPolicy,
     udp: Option<Arc<UdpProxyContext>>,
 }
 
@@ -423,6 +425,7 @@ pub(crate) async fn register_proxy(
         permits: Arc::new(Semaphore::new(runtime_policy.max_connections)),
         statistics: statistics.clone(),
         bandwidth_limiter,
+        egress_policy: EgressPolicy::new(runtime_policy.allow_private_networks),
         udp: udp_runtime.as_ref().map(|runtime| runtime.0.clone()),
     };
     tokio::spawn(accept_public_connections(
@@ -457,6 +460,7 @@ pub(crate) async fn register_proxy(
             proxy_id: runtime_policy.policy_id,
             public_port,
             udp_associate: udp_enabled,
+            allow_private_networks: runtime_policy.allow_private_networks,
         },
     )
     .await
@@ -990,7 +994,21 @@ async fn serve_public_connection(
         .requests_total
         .fetch_add(1, Ordering::Relaxed);
     let (target_host, target_port) = match request {
-        Socks5Request::Connect { host, port } => (host, port),
+        Socks5Request::Connect { host, port } => {
+            let target = match resolve_connect_target(&host, port, context.egress_policy).await {
+                Ok(target) => target,
+                Err(()) => {
+                    context
+                        .statistics
+                        .rejected_connections
+                        .fetch_add(1, Ordering::Relaxed);
+                    let _ = write_socks5_reply(&mut external, 0x02).await;
+                    finish_connection(&context.statistics);
+                    return;
+                }
+            };
+            (target.ip().to_string(), target.port())
+        }
         Socks5Request::UdpAssociate { requested } => {
             serve_udp_association(&context, &mut external, requested, &mut stop).await;
             finish_connection(&context.statistics);
@@ -1219,7 +1237,7 @@ async fn serve_bind(
     constraint: BindPeerConstraint,
     stop: &mut watch::Receiver<()>,
 ) {
-    let allowed_ips = match resolve_bind_constraint(&constraint).await {
+    let allowed_ips = match resolve_bind_constraint(&constraint, context.egress_policy).await {
         Ok(allowed) => allowed,
         Err(()) => {
             context
@@ -1501,10 +1519,14 @@ async fn bind_dynamic_listener(
 
 async fn resolve_bind_constraint(
     constraint: &BindPeerConstraint,
+    egress_policy: EgressPolicy,
 ) -> Result<Option<HashSet<IpAddr>>, ()> {
     match &constraint.host {
         None => Ok(None),
-        Some(Socks5RequestHost::Ip(ip)) => Ok(Some(HashSet::from([*ip]))),
+        Some(Socks5RequestHost::Ip(ip)) => {
+            egress_policy.validate_ip(*ip).map_err(|_| ())?;
+            Ok(Some(HashSet::from([*ip])))
+        }
         Some(Socks5RequestHost::Domain(domain)) => {
             let port = constraint.port.unwrap_or(0);
             let resolved = timeout(BIND_DNS_TIMEOUT, lookup_host((domain.as_str(), port)))
@@ -1515,9 +1537,48 @@ async fn resolve_bind_constraint(
                 .take(BIND_MAX_RESOLVED_ADDRESSES)
                 .map(|address| address.ip())
                 .collect::<HashSet<_>>();
-            (!addresses.is_empty()).then_some(Some(addresses)).ok_or(())
+            if addresses.is_empty()
+                || addresses
+                    .iter()
+                    .any(|address| egress_policy.validate_ip(*address).is_err())
+            {
+                return Err(());
+            }
+            Ok(Some(addresses))
         }
     }
+}
+
+async fn resolve_connect_target(
+    host: &str,
+    port: u16,
+    egress_policy: EgressPolicy,
+) -> Result<SocketAddr, ()> {
+    let candidates = if let Ok(address) = host.parse::<IpAddr>() {
+        vec![SocketAddr::new(address, port)]
+    } else {
+        timeout(BIND_DNS_TIMEOUT, lookup_host((host, port)))
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())?
+            .take(BIND_MAX_RESOLVED_ADDRESSES + 1)
+            .collect::<Vec<_>>()
+    };
+    if candidates.is_empty() || candidates.len() > BIND_MAX_RESOLVED_ADDRESSES {
+        return Err(());
+    }
+    if candidates
+        .iter()
+        .any(|candidate| egress_policy.validate_ip(candidate.ip()).is_err())
+    {
+        return Err(());
+    }
+    candidates
+        .iter()
+        .copied()
+        .find(SocketAddr::is_ipv4)
+        .or_else(|| candidates.first().copied())
+        .ok_or(())
 }
 
 fn bind_peer_matches(

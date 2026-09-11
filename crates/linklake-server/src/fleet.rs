@@ -388,14 +388,18 @@ impl FleetCatalog {
 
     fn persist(&self, peer: &FleetPeer) -> anyhow::Result<()> {
         self.database.execute(
-            "INSERT OR REPLACE INTO fleet_peers (id, name, url, region, weight, priority, token_env, enabled, created_unix_seconds, updated_unix_seconds) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO fleet_peers (id, name, url, region, weight, priority, token_env, enabled, created_unix_seconds, updated_unix_seconds) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(id) DO UPDATE SET name=excluded.name, url=excluded.url,
+                 region=excluded.region, weight=excluded.weight, priority=excluded.priority,
+                 token_env=excluded.token_env, enabled=excluded.enabled,
+                 updated_unix_seconds=excluded.updated_unix_seconds",
             params![peer.id.to_string(), peer.name, peer.url, peer.region, peer.weight, peer.priority, peer.token_env, i64::from(peer.enabled), peer.created_unix_seconds as i64, peer.updated_unix_seconds as i64],
         )?;
         Ok(())
     }
 }
 
-fn validate(request: UpsertFleetPeer) -> anyhow::Result<UpsertFleetPeer> {
+pub(crate) fn validate(request: UpsertFleetPeer) -> anyhow::Result<UpsertFleetPeer> {
     let name = request.name.trim();
     let region = request.region.trim();
     let token_env = request.token_env.trim();

@@ -11,7 +11,7 @@ use std::{
 };
 use uuid::Uuid;
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 13;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 14;
 pub(crate) const MIN_READABLE_SCHEMA_VERSION: u32 = 0;
 pub(crate) const MAX_READABLE_SCHEMA_VERSION: u32 = CURRENT_SCHEMA_VERSION;
 
@@ -77,6 +77,9 @@ CREATE UNIQUE INDEX clients_agent_identity_public_key ON clients(agent_identity_
 ALTER TABLE management_api_tokens ADD COLUMN fleet_source_instance_id TEXT;";
 
 const MIGRATION_V13_NAME: &str = "certificate_routing_metadata";
+const MIGRATION_V14_NAME: &str = "dynamic_proxy_egress_policy";
+const MIGRATION_V14_CONTRACT: &str = "ALTER TABLE socks5_proxy_policies ADD COLUMN allow_private_networks INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE http_proxy_policies ADD COLUMN allow_private_networks INTEGER NOT NULL DEFAULT 0;";
 const MIGRATION_V13_CONTRACT: &str = "CREATE TABLE IF NOT EXISTS acme_config (... challenge_type TEXT NOT NULL DEFAULT 'http-01' ...);
 CREATE TABLE IF NOT EXISTS http_route_tls_policies (... certificate_identifier TEXT ...);
 ALTER TABLE acme_config ADD COLUMN challenge_type TEXT NOT NULL DEFAULT 'http-01';
@@ -209,6 +212,10 @@ impl MigrationPlan {
                     13 => {
                         apply_v13(transaction)?;
                         (MIGRATION_V13_NAME, migration_v13_checksum())
+                    }
+                    14 => {
+                        apply_v14(transaction)?;
+                        (MIGRATION_V14_NAME, migration_checksum(MIGRATION_V14_CONTRACT))
                     }
                     _ => anyhow::bail!("unsupported database migration version {version}"),
                 };
@@ -1026,12 +1033,38 @@ fn update_length_prefixed(digest: &mut Sha256, value: &[u8]) {
     digest.update(value);
 }
 
+// 新数据库的表由 Catalog 建立；旧数据库必须在迁移备份和账本事务内扩展。
+fn apply_v14(transaction: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
+    for table in ["socks5_proxy_policies", "http_proxy_policies"] {
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [table],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            continue;
+        }
+        let has_column: bool = transaction.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name = 'allow_private_networks')"),
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_column {
+            transaction.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN allow_private_networks INTEGER NOT NULL DEFAULT 0;"
+            ))?;
+        }
+    }
+    Ok(())
+}
+
 fn expected_migration(version: u32) -> anyhow::Result<(&'static str, String)> {
     match version {
         10 => Ok((MIGRATION_V10_NAME, migration_checksum(MIGRATION_V10_SQL))),
         11 => Ok((MIGRATION_V11_NAME, migration_v11_checksum())),
         12 => Ok((MIGRATION_V12_NAME, migration_v12_checksum())),
         13 => Ok((MIGRATION_V13_NAME, migration_v13_checksum())),
+        14 => Ok((MIGRATION_V14_NAME, migration_checksum(MIGRATION_V14_CONTRACT))),
         _ => anyhow::bail!("unsupported database migration version {version}"),
     }
 }

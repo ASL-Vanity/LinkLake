@@ -14,6 +14,8 @@ mod dual_stack_udp;
 mod fleet;
 mod fleet_coordination;
 mod fleet_health;
+mod fleet_health_store;
+mod fleet_store;
 mod ha_coordination;
 mod ha_management;
 mod ha_runtime;
@@ -503,6 +505,7 @@ pub(crate) fn managed_config_for_client(
         .map(|policy| ManagedSocks5Proxy {
             name: policy.name,
             public_port: policy.public_port,
+            allow_private_networks: policy.allow_private_networks,
             enabled: policy.enabled,
         })
         .collect::<Vec<_>>();
@@ -517,6 +520,7 @@ pub(crate) fn managed_config_for_client(
         .map(|policy| ManagedHttpProxy {
             name: policy.name,
             public_port: policy.public_port,
+            allow_private_networks: policy.allow_private_networks,
             enabled: policy.enabled,
         })
         .collect::<Vec<_>>();
@@ -552,13 +556,13 @@ struct AppState {
     audit: Mutex<AuditLog>,
     server_update_authentication_audit_limiter: Mutex<ServerUpdateAuthenticationAuditLimiter>,
     alerts: Mutex<AlertCatalog>,
-    fleet: Mutex<FleetCatalog>,
+    fleet: fleet_store::FleetStore,
     policy_service: PolicyService,
     policy_mutation_lock: AsyncMutex<()>,
     server_update_data_directory: Option<PathBuf>,
     server_update_operation_lock: AsyncMutex<()>,
     update_tasks: Arc<dyn UpdateTaskCoordinationStorage>,
-    fleet_health: Mutex<FleetHealthCatalog>,
+    fleet_health: fleet_health_store::FleetHealthStore,
     traffic_controls: Mutex<TrafficControlCatalog>,
     management_cookies_secure: bool,
     public_port_policy: PublicPortPolicy,
@@ -4249,7 +4253,6 @@ async fn run_server(
         StorageBackend::Sqlite => Arc::new(UpdateTaskCatalog::open(&database)?),
         StorageBackend::Postgres => Arc::new(PostgresUpdateTaskCatalog::open(
             coordination_storage.clone(),
-            &database,
             ha_runtime.clone(),
         )?),
     };
@@ -4261,7 +4264,7 @@ async fn run_server(
         started_at: Instant::now(),
         instance_id,
         lifecycle: LifecycleController::new(unix_seconds()),
-        ha_runtime,
+        ha_runtime: ha_runtime.clone(),
         enrollment_token,
         management_token: configured_management_token,
         admin_auth: AsyncMutex::new(
@@ -4275,13 +4278,21 @@ async fn run_server(
             ServerUpdateAuthenticationAuditLimiter::default(),
         ),
         alerts: Mutex::new(AlertCatalog::open_with_database(&database)?),
-        fleet: Mutex::new(FleetCatalog::open_with_database(&database)?),
+        fleet: fleet_store::FleetStore::open(
+            &database,
+            coordination_storage.clone(),
+            ha_runtime.clone(),
+        )?,
         policy_service,
         policy_mutation_lock: AsyncMutex::new(()),
         server_update_data_directory: data_dir.clone(),
         server_update_operation_lock: AsyncMutex::new(()),
         update_tasks,
-        fleet_health: Mutex::new(FleetHealthCatalog::open_with_database(&database)?),
+        fleet_health: fleet_health_store::FleetHealthStore::open(
+            &database,
+            coordination_storage.clone(),
+            ha_runtime.clone(),
+        )?,
         traffic_controls: Mutex::new(TrafficControlCatalog::open_with_database(&database)?),
         management_cookies_secure,
         public_port_policy: public_port_policy.clone(),
@@ -5861,17 +5872,12 @@ async fn metrics(
                 "could not read notification delivery metrics",
             )
         })?;
-    let fleet_health = state
-        .fleet_health
-        .lock()
-        .expect("fleet health catalog lock poisoned")
-        .metrics()
-        .map_err(|_| {
-            ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "could not read fleet health metrics",
-            )
-        })?;
+    let fleet_health = state.fleet_health.metrics().await.map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not read fleet health metrics",
+        )
+    })?;
     let statistics = state
         .tunnel_statistics
         .lock()
@@ -10191,12 +10197,11 @@ async fn retry_alert_notification_delivery(
     }
 }
 
-fn fleet_peer_exists(state: &AppState, peer_id: Uuid) -> anyhow::Result<bool> {
+async fn fleet_peer_exists(state: &AppState, peer_id: Uuid) -> anyhow::Result<bool> {
     Ok(state
         .fleet
-        .lock()
-        .expect("fleet catalog lock poisoned")
-        .list()?
+        .list()
+        .await?
         .iter()
         .any(|peer| peer.id == peer_id))
 }
@@ -10209,14 +10214,7 @@ async fn list_fleet_peers(
         .await
         .map_err(coded_management_error)?;
     require_fleet_state_leader(&state)?;
-    Ok(Json(
-        state
-            .fleet
-            .lock()
-            .expect("fleet catalog lock poisoned")
-            .list()
-            .map_err(coded_fleet_error)?,
-    ))
+    Ok(Json(state.fleet.list().await.map_err(coded_fleet_error)?))
 }
 
 async fn create_fleet_peer(
@@ -10230,15 +10228,13 @@ async fn create_fleet_peer(
     require_fleet_state_leader(&state)?;
     let peer = state
         .fleet
-        .lock()
-        .expect("fleet catalog lock poisoned")
         .create(request, unix_seconds())
+        .await
         .map_err(coded_fleet_error)?;
     state
         .fleet_health
-        .lock()
-        .expect("fleet health catalog lock poisoned")
         .ensure_peer(peer.id, unix_seconds())
+        .await
         .map_err(coded_fleet_error)?;
     record_audit(
         &state,
@@ -10261,9 +10257,8 @@ async fn update_fleet_peer(
     require_fleet_state_leader(&state)?;
     let peer = state
         .fleet
-        .lock()
-        .expect("fleet catalog lock poisoned")
         .update(peer_id, request, unix_seconds())
+        .await
         .map_err(coded_fleet_error)?
         .ok_or(CodedApiError(
             StatusCode::NOT_FOUND,
@@ -10290,9 +10285,8 @@ async fn delete_fleet_peer(
     require_fleet_state_leader(&state)?;
     if !state
         .fleet
-        .lock()
-        .expect("fleet catalog lock poisoned")
         .delete(peer_id)
+        .await
         .map_err(coded_fleet_error)?
     {
         return Err(CodedApiError(
@@ -10319,7 +10313,10 @@ async fn get_fleet_health_config(
         .await
         .map_err(coded_management_error)?;
     require_fleet_state_leader(&state)?;
-    if !fleet_peer_exists(&state, peer_id).map_err(coded_fleet_error)? {
+    if !fleet_peer_exists(&state, peer_id)
+        .await
+        .map_err(coded_fleet_error)?
+    {
         return Err(CodedApiError(
             StatusCode::NOT_FOUND,
             "unknown_fleet_peer",
@@ -10328,15 +10325,13 @@ async fn get_fleet_health_config(
     }
     state
         .fleet_health
-        .lock()
-        .expect("fleet health catalog lock poisoned")
         .ensure_peer(peer_id, unix_seconds())
+        .await
         .map_err(coded_fleet_error)?;
     state
         .fleet_health
-        .lock()
-        .expect("fleet health catalog lock poisoned")
         .snapshot(peer_id)
+        .await
         .map_err(coded_fleet_error)?
         .map(Json)
         .ok_or(CodedApiError(
@@ -10354,7 +10349,10 @@ async fn update_fleet_health_config(
 ) -> Result<Json<FleetHealthSnapshot>, CodedApiError> {
     let principal = require_administrator(&state, &headers).await?;
     require_fleet_state_leader(&state)?;
-    if !fleet_peer_exists(&state, peer_id).map_err(coded_fleet_error)? {
+    if !fleet_peer_exists(&state, peer_id)
+        .await
+        .map_err(coded_fleet_error)?
+    {
         return Err(CodedApiError(
             StatusCode::NOT_FOUND,
             "unknown_fleet_peer",
@@ -10363,9 +10361,8 @@ async fn update_fleet_health_config(
     }
     let snapshot = state
         .fleet_health
-        .lock()
-        .expect("fleet health catalog lock poisoned")
         .update_health_config(peer_id, request, unix_seconds())
+        .await
         .map_err(coded_fleet_error)?
         .ok_or(CodedApiError(
             StatusCode::NOT_FOUND,
@@ -10398,9 +10395,8 @@ async fn list_fleet_dns_failovers(
     Ok(Json(
         state
             .fleet_health
-            .lock()
-            .expect("fleet health catalog lock poisoned")
             .list_dns_failovers()
+            .await
             .map_err(coded_fleet_error)?,
     ))
 }
@@ -10414,12 +10410,10 @@ async fn list_fleet_dns_switch_events(
         .await
         .map_err(coded_management_error)?;
     require_fleet_state_leader(&state)?;
-    let fleet_health = state
-        .fleet_health
-        .lock()
-        .expect("fleet health catalog lock poisoned");
+    let fleet_health = &state.fleet_health;
     if fleet_health
         .get_dns_failover(failover_id)
+        .await
         .map_err(coded_fleet_error)?
         .is_none()
     {
@@ -10432,6 +10426,7 @@ async fn list_fleet_dns_switch_events(
     Ok(Json(
         fleet_health
             .list_dns_switch_events(failover_id, 100)
+            .await
             .map_err(coded_fleet_error)?,
     ))
 }
@@ -10442,17 +10437,11 @@ async fn create_fleet_dns_failover(
     Json(request): Json<UpsertFleetDnsFailover>,
 ) -> Result<(StatusCode, Json<FleetDnsFailover>), CodedApiError> {
     let principal = require_administrator(&state, &headers).await?;
-    let peers = state
-        .fleet
-        .lock()
-        .expect("fleet catalog lock poisoned")
-        .list()
-        .map_err(coded_fleet_error)?;
+    let peers = state.fleet.list().await.map_err(coded_fleet_error)?;
     let failover = state
         .fleet_health
-        .lock()
-        .expect("fleet health catalog lock poisoned")
         .create_dns_failover(request, &peers, unix_seconds())
+        .await
         .map_err(coded_fleet_error)?;
     record_audit(
         &state,
@@ -10477,17 +10466,11 @@ async fn update_fleet_dns_failover(
     Json(request): Json<UpsertFleetDnsFailover>,
 ) -> Result<Json<FleetDnsFailover>, CodedApiError> {
     let principal = require_administrator(&state, &headers).await?;
-    let peers = state
-        .fleet
-        .lock()
-        .expect("fleet catalog lock poisoned")
-        .list()
-        .map_err(coded_fleet_error)?;
+    let peers = state.fleet.list().await.map_err(coded_fleet_error)?;
     let failover = state
         .fleet_health
-        .lock()
-        .expect("fleet health catalog lock poisoned")
         .update_dns_failover(failover_id, request, &peers, unix_seconds())
+        .await
         .map_err(coded_fleet_error)?
         .ok_or(CodedApiError(
             StatusCode::NOT_FOUND,
@@ -10517,9 +10500,8 @@ async fn delete_fleet_dns_failover(
     let principal = require_administrator(&state, &headers).await?;
     if !state
         .fleet_health
-        .lock()
-        .expect("fleet health catalog lock poisoned")
         .delete_dns_failover(failover_id)
+        .await
         .map_err(coded_fleet_error)?
     {
         return Err(CodedApiError(
@@ -10546,9 +10528,8 @@ async fn freeze_fleet_dns_failover(
     let principal = require_administrator(&state, &headers).await?;
     let failover = state
         .fleet_health
-        .lock()
-        .expect("fleet health catalog lock poisoned")
         .set_dns_frozen(failover_id, true, Some(&request.reason), unix_seconds())
+        .await
         .map_err(coded_fleet_error)?
         .ok_or(CodedApiError(
             StatusCode::NOT_FOUND,
@@ -10576,9 +10557,8 @@ async fn resume_fleet_dns_failover(
     let principal = require_administrator(&state, &headers).await?;
     let failover = state
         .fleet_health
-        .lock()
-        .expect("fleet health catalog lock poisoned")
         .set_dns_frozen(failover_id, false, None, unix_seconds())
+        .await
         .map_err(coded_fleet_error)?
         .ok_or(CodedApiError(
             StatusCode::NOT_FOUND,
@@ -10602,9 +10582,8 @@ async fn reconcile_fleet_dns_failover(
     let principal = require_administrator(&state, &headers).await?;
     if state
         .fleet_health
-        .lock()
-        .expect("fleet health catalog lock poisoned")
         .get_dns_failover(failover_id)
+        .await
         .map_err(coded_fleet_error)?
         .is_none()
     {
@@ -10634,28 +10613,22 @@ async fn fleet_overview(
         .await
         .map_err(coded_management_error)?;
     require_fleet_state_leader(&state)?;
-    let peers = state
-        .fleet
-        .lock()
-        .expect("fleet catalog lock poisoned")
-        .list()
-        .map_err(coded_fleet_error)?;
+    let peers = state.fleet.list().await.map_err(coded_fleet_error)?;
     let now = unix_seconds();
-    let fleet_health = state
-        .fleet_health
-        .lock()
-        .expect("fleet health catalog lock poisoned");
+    let fleet_health = &state.fleet_health;
     for peer in &peers {
         fleet_health
             .ensure_peer(peer.id, now)
+            .await
             .map_err(coded_fleet_error)?;
     }
-    let snapshots = fleet_health.snapshots().map_err(coded_fleet_error)?;
+    let snapshots = fleet_health.snapshots().await.map_err(coded_fleet_error)?;
     let dns_failovers = fleet_health
         .list_dns_failovers()
+        .await
         .map_err(coded_fleet_error)?;
-    let health_metrics = fleet_health.metrics().map_err(coded_fleet_error)?;
-    drop(fleet_health);
+    let health_metrics = fleet_health.metrics().await.map_err(coded_fleet_error)?;
+
     let mut statuses = Vec::with_capacity(peers.len());
     for peer in peers {
         let snapshot = snapshots.get(&peer.id).cloned().ok_or(CodedApiError(
@@ -10721,9 +10694,16 @@ async fn export_fleet_bundle_v2(
         .await
         .map_err(coded_management_error)?;
     require_fleet_state_leader(&state)?;
+    let clients = state
+        .clients
+        .lock()
+        .await
+        .summaries()
+        .await
+        .map_err(coded_client_management_error)?;
     state
         .policy_service
-        .export_bundle(unix_seconds())
+        .export_bundle_with_clients(unix_seconds(), &clients)
         .map(Json)
         .map_err(coded_policy_service_error)
 }
@@ -10756,32 +10736,43 @@ async fn reconcile_fleet_bundle_v2(
         .metrics
         .fleet_reconcile_attempts_total
         .fetch_add(1, Ordering::Relaxed);
-    let result = match state.policy_service.reconcile(request, unix_seconds()) {
-        Ok(result) => result,
-        Err(error) => {
-            state
-                .metrics
-                .fleet_reconcile_failures_total
-                .fetch_add(1, Ordering::Relaxed);
-            if track_generation {
-                record_fleet_generation(
+    let clients = state
+        .clients
+        .lock()
+        .await
+        .summaries()
+        .await
+        .map_err(coded_client_management_error)?;
+    let result =
+        match state
+            .policy_service
+            .reconcile_with_clients(request.clone(), unix_seconds(), &clients)
+        {
+            Ok(result) => result,
+            Err(error) => {
+                state
+                    .metrics
+                    .fleet_reconcile_failures_total
+                    .fetch_add(1, Ordering::Relaxed);
+                if track_generation {
+                    record_fleet_generation(
+                        &state,
+                        &request.bundle,
+                        FleetSyncState::Failed,
+                        0,
+                        fencing_token,
+                    )
+                    .await?;
+                }
+                record_audit(
                     &state,
-                    &request.bundle,
-                    FleetSyncState::Failed,
-                    0,
-                    fencing_token,
-                )
-                .await?;
+                    "fleet.v2.reconcile.failed",
+                    &source_instance_id.to_string(),
+                    &format!("actor={}; {}", principal.username, error),
+                );
+                return Err(coded_policy_service_error(error));
             }
-            record_audit(
-                &state,
-                "fleet.v2.reconcile.failed",
-                &source_instance_id.to_string(),
-                &format!("actor={}; {}", principal.username, error),
-            );
-            return Err(coded_policy_service_error(error));
-        }
-    };
+        };
     if !result.conflicts.is_empty() {
         if track_generation {
             record_fleet_generation(
@@ -11233,13 +11224,12 @@ async fn sync_fleet_policies(
     .map_err(coded_fleet_error)?;
     let bundle = state
         .policy_service
-        .export_bundle(unix_seconds())
+        .export_bundle_with_clients(unix_seconds(), &clients)
         .map_err(coded_policy_service_error)?;
     let peers = state
         .fleet
-        .lock()
-        .expect("fleet catalog lock poisoned")
         .list()
+        .await
         .map_err(coded_fleet_error)?
         .into_iter()
         .filter(|peer| {
@@ -11552,9 +11542,8 @@ async fn run_fleet_probe_round(
     }
     let peers = state
         .fleet
-        .lock()
-        .expect("fleet catalog lock poisoned")
-        .list()?
+        .list()
+        .await?
         .into_iter()
         .filter(|peer| peer.enabled)
         .collect::<Vec<_>>();
@@ -11597,9 +11586,8 @@ async fn run_fleet_probe_round(
         }
         let result = state
             .fleet_health
-            .lock()
-            .expect("fleet health catalog lock poisoned")
-            .record_probe(peer_id, observation)?;
+            .record_probe(peer_id, observation)
+            .await?;
         if result.duplicate {
             tracing::debug!(peer_id = %result.peer_id, "Ignored duplicate Fleet probe event");
         }
@@ -11763,9 +11751,8 @@ async fn execute_fleet_dns_reconciliation_with_stop(
     }
     let plans = state
         .fleet_health
-        .lock()
-        .expect("fleet health catalog lock poisoned")
-        .plan_dns_changes(unix_seconds(), only)?;
+        .plan_dns_changes(unix_seconds(), only)
+        .await?;
     if plans.is_empty() {
         return Ok(Vec::new());
     }
@@ -11791,13 +11778,12 @@ async fn execute_fleet_dns_reconciliation_with_stop(
         let apply_error = apply_result.err().map(|error| error.to_string());
         let completion = state
             .fleet_health
-            .lock()
-            .expect("fleet health catalog lock poisoned")
             .complete_dns_change(
                 &plan,
                 apply_error.as_deref().map_or(Ok(()), Err),
                 unix_seconds(),
-            )?;
+            )
+            .await?;
         record_audit(
             state,
             if completion.applied {
@@ -12515,11 +12501,12 @@ async fn create_socks5_proxy(
         "socks5_proxy.policy.created",
         &created.policy.id.to_string(),
         &format!(
-            "client={}; port={}; name={}; username={}",
+            "client={}; port={}; name={}; username={}; allow_private_networks={}",
             created.policy.client_id,
             created.policy.public_port,
             created.policy.name,
-            created.policy.username
+            created.policy.username,
+            created.policy.allow_private_networks
         ),
     );
     Ok((StatusCode::CREATED, Json(created)))
@@ -12570,8 +12557,12 @@ async fn update_socks5_proxy(
         "socks5_proxy.policy.updated",
         &proxy_id.to_string(),
         &format!(
-            "client={}; port={}; name={}; username={}",
-            policy.client_id, policy.public_port, policy.name, policy.username
+            "client={}; port={}; name={}; username={}; allow_private_networks={}",
+            policy.client_id,
+            policy.public_port,
+            policy.name,
+            policy.username,
+            policy.allow_private_networks
         ),
     );
     Ok(Json(policy))
@@ -12742,11 +12733,12 @@ async fn create_http_proxy(
         "http_proxy.policy.created",
         &created.policy.id.to_string(),
         &format!(
-            "client={}; port={}; name={}; username={}",
+            "client={}; port={}; name={}; username={}; allow_private_networks={}",
             created.policy.client_id,
             created.policy.public_port,
             created.policy.name,
-            created.policy.username
+            created.policy.username,
+            created.policy.allow_private_networks
         ),
     );
     Ok((StatusCode::CREATED, Json(created)))
@@ -12797,8 +12789,12 @@ async fn update_http_proxy(
         "http_proxy.policy.updated",
         &proxy_id.to_string(),
         &format!(
-            "client={}; port={}; name={}; username={}",
-            policy.client_id, policy.public_port, policy.name, policy.username
+            "client={}; port={}; name={}; username={}; allow_private_networks={}",
+            policy.client_id,
+            policy.public_port,
+            policy.name,
+            policy.username,
+            policy.allow_private_networks
         ),
     );
     Ok(Json(policy))

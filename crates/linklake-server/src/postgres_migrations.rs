@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tokio_postgres::{Client, Transaction};
 
-pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 6;
+pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 8;
 const ADVISORY_LOCK_ID: i64 = 0x4c4c_4841_4d49_4752;
 
 const MIGRATION_V1_NAME: &str = "ha_coordination_foundation";
@@ -313,6 +313,60 @@ CREATE INDEX IF NOT EXISTS linklake_clients_last_seen
     ON linklake_clients(last_seen_unix_seconds DESC);
 "#;
 
+const MIGRATION_V7_NAME: &str = "shared_fleet_peer_catalog";
+const MIGRATION_V7_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS linklake_fleet_peers (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    url TEXT NOT NULL UNIQUE,
+    region TEXT NOT NULL,
+    weight INTEGER NOT NULL CHECK (weight BETWEEN 1 AND 10000),
+    priority INTEGER NOT NULL CHECK (priority BETWEEN 0 AND 10000),
+    token_env TEXT NOT NULL,
+    enabled BOOLEAN NOT NULL,
+    created_unix_seconds BIGINT NOT NULL CHECK (created_unix_seconds >= 0),
+    updated_unix_seconds BIGINT NOT NULL CHECK (updated_unix_seconds >= 0)
+);
+"#;
+
+const MIGRATION_V8_NAME: &str = "shared_fleet_health_dns";
+const MIGRATION_V8_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS linklake_fleet_health (
+    peer_id TEXT PRIMARY KEY REFERENCES linklake_fleet_peers(id) ON DELETE CASCADE,
+    snapshot JSONB NOT NULL CHECK (jsonb_typeof(snapshot) = 'object')
+);
+CREATE TABLE IF NOT EXISTS linklake_fleet_probe_events (
+    sequence BIGSERIAL NOT NULL,
+    event_id TEXT PRIMARY KEY,
+    peer_id TEXT NOT NULL REFERENCES linklake_fleet_peers(id) ON DELETE CASCADE,
+    observed_unix_seconds BIGINT NOT NULL,
+    success BOOLEAN NOT NULL,
+    accepted BOOLEAN NOT NULL,
+    transition_reason TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS linklake_fleet_probe_events_peer ON linklake_fleet_probe_events(peer_id, observed_unix_seconds DESC, sequence DESC);
+CREATE TABLE IF NOT EXISTS linklake_fleet_health_counters (
+    name TEXT PRIMARY KEY,
+    value BIGINT NOT NULL CHECK (value >= 0)
+);
+CREATE TABLE IF NOT EXISTS linklake_fleet_dns_failovers (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    zone_id TEXT NOT NULL,
+    record_id TEXT NOT NULL,
+    snapshot JSONB NOT NULL CHECK (jsonb_typeof(snapshot) = 'object'),
+    UNIQUE(zone_id, record_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS linklake_fleet_dns_hostname ON linklake_fleet_dns_failovers ((snapshot->>'hostname'));
+CREATE TABLE IF NOT EXISTS linklake_fleet_dns_events (
+    operation_id TEXT PRIMARY KEY,
+    failover_id TEXT NOT NULL REFERENCES linklake_fleet_dns_failovers(id) ON DELETE CASCADE,
+    completed_unix_seconds BIGINT NOT NULL,
+    snapshot JSONB NOT NULL CHECK (jsonb_typeof(snapshot) = 'object')
+);
+CREATE INDEX IF NOT EXISTS linklake_fleet_dns_events_failover ON linklake_fleet_dns_events(failover_id, completed_unix_seconds DESC, operation_id DESC);
+"#;
+
 struct Migration {
     version: i64,
     name: &'static str,
@@ -361,6 +415,16 @@ const MIGRATIONS: &[Migration] = &[
         version: 6,
         name: MIGRATION_V6_NAME,
         sql: MIGRATION_V6_SQL,
+    },
+    Migration {
+        version: 7,
+        name: MIGRATION_V7_NAME,
+        sql: MIGRATION_V7_SQL,
+    },
+    Migration {
+        version: 8,
+        name: MIGRATION_V8_NAME,
+        sql: MIGRATION_V8_SQL,
     },
 ];
 
@@ -453,6 +517,66 @@ pub(crate) async fn apply(client: &mut Client) -> anyhow::Result<()> {
 
 async fn verify_schema_structure(transaction: &Transaction<'_>) -> anyhow::Result<()> {
     const TABLES: &[TableExpectation] = &[
+        TableExpectation {
+            name: "linklake_fleet_health",
+            primary_key: &["peer_id"],
+            columns: &[required("peer_id", "text"), required("snapshot", "jsonb")],
+        },
+        TableExpectation {
+            name: "linklake_fleet_probe_events",
+            primary_key: &["event_id"],
+            columns: &[
+                required("sequence", "int8"),
+                required("event_id", "text"),
+                required("peer_id", "text"),
+                required("observed_unix_seconds", "int8"),
+                required("success", "bool"),
+                required("accepted", "bool"),
+                required("transition_reason", "text"),
+            ],
+        },
+        TableExpectation {
+            name: "linklake_fleet_health_counters",
+            primary_key: &["name"],
+            columns: &[required("name", "text"), required("value", "int8")],
+        },
+        TableExpectation {
+            name: "linklake_fleet_dns_failovers",
+            primary_key: &["id"],
+            columns: &[
+                required("id", "text"),
+                required("name", "text"),
+                required("zone_id", "text"),
+                required("record_id", "text"),
+                required("snapshot", "jsonb"),
+            ],
+        },
+        TableExpectation {
+            name: "linklake_fleet_dns_events",
+            primary_key: &["operation_id"],
+            columns: &[
+                required("operation_id", "text"),
+                required("failover_id", "text"),
+                required("completed_unix_seconds", "int8"),
+                required("snapshot", "jsonb"),
+            ],
+        },
+        TableExpectation {
+            name: "linklake_fleet_peers",
+            primary_key: &["id"],
+            columns: &[
+                required("id", "text"),
+                required("name", "text"),
+                required("url", "text"),
+                required("region", "text"),
+                required("weight", "int4"),
+                required("priority", "int4"),
+                required("token_env", "text"),
+                required("enabled", "bool"),
+                required("created_unix_seconds", "int8"),
+                required("updated_unix_seconds", "int8"),
+            ],
+        },
         TableExpectation {
             name: "linklake_ha_members",
             primary_key: &["instance_id"],

@@ -13,6 +13,9 @@ use uuid::Uuid;
 use crate::database::Database;
 use crate::fleet::FleetPeer;
 
+#[path = "fleet_health_postgres.rs"]
+pub(crate) mod postgres;
+
 const DEFAULT_SUCCESS_THRESHOLD: u16 = 2;
 const DEFAULT_FAILURE_THRESHOLD: u16 = 3;
 const DEFAULT_HEALTH_COOLDOWN_SECONDS: u32 = 30;
@@ -77,7 +80,7 @@ fn default_health_cooldown() -> u32 {
     DEFAULT_HEALTH_COOLDOWN_SECONDS
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct FleetHealthConfig {
     pub(crate) peer_id: Uuid,
     pub(crate) success_threshold: u16,
@@ -86,7 +89,7 @@ pub(crate) struct FleetHealthConfig {
     pub(crate) updated_unix_seconds: u64,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct FleetPeerHealth {
     pub(crate) peer_id: Uuid,
     pub(crate) state: FleetHealthState,
@@ -115,7 +118,7 @@ impl FleetPeerHealth {
     }
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct FleetHealthSnapshot {
     pub(crate) config: FleetHealthConfig,
     pub(crate) health: FleetPeerHealth,
@@ -212,7 +215,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct FleetDnsFailover {
     pub(crate) id: Uuid,
     pub(crate) name: String,
@@ -282,7 +285,7 @@ pub(crate) struct FleetDnsChangeResult {
     pub(crate) error_summary: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct FleetDnsSwitchEvent {
     pub(crate) operation_id: Uuid,
     pub(crate) failover_id: Uuid,

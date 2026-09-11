@@ -63,6 +63,8 @@ pub(crate) struct CreateSocks5ProxyPolicy {
     pub(crate) username: String,
     pub(crate) max_connections: Option<u16>,
     pub(crate) bandwidth_limit_bps: Option<u64>,
+    #[serde(default)]
+    pub(crate) allow_private_networks: bool,
 }
 
 // 更新代理策略时不会重置一次性生成的密码，只更新公开策略字段。
@@ -77,6 +79,7 @@ pub(crate) struct Socks5ProxyPolicy {
     pub(crate) username: String,
     pub(crate) max_connections: u16,
     pub(crate) bandwidth_limit_bps: Option<u64>,
+    pub(crate) allow_private_networks: bool,
     pub(crate) enabled: bool,
 }
 
@@ -94,6 +97,7 @@ pub(crate) struct Socks5ProxyRuntimePolicy {
     pub(crate) password_hash: String,
     pub(crate) max_connections: usize,
     pub(crate) bandwidth_limit_bps: Option<u64>,
+    pub(crate) allow_private_networks: bool,
 }
 
 #[derive(Deserialize)]
@@ -104,6 +108,8 @@ pub(crate) struct CreateHttpProxyPolicy {
     pub(crate) username: String,
     pub(crate) max_connections: Option<u16>,
     pub(crate) bandwidth_limit_bps: Option<u64>,
+    #[serde(default)]
+    pub(crate) allow_private_networks: bool,
 }
 
 pub(crate) type UpdateHttpProxyPolicy = CreateHttpProxyPolicy;
@@ -117,6 +123,7 @@ pub(crate) struct HttpProxyPolicy {
     pub(crate) username: String,
     pub(crate) max_connections: u16,
     pub(crate) bandwidth_limit_bps: Option<u64>,
+    pub(crate) allow_private_networks: bool,
     pub(crate) enabled: bool,
 }
 
@@ -134,6 +141,7 @@ pub(crate) struct HttpProxyRuntimePolicy {
     pub(crate) password_hash: String,
     pub(crate) max_connections: usize,
     pub(crate) bandwidth_limit_bps: Option<u64>,
+    pub(crate) allow_private_networks: bool,
 }
 
 #[derive(Debug)]
@@ -493,6 +501,7 @@ impl TunnelCatalog {
                 password_hash TEXT NOT NULL,
                 max_connections INTEGER NOT NULL DEFAULT 64,
                 bandwidth_limit_bps INTEGER,
+                allow_private_networks INTEGER NOT NULL DEFAULT 0,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 UNIQUE(client_id, name)
             );
@@ -505,6 +514,7 @@ impl TunnelCatalog {
                 password_hash TEXT NOT NULL,
                 max_connections INTEGER NOT NULL DEFAULT 64,
                 bandwidth_limit_bps INTEGER,
+                allow_private_networks INTEGER NOT NULL DEFAULT 0,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 UNIQUE(client_id, name)
             );
@@ -551,6 +561,23 @@ impl TunnelCatalog {
                 "ALTER TABLE tcp_tunnel_policies ADD COLUMN bandwidth_limit_bps INTEGER",
                 [],
             )?;
+        }
+        for table in ["socks5_proxy_policies", "http_proxy_policies"] {
+            let count: i64 = database.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = 'allow_private_networks'"
+                ),
+                [],
+                |row| row.get(0),
+            )?;
+            if count == 0 {
+                database.execute(
+                    &format!(
+                        "ALTER TABLE {table} ADD COLUMN allow_private_networks INTEGER NOT NULL DEFAULT 0"
+                    ),
+                    [],
+                )?;
+            }
         }
         validate_existing_public_ports(&database, &public_port_policy)?;
         Ok(Self {
@@ -750,10 +777,11 @@ impl TunnelCatalog {
             username: request.username.trim().to_owned(),
             max_connections: request.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
             bandwidth_limit_bps: request.bandwidth_limit_bps,
+            allow_private_networks: request.allow_private_networks,
             enabled: true,
         };
         let result = self.database.execute(
-            "INSERT INTO socks5_proxy_policies (id, client_id, name, public_port, username, password_hash, max_connections, bandwidth_limit_bps, enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
+            "INSERT INTO socks5_proxy_policies (id, client_id, name, public_port, username, password_hash, max_connections, bandwidth_limit_bps, allow_private_networks, enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)",
             params![
                 policy.id.to_string(),
                 policy.client_id.to_string(),
@@ -763,6 +791,7 @@ impl TunnelCatalog {
                 hash_socks5_password(&password),
                 policy.max_connections,
                 policy.bandwidth_limit_bps,
+                policy.allow_private_networks,
             ],
         );
         match result {
@@ -785,7 +814,7 @@ impl TunnelCatalog {
 
     pub(crate) fn list_socks5(&self) -> Result<Vec<Socks5ProxyPolicy>, Socks5PolicyError> {
         let mut statement = self.database.prepare(
-            "SELECT id, client_id, name, public_port, username, max_connections, bandwidth_limit_bps, enabled FROM socks5_proxy_policies ORDER BY public_port",
+            "SELECT id, client_id, name, public_port, username, max_connections, bandwidth_limit_bps, allow_private_networks, enabled FROM socks5_proxy_policies ORDER BY public_port",
         )?;
         let rows = statement.query_map([], read_socks5_policy)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -822,7 +851,7 @@ impl TunnelCatalog {
     ) -> Result<Option<Socks5ProxyPolicy>, Socks5PolicyError> {
         self.database
             .query_row(
-                "SELECT id, client_id, name, public_port, username, max_connections, bandwidth_limit_bps, enabled FROM socks5_proxy_policies WHERE id = ?1",
+                "SELECT id, client_id, name, public_port, username, max_connections, bandwidth_limit_bps, allow_private_networks, enabled FROM socks5_proxy_policies WHERE id = ?1",
                 [id.to_string()],
                 read_socks5_policy,
             )
@@ -863,10 +892,11 @@ impl TunnelCatalog {
             username: request.username.trim().to_owned(),
             max_connections: request.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
             bandwidth_limit_bps: request.bandwidth_limit_bps,
+            allow_private_networks: request.allow_private_networks,
             enabled: current.enabled,
         };
         self.database.execute(
-            "UPDATE socks5_proxy_policies SET client_id = ?1, name = ?2, public_port = ?3, username = ?4, max_connections = ?5, bandwidth_limit_bps = ?6 WHERE id = ?7",
+            "UPDATE socks5_proxy_policies SET client_id = ?1, name = ?2, public_port = ?3, username = ?4, max_connections = ?5, bandwidth_limit_bps = ?6, allow_private_networks = ?7 WHERE id = ?8",
             params![
                 policy.client_id.to_string(),
                 policy.name,
@@ -874,6 +904,7 @@ impl TunnelCatalog {
                 policy.username,
                 policy.max_connections,
                 policy.bandwidth_limit_bps,
+                policy.allow_private_networks,
                 policy.id.to_string(),
             ],
         )?;
@@ -888,7 +919,7 @@ impl TunnelCatalog {
     ) -> Result<Option<Socks5ProxyRuntimePolicy>, Socks5PolicyError> {
         self.database
             .query_row(
-                "SELECT id, username, password_hash, max_connections, bandwidth_limit_bps FROM socks5_proxy_policies WHERE client_id = ?1 AND name = ?2 AND public_port = ?3 AND enabled = 1",
+                "SELECT id, username, password_hash, max_connections, bandwidth_limit_bps, allow_private_networks FROM socks5_proxy_policies WHERE client_id = ?1 AND name = ?2 AND public_port = ?3 AND enabled = 1",
                 params![client_id.to_string(), name, public_port],
                 |row| {
                     let id: String = row.get(0)?;
@@ -901,6 +932,7 @@ impl TunnelCatalog {
                         bandwidth_limit_bps: row
                             .get::<_, Option<i64>>(4)?
                             .map(|value| value as u64),
+                        allow_private_networks: row.get::<_, i64>(5)? != 0,
                     })
                 },
             )
@@ -930,10 +962,11 @@ impl TunnelCatalog {
             username: request.username.trim().to_owned(),
             max_connections: request.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
             bandwidth_limit_bps: request.bandwidth_limit_bps,
+            allow_private_networks: request.allow_private_networks,
             enabled: true,
         };
         let result = self.database.execute(
-            "INSERT INTO http_proxy_policies (id, client_id, name, public_port, username, password_hash, max_connections, bandwidth_limit_bps, enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
+            "INSERT INTO http_proxy_policies (id, client_id, name, public_port, username, password_hash, max_connections, bandwidth_limit_bps, allow_private_networks, enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)",
             params![
                 policy.id.to_string(),
                 policy.client_id.to_string(),
@@ -943,6 +976,7 @@ impl TunnelCatalog {
                 hash_http_proxy_password(&password),
                 policy.max_connections,
                 policy.bandwidth_limit_bps,
+                policy.allow_private_networks,
             ],
         );
         match result {
@@ -965,7 +999,7 @@ impl TunnelCatalog {
 
     pub(crate) fn list_http_proxies(&self) -> Result<Vec<HttpProxyPolicy>, HttpProxyPolicyError> {
         let mut statement = self.database.prepare(
-            "SELECT id, client_id, name, public_port, username, max_connections, bandwidth_limit_bps, enabled FROM http_proxy_policies ORDER BY public_port",
+            "SELECT id, client_id, name, public_port, username, max_connections, bandwidth_limit_bps, allow_private_networks, enabled FROM http_proxy_policies ORDER BY public_port",
         )?;
         let rows = statement.query_map([], read_http_proxy_policy)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1002,7 +1036,7 @@ impl TunnelCatalog {
     ) -> Result<Option<HttpProxyPolicy>, HttpProxyPolicyError> {
         self.database
             .query_row(
-                "SELECT id, client_id, name, public_port, username, max_connections, bandwidth_limit_bps, enabled FROM http_proxy_policies WHERE id = ?1",
+                "SELECT id, client_id, name, public_port, username, max_connections, bandwidth_limit_bps, allow_private_networks, enabled FROM http_proxy_policies WHERE id = ?1",
                 [id.to_string()],
                 read_http_proxy_policy,
             )
@@ -1043,10 +1077,11 @@ impl TunnelCatalog {
             username: request.username.trim().to_owned(),
             max_connections: request.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
             bandwidth_limit_bps: request.bandwidth_limit_bps,
+            allow_private_networks: request.allow_private_networks,
             enabled: current.enabled,
         };
         self.database.execute(
-            "UPDATE http_proxy_policies SET client_id = ?1, name = ?2, public_port = ?3, username = ?4, max_connections = ?5, bandwidth_limit_bps = ?6 WHERE id = ?7",
+            "UPDATE http_proxy_policies SET client_id = ?1, name = ?2, public_port = ?3, username = ?4, max_connections = ?5, bandwidth_limit_bps = ?6, allow_private_networks = ?7 WHERE id = ?8",
             params![
                 policy.client_id.to_string(),
                 policy.name,
@@ -1054,6 +1089,7 @@ impl TunnelCatalog {
                 policy.username,
                 policy.max_connections,
                 policy.bandwidth_limit_bps,
+                policy.allow_private_networks,
                 policy.id.to_string(),
             ],
         )?;
@@ -1068,7 +1104,7 @@ impl TunnelCatalog {
     ) -> Result<Option<HttpProxyRuntimePolicy>, HttpProxyPolicyError> {
         self.database
             .query_row(
-                "SELECT id, username, password_hash, max_connections, bandwidth_limit_bps FROM http_proxy_policies WHERE client_id = ?1 AND name = ?2 AND public_port = ?3 AND enabled = 1",
+                "SELECT id, username, password_hash, max_connections, bandwidth_limit_bps, allow_private_networks FROM http_proxy_policies WHERE client_id = ?1 AND name = ?2 AND public_port = ?3 AND enabled = 1",
                 params![client_id.to_string(), name, public_port],
                 |row| {
                     let id: String = row.get(0)?;
@@ -1081,6 +1117,7 @@ impl TunnelCatalog {
                         bandwidth_limit_bps: row
                             .get::<_, Option<i64>>(4)?
                             .map(|value| value as u64),
+                        allow_private_networks: row.get::<_, i64>(5)? != 0,
                     })
                 },
             )
@@ -1734,7 +1771,8 @@ fn read_socks5_policy(row: &rusqlite::Row<'_>) -> rusqlite::Result<Socks5ProxyPo
         username: row.get(4)?,
         max_connections: row.get(5)?,
         bandwidth_limit_bps: row.get(6)?,
-        enabled: row.get::<_, i64>(7)? != 0,
+        allow_private_networks: row.get::<_, i64>(7)? != 0,
+        enabled: row.get::<_, i64>(8)? != 0,
     })
 }
 
@@ -1749,7 +1787,8 @@ fn read_http_proxy_policy(row: &rusqlite::Row<'_>) -> rusqlite::Result<HttpProxy
         username: row.get(4)?,
         max_connections: row.get(5)?,
         bandwidth_limit_bps: row.get(6)?,
-        enabled: row.get::<_, i64>(7)? != 0,
+        allow_private_networks: row.get::<_, i64>(7)? != 0,
+        enabled: row.get::<_, i64>(8)? != 0,
     })
 }
 
@@ -1960,6 +1999,7 @@ mod tests {
             username: "linklake-user".to_owned(),
             max_connections: Some(8),
             bandwidth_limit_bps: Some(1_048_576),
+            allow_private_networks: false,
         }
     }
 
@@ -1971,6 +2011,7 @@ mod tests {
             username: "proxy-user".to_owned(),
             max_connections: Some(8),
             bandwidth_limit_bps: Some(1_048_576),
+            allow_private_networks: false,
         }
     }
 

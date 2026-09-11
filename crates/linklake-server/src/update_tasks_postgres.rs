@@ -15,7 +15,6 @@ const MAINTENANCE_LOCK_NAMESPACE: i32 = 0x4c4c_554d;
 #[derive(Clone)]
 pub(crate) struct PostgresUpdateTaskCatalog {
     storage: CoordinationStorage,
-    database: Database,
     runtime: Arc<HaRuntime>,
 }
 
@@ -36,7 +35,6 @@ enum TokenUpdate<'a> {
 impl PostgresUpdateTaskCatalog {
     pub(crate) fn open(
         storage: CoordinationStorage,
-        database: &Database,
         runtime: Arc<HaRuntime>,
     ) -> Result<Self, UpdateTaskError> {
         if storage.backend() != StorageBackend::Postgres {
@@ -44,11 +42,7 @@ impl PostgresUpdateTaskCatalog {
                 "PostgreSQL remote update catalog requires PostgreSQL coordination storage"
             )));
         }
-        Ok(Self {
-            storage,
-            database: database.clone(),
-            runtime,
-        })
+        Ok(Self { storage, runtime })
     }
 
     async fn create_inner(
@@ -60,19 +54,23 @@ impl PostgresUpdateTaskCatalog {
             .validate()
             .map_err(|error| domain_error(UpdateTaskError::Contract(error)))?;
         validate_requested_by(requested_by).map_err(domain_error)?;
-        if !self
-            .client_exists(request.target_client_id)
-            .map_err(domain_error)?
-        {
-            return Err(domain_error(UpdateTaskError::TargetNotFound));
-        }
-
         let request = request.clone();
         let requested_by = requested_by.to_owned();
         let fingerprint = request_fingerprint(&request, &requested_by);
         let mut client = self.storage.postgres_client().await?;
         let transaction = client.transaction().await?;
         self.assert_leader(&transaction).await?;
+        // 目标身份与任务在同一共享数据库事务内读取，禁止回退本地 SQLite。
+        // 行锁让并发删除等待任务创建结束，避免校验与写入之间目标消失。
+        let target = transaction
+            .query_opt(
+                "SELECT client_id FROM linklake_clients WHERE client_id = $1 FOR KEY SHARE",
+                &[&request.target_client_id.to_string()],
+            )
+            .await?;
+        if target.is_none() {
+            return Err(domain_error(UpdateTaskError::TargetNotFound));
+        }
         lock_text(
             &transaction,
             IDEMPOTENCY_LOCK_NAMESPACE,
@@ -624,20 +622,6 @@ impl PostgresUpdateTaskCatalog {
         append_event(&transaction, &stored.task, event, now).await?;
         transaction.commit().await?;
         Ok(stored.task)
-    }
-
-    fn client_exists(&self, target_client_id: Uuid) -> Result<bool, UpdateTaskError> {
-        self.database
-            .with_connection(|connection| {
-                connection
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM clients WHERE client_id = ?1)",
-                        [target_client_id.to_string()],
-                        |row| row.get(0),
-                    )
-                    .map_err(Into::into)
-            })
-            .map_err(UpdateTaskError::Storage)
     }
 
     async fn assert_leader(&self, transaction: &PostgresTransaction<'_>) -> anyhow::Result<()> {

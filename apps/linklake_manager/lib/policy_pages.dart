@@ -409,6 +409,13 @@ extension PolicyKindInfo on PolicyKind {
       ),
       PolicyField('username', '代理用户名', 'Proxy username', required: true),
       PolicyField(
+        'allow_private_networks',
+        '允许访问私有网络（仍禁止回环、链路本地和云元数据地址）',
+        'Allow private networks (loopback, link-local and cloud metadata remain blocked)',
+        type: PolicyFieldType.toggle,
+        defaultValue: false,
+      ),
+      PolicyField(
         'max_connections',
         '最大连接数',
         'Maximum connections',

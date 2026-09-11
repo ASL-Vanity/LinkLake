@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use linklake_core::{
+    egress_policy::EgressPolicy,
     read_udp_data_plane_control_frame,
     socks5_udp::{
         decode_socks5_udp_datagram, encode_socks5_udp_response, Socks5UdpDatagram, Socks5UdpTarget,
@@ -18,7 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    net::{lookup_host, UdpSocket},
+    net::UdpSocket,
     sync::{mpsc, Semaphore},
     time::{interval, MissedTickBehavior},
 };
@@ -52,6 +53,7 @@ pub(crate) async fn run(
     mut data_plane: EstablishedDataPlane,
     idle_timeout: Duration,
     queue_budget: Arc<Semaphore>,
+    egress_policy: EgressPolicy,
 ) -> anyhow::Result<()> {
     let connection = data_plane.connection.clone();
     let max_datagram_size = data_plane.max_datagram_size;
@@ -105,6 +107,7 @@ pub(crate) async fn run(
                         connection.clone(),
                         max_datagram_size,
                         next_datagram_id.clone(),
+                        egress_policy,
                     ).await?);
                 }
                 let Some(session) = sessions.get(&session_id) else { continue; };
@@ -144,6 +147,7 @@ async fn create_session(
     connection: quinn::Connection,
     max_datagram_size: usize,
     next_datagram_id: Arc<AtomicU64>,
+    egress_policy: EgressPolicy,
 ) -> anyhow::Result<TargetSession> {
     let ipv4 = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)).await?;
     let ipv6 = UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0))
@@ -160,6 +164,7 @@ async fn create_session(
         max_datagram_size,
         next_datagram_id,
         last_activity.clone(),
+        egress_policy,
     ));
     Ok(TargetSession {
         sender,
@@ -178,6 +183,7 @@ async fn run_session(
     max_datagram_size: usize,
     next_datagram_id: Arc<AtomicU64>,
     last_activity: Arc<Mutex<Instant>>,
+    egress_policy: EgressPolicy,
 ) {
     let mut allowed_targets = HashSet::<SocketAddr>::new();
     let mut ipv4_buffer = vec![0_u8; MAX_UDP_DATAGRAM_BYTES];
@@ -186,7 +192,7 @@ async fn run_session(
         tokio::select! {
             datagram = incoming.recv() => {
                 let Some(QueuedDatagram { datagram, _permit }) = datagram else { return; };
-                let Some(target) = resolve_target(&datagram).await else { continue; };
+                let Some(target) = resolve_target(&datagram, egress_policy).await else { continue; };
                 if !target_is_admissible(&allowed_targets, target) {
                     continue;
                 }
@@ -225,17 +231,19 @@ async fn run_session(
     }
 }
 
-async fn resolve_target(datagram: &Socks5UdpDatagram) -> Option<SocketAddr> {
+async fn resolve_target(
+    datagram: &Socks5UdpDatagram,
+    egress_policy: EgressPolicy,
+) -> Option<SocketAddr> {
     match &datagram.target {
-        Socks5UdpTarget::Ip(ip) => Some(SocketAddr::new(*ip, datagram.port)),
+        Socks5UdpTarget::Ip(ip) => egress_policy
+            .validate_ip(*ip)
+            .ok()
+            .map(|_| SocketAddr::new(*ip, datagram.port)),
         Socks5UdpTarget::Domain(domain) => {
-            let mut addresses = lookup_host((domain.as_str(), datagram.port)).await.ok()?;
-            let first = addresses.next()?;
-            if first.is_ipv4() {
-                Some(first)
-            } else {
-                addresses.find(SocketAddr::is_ipv4).or(Some(first))
-            }
+            crate::proxy_egress::resolve_udp_target(domain, datagram.port, egress_policy)
+                .await
+                .ok()
         }
     }
 }

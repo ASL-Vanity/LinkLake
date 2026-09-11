@@ -40,6 +40,7 @@ use uuid::Uuid;
 
 mod p2p_iroh;
 mod p2p_noise;
+mod proxy_egress;
 mod remote_update;
 mod socks5_udp_agent;
 mod target_probe;
@@ -671,12 +672,16 @@ enum P2pPathPolicy {
 struct Socks5ProxyConfig {
     name: String,
     public_port: u16,
+    #[serde(default)]
+    allow_private_networks: bool,
 }
 
 #[derive(Clone, Deserialize)]
 struct HttpProxyConfig {
     name: String,
     public_port: u16,
+    #[serde(default)]
+    allow_private_networks: bool,
 }
 
 #[derive(Clone, Copy, Deserialize, Hash, PartialEq, Eq)]
@@ -742,10 +747,12 @@ enum AgentSpec {
     Socks5 {
         name: String,
         public_port: u16,
+        allow_private_networks: bool,
     },
     HttpProxy {
         name: String,
         public_port: u16,
+        allow_private_networks: bool,
     },
 }
 
@@ -1730,7 +1737,11 @@ fn spawn_agent_task(
                 )
                 .await
             }
-            AgentSpec::Socks5 { name, public_port } => {
+            AgentSpec::Socks5 {
+                name,
+                public_port,
+                allow_private_networks,
+            } => {
                 run_socks5_agent(
                     transport,
                     identity.client_id,
@@ -1738,16 +1749,22 @@ fn spawn_agent_task(
                     public_port,
                     name,
                     udp_queue_budget,
+                    allow_private_networks,
                 )
                 .await
             }
-            AgentSpec::HttpProxy { name, public_port } => {
+            AgentSpec::HttpProxy {
+                name,
+                public_port,
+                allow_private_networks,
+            } => {
                 run_http_proxy_agent(
                     transport,
                     identity.client_id,
                     identity.client_token,
                     public_port,
                     name,
+                    allow_private_networks,
                 )
                 .await
             }
@@ -1829,6 +1846,7 @@ fn agent_specs(
             AgentSpec::Socks5 {
                 name: proxy.name.clone(),
                 public_port: proxy.public_port,
+                allow_private_networks: proxy.allow_private_networks,
             },
         );
     }
@@ -1838,6 +1856,7 @@ fn agent_specs(
             AgentSpec::HttpProxy {
                 name: proxy.name.clone(),
                 public_port: proxy.public_port,
+                allow_private_networks: proxy.allow_private_networks,
             },
         );
     }
@@ -1928,6 +1947,7 @@ fn local_managed_config(config: &ClientConfigFile) -> ManagedClientConfig {
         .map(|proxy| ManagedSocks5Proxy {
             name: proxy.name.clone(),
             public_port: proxy.public_port,
+            allow_private_networks: proxy.allow_private_networks,
             enabled: true,
         })
         .collect::<Vec<_>>();
@@ -1937,6 +1957,7 @@ fn local_managed_config(config: &ClientConfigFile) -> ManagedClientConfig {
         .map(|proxy| ManagedHttpProxy {
             name: proxy.name.clone(),
             public_port: proxy.public_port,
+            allow_private_networks: proxy.allow_private_networks,
             enabled: true,
         })
         .collect::<Vec<_>>();
@@ -3577,6 +3598,7 @@ mod tests {
         config.http_proxies.push(ManagedHttpProxy {
             name: "web-exit".to_owned(),
             public_port: 32_023,
+            allow_private_networks: false,
             enabled: true,
         });
         config.revision = linklake_core::managed_config_revision(&config)
@@ -3597,6 +3619,7 @@ mod tests {
         config.socks5_proxies.push(ManagedSocks5Proxy {
             name: "office-exit".to_owned(),
             public_port: 32_021,
+            allow_private_networks: false,
             enabled: true,
         });
         config.revision = linklake_core::managed_config_revision(&config)
@@ -4044,6 +4067,7 @@ async fn run_socks5_agent(
     public_port: u16,
     name: String,
     udp_queue_budget: Arc<tokio::sync::Semaphore>,
+    allow_private_networks: bool,
 ) -> anyhow::Result<()> {
     let mut retry_seconds = 1_u64;
     loop {
@@ -4055,6 +4079,7 @@ async fn run_socks5_agent(
             public_port,
             name.clone(),
             udp_queue_budget.clone(),
+            allow_private_networks,
         )
         .await;
         if session_started.elapsed() >= Duration::from_secs(30) {
@@ -4086,6 +4111,7 @@ async fn run_socks5_agent_session(
     public_port: u16,
     name: String,
     udp_queue_budget: Arc<tokio::sync::Semaphore>,
+    configured_allow_private_networks: bool,
 ) -> anyhow::Result<()> {
     let mut stream = connect_control(&transport).await?;
     write_control_frame(
@@ -4095,6 +4121,7 @@ async fn run_socks5_agent_session(
             client_token: token.clone(),
             name,
             public_port,
+            supports_egress_policy: true,
         },
     )
     .await?;
@@ -4125,10 +4152,11 @@ async fn run_socks5_agent_session(
         }
         frame => (frame, None),
     };
-    match registered {
+    let allow_private_networks = match registered {
         ControlFrame::Socks5ProxyRegistered {
             public_port,
             udp_associate,
+            allow_private_networks,
             ..
         } => {
             tracing::info!("SOCKS5 proxy registered on public port {public_port}.");
@@ -4136,19 +4164,30 @@ async fn run_socks5_agent_session(
                 udp_associate == udp_data_plane.is_some(),
                 "SOCKS5 UDP negotiation state mismatch"
             );
+            anyhow::ensure!(
+                allow_private_networks == configured_allow_private_networks,
+                "SOCKS5 egress policy negotiation mismatch"
+            );
+            allow_private_networks
         }
         ControlFrame::Error { message } => {
             anyhow::bail!("server rejected SOCKS5 proxy: {message}")
         }
         frame => anyhow::bail!("unexpected SOCKS5 registration response: {frame:?}"),
-    }
+    };
     let (reader, writer) = split(stream);
     let heartbeat = tokio::spawn(send_control_heartbeats(writer));
-    let control = read_socks5_registered_control(reader, transport, client_id, token);
+    let control =
+        read_socks5_registered_control(reader, transport, client_id, token, allow_private_networks);
     let result = if let Some((data_plane, idle_timeout)) = udp_data_plane {
         tokio::select! {
             result = control => result,
-            result = socks5_udp_agent::run(data_plane, idle_timeout, udp_queue_budget) => result,
+            result = socks5_udp_agent::run(
+                data_plane,
+                idle_timeout,
+                udp_queue_budget,
+                linklake_core::egress_policy::EgressPolicy::new(allow_private_networks),
+            ) => result,
         }
     } else {
         control.await
@@ -4162,6 +4201,7 @@ async fn read_socks5_registered_control(
     transport: ControlTransport,
     client_id: Uuid,
     token: String,
+    allow_private_networks: bool,
 ) -> anyhow::Result<()> {
     loop {
         let frame = timeout(CONTROL_HEARTBEAT_TIMEOUT, read_control_frame(&mut reader))
@@ -4183,6 +4223,7 @@ async fn read_socks5_registered_control(
                         client_id,
                         token,
                         connection_id,
+                        allow_private_networks,
                     )
                     .await
                     {
@@ -4204,10 +4245,15 @@ async fn open_socks5_data_connection(
     client_id: Uuid,
     client_token: String,
     connection_id: Uuid,
+    allow_private_networks: bool,
 ) -> anyhow::Result<()> {
     let mut target_stream = timeout(
         TARGET_CONNECT_TIMEOUT,
-        TcpStream::connect((target_host.as_str(), target_port)),
+        proxy_egress::connect_tcp(
+            &target_host,
+            target_port,
+            linklake_core::egress_policy::EgressPolicy::new(allow_private_networks),
+        ),
     )
     .await
     .map_err(|_| anyhow::anyhow!("SOCKS5 target connection timed out"))??;
@@ -4231,6 +4277,7 @@ async fn run_http_proxy_agent(
     token: String,
     public_port: u16,
     name: String,
+    allow_private_networks: bool,
 ) -> anyhow::Result<()> {
     let mut retry_seconds = 1_u64;
     loop {
@@ -4241,6 +4288,7 @@ async fn run_http_proxy_agent(
             token.clone(),
             public_port,
             name.clone(),
+            allow_private_networks,
         )
         .await;
         if session_started.elapsed() >= Duration::from_secs(30) {
@@ -4271,6 +4319,7 @@ async fn run_http_proxy_agent_session(
     token: String,
     public_port: u16,
     name: String,
+    configured_allow_private_networks: bool,
 ) -> anyhow::Result<()> {
     let mut stream = connect_control(&transport).await?;
     write_control_frame(
@@ -4280,12 +4329,21 @@ async fn run_http_proxy_agent_session(
             client_token: token.clone(),
             name,
             public_port,
+            supports_egress_policy: true,
         },
     )
     .await?;
     match read_control_frame(&mut stream).await? {
-        ControlFrame::HttpProxyRegistered { public_port, .. } => {
+        ControlFrame::HttpProxyRegistered {
+            public_port,
+            allow_private_networks,
+            ..
+        } => {
             tracing::info!("HTTP forward proxy registered on public port {public_port}.");
+            anyhow::ensure!(
+                allow_private_networks == configured_allow_private_networks,
+                "HTTP proxy egress policy negotiation mismatch"
+            );
         }
         ControlFrame::Error { message } => {
             anyhow::bail!("server rejected HTTP forward proxy: {message}")
@@ -4294,7 +4352,14 @@ async fn run_http_proxy_agent_session(
     }
     let (reader, writer) = split(stream);
     let heartbeat = tokio::spawn(send_control_heartbeats(writer));
-    let result = read_http_proxy_registered_control(reader, transport, client_id, token).await;
+    let result = read_http_proxy_registered_control(
+        reader,
+        transport,
+        client_id,
+        token,
+        configured_allow_private_networks,
+    )
+    .await;
     heartbeat.abort();
     result
 }
@@ -4304,6 +4369,7 @@ async fn read_http_proxy_registered_control(
     transport: ControlTransport,
     client_id: Uuid,
     token: String,
+    allow_private_networks: bool,
 ) -> anyhow::Result<()> {
     loop {
         let frame = timeout(CONTROL_HEARTBEAT_TIMEOUT, read_control_frame(&mut reader))
@@ -4325,6 +4391,7 @@ async fn read_http_proxy_registered_control(
                         client_id,
                         token,
                         connection_id,
+                        allow_private_networks,
                     )
                     .await
                     {
@@ -4346,10 +4413,15 @@ async fn open_http_proxy_data_connection(
     client_id: Uuid,
     client_token: String,
     connection_id: Uuid,
+    allow_private_networks: bool,
 ) -> anyhow::Result<()> {
     let mut target_stream = timeout(
         TARGET_CONNECT_TIMEOUT,
-        TcpStream::connect((target_host.as_str(), target_port)),
+        proxy_egress::connect_tcp(
+            &target_host,
+            target_port,
+            linklake_core::egress_policy::EgressPolicy::new(allow_private_networks),
+        ),
     )
     .await
     .map_err(|_| anyhow::anyhow!("HTTP proxy target connection timed out"))??;

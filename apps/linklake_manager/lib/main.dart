@@ -572,6 +572,8 @@ class _DashboardPageState extends State<DashboardPage> {
   Map<String, dynamic> _identity = {};
   Map<String, dynamic> _fleet = {};
   Map<String, dynamic> _ha = {};
+  List<dynamic> _fleetGenerations = [];
+  List<dynamic> _fleetConflicts = [];
   Map<String, dynamic> _serverUpdate = {};
   List<dynamic> _remoteUpdateTasks = [];
   Map<String, dynamic> _diagnostics = {};
@@ -716,6 +718,10 @@ class _DashboardPageState extends State<DashboardPage> {
         _fleet = Map<String, dynamic>.from(value as Map);
       case 'ha':
         _ha = Map<String, dynamic>.from(value as Map);
+      case 'fleetGenerations':
+        _fleetGenerations = value as List<dynamic>;
+      case 'fleetConflicts':
+        _fleetConflicts = value as List<dynamic>;
       case 'serverUpdate':
         _serverUpdate = Map<String, dynamic>.from(value as Map);
       case 'remoteUpdateTasks':
@@ -1183,6 +1189,7 @@ class _DashboardPageState extends State<DashboardPage> {
       'proxy': (Icons.language_outlined, 'HTTP Proxy'),
       'p2p': (Icons.hub_outlined, 'P2P'),
       'ha': (Icons.lan_outlined, t('HA 绠＄悊', 'HA management')),
+      'fleetLedger': (Icons.account_tree_outlined, t('Fleet 鍏变韩璐︽湰', 'Fleet ledger')),
       'fleet': (Icons.cloud_sync_outlined, t('多云', 'Multi-cloud')),
       'updates': (Icons.system_update_alt, t('更新', 'Updates')),
       'alerts': (Icons.warning_amber_outlined, t('告警', 'Alerts')),
@@ -1212,6 +1219,7 @@ class _DashboardPageState extends State<DashboardPage> {
     'proxy' => _policyPage(PolicyKind.proxy),
     'p2p' => _p2pPage(),
     'ha' when _capabilities.canViewHa => _haPage(),
+    'fleetLedger' => _fleetLedgerPage(),
     'fleet' when _capabilities.canViewFleet => _fleetPage(),
     'updates' when _capabilities.canManageUpdates => _updatesPage(),
     'alerts' => _alertsPage(),
@@ -1363,34 +1371,44 @@ class _DashboardPageState extends State<DashboardPage> {
     final jobs = _haRecords(_ha['job_leases']);
     final ports = _haRecords(_ha['port_ownership']);
     final events = _haRecords(_ha['recent_events']);
-    final targetHealth = Map<String, dynamic>.from(
-      _ha['target_health'] as Map? ?? const {},
-    );
+    final rawTargetHealth = _ha['target_health'];
+    final targetHealth = rawTargetHealth is Map
+        ? Map<String, dynamic>.from(rawTargetHealth)
+        : <String, dynamic>{};
     final targets = _haRecords(targetHealth['targets']);
-    final leader = _ha['current_leader'] is Map
-        ? Map<String, dynamic>.from(_ha['current_leader'] as Map)
+    final rawLeader = _ha['current_leader'];
+    final leader = rawLeader is Map
+        ? Map<String, dynamic>.from(rawLeader)
         : <String, dynamic>{};
     final postgresHa = _ha['mode'] == 'postgres_ha';
     final localLeader = _ha['local_is_leader'] == true;
     final cards = <(String, String, IconData)>[
       (
-        t('鍗忚皟妯″紡', 'Coordination mode'),
-        postgresHa ? 'PostgreSQL HA' : t('SQLite 鍗曞疄渚?, 'SQLite single instance'),
+        t('\u534f\u8c03\u6a21\u5f0f', 'Coordination mode'),
+        postgresHa
+            ? 'PostgreSQL HA'
+            : t('SQLite \u5355\u5b9e\u4f8b', 'SQLite single instance'),
         Icons.storage_outlined,
       ),
       (
-        t('褰撳墠瑙掕壊', 'Local role'),
+        t('\u5f53\u524d\u89d2\u8272', 'Local role'),
         localLeader ? 'Leader' : 'Follower',
-        localLeader ? Icons.workspace_premium_outlined : Icons.visibility_outlined,
+        localLeader
+            ? Icons.workspace_premium_outlined
+            : Icons.visibility_outlined,
       ),
-      (t('娲诲姩鎴愬憳', 'Active members'), '${members.length}', Icons.dns_outlined),
       (
-        t('鍋ュ悍鐩爣', 'Healthy targets'),
+        t('\u6d3b\u52a8\u6210\u5458', 'Active members'),
+        '${members.length}',
+        Icons.dns_outlined,
+      ),
+      (
+        t('\u5065\u5eb7\u76ee\u6807', 'Healthy targets'),
         '${targetHealth['healthy'] ?? 0}/${targetHealth['total'] ?? 0}',
         Icons.monitor_heart_outlined,
       ),
       (
-        t('绔彛 / 浠诲姟绉熺害', 'Port / job leases'),
+        t('\u7aef\u53e3 / \u4efb\u52a1\u79df\u7ea6', 'Port / job leases'),
         '${ports.length} / ${jobs.length}',
         Icons.lock_clock_outlined,
       ),
@@ -1399,39 +1417,32 @@ class _DashboardPageState extends State<DashboardPage> {
       ListView(
         children: [
           _pageTitle(
-            t('HA 绠＄悊', 'HA management'),
+            t('HA \u7ba1\u7406', 'HA management'),
             t(
-              '鍙鏌ョ湅鎴愬憳銆丩eader銆乫encing銆佺绾︿笌鐩爣鍋ュ悍锛屼笉鏄剧ず杩炴帴涓插拰鍑嵁銆?,
+              '\u53ea\u8bfb\u67e5\u770b\u6210\u5458\u3001Leader\u3001fencing\u3001\u79df\u7ea6\u4e0e\u76ee\u6807\u5065\u5eb7\uff0c\u4e0d\u663e\u793a\u8fde\u63a5\u4e32\u548c\u51ed\u636e\u3002',
               'Read-only members, leader, fencing, leases, and target health without connection strings or credentials.',
             ),
           ),
           const SizedBox(height: 18),
-          LayoutBuilder(
-            builder: (context, constraints) {
-              final columns = constraints.maxWidth >= 1100 ? 5 : constraints.maxWidth >= 700 ? 3 : 1;
-              final width = (constraints.maxWidth - (columns - 1) * 12) / columns;
-              return Wrap(
-                spacing: 12,
-                runSpacing: 12,
-                children: [
-                  for (final card in cards)
-                    SizedBox(width: width, child: _metricCard(card)),
-                ],
-              );
-            },
-          ),
+          _managementMetricWrap(cards),
           const SizedBox(height: 18),
           _haSection(
-            t('Leader 绉熺害', 'Leader lease'),
+            t('Leader \u79df\u7ea6', 'Leader lease'),
             leader.isEmpty
-                ? [_emptyHaLine(t('鏆傛棤娲诲姩 Leader', 'No active leader'))]
+                ? [
+                    _emptyHaLine(
+                      t('\u6682\u65e0\u6d3b\u52a8 Leader', 'No active leader'),
+                    ),
+                  ]
                 : [
                     ListTile(
                       leading: const Icon(Icons.workspace_premium_outlined),
                       title: SelectableText(_haShortId(leader['instance_id'])),
                       subtitle: Text(
-                        '${t('Fencing token', 'Fencing token')}: ${leader['fencing_token']}\n'
-                        '${t('绉熺害鍓╀綑', 'Lease remaining')}: ${_duration(leader['lease_remaining_seconds'])} · ${_haTimestamp(leader['lease_until_unix_seconds'])}',
+                        'Fencing token: ${leader['fencing_token']}\n'
+                        '${t('\u79df\u7ea6\u5269\u4f59', 'Lease remaining')}: '
+                        '${_duration(leader['lease_remaining_seconds'])} · '
+                        '${_haTimestamp(leader['lease_until_unix_seconds'])}',
                       ),
                       isThreeLine: true,
                     ),
@@ -1439,9 +1450,13 @@ class _DashboardPageState extends State<DashboardPage> {
           ),
           const SizedBox(height: 14),
           _haSection(
-            t('鎴愬憳绉熺害', 'Member leases'),
+            t('\u6210\u5458\u79df\u7ea6', 'Member leases'),
             members.isEmpty
-                ? [_emptyHaLine(t('鏆傛棤娲诲姩鎴愬憳', 'No active HA members'))]
+                ? [
+                    _emptyHaLine(
+                      t('\u6682\u65e0\u6d3b\u52a8\u6210\u5458', 'No active HA members'),
+                    ),
+                  ]
                 : [
                     for (final member in members)
                       ListTile(
@@ -1449,15 +1464,25 @@ class _DashboardPageState extends State<DashboardPage> {
                           member['is_leader'] == true
                               ? Icons.workspace_premium
                               : Icons.dns_outlined,
-                          color: member['is_leader'] == true ? Colors.green : null,
+                          color: member['is_leader'] == true
+                              ? Colors.green
+                              : null,
                         ),
-                        title: SelectableText(_haShortId(member['instance_id'])),
+                        title: SelectableText(
+                          _haShortId(member['instance_id']),
+                        ),
                         subtitle: Text(
-                          '${t('杩涚▼涓栦唬', 'Incarnation')}: ${_haShortId(member['incarnation_id'])}\n'
-                          '${t('鏈€鍚庡績璺?, 'Last seen')}: ${_haTimestamp(member['last_seen_unix_seconds'])} · ${t('鍓╀綑', 'remaining')} ${_duration(member['lease_remaining_seconds'])}',
+                          '${t('\u8fdb\u7a0b\u4e16\u4ee3', 'Incarnation')}: '
+                          '${_haShortId(member['incarnation_id'])}\n'
+                          '${t('\u6700\u540e\u5fc3\u8df3', 'Last seen')}: '
+                          '${_haTimestamp(member['last_seen_unix_seconds'])} · '
+                          '${t('\u5269\u4f59', 'remaining')} '
+                          '${_duration(member['lease_remaining_seconds'])}',
                         ),
                         trailing: Chip(
-                          label: Text(member['is_leader'] == true ? 'Leader' : 'Follower'),
+                          label: Text(
+                            member['is_leader'] == true ? 'Leader' : 'Follower',
+                          ),
                         ),
                         isThreeLine: true,
                       ),
@@ -1465,40 +1490,61 @@ class _DashboardPageState extends State<DashboardPage> {
           ),
           const SizedBox(height: 14),
           _haSection(
-            t('浠诲姟绉熺害', 'Job leases'),
+            t('\u4efb\u52a1\u79df\u7ea6', 'Job leases'),
             jobs.isEmpty
-                ? [_emptyHaLine(t('鏆傛棤娲诲姩浠诲姟绉熺害', 'No active job leases'))]
+                ? [
+                    _emptyHaLine(
+                      t('\u6682\u65e0\u6d3b\u52a8\u4efb\u52a1\u79df\u7ea6', 'No active job leases'),
+                    ),
+                  ]
                 : [
                     for (final job in jobs)
                       ListTile(
                         leading: const Icon(Icons.task_alt_outlined),
-                        title: SelectableText('${job['job_kind']}: ${job['job_key']}'),
+                        title: SelectableText(
+                          '${job['job_kind']}: ${job['job_key']}',
+                        ),
                         subtitle: Text(
-                          '${t('鎵€鏈夎€?, 'Owner')}: ${_haShortId(job['owner_instance_id'])}\n'
-                          '${t('绉熺害鍓╀綑', 'Lease remaining')}: ${_duration(job['lease_remaining_seconds'])}',
+                          '${t('\u6240\u6709\u8005', 'Owner')}: '
+                          '${_haShortId(job['owner_instance_id'])}\n'
+                          '${t('\u79df\u7ea6\u5269\u4f59', 'Lease remaining')}: '
+                          '${_duration(job['lease_remaining_seconds'])}',
                         ),
                         trailing: job['last_error_code'] == null
                             ? null
-                            : Chip(label: Text(job['last_error_code'].toString())),
+                            : Chip(
+                                label: Text(
+                                  job['last_error_code'].toString(),
+                                ),
+                              ),
                         isThreeLine: true,
                       ),
                   ],
           ),
           const SizedBox(height: 14),
           _haSection(
-            t('鍏綉绔彛褰掑睘', 'Public port ownership'),
+            t('\u516c\u7f51\u7aef\u53e3\u5f52\u5c5e', 'Public port ownership'),
             ports.isEmpty
-                ? [_emptyHaLine(t('鏆傛棤鍏綉绔彛绉熺害', 'No active public port ownership'))]
+                ? [
+                    _emptyHaLine(
+                      t('\u6682\u65e0\u516c\u7f51\u7aef\u53e3\u79df\u7ea6', 'No active public port ownership'),
+                    ),
+                  ]
                 : [
                     for (final port in ports)
                       ListTile(
                         leading: const Icon(Icons.router_outlined),
                         title: SelectableText(
-                          '${port['protocol']?.toString().toUpperCase()} : ${port['public_port']}',
+                          '${port['protocol']?.toString().toUpperCase()} : '
+                          '${port['public_port']}',
                         ),
                         subtitle: Text(
-                          '${t('绛栫暐', 'Policy')}: ${_haShortId(port['policy_id'])}\n'
-                          '${t('鎵€鏈夎€?, 'Owner')}: ${_haShortId(port['owner_instance_id'])} · ${t('鍓╀綑', 'remaining')} ${_duration(port['lease_remaining_seconds'])}',
+                          '${t('\u7b56\u7565', 'Policy')}: '
+                          '${_haShortId(port['policy_id'])}\n'
+                          '${t('\u6240\u6709\u8005', 'Owner')}: '
+                          '${_haShortId(port['owner_instance_id'])} · '
+                          '${t('\u5269\u4f59', 'remaining')} '
+                          '${_duration(port['lease_remaining_seconds'])}',
                         ),
                         isThreeLine: true,
                       ),
@@ -1506,9 +1552,13 @@ class _DashboardPageState extends State<DashboardPage> {
           ),
           const SizedBox(height: 14),
           _haSection(
-            t('鐩爣鍋ュ悍', 'Target health'),
+            t('\u76ee\u6807\u5065\u5eb7', 'Target health'),
             targets.isEmpty
-                ? [_emptyHaLine(t('鏆傛棤鐩爣鍋ュ悍璁板綍', 'No target health records'))]
+                ? [
+                    _emptyHaLine(
+                      t('\u6682\u65e0\u76ee\u6807\u5065\u5eb7\u8bb0\u5f55', 'No target health records'),
+                    ),
+                  ]
                 : [
                     for (final target in targets)
                       ListTile(
@@ -1520,14 +1570,23 @@ class _DashboardPageState extends State<DashboardPage> {
                               ? Colors.green
                               : Colors.orange,
                         ),
-                        title: SelectableText(target['target_key']?.toString() ?? '-'),
+                        title: SelectableText(
+                          target['target_key']?.toString() ?? '-',
+                        ),
                         subtitle: Text(
-                          '${t('鎴愬憳 / 鎺у埗 / 搴旂敤', 'Member / control / application')}: '
-                          '${_haBool(target['member_alive'])} / ${_haBool(target['control_channel_healthy'])} / ${_haBool(target['application_healthy'])}\n'
-                          '${t('鏈€鍚庢帰娴?, 'Last probe')}: ${_haTimestamp(target['last_probe_unix_seconds'])}',
+                          '${t('\u6210\u5458 / \u63a7\u5236 / \u5e94\u7528', 'Member / control / application')}: '
+                          '${_haBool(target['member_alive'])} / '
+                          '${_haBool(target['control_channel_healthy'])} / '
+                          '${_haBool(target['application_healthy'])}\n'
+                          '${t('\u6700\u540e\u63a2\u6d4b', 'Last probe')}: '
+                          '${_haTimestamp(target['last_probe_unix_seconds'])}',
                         ),
                         trailing: target['has_error'] == true
-                            ? Chip(label: Text(t('鏈夊紓甯?, 'Has error')))
+                            ? Chip(
+                                label: Text(
+                                  t('\u6709\u5f02\u5e38', 'Has error'),
+                                ),
+                              )
                             : null,
                         isThreeLine: true,
                       ),
@@ -1535,9 +1594,13 @@ class _DashboardPageState extends State<DashboardPage> {
           ),
           const SizedBox(height: 14),
           _haSection(
-            t('鏈€杩戞帴绠′笌寮傚父', 'Recent takeover and anomalies'),
+            t('\u6700\u8fd1\u63a5\u7ba1\u4e0e\u5f02\u5e38', 'Recent takeover and anomalies'),
             events.isEmpty
-                ? [_emptyHaLine(t('鏆傛棤 HA 浜嬩欢', 'No recent HA events'))]
+                ? [
+                    _emptyHaLine(
+                      t('\u6682\u65e0 HA \u4e8b\u4ef6', 'No recent HA events'),
+                    ),
+                  ]
                 : [
                     for (final event in events)
                       ListTile(
@@ -1545,11 +1608,15 @@ class _DashboardPageState extends State<DashboardPage> {
                           event['severity'] == 'warning'
                               ? Icons.warning_amber_outlined
                               : Icons.info_outline,
-                          color: event['severity'] == 'warning' ? Colors.orange : null,
+                          color: event['severity'] == 'warning'
+                              ? Colors.orange
+                              : null,
                         ),
                         title: Text(_haEventLabel(event['code'])),
                         subtitle: Text(event['message']?.toString() ?? ''),
-                        trailing: Text(_haTimestamp(event['at_unix_seconds'])),
+                        trailing: Text(
+                          _haTimestamp(event['at_unix_seconds']),
+                        ),
                       ),
                   ],
           ),
@@ -1557,6 +1624,296 @@ class _DashboardPageState extends State<DashboardPage> {
       ),
     );
   }
+
+  Widget _fleetLedgerPage() {
+    final generations = _haRecords(_fleetGenerations);
+    final conflicts = _haRecords(_fleetConflicts);
+    final open = conflicts
+        .where((conflict) => conflict['state'] == 'open')
+        .toList();
+    final resolved = conflicts
+        .where((conflict) => conflict['state'] == 'resolved')
+        .toList();
+    final ready = generations
+        .where((generation) => generation['sync_state'] == 'ready')
+        .length;
+    final average = generations.isEmpty
+        ? 0
+        : generations.fold<int>(
+                0,
+                (total, generation) =>
+                    total + _fleetProgress(generation),
+              ) ~/
+              generations.length;
+    final cards = <(String, String, IconData)>[
+      (
+        t('\u5171\u4eab generation', 'Shared generations'),
+        '${generations.length}',
+        Icons.layers_outlined,
+      ),
+      (
+        t('\u5e73\u5747\u8fdb\u5ea6', 'Average progress'),
+        '$average%',
+        Icons.stacked_line_chart,
+      ),
+      (
+        t('\u5df2\u5c31\u7eea', 'Ready'),
+        '$ready',
+        Icons.check_circle_outline,
+      ),
+      (
+        t('\u672a\u89e3\u51b3\u51b2\u7a81', 'Open conflicts'),
+        '${open.length}',
+        Icons.warning_amber_outlined,
+      ),
+      (
+        t('\u5df2\u89e3\u51b3\u51b2\u7a81', 'Resolved conflicts'),
+        '${resolved.length}',
+        Icons.task_alt_outlined,
+      ),
+    ];
+    return _pagePadding(
+      ListView(
+        children: [
+          _pageTitle(
+            t('Fleet \u5171\u4eab\u8d26\u672c', 'Fleet ledger'),
+            t(
+              '\u67e5\u770b generation \u8fdb\u5ea6\u3001\u6240\u6709\u8005\u3001fencing \u548c\u51b2\u7a81\u5386\u53f2\u3002\u8bfb\u89d2\u8272\u53ea\u8bfb\uff0c\u64cd\u4f5c\u5458\u548c\u7ba1\u7406\u5458\u53ef\u8bb0\u5f55\u4eba\u5de5\u5904\u7406\u7ed3\u679c\u3002',
+              'Inspect generation progress, owner, fencing, and conflict history. Read users remain read-only; operators and administrators may record a manual resolution.',
+            ),
+          ),
+          const SizedBox(height: 18),
+          _managementMetricWrap(cards),
+          const SizedBox(height: 18),
+          _haSection(
+            t('\u5171\u4eab generation', 'Shared generations'),
+            generations.isEmpty
+                ? [
+                    _emptyHaLine(
+                      t('\u6682\u65e0 generation \u8bb0\u5f55', 'No Fleet generations'),
+                    ),
+                  ]
+                : [
+                    for (final generation in generations)
+                      _fleetGenerationTile(generation),
+                  ],
+          ),
+          const SizedBox(height: 14),
+          _haSection(
+            t('\u672a\u89e3\u51b3\u51b2\u7a81', 'Open conflicts'),
+            open.isEmpty
+                ? [
+                    _emptyHaLine(
+                      t('\u6ca1\u6709\u672a\u89e3\u51b3\u51b2\u7a81', 'No open Fleet conflicts'),
+                    ),
+                  ]
+                : [
+                    for (final conflict in open)
+                      _fleetConflictTile(conflict, open: true),
+                  ],
+          ),
+          const SizedBox(height: 14),
+          _haSection(
+            t('\u5df2\u89e3\u51b3\u51b2\u7a81', 'Resolved conflicts'),
+            resolved.isEmpty
+                ? [
+                    _emptyHaLine(
+                      t('\u6ca1\u6709\u5df2\u89e3\u51b3\u51b2\u7a81', 'No resolved Fleet conflicts'),
+                    ),
+                  ]
+                : [
+                    for (final conflict in resolved)
+                      _fleetConflictTile(conflict, open: false),
+                  ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  int _fleetProgress(Map<String, dynamic> generation) =>
+      (int.tryParse(generation['sync_progress']?.toString() ?? '') ?? 0)
+          .clamp(0, 100)
+          .toInt();
+
+  Widget _fleetGenerationTile(Map<String, dynamic> generation) {
+    final progress = _fleetProgress(generation);
+    final state = generation['sync_state']?.toString() ?? 'pending';
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(8, 5, 8, 5),
+      child: Card(
+        elevation: 0,
+        child: Padding(
+          padding: const EdgeInsets.all(14),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: SelectableText(
+                      '${_haShortId(generation['source_instance_id'])} · '
+                      '#${generation['generation']}',
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                  ),
+                  Chip(label: Text(_fleetSyncLabel(state))),
+                ],
+              ),
+              const SizedBox(height: 8),
+              LinearProgressIndicator(value: progress / 100.0),
+              const SizedBox(height: 6),
+              Text(
+                '$progress% · ${generation['resource_count'] ?? 0} '
+                '${t('\u8d44\u6e90', 'resources')}',
+              ),
+              const SizedBox(height: 5),
+              SelectableText(
+                '${t('\u6240\u6709\u8005', 'Owner')}: '
+                '${_haShortId(generation['owner_instance_id'])} · '
+                'fencing ${generation['fencing_token']}\n'
+                '${t('\u4fee\u8ba2', 'Revision')}: '
+                '${generation['revision'] ?? '-'} · '
+                '${t('\u66f4\u65b0', 'Updated')}: '
+                '${_haTimestamp(generation['updated_unix_seconds'])}',
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _fleetConflictTile(
+    Map<String, dynamic> conflict, {
+    required bool open,
+  }) => Padding(
+    padding: const EdgeInsets.fromLTRB(8, 5, 8, 5),
+    child: Card(
+      elevation: 0,
+      child: ListTile(
+        leading: Icon(
+          open ? Icons.warning_amber_outlined : Icons.task_alt_outlined,
+          color: open ? Colors.orange : Colors.green,
+        ),
+        title: SelectableText(
+          '${conflict['resource_kind']} · '
+          '${_haShortId(conflict['resource_id'])}',
+        ),
+        subtitle: SelectableText(
+          '${conflict['detail_summary'] ?? conflict['conflict_code'] ?? '-'}\n'
+          '${t('\u51b2\u7a81\u4ee3\u7801', 'Conflict code')}: '
+          '${conflict['conflict_code'] ?? '-'} · '
+          'Generation: ${conflict['generation'] ?? '-'}\n'
+          '${t('\u6765\u6e90', 'Source')}: '
+          '${_haShortId(conflict['source_instance_id'])} · '
+          '${t('\u6240\u6709\u8005', 'Owner')}: '
+          '${_haShortId(conflict['owner_instance_id'])}\n'
+          '${open ? t('\u68c0\u6d4b', 'Detected') : t('\u89e3\u51b3', 'Resolved')}: '
+          '${_haTimestamp(open ? conflict['detected_unix_seconds'] : conflict['resolved_unix_seconds'])}'
+          '${open ? '' : '\n${t('\u5904\u7406\u7ed3\u679c', 'Resolution')}: ${conflict['resolution'] ?? '-'}'}',
+        ),
+        isThreeLine: true,
+        trailing: open && _capabilities.canResolveFleetConflicts
+            ? FilledButton(
+                onPressed: () => _resolveFleetConflict(conflict),
+                child: Text(t('\u89e3\u51b3', 'Resolve')),
+              )
+            : null,
+      ),
+    ),
+  );
+
+  String _fleetSyncLabel(String value) => switch (value) {
+    'applying' => t('\u5e94\u7528\u4e2d', 'Applying'),
+    'ready' => t('\u5df2\u5c31\u7eea', 'Ready'),
+    'conflicted' => t('\u6709\u51b2\u7a81', 'Conflicted'),
+    'failed' => t('\u5931\u8d25', 'Failed'),
+    _ => t('\u7b49\u5f85\u4e2d', 'Pending'),
+  };
+
+  Future<void> _resolveFleetConflict(Map<String, dynamic> conflict) async {
+    if (!_capabilities.canResolveFleetConflicts) return;
+    final controller = TextEditingController();
+    final resolution = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(
+          t('\u89e3\u51b3 Fleet \u51b2\u7a81', 'Resolve Fleet conflict'),
+        ),
+        content: SizedBox(
+          width: 520,
+          child: TextField(
+            controller: controller,
+            autofocus: true,
+            maxLength: 512,
+            minLines: 3,
+            maxLines: 7,
+            decoration: InputDecoration(
+              labelText: t('\u4eba\u5de5\u5904\u7406\u7ed3\u679c', 'Manual resolution'),
+              helperText: t(
+                '\u53ea\u8bb0\u5f55\u5904\u7406\u7ed3\u679c\uff0c\u4e0d\u8981\u586b\u5199\u5bc6\u94a5\u3001\u4ee4\u724c\u6216\u8fde\u63a5\u4e32\u3002',
+                'Record the outcome only; do not enter keys, tokens, or connection strings.',
+              ),
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: Text(t('\u53d6\u6d88', 'Cancel')),
+          ),
+          FilledButton(
+            onPressed: () {
+              final value = controller.text.trim();
+              if (value.isNotEmpty) Navigator.pop(dialogContext, value);
+            },
+            child: Text(t('\u786e\u8ba4\u89e3\u51b3', 'Resolve')),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (resolution == null || resolution.isEmpty) return;
+    try {
+      await widget.api.post(
+        '/api/v1/fleet/v2/conflicts/${conflict['conflict_id']}/resolve',
+        {'resolution': resolution},
+      );
+      await _refresh(silent: true);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            t('Fleet \u51b2\u7a81\u5df2\u89e3\u51b3\u3002', 'Fleet conflict resolved.'),
+          ),
+        ),
+      );
+    } catch (error) {
+      if (mounted) setState(() => _error = error.toString());
+    }
+  }
+
+  Widget _managementMetricWrap(
+    List<(String, String, IconData)> cards,
+  ) => LayoutBuilder(
+    builder: (context, constraints) {
+      final columns = constraints.maxWidth >= 1100
+          ? 5
+          : constraints.maxWidth >= 700
+          ? 3
+          : 1;
+      final width = (constraints.maxWidth - (columns - 1) * 12) / columns;
+      return Wrap(
+        spacing: 12,
+        runSpacing: 12,
+        children: [
+          for (final card in cards)
+            SizedBox(width: width, child: _metricCard(card)),
+        ],
+      );
+    },
+  );
 
   Widget _updatesPage() => RemoteUpdateManagementPage(
     key: const Key('remote-update-management-page'),

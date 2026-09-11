@@ -280,7 +280,18 @@ pub(crate) async fn handle_connection(
             client_token,
             name,
             public_port,
+            supports_egress_policy,
         } => {
+            // 旧客户端无法校验实际出口地址，拒绝注册以避免绕过代理策略。
+            if !supports_egress_policy {
+                let _ = write_control_frame_and_shutdown(
+                    &mut stream,
+                    &ControlFrame::Error {
+                        message: "proxy egress policy support required; upgrade client".to_owned(),
+                    },
+                ).await;
+                return;
+            }
             crate::socks5_tunnel::register_proxy(
                 state,
                 stream,
@@ -296,7 +307,18 @@ pub(crate) async fn handle_connection(
             client_token,
             name,
             public_port,
+            supports_egress_policy,
         } => {
+            // 与 SOCKS5 使用相同能力门槛，防止旧客户端忽略出口限制。
+            if !supports_egress_policy {
+                let _ = write_control_frame_and_shutdown(
+                    &mut stream,
+                    &ControlFrame::Error {
+                        message: "proxy egress policy support required; upgrade client".to_owned(),
+                    },
+                ).await;
+                return;
+            }
             crate::http_proxy_tunnel::register_proxy(
                 state,
                 stream,

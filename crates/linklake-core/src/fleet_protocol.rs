@@ -128,6 +128,8 @@ pub struct FleetSocks5ProxyResource {
     pub username: String,
     pub max_connections: u16,
     pub bandwidth_limit_bps: Option<u64>,
+    #[serde(default)]
+    pub allow_private_networks: bool,
 }
 
 /// credential_ref 仅是外部凭据记录的稳定标识，不携带密码或哈希。
@@ -141,6 +143,8 @@ pub struct FleetHttpProxyResource {
     pub username: String,
     pub max_connections: u16,
     pub bandwidth_limit_bps: Option<u64>,
+    #[serde(default)]
+    pub allow_private_networks: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -981,6 +985,7 @@ mod tests {
                     username: "office_user".to_owned(),
                     max_connections: 64,
                     bandwidth_limit_bps: None,
+                    allow_private_networks: false,
                 }),
             },
             FleetResource {
@@ -994,6 +999,7 @@ mod tests {
                     username: "office_user".to_owned(),
                     max_connections: 64,
                     bandwidth_limit_bps: None,
+                    allow_private_networks: false,
                 }),
             },
         ];

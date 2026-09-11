@@ -107,6 +107,7 @@
             </div>
             <a class="nav-link" href="#/p2p" data-view="p2p" data-route-prefix="p2p"><span class="nav-icon">◎</span><span data-i18n="p2p">P2P network</span></a>
             <a class="nav-link" href="#/ha" data-view="ha" data-route-prefix="ha"><span class="nav-icon">⛓</span><span data-i18n="haManagement">HA management</span></a>
+            <a class="nav-link" href="#/fleet-ledger" data-view="fleet-ledger" data-route-prefix="fleet-ledger"><span class="nav-icon">≋</span><span data-i18n="fleetLedger">Fleet ledger</span></a>
             <a class="nav-link admin-only" href="#/fleet" data-view="fleet" data-route-prefix="fleet"><span class="nav-icon">⌘</span><span data-i18n="fleet">Multi-cloud</span></a>
             <div class="nav-group-label admin-only" data-i18n="accessControl">Access control</div>
             <a class="nav-link admin-only" href="#/users" data-view="users" data-route-prefix="users"><span class="nav-icon">♙</span><span data-i18n="userManagement">Users</span></a>
@@ -182,6 +183,18 @@
               <section class="panel"><div class="panel-heading"><div><h3 data-i18n="haPorts">Public port ownership</h3><p data-i18n="haPortsHelp">Ports currently held by a valid member and leader lease.</p></div></div><div class="data-table-wrap"><table class="data-table"><thead><tr><th data-i18n="protocol">Protocol</th><th data-i18n="publicPort">Port</th><th data-i18n="policyId">Policy</th><th data-i18n="owner">Owner</th><th data-i18n="lease">Lease</th></tr></thead><tbody id="ha-ports-list"></tbody></table></div></section>
             </div>
             <section class="panel"><div class="panel-heading"><div><h3 data-i18n="haTargets">Target health</h3><p data-i18n="haTargetsHelp">Control-channel and application health are summarized without exposing endpoint errors.</p></div></div><div id="ha-target-kpis" class="insight-kpis"></div><div class="data-table-wrap"><table class="data-table"><thead><tr><th data-i18n="target">Target</th><th data-i18n="member">Member</th><th data-i18n="controlChannel">Control</th><th data-i18n="application">Application</th><th data-i18n="status">Effective</th><th data-i18n="lastProbe">Last probe</th></tr></thead><tbody id="ha-targets-list"></tbody></table></div></section>
+          </section>
+
+          <section id="fleet-ledger-view" class="view-panel hidden">
+            <div id="fleet-ledger-kpis" class="kpi-grid"></div>
+            <section class="panel" style="margin-bottom:12px">
+              <div class="panel-heading"><div><h3 data-i18n="fleetGenerations">Shared generations</h3><p data-i18n="fleetGenerationsHelp">Track generation, progress, owner and fencing state for every Fleet source.</p></div></div>
+              <div class="data-table-wrap"><table class="data-table"><thead><tr><th data-i18n="source">Source</th><th data-i18n="generation">Generation</th><th data-i18n="progress">Progress</th><th data-i18n="owner">Owner</th><th data-i18n="resources">Resources</th><th data-i18n="updatedAt">Updated</th></tr></thead><tbody id="fleet-generation-list"></tbody></table></div>
+            </section>
+            <div class="overview-grid fleet-ledger-grid">
+              <section class="panel"><div class="panel-heading"><div><h3 data-i18n="openConflicts">Open conflicts</h3><p data-i18n="openConflictsHelp">Operators and administrators may record a bounded manual resolution.</p></div></div><div id="fleet-open-conflicts" class="fleet-ledger-conflicts"></div></section>
+              <section class="panel"><div class="panel-heading"><div><h3 data-i18n="resolvedConflicts">Resolved conflicts</h3><p data-i18n="resolvedConflictsHelp">Resolved entries remain visible as an immutable operational history.</p></div></div><div id="fleet-resolved-conflicts" class="fleet-ledger-conflicts"></div></section>
+            </div>
           </section>
 
           <section id="fleet-view" class="view-panel hidden">

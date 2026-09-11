@@ -24,6 +24,7 @@ class RoleCapabilities {
   bool get canManageFleet => isAdministrator;
   bool get canViewFleet => isAdministrator;
   bool get canViewHa => true;
+  bool get canResolveFleetConflicts => role != ManagementRole.auditor;
   bool get canManageUpdates => isAdministrator;
   bool get canManageTrafficControl => isAdministrator;
   bool get canManageTotp => role != ManagementRole.auditor;
@@ -44,6 +45,8 @@ List<DashboardRequest> dashboardRequestPlan(ManagementRole role) {
     const DashboardRequest('clients', '/api/v1/clients'),
     const DashboardRequest('p2p', '/api/v1/p2p/nodes'),
     const DashboardRequest('ha', '/api/v1/ha/overview', object: true),
+    const DashboardRequest('fleetGenerations', '/api/v1/fleet/v2/generations'),
+    const DashboardRequest('fleetConflicts', '/api/v1/fleet/v2/conflicts'),
     const DashboardRequest('audit', '/api/v1/audit?limit=50'),
     const DashboardRequest('tcp', '/api/v1/tcp-tunnels'),
     const DashboardRequest('udp', '/api/v1/udp-tunnels'),
@@ -89,6 +92,7 @@ List<String> visibleDestinationIds(ManagementRole role) => [
   'proxy',
   'p2p',
   'ha',
+  'fleetLedger',
   if (role == ManagementRole.administrator) 'fleet',
   if (role == ManagementRole.administrator) 'updates',
   'alerts',

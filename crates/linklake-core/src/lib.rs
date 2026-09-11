@@ -7,6 +7,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
+pub mod egress_policy;
 pub mod fleet_protocol;
 pub mod p2p_protocol;
 pub mod port_mapping;
@@ -190,6 +191,8 @@ pub struct ManagedSecretTunnel {
 pub struct ManagedSocks5Proxy {
     pub name: String,
     pub public_port: u16,
+    #[serde(default)]
+    pub allow_private_networks: bool,
     pub enabled: bool,
 }
 
@@ -197,6 +200,8 @@ pub struct ManagedSocks5Proxy {
 pub struct ManagedHttpProxy {
     pub name: String,
     pub public_port: u16,
+    #[serde(default)]
+    pub allow_private_networks: bool,
     pub enabled: bool,
 }
 
@@ -385,11 +390,15 @@ pub enum ControlFrame {
         client_token: String,
         name: String,
         public_port: u16,
+        #[serde(default)]
+        supports_egress_policy: bool,
     },
     Socks5ProxyRegistered {
         proxy_id: Uuid,
         public_port: u16,
         udp_associate: bool,
+        #[serde(default)]
+        allow_private_networks: bool,
     },
     Socks5UdpDataPlaneOffer {
         registration_id: Uuid,
@@ -409,10 +418,14 @@ pub enum ControlFrame {
         client_token: String,
         name: String,
         public_port: u16,
+        #[serde(default)]
+        supports_egress_policy: bool,
     },
     HttpProxyRegistered {
         proxy_id: Uuid,
         public_port: u16,
+        #[serde(default)]
+        allow_private_networks: bool,
     },
     OpenHttpProxyConnection {
         connection_id: Uuid,
@@ -822,6 +835,7 @@ mod tests {
                 proxy_id: registration_id,
                 public_port: 1080,
                 udp_associate: true,
+                allow_private_networks: false,
             },
         ];
         for expected in frames {
@@ -843,10 +857,12 @@ mod tests {
                 client_token: "token".to_owned(),
                 name: "web-exit".to_owned(),
                 public_port: 32022,
+                supports_egress_policy: true,
             },
             ControlFrame::HttpProxyRegistered {
                 proxy_id,
                 public_port: 32022,
+                allow_private_networks: false,
             },
             ControlFrame::OpenHttpProxyConnection {
                 connection_id,
