@@ -5,6 +5,7 @@ mod api_tokens;
 mod audit_log;
 mod audit_store;
 mod certificate_catalog;
+mod certificate_job;
 mod certificate_manager;
 mod certificate_material;
 mod certificate_store;
@@ -1878,6 +1879,8 @@ struct PreparedCertificateOperation {
     certificate_identifier: String,
     acme_config: AcmeConfig,
     operation: CertificateOperation,
+    lease: job_leases::JobLease,
+    reservation: CertificateJobGuard,
 }
 
 struct CertificateJobGuard {
@@ -8762,6 +8765,8 @@ async fn queue_certificate_operation(
         prepared.certificate_identifier,
         prepared.acme_config,
         prepared.operation,
+        prepared.lease,
+        prepared.reservation,
         None,
     ));
     Ok(())
@@ -8885,12 +8890,49 @@ async fn prepare_certificate_operation(
             "certificate operation is already in progress",
         ));
     }
+    let reservation = CertificateJobGuard {
+        state: state.clone(),
+        certificate_identifier: certificate_identifier.clone(),
+        route_id,
+    };
+    let lease_result = async {
+        let token = state.ha_runtime.fencing_token()?;
+        let key = certificate_catalog::postgres::certificate_job_key(&certificate_identifier)?;
+        state
+            .ha_runtime
+            .jobs()
+            .acquire(&key, "certificate", token)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("certificate job is already leased"))
+    }
+    .await;
+    let lease = match lease_result {
+        Ok(lease) => lease,
+        Err(error) => {
+            tracing::warn!(%error, %route_id, "could not acquire certificate job lease");
+            return Err(CodedApiError(
+                StatusCode::CONFLICT,
+                "certificate_operation_unavailable",
+                "certificate operation could not acquire a current job lease",
+            ));
+        }
+    };
     let target_status = match operation {
         CertificateOperation::Issue => CertificateStatus::Issuing,
         CertificateOperation::Renew => CertificateStatus::Renewing,
     };
     if let Err(error) = mark_certificate_operation_status(state, route_id, target_status) {
-        release_certificate_job(state, &certificate_identifier, route_id);
+        let _ = state
+            .ha_runtime
+            .jobs()
+            .fail(
+                &lease.job_key,
+                &lease.job_kind,
+                lease.lease_id,
+                lease.fencing_token,
+                "certificate_prepare_failed",
+            )
+            .await;
         return Err(error);
     }
     state
@@ -8922,6 +8964,8 @@ async fn prepare_certificate_operation(
         certificate_identifier,
         acme_config,
         operation,
+        lease,
+        reservation,
     })
 }
 
@@ -9018,29 +9062,94 @@ async fn run_certificate_operation(
     certificate_identifier: String,
     acme_config: AcmeConfig,
     operation: CertificateOperation,
-    mut stop: Option<watch::Receiver<bool>>,
+    lease: job_leases::JobLease,
+    reservation: CertificateJobGuard,
+    stop: Option<watch::Receiver<bool>>,
 ) {
-    let _job_guard = CertificateJobGuard {
-        state: state.clone(),
-        certificate_identifier: certificate_identifier.clone(),
-        route_id: route.id,
-    };
+    // guard 在准备阶段创建并移入 future；即使 future 从未被轮询也能释放本地占位。
+    let result = certificate_job::run(
+        state.ha_runtime.clone(),
+        lease.clone(),
+        stop.clone(),
+        run_certificate_operation_inner(
+            state.clone(),
+            manager,
+            route,
+            certificate_identifier,
+            acme_config,
+            operation,
+            stop,
+        ),
+    )
+    .await;
+    match result {
+        Ok(true) => {
+            if let Err(error) = state
+                .ha_runtime
+                .jobs()
+                .complete(
+                    &lease.job_key,
+                    &lease.job_kind,
+                    lease.lease_id,
+                    lease.fencing_token,
+                )
+                .await
+            {
+                tracing::warn!(%error, "could not complete certificate job lease");
+            }
+        }
+        Ok(false) => {
+            if let Err(error) = state
+                .ha_runtime
+                .jobs()
+                .fail(
+                    &lease.job_key,
+                    &lease.job_kind,
+                    lease.lease_id,
+                    lease.fencing_token,
+                    "certificate_operation_failed",
+                )
+                .await
+            {
+                tracing::warn!(%error, "could not record certificate job failure");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "certificate operation abandoned after lease or leadership loss")
+        }
+    }
+    drop(reservation);
+}
+
+async fn run_certificate_operation_inner(
+    state: Arc<AppState>,
+    manager: CertificateManager,
+    route: HttpRoutePolicy,
+    certificate_identifier: String,
+    acme_config: AcmeConfig,
+    operation: CertificateOperation,
+    mut stop: Option<watch::Receiver<bool>>,
+) -> bool {
     let issue_config = certificate_manager::AcmeIssueConfig {
-        directory_url: acme_config.directory_url,
-        contact_email: acme_config.contact_email,
+        directory_url: acme_config.directory_url.clone(),
+        contact_email: acme_config.contact_email.clone(),
         challenge_type: acme_config.challenge_type,
         root_ca_path: std::env::var_os("LINKLAKE_ACME_ROOT_CA_PATH").map(PathBuf::from),
     };
     let result = if let Some(stop) = stop.as_mut() {
+        if *stop.borrow() {
+            return false;
+        }
         let result = tokio::select! {
+            biased;
             changed = stop.changed() => {
-                if changed.is_err() || *stop.borrow() { None } else { None }
+                let _ = changed;
+                None
             }
             result = manager.issue_certificate(&certificate_identifier, &issue_config) => Some(result),
         };
         let Some(result) = result else {
-            manager.remove_certificate(&certificate_identifier);
-            return;
+            return false;
         };
         result
     } else {
@@ -9049,10 +9158,10 @@ async fn run_certificate_operation(
             .await
     };
     if stop.as_ref().is_some_and(|stop| *stop.borrow()) {
-        manager.remove_certificate(&certificate_identifier);
-        return;
+        return false;
     }
     let now = unix_seconds() as i64;
+    let mut committed = false;
     match result {
         Ok(result) => {
             state
@@ -9067,13 +9176,14 @@ async fn run_certificate_operation(
                 &state,
                 &route,
                 &certificate_identifier,
-                &result.metadata.issuer,
-                result.metadata.not_before_unix_seconds as i64,
-                result.metadata.not_after_unix_seconds as i64,
+                &manager,
+                &result,
+                &acme_config,
                 now,
             );
             match current {
                 Ok(true) => {
+                    committed = true;
                     record_audit(
                         &state,
                         match operation {
@@ -9132,6 +9242,7 @@ async fn run_certificate_operation(
                     CertificateOperation::Renew => "certificate_renew_failed",
                 },
                 &message,
+                &acme_config,
                 now,
             ) {
                 Ok(true) => {
@@ -9166,6 +9277,7 @@ async fn run_certificate_operation(
             }
         }
     }
+    committed
 }
 
 fn certificate_target_matches(
@@ -9191,11 +9303,15 @@ fn record_certificate_success_if_current(
     state: &AppState,
     expected: &HttpRoutePolicy,
     expected_certificate_identifier: &str,
-    issuer: &str,
-    not_before: i64,
-    not_after: i64,
+    manager: &CertificateManager,
+    issued: &certificate_manager::CertificateIssueResult,
+    expected_config: &AcmeConfig,
     completed_at: i64,
 ) -> anyhow::Result<bool> {
+    anyhow::ensure!(
+        issued.identifier() == expected_certificate_identifier,
+        "issued certificate target differs from requested target"
+    );
     let route_catalog = state
         .http_route_catalog
         .lock()
@@ -9207,6 +9323,10 @@ fn record_certificate_success_if_current(
         .lock()
         .expect("certificate catalog lock poisoned");
     let tls_policy = certificate_catalog.get_route_tls(expected.id)?;
+    let current_config = certificate_catalog.get_acme_config()?;
+    if !current_config.enabled || &current_config != expected_config {
+        return Ok(false);
+    }
     if !certificate_target_matches(
         expected,
         expected_certificate_identifier,
@@ -9215,13 +9335,16 @@ fn record_certificate_success_if_current(
     ) {
         return Ok(false);
     }
-    certificate_catalog.record_certificate_success(
-        expected.id,
-        issuer,
-        not_before,
-        not_after,
-        completed_at,
-    )?;
+    manager.commit_issued_certificate(issued, |metadata| {
+        certificate_catalog.record_certificate_success(
+            expected.id,
+            &metadata.issuer,
+            i64::try_from(metadata.not_before_unix_seconds)?,
+            i64::try_from(metadata.not_after_unix_seconds)?,
+            completed_at,
+        )?;
+        Ok(())
+    })?;
     drop(certificate_catalog);
     drop(route_catalog);
     Ok(true)
@@ -9233,6 +9356,7 @@ fn record_certificate_failure_if_current(
     expected_certificate_identifier: &str,
     error_code: &str,
     error_message: &str,
+    expected_config: &AcmeConfig,
     attempted_at: i64,
 ) -> anyhow::Result<bool> {
     let route_catalog = state
@@ -9246,6 +9370,10 @@ fn record_certificate_failure_if_current(
         .lock()
         .expect("certificate catalog lock poisoned");
     let tls_policy = certificate_catalog.get_route_tls(expected.id)?;
+    let current_config = certificate_catalog.get_acme_config()?;
+    if !current_config.enabled || &current_config != expected_config {
+        return Ok(false);
+    }
     if !certificate_target_matches(
         expected,
         expected_certificate_identifier,
@@ -9267,17 +9395,12 @@ fn record_certificate_failure_if_current(
 
 async fn discard_stale_certificate_result(
     state: &AppState,
-    manager: &CertificateManager,
+    _manager: &CertificateManager,
     route: &HttpRoutePolicy,
-    certificate_identifier: &str,
+    _certificate_identifier: &str,
     operation: CertificateOperation,
 ) {
-    if let Err(error) = manager.delete_certificate(certificate_identifier) {
-        tracing::warn!(
-            "could not remove stale certificate result for {}: {error}",
-            route.hostname
-        );
-    }
+    // 未提交结果只存在于持有 Zeroizing 私钥的返回值中，丢弃它不应删除当前证书。
     record_audit(
         state,
         match operation {
@@ -9520,6 +9643,8 @@ async fn scan_certificate_maintenance(
                         prepared.certificate_identifier,
                         prepared.acme_config,
                         prepared.operation,
+                        prepared.lease,
+                        prepared.reservation,
                         Some(stop.clone()),
                     ));
                 }

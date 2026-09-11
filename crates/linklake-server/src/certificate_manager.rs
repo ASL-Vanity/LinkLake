@@ -28,6 +28,7 @@ use std::{
 };
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use x509_parser::{extensions::GeneralName, parse_x509_certificate};
+use zeroize::Zeroizing;
 
 const CHALLENGE_TTL: Duration = Duration::from_secs(10 * 60);
 const ACME_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
@@ -51,11 +52,34 @@ pub(crate) struct CertificateMetadata {
     pub(crate) not_after_unix_seconds: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CertificateIssueResult {
     pub(crate) metadata: CertificateMetadata,
     pub(crate) http01_challenges_completed: u64,
     pub(crate) dns01_challenges_completed: u64,
+    identifier: String,
+    certificate_pem: Vec<u8>,
+    private_key_pem: Zeroizing<Vec<u8>>,
+}
+
+impl fmt::Debug for CertificateIssueResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CertificateIssueResult")
+            .field("identifier", &self.identifier)
+            .field("metadata", &self.metadata)
+            .field("material", &"<redacted>")
+            .finish()
+    }
+}
+
+impl CertificateIssueResult {
+    pub(crate) fn identifier(&self) -> &str {
+        &self.identifier
+    }
+
+    pub(crate) fn material(&self) -> (&[u8], &[u8]) {
+        (&self.certificate_pem, &self.private_key_pem)
+    }
 }
 
 #[derive(Clone)]
@@ -256,7 +280,7 @@ impl CertificateManager {
             if status != OrderStatus::Ready {
                 anyhow::bail!("ACME order did not become ready: {status:?}");
             }
-            let private_key_pem = order.finalize().await?;
+            let private_key_pem = Zeroizing::new(order.finalize().await?);
             let certificate_pem = order.poll_certificate(&retry).await?;
             Ok::<_, anyhow::Error>((certificate_pem, private_key_pem))
         }
@@ -274,21 +298,50 @@ impl CertificateManager {
             private_key_pem.as_bytes(),
         )?
         .1;
-        self.persist_certificate(
-            hostname,
-            certificate_pem.as_bytes(),
-            private_key_pem.as_bytes(),
-        )?;
-        self.install_certificate(
-            hostname,
-            certificate_pem.as_bytes(),
-            private_key_pem.as_bytes(),
-        )?;
+        // 此处只返回材料；路由/任务校验和持久提交成功后，调用方才允许安装。
         Ok(CertificateIssueResult {
             metadata,
             http01_challenges_completed,
             dns01_challenges_completed,
+            identifier: hostname.to_owned(),
+            certificate_pem: certificate_pem.into_bytes(),
+            private_key_pem: Zeroizing::new(private_key_pem.as_bytes().to_vec()),
         })
+    }
+
+    /// SQLite 路径在调用方持有路由与目录锁时提交，拒绝结果不会触碰已有证书。
+    pub(crate) fn commit_issued_certificate(
+        &self,
+        issued: &CertificateIssueResult,
+        persist_metadata: impl FnOnce(&CertificateMetadata) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let (key, metadata) = validate_certificate(
+            &issued.identifier,
+            &issued.certificate_pem,
+            &issued.private_key_pem,
+        )?;
+        self.persist_certificate_with_commit(
+            &issued.identifier,
+            &issued.certificate_pem,
+            &issued.private_key_pem,
+            || persist_metadata(&metadata),
+        )?;
+        self.resolver.install(&issued.identifier, key);
+        Ok(())
+    }
+
+    /// 共享事务提交之后安装本地副本；本地失败不会撤销共享库中的已提交材料。
+    pub(crate) fn install_shared_certificate(
+        &self,
+        identifier: &str,
+        certificate_pem: &[u8],
+        private_key_pem: &[u8],
+    ) -> anyhow::Result<CertificateMetadata> {
+        let identifier = normalize_certificate_identifier(identifier)?;
+        let (key, metadata) = validate_certificate(&identifier, certificate_pem, private_key_pem)?;
+        self.persist_certificate(&identifier, certificate_pem, private_key_pem)?;
+        self.resolver.install(&identifier, key);
+        Ok(metadata)
     }
 
     fn install_certificate(
@@ -335,6 +388,16 @@ impl CertificateManager {
         certificate_pem: &[u8],
         private_key_pem: &[u8],
     ) -> anyhow::Result<()> {
+        self.persist_certificate_with_commit(hostname, certificate_pem, private_key_pem, || Ok(()))
+    }
+
+    fn persist_certificate_with_commit(
+        &self,
+        hostname: &str,
+        certificate_pem: &[u8],
+        private_key_pem: &[u8],
+        commit: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         let directory = self.certificate_directory(hostname);
         let generations = directory.join(CERTIFICATE_GENERATIONS_DIRECTORY);
         fs::create_dir_all(&generations)?;
@@ -356,20 +419,32 @@ impl CertificateManager {
             write_secret_file(&staging.join("committed"), CERTIFICATE_COMMIT_MARKER)?;
             sync_directory(&staging)?;
 
-            // 继续维护原文件名，供运维脚本读取；恢复逻辑不会把它们当作新格式的
-            // 权威证书对，因此跨文件更新中断不会造成新旧证书混装。
-            write_secret_file(&directory.join("fullchain.pem"), certificate_pem)?;
-            write_secret_file(&directory.join("private-key.pem"), private_key_pem)?;
-
             fs::rename(&staging, &committed)?;
             sync_directory(&generations)?;
-            let _ = cleanup_old_certificate_generations(&generations);
+            commit()?;
             Ok(())
         })();
         if result.is_err() {
             let _ = fs::remove_dir_all(&staging);
+            // 只移除本次生成的目录；不能删除旧代、兼容副本或已在使用的 resolver。
+            if let Err(error) = fs::remove_dir_all(&committed) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::error!(%error, "could not discard unaccepted certificate generation");
+                }
+            }
+            let _ = sync_directory(&generations);
         }
         result?;
+        // 元数据提交之后维护兼容副本；兼容文件故障不能反转已提交的权威代目录。
+        for (name, bytes) in [
+            ("fullchain.pem", certificate_pem),
+            ("private-key.pem", private_key_pem),
+        ] {
+            if let Err(error) = write_secret_file(&directory.join(name), bytes) {
+                tracing::warn!(%error, "could not refresh certificate compatibility file");
+            }
+        }
+        let _ = cleanup_old_certificate_generations(&generations);
         Ok(())
     }
 
@@ -1011,6 +1086,113 @@ mod tests {
             assert!(!resolver.contains(&format!("remove-{index}.example.com")));
             assert!(resolver.contains(&format!("add-{index}.example.com")));
         }
+    }
+
+    #[test]
+    fn rejected_certificate_commit_preserves_existing_generation_and_resolver() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let directory = std::env::temp_dir().join(format!(
+            "linklake-certificate-reject-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let hostname = "preserved.example.com";
+        let manager = CertificateManager::new(directory.clone()).expect("manager should open");
+        let old = generate_simple_self_signed(vec![hostname.to_owned()])
+            .expect("old certificate should generate");
+        let old_pem = old.cert.pem();
+        let old_key = old.signing_key.serialize_pem();
+        manager
+            .install_shared_certificate(hostname, old_pem.as_bytes(), old_key.as_bytes())
+            .expect("old certificate should install");
+        let replacement = generate_simple_self_signed(vec![hostname.to_owned()])
+            .expect("replacement should generate");
+        let new_pem = replacement.cert.pem().into_bytes();
+        let new_key = Zeroizing::new(replacement.signing_key.serialize_pem().into_bytes());
+        let metadata = validate_certificate(hostname, &new_pem, &new_key)
+            .unwrap()
+            .1;
+        let issued = CertificateIssueResult {
+            metadata,
+            http01_challenges_completed: 1,
+            dns01_challenges_completed: 0,
+            identifier: hostname.to_owned(),
+            certificate_pem: new_pem,
+            private_key_pem: new_key,
+        };
+        assert!(!format!("{issued:?}").contains("PRIVATE KEY"));
+        let rejected = manager
+            .commit_issued_certificate(&issued, |_| anyhow::bail!("simulated metadata failure"));
+        assert!(rejected.is_err());
+        assert!(manager.has_certificate(hostname));
+        let pairs = committed_certificate_pairs(&manager.certificate_directory(hostname)).unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, old_pem.as_bytes());
+        assert_eq!(
+            fs::read(
+                manager
+                    .certificate_directory(hostname)
+                    .join("fullchain.pem")
+            )
+            .unwrap(),
+            old_pem.as_bytes()
+        );
+        assert_eq!(
+            fs::read(
+                manager
+                    .certificate_directory(hostname)
+                    .join("private-key.pem")
+            )
+            .unwrap(),
+            old_key.as_bytes()
+        );
+        let restored = CertificateManager::new(directory.clone()).unwrap();
+        restored
+            .load_certificate(hostname)
+            .expect("old generation should still restore");
+        drop(issued);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn issued_material_is_installed_only_after_metadata_acceptance() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let directory = std::env::temp_dir().join(format!(
+            "linklake-certificate-pending-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let hostname = "pending.example.com";
+        let manager = CertificateManager::new(directory.clone()).unwrap();
+        let generated = generate_simple_self_signed(vec![hostname.to_owned()]).unwrap();
+        let certificate_pem = generated.cert.pem().into_bytes();
+        let private_key_pem = Zeroizing::new(generated.signing_key.serialize_pem().into_bytes());
+        let metadata = validate_certificate(hostname, &certificate_pem, &private_key_pem)
+            .unwrap()
+            .1;
+        let issued = CertificateIssueResult {
+            metadata,
+            http01_challenges_completed: 1,
+            dns01_challenges_completed: 0,
+            identifier: hostname.to_owned(),
+            certificate_pem,
+            private_key_pem,
+        };
+        assert!(!manager.has_certificate(hostname));
+        assert!(!manager.certificate_directory(hostname).exists());
+        manager
+            .commit_issued_certificate(&issued, |metadata| {
+                assert!(!manager.has_certificate(hostname));
+                assert_eq!(metadata, &issued.metadata);
+                Ok(())
+            })
+            .unwrap();
+        assert!(manager.has_certificate(hostname));
+        assert_eq!(
+            committed_certificate_pairs(&manager.certificate_directory(hostname))
+                .unwrap()
+                .len(),
+            1
+        );
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
