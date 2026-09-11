@@ -68,6 +68,32 @@ impl JobLeases {
         Duration::from_secs((self.lease_seconds / 3).max(1))
     }
 
+    /// 在业务提交事务中核对精确任务身份，防止旧 worker 提交新租约的结果。
+    pub(crate) async fn assert_postgres_transaction_lease(
+        &self,
+        transaction: &PostgresTransaction<'_>,
+        lease: &JobLease,
+    ) -> anyhow::Result<()> {
+        self.coordinator
+            .assert_postgres_transaction_fence(transaction, lease.fencing_token)
+            .await?;
+        lock_postgres_job(transaction, &lease.job_key).await?;
+        let current = read_postgres_job_for_update(transaction, &lease.job_key).await?;
+        let now = postgres_now(transaction).await?;
+        anyhow::ensure!(
+            current.is_some_and(|current| {
+                current.lease_id == lease.lease_id
+                    && current.job_kind == lease.job_kind
+                    && current.owner_instance_id == self.coordinator.instance_id()
+                    && current.owner_incarnation_id == self.coordinator.incarnation_id()
+                    && current.fencing_token == lease.fencing_token
+                    && current.lease_until_unix_seconds > now
+            }),
+            "job lease is stale; refusing business state write"
+        );
+        Ok(())
+    }
+
     pub(crate) async fn acquire(
         &self,
         job_key: &str,

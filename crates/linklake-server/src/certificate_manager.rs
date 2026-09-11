@@ -609,7 +609,7 @@ pub(crate) fn validate_certificate_key_pair(
     Ok((certificates, private_key))
 }
 
-fn validate_certificate(
+pub(crate) fn validate_certificate(
     hostname: &str,
     certificate_pem: &[u8],
     private_key_pem: &[u8],

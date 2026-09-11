@@ -6,6 +6,8 @@ mod audit_log;
 mod audit_store;
 mod certificate_catalog;
 mod certificate_manager;
+mod certificate_material;
+mod certificate_store;
 mod client_registry;
 mod cloudflare_dns;
 mod database;

@@ -4,8 +4,43 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tokio_postgres::{Client, Transaction};
 
-pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 11;
+pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 12;
 const ADVISORY_LOCK_ID: i64 = 0x4c4c_4841_4d49_4752;
+
+const MIGRATION_V12_NAME: &str = "shared_certificate_catalog";
+const MIGRATION_V12_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS linklake_acme_config (
+    singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1),
+    config JSONB NOT NULL
+);
+INSERT INTO linklake_acme_config(singleton_id,config) VALUES(1,
+    '{"enabled":false,"environment":"production","directory_url":"https://acme-v02.api.letsencrypt.org/directory","contact_email":"","terms_accepted":false,"challenge_type":"http-01","renew_before_days":30,"updated_at":0}'::jsonb)
+    ON CONFLICT(singleton_id) DO NOTHING;
+CREATE TABLE IF NOT EXISTS linklake_route_tls (
+    route_id TEXT PRIMARY KEY,
+    revision TEXT NOT NULL,
+    policy JSONB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS linklake_certificate_states (
+    route_id TEXT PRIMARY KEY,
+    state JSONB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS linklake_certificate_states_renewal
+    ON linklake_certificate_states((state->>'status'),((state->>'next_renewal')::bigint));
+CREATE TABLE IF NOT EXISTS linklake_certificate_materials (
+    identifier TEXT PRIMARY KEY,
+    route_id TEXT NOT NULL UNIQUE,
+    generation TEXT NOT NULL,
+    certificate_pem BYTEA NOT NULL CHECK(octet_length(certificate_pem) <= 2097152),
+    encrypted_private_key BYTEA NOT NULL CHECK(octet_length(encrypted_private_key) <= 2097200),
+    updated_unix_seconds BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS linklake_acme_accounts (
+    directory_url TEXT PRIMARY KEY,
+    encrypted_credentials BYTEA NOT NULL CHECK(octet_length(encrypted_credentials) <= 2097200),
+    updated_unix_seconds BIGINT NOT NULL
+);
+"#;
 
 const MIGRATION_V11_NAME: &str = "shared_alerts_and_notification_outbox";
 const MIGRATION_V11_SQL: &str = r#"
@@ -526,6 +561,11 @@ const MIGRATIONS: &[Migration] = &[
         name: MIGRATION_V11_NAME,
         sql: MIGRATION_V11_SQL,
     },
+    Migration {
+        version: 12,
+        name: MIGRATION_V12_NAME,
+        sql: MIGRATION_V12_SQL,
+    },
 ];
 
 pub(crate) async fn apply(client: &mut Client) -> anyhow::Result<()> {
@@ -617,6 +657,49 @@ pub(crate) async fn apply(client: &mut Client) -> anyhow::Result<()> {
 
 async fn verify_schema_structure(transaction: &Transaction<'_>) -> anyhow::Result<()> {
     const TABLES: &[TableExpectation] = &[
+        TableExpectation {
+            name: "linklake_acme_config",
+            primary_key: &["singleton_id"],
+            columns: &[
+                required("singleton_id", "int4"),
+                required("config", "jsonb"),
+            ],
+        },
+        TableExpectation {
+            name: "linklake_route_tls",
+            primary_key: &["route_id"],
+            columns: &[
+                required("route_id", "text"),
+                required("revision", "text"),
+                required("policy", "jsonb"),
+            ],
+        },
+        TableExpectation {
+            name: "linklake_certificate_states",
+            primary_key: &["route_id"],
+            columns: &[required("route_id", "text"), required("state", "jsonb")],
+        },
+        TableExpectation {
+            name: "linklake_certificate_materials",
+            primary_key: &["identifier"],
+            columns: &[
+                required("identifier", "text"),
+                required("route_id", "text"),
+                required("generation", "text"),
+                required("certificate_pem", "bytea"),
+                required("encrypted_private_key", "bytea"),
+                required("updated_unix_seconds", "int8"),
+            ],
+        },
+        TableExpectation {
+            name: "linklake_acme_accounts",
+            primary_key: &["directory_url"],
+            columns: &[
+                required("directory_url", "text"),
+                required("encrypted_credentials", "bytea"),
+                required("updated_unix_seconds", "int8"),
+            ],
+        },
         TableExpectation {
             name: "linklake_alert_rules",
             primary_key: &["id"],

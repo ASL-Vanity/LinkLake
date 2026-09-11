@@ -6,6 +6,9 @@ use uuid::Uuid;
 
 use crate::database::Database;
 
+#[path = "certificate_catalog_postgres.rs"]
+pub(crate) mod postgres;
+
 pub(crate) const LETS_ENCRYPT_PRODUCTION_DIRECTORY: &str =
     "https://acme-v02.api.letsencrypt.org/directory";
 pub(crate) const LETS_ENCRYPT_STAGING_DIRECTORY: &str =
@@ -72,7 +75,7 @@ impl AcmeChallengeType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AcmeConfig {
     pub(crate) enabled: bool,
     pub(crate) environment: AcmeEnvironment,
@@ -121,7 +124,7 @@ impl RouteTlsMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RouteTlsPolicy {
     pub(crate) route_id: Uuid,
     pub(crate) mode: RouteTlsMode,
@@ -179,7 +182,7 @@ impl CertificateStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CertificateState {
     pub(crate) route_id: Uuid,
     pub(crate) status: CertificateStatus,
@@ -225,6 +228,7 @@ pub(crate) enum CertificateCatalogError {
     InvalidStoredData(&'static str),
     Io(std::io::Error),
     Database(rusqlite::Error),
+    SharedStorage(anyhow::Error),
 }
 
 impl CertificateCatalogError {
@@ -245,6 +249,7 @@ impl CertificateCatalogError {
             Self::InvalidStoredData(_) => "invalid_stored_data",
             Self::Io(_) => "certificate_io_error",
             Self::Database(_) => "certificate_database_error",
+            Self::SharedStorage(_) => "certificate_database_error",
         }
     }
 }
@@ -274,6 +279,7 @@ impl fmt::Display for CertificateCatalogError {
             Self::InvalidStoredData(_) => unreachable!("handled before message selection"),
             Self::Io(_) => "certificate storage operation failed",
             Self::Database(_) => "certificate database operation failed",
+            Self::SharedStorage(_) => "certificate shared storage operation failed",
         };
         formatter.write_str(message)
     }
@@ -284,6 +290,7 @@ impl Error for CertificateCatalogError {
         match self {
             Self::Io(error) => Some(error),
             Self::Database(error) => Some(error),
+            Self::SharedStorage(error) => Some(error.as_ref()),
             _ => None,
         }
     }
