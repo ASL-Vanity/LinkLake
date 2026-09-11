@@ -147,6 +147,7 @@ class MockCloudflareState:
                 "content": content,
                 "ttl": int(payload.get("ttl", 1)),
                 "proxied": False,
+                "comment": payload.get("comment"),
             }
             self.records[record_id] = record
             mode = self.publish_mode
@@ -251,6 +252,19 @@ class MockCloudflareHandler(BaseHTTPRequestHandler):
             "/dns_records"
         ):
             self._handle_record_lookup(parsed)
+            return
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) == 6 and parts[:3] == ["client", "v4", "zones"] and parts[4] == "dns_records":
+            with self.state.lock:
+                record = self.state.records.get(parts[5])
+                if record is not None and record["zone_id"] != parts[3]:
+                    record = None
+                record = dict(record) if record is not None else None
+            self.state.append_event("record_lookup_by_id", zone_id=parts[3], record_id=parts[5])
+            self._write_json(
+                HTTPStatus.OK if record is not None else HTTPStatus.NOT_FOUND,
+                _cloudflare_envelope(record, success=record is not None),
+            )
             return
         self._write_json(
             HTTPStatus.NOT_FOUND,
@@ -357,7 +371,15 @@ class MockCloudflareHandler(BaseHTTPRequestHandler):
                 and (not record_type or record["type"] == record_type)
             ]
         self.state.append_event("record_lookup", zone_id=zone_id, name=name, type=record_type)
-        self._write_json(HTTPStatus.OK, _cloudflare_envelope(records))
+        page = max(1, int(query.get("page", ["1"])[0]))
+        per_page = max(1, min(1000, int(query.get("per_page", ["100"])[0])))
+        start = (page - 1) * per_page
+        envelope = _cloudflare_envelope(records[start : start + per_page])
+        envelope["result_info"] = {
+            "page": page, "per_page": per_page, "total_count": len(records),
+            "total_pages": max(1, (len(records) + per_page - 1) // per_page),
+        }
+        self._write_json(HTTPStatus.OK, envelope)
 
     def _handle_record_create(self, zone_id: str) -> None:
         if self.state.take_failure("create"):

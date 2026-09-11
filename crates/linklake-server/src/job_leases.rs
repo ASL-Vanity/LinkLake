@@ -68,6 +68,15 @@ impl JobLeases {
         Duration::from_secs((self.lease_seconds / 3).max(1))
     }
 
+    /// 清理其他任务资源前，与该任务的续租/完成串行化，再读取其活动状态。
+    pub(crate) async fn lock_postgres_transaction_job(
+        &self,
+        transaction: &PostgresTransaction<'_>,
+        job_key: &str,
+    ) -> anyhow::Result<()> {
+        lock_postgres_job(transaction, job_key).await
+    }
+
     pub(crate) fn assert_sqlite_transaction_lease(
         &self,
         transaction: &SqliteTransaction<'_>,

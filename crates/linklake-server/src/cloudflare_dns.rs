@@ -1,5 +1,7 @@
 use crate::{
-    certificate_catalog::normalize_certificate_identifier, certificate_manager::write_secret_file,
+    certificate_catalog::normalize_certificate_identifier,
+    dns01_store::{Dns01Intent, Dns01JournalStore, Dns01Mutation},
+    job_leases::JobLease,
 };
 use reqwest::{Method, StatusCode, Url};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -11,7 +13,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::sync::Mutex as AsyncMutex;
 use zeroize::Zeroizing;
 
 const DEFAULT_API_BASE_URL: &str = "https://api.cloudflare.com/client/v4/";
@@ -62,6 +64,7 @@ pub(crate) struct CloudflareDnsClient {
     propagation_timeout: Duration,
     propagation_interval: Duration,
     operation_lock: Arc<AsyncMutex<()>>,
+    journal: Option<Arc<Dns01JournalStore>>,
 }
 
 impl fmt::Debug for CloudflareDnsClient {
@@ -106,6 +109,7 @@ impl CloudflareDnsClient {
         );
         let http = reqwest::Client::builder()
             .timeout(API_REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("LinkLake/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Some(Self {
@@ -117,6 +121,7 @@ impl CloudflareDnsClient {
             propagation_timeout,
             propagation_interval,
             operation_lock: Arc::new(AsyncMutex::new(())),
+            journal: None,
         }))
     }
 
@@ -131,6 +136,7 @@ impl CloudflareDnsClient {
     ) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(API_REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
         Ok(Self {
             http,
@@ -141,6 +147,7 @@ impl CloudflareDnsClient {
             propagation_timeout,
             propagation_interval,
             operation_lock: Arc::new(AsyncMutex::new(())),
+            journal: None,
         })
     }
 
@@ -148,44 +155,74 @@ impl CloudflareDnsClient {
         &self,
         certificate_identifier: &str,
         value: String,
+        lease: &JobLease,
     ) -> anyhow::Result<Dns01ChallengeGuard> {
-        let operation_guard = self.operation_lock.clone().lock_owned().await;
-        self.recover_orphaned_records().await?;
+        let journal = self.journal()?;
         let certificate_identifier = normalize_certificate_identifier(certificate_identifier)?;
+        anyhow::ensure!(
+            value.len() == 43
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+            "DNS-01 TXT value is invalid"
+        );
         let dns_name = certificate_identifier
             .strip_prefix("*.")
             .unwrap_or(&certificate_identifier);
         let record_name = format!("_acme-challenge.{dns_name}");
         let zone = self.discover_zone(dns_name).await?;
-        let record = self
-            .create_txt_record(&zone.id, &record_name, &value)
-            .await?;
-        let journal = Dns01Journal {
+        let intent = Dns01Intent {
+            id: uuid::Uuid::new_v4(),
+            identifier: certificate_identifier.clone(),
+            provider: self.api_base_url.as_str().to_owned(),
             zone_id: zone.id,
-            record_id: record.id,
+            record_name,
+            value,
+            record_id: None,
+            creation_observed: false,
+            creation_rejected: false,
+            job_key: lease.job_key.clone(),
+            job_lease_id: lease.lease_id.to_string(),
+            cleanup_requested: false,
+            next_cleanup: 0,
         };
-        let journal_path = self
-            .journal_dir
-            .join(format!("{}.json", uuid::Uuid::new_v4()));
-        if let Err(error) = write_secret_file(&journal_path, &serde_json::to_vec(&journal)?) {
-            let _ = self
-                .delete_txt_record(&journal.zone_id, &journal.record_id)
-                .await;
-            return Err(error.context("could not persist DNS-01 cleanup journal"));
-        }
+        let id = intent.id;
+        let intent = journal
+            .apply(id, lease, Dns01Mutation::Create(intent))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("DNS-01 publication intent was not saved"))?;
+        let record = match self.create_txt_record(&intent).await {
+            Ok(record) => record,
+            Err(error) => {
+                if error.downcast_ref::<CloudflareRequestRejected>().is_some() {
+                    let _ = journal.apply(id, lease, Dns01Mutation::Rejected).await;
+                }
+                return Err(error);
+            }
+        };
+        let intent = journal
+            .apply(id, lease, Dns01Mutation::Published(record.id))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("DNS-01 publication intent disappeared"))?;
         Ok(Dns01ChallengeGuard {
             client: self.clone(),
-            operation_guard: Some(operation_guard),
-            record: Some(PublishedDns01Record {
-                journal,
-                journal_path,
-                record_name,
-                value,
-            }),
+            intent,
+            issuing_lease: lease.clone(),
         })
     }
 
-    async fn recover_orphaned_records(&self) -> anyhow::Result<()> {
+    pub(crate) fn with_journal(mut self, journal: Arc<Dns01JournalStore>) -> Self {
+        self.journal = Some(journal);
+        self
+    }
+
+    fn journal(&self) -> anyhow::Result<&Arc<Dns01JournalStore>> {
+        self.journal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("DNS-01 durable journal is not configured"))
+    }
+
+    async fn recover_orphaned_records(&self, lease: &JobLease) -> anyhow::Result<()> {
         let entries = match fs::read_dir(&self.journal_dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -206,7 +243,10 @@ impl CloudflareDnsClient {
         }
         paths.sort();
         for path in paths {
-            let serialized = fs::read(&path)?;
+            let mut serialized = Vec::new();
+            fs::File::open(&path)?
+                .take(4097)
+                .read_to_end(&mut serialized)?;
             anyhow::ensure!(
                 serialized.len() <= 4096,
                 "DNS-01 cleanup journal is too large"
@@ -214,8 +254,33 @@ impl CloudflareDnsClient {
             let journal: Dns01Journal = serde_json::from_slice(&serialized)?;
             validate_cloudflare_id(&journal.zone_id)?;
             validate_cloudflare_id(&journal.record_id)?;
-            self.delete_txt_record(&journal.zone_id, &journal.record_id)
-                .await?;
+            if let Some(record) = self
+                .read_record(&journal.zone_id, &journal.record_id)
+                .await?
+            {
+                anyhow::ensure!(
+                    record.record_type == "TXT"
+                        && record.name.starts_with("_acme-challenge.")
+                        && record.comment.as_deref() == Some("LinkLake ACME DNS-01 challenge"),
+                    "legacy DNS-01 record ownership cannot be verified; refusing deletion"
+                );
+                anyhow::ensure!(
+                    self.journal()?
+                        .runtime
+                        .jobs()
+                        .renew(
+                            &lease.job_key,
+                            &lease.job_kind,
+                            lease.lease_id,
+                            lease.fencing_token
+                        )
+                        .await?
+                        .is_some(),
+                    "legacy DNS-01 cleanup lease expired"
+                );
+                self.delete_txt_record(&journal.zone_id, &journal.record_id)
+                    .await?;
+            }
             remove_journal(&path)?;
         }
         Ok(())
@@ -247,30 +312,22 @@ impl CloudflareDnsClient {
         anyhow::bail!("Cloudflare zone was not found for the DNS-01 name")
     }
 
-    async fn create_txt_record(
-        &self,
-        zone_id: &str,
-        record_name: &str,
-        value: &str,
-    ) -> anyhow::Result<CloudflareDnsRecord> {
-        validate_cloudflare_id(zone_id)?;
-        let url = self.api_url(&format!("zones/{zone_id}/dns_records"))?;
+    async fn create_txt_record(&self, intent: &Dns01Intent) -> anyhow::Result<CloudflareDnsRecord> {
+        validate_cloudflare_id(&intent.zone_id)?;
+        let url = self.api_url(&format!("zones/{}/dns_records", intent.zone_id))?;
+        let comment = intent.comment();
         let request = CreateDnsRecordRequest {
             record_type: "TXT",
-            name: record_name,
-            content: value,
+            name: &intent.record_name,
+            content: &intent.value,
             ttl: 120,
-            comment: "LinkLake ACME DNS-01 challenge",
+            comment: &comment,
         };
         let record: CloudflareDnsRecord =
             self.request_json(Method::POST, url, Some(&request)).await?;
         validate_cloudflare_id(&record.id)?;
         anyhow::ensure!(
-            record
-                .name
-                .trim_end_matches('.')
-                .eq_ignore_ascii_case(record_name)
-                && record.content == value,
+            record.matches_intent(intent),
             "Cloudflare returned an unexpected DNS record"
         );
         Ok(record)
@@ -345,16 +402,13 @@ impl CloudflareDnsClient {
 
 pub(crate) struct Dns01ChallengeGuard {
     client: CloudflareDnsClient,
-    operation_guard: Option<OwnedMutexGuard<()>>,
-    record: Option<PublishedDns01Record>,
+    intent: Dns01Intent,
+    issuing_lease: JobLease,
 }
 
 impl Dns01ChallengeGuard {
     pub(crate) async fn wait_for_propagation(&self) -> anyhow::Result<()> {
-        let record = self
-            .record
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("DNS-01 record was already cleaned up"))?;
+        let record = &self.intent;
         let deadline = Instant::now() + self.client.propagation_timeout;
         loop {
             if self
@@ -372,45 +426,229 @@ impl Dns01ChallengeGuard {
         }
     }
 
-    pub(crate) async fn cleanup(mut self) -> anyhow::Result<()> {
-        let result = match self.record.take() {
-            Some(record) => self.client.cleanup_published_record(record).await,
-            None => Ok(()),
-        };
-        self.operation_guard.take();
-        result
-    }
-}
-
-impl Drop for Dns01ChallengeGuard {
-    fn drop(&mut self) {
-        let Some(record) = self.record.take() else {
-            return;
-        };
-        let client = self.client.clone();
-        let operation_guard = self.operation_guard.take();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                let _operation_guard = operation_guard;
-                let _ = client.cleanup_published_record(record).await;
-            });
-        }
+    pub(crate) async fn cleanup(self) -> anyhow::Result<()> {
+        self.client
+            .journal()?
+            .apply(
+                self.intent.id,
+                &self.issuing_lease,
+                Dns01Mutation::RequestCleanup,
+            )
+            .await?;
+        self.client.cleanup_intent(&self.intent, None).await
     }
 }
 
 impl CloudflareDnsClient {
-    async fn cleanup_published_record(&self, record: PublishedDns01Record) -> anyhow::Result<()> {
-        self.delete_txt_record(&record.journal.zone_id, &record.journal.record_id)
-            .await?;
-        remove_journal(&record.journal_path)
+    pub(crate) async fn recover_pending(
+        &self,
+        stop: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> anyhow::Result<()> {
+        let journal = self.journal()?;
+        let active = journal.runtime.jobs().active().await?;
+        for intent in journal.due(self.api_base_url.as_str()).await? {
+            if stop.as_ref().is_some_and(|stop| *stop.borrow()) {
+                return Ok(());
+            }
+            if !intent.cleanup_requested
+                && active.iter().any(|lease| {
+                    lease.job_key == intent.job_key
+                        && lease.lease_id.to_string() == intent.job_lease_id
+                })
+            {
+                continue;
+            }
+            if let Err(error) = self.cleanup_intent(&intent, stop.clone()).await {
+                tracing::warn!(%error, publication_id=%intent.id, "could not recover DNS-01 cleanup intent");
+            }
+        }
+        self.recover_legacy_journals(stop).await
     }
-}
 
-struct PublishedDns01Record {
-    journal: Dns01Journal,
-    journal_path: PathBuf,
-    record_name: String,
-    value: String,
+    async fn cleanup_intent(
+        &self,
+        intent: &Dns01Intent,
+        stop: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> anyhow::Result<()> {
+        let journal = self.journal()?;
+        let jobs = journal.runtime.jobs();
+        let Some(lease) = jobs
+            .acquire(
+                &intent.cleanup_job_key(),
+                "dns01_cleanup",
+                journal.runtime.fencing_token()?,
+            )
+            .await?
+        else {
+            return Ok(());
+        };
+        let outcome = crate::job_execution::run(journal.runtime.clone(), lease.clone(), stop, async {
+            let Some(current) = journal.apply(intent.id, &lease, Dns01Mutation::AuthorizeCleanup).await? else { return Ok(()); };
+            anyhow::ensure!(current.provider == self.api_base_url.as_str(), "DNS-01 journal belongs to another provider endpoint");
+            let records = self.owned_records(&current).await?;
+            if !records.is_empty() {
+                // 先确认曾观察到创建，再删除；删除成功但回写前崩溃也可以收敛。
+                journal.apply(current.id, &lease, Dns01Mutation::ObservedCreation).await?;
+                for record in &records {
+                    journal.apply(current.id, &lease, Dns01Mutation::AuthorizeCleanup).await?;
+                    self.delete_txt_record(&current.zone_id, &record.id).await?;
+                }
+            }
+            if records.is_empty() && !current.creation_observed && !current.creation_rejected {
+                // POST 结果不明且暂时查不到记录，不能丢弃意图；迟到创建仍需下一轮发现。
+                journal.apply(current.id, &lease, Dns01Mutation::RetryCleanup).await?;
+                tracing::warn!(publication_id=%current.id, "DNS-01 creation outcome is unknown; retaining cleanup intent");
+            } else {
+                journal.apply(current.id, &lease, Dns01Mutation::CompleteCleanup).await?;
+            }
+            Ok::<_,anyhow::Error>(())
+        }).await?;
+        match outcome {
+            Ok(()) => {
+                jobs.complete(
+                    &lease.job_key,
+                    &lease.job_kind,
+                    lease.lease_id,
+                    lease.fencing_token,
+                )
+                .await?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = journal
+                    .apply(intent.id, &lease, Dns01Mutation::RetryCleanup)
+                    .await;
+                let _ = jobs
+                    .fail(
+                        &lease.job_key,
+                        &lease.job_kind,
+                        lease.lease_id,
+                        lease.fencing_token,
+                        "dns01_cleanup_failed",
+                    )
+                    .await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn read_record(
+        &self,
+        zone_id: &str,
+        record_id: &str,
+    ) -> anyhow::Result<Option<CloudflareDnsRecord>> {
+        validate_cloudflare_id(zone_id)?;
+        validate_cloudflare_id(record_id)?;
+        let response = self
+            .http
+            .get(self.api_url(&format!("zones/{zone_id}/dns_records/{record_id}"))?)
+            .bearer_auth(self.token.expose())
+            .send()
+            .await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let record: CloudflareDnsRecord = decode_cloudflare_response(response).await?;
+        anyhow::ensure!(
+            record.id == record_id,
+            "Cloudflare record lookup returned another record"
+        );
+        Ok(Some(record))
+    }
+
+    async fn owned_records(
+        &self,
+        intent: &Dns01Intent,
+    ) -> anyhow::Result<Vec<CloudflareDnsRecord>> {
+        if let Some(id) = &intent.record_id {
+            return match self.read_record(&intent.zone_id, id).await? {
+                Some(record) => {
+                    anyhow::ensure!(
+                        record.matches_intent(intent),
+                        "DNS-01 record was modified; refusing to delete it"
+                    );
+                    Ok(vec![record])
+                }
+                None => Ok(Vec::new()),
+            };
+        }
+        validate_cloudflare_id(&intent.zone_id)?;
+        let mut owned = Vec::new();
+        for page in 1..=32 {
+            let mut url = self.api_url(&format!("zones/{}/dns_records", intent.zone_id))?;
+            url.query_pairs_mut()
+                .append_pair("type", "TXT")
+                .append_pair("name", &intent.record_name)
+                .append_pair("per_page", "100")
+                .append_pair("page", &page.to_string());
+            let records: Vec<CloudflareDnsRecord> = self
+                .request_json(Method::GET, url, Option::<&()>::None)
+                .await?;
+            let count = records.len();
+            for record in records
+                .into_iter()
+                .filter(|record| record.matches_intent(intent))
+            {
+                validate_cloudflare_id(&record.id)?;
+                owned.push(record);
+            }
+            if count < 100 {
+                return Ok(owned);
+            }
+        }
+        anyhow::bail!("DNS-01 record lookup exceeded the pagination limit")
+    }
+
+    async fn recover_legacy_journals(
+        &self,
+        stop: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> anyhow::Result<()> {
+        if !self.journal_dir.exists() {
+            return Ok(());
+        }
+        let journal = self.journal()?;
+        let jobs = journal.runtime.jobs();
+        let Some(lease) = jobs
+            .acquire(
+                "dns01_legacy_cleanup",
+                "dns01_legacy_cleanup",
+                journal.runtime.fencing_token()?,
+            )
+            .await?
+        else {
+            return Ok(());
+        };
+        let result =
+            crate::job_execution::run(journal.runtime.clone(), lease.clone(), stop, async {
+                let _guard = self.operation_lock.lock().await;
+                self.recover_orphaned_records(&lease).await
+            })
+            .await?;
+        match result {
+            Ok(()) => {
+                jobs.complete(
+                    &lease.job_key,
+                    &lease.job_kind,
+                    lease.lease_id,
+                    lease.fencing_token,
+                )
+                .await?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = jobs
+                    .fail(
+                        &lease.job_key,
+                        &lease.job_kind,
+                        lease.lease_id,
+                        lease.fencing_token,
+                        "dns01_legacy_cleanup_failed",
+                    )
+                    .await;
+                Err(error)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -444,6 +682,21 @@ struct CloudflareDnsRecord {
     id: String,
     name: String,
     content: String,
+    #[serde(rename = "type")]
+    record_type: String,
+    comment: Option<String>,
+}
+
+impl CloudflareDnsRecord {
+    fn matches_intent(&self, intent: &Dns01Intent) -> bool {
+        self.record_type == "TXT"
+            && self
+                .name
+                .trim_end_matches('.')
+                .eq_ignore_ascii_case(&intent.record_name)
+            && self.content == intent.value
+            && self.comment.as_deref() == Some(intent.comment().as_str())
+    }
 }
 
 #[derive(Serialize)]
@@ -453,7 +706,7 @@ struct CreateDnsRecordRequest<'a> {
     name: &'a str,
     content: &'a str,
     ttl: u32,
-    comment: &'static str,
+    comment: &'a str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -489,12 +742,27 @@ async fn decode_cloudflare_response<T: DeserializeOwned>(
                 format!("code {code}")
             })
             .unwrap_or_else(|| "request rejected".to_owned());
-        anyhow::bail!("Cloudflare API request failed ({status}; {summary})");
+        let message = format!("Cloudflare API request failed ({status}; {summary})");
+        if !envelope.success && envelope.result.is_none() {
+            return Err(CloudflareRequestRejected(message).into());
+        }
+        anyhow::bail!(message);
     }
     envelope
         .result
         .ok_or_else(|| anyhow::anyhow!("Cloudflare API response did not contain a result"))
 }
+
+#[derive(Debug)]
+struct CloudflareRequestRejected(String);
+
+impl fmt::Display for CloudflareRequestRejected {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CloudflareRequestRejected {}
 
 async fn limited_response_bytes(mut response: reqwest::Response) -> anyhow::Result<bytes::Bytes> {
     if response
@@ -633,7 +901,7 @@ fn environment_duration(
     Ok(duration)
 }
 
-fn validate_cloudflare_id(value: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_cloudflare_id(value: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         (1..=128).contains(&value.len())
             && value
@@ -665,7 +933,7 @@ fn remove_journal(path: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::{
         normalize_txt_answer, validate_cloudflare_id, validated_url, CloudflareApiToken,
-        CloudflareDnsClient,
+        CloudflareDnsClient, CloudflareDnsRecord, Dns01Intent,
     };
     use std::time::Duration;
 
@@ -698,5 +966,40 @@ mod tests {
         )
         .expect("test Cloudflare client should build");
         assert!(client.api_base_url.path().ends_with('/'));
+    }
+
+    #[test]
+    fn record_ownership_requires_type_name_value_and_publication_marker() {
+        let intent = Dns01Intent {
+            id: uuid::Uuid::new_v4(),
+            identifier: "site.example.com".to_owned(),
+            provider: "https://api.cloudflare.com/client/v4/".to_owned(),
+            zone_id: "zone-1".to_owned(),
+            record_name: "_acme-challenge.site.example.com".to_owned(),
+            value: "A".repeat(43),
+            record_id: None,
+            creation_observed: false,
+            creation_rejected: false,
+            job_key: "test".to_owned(),
+            job_lease_id: "test".to_owned(),
+            cleanup_requested: false,
+            next_cleanup: 0,
+        };
+        let mut record = CloudflareDnsRecord {
+            id: "record-1".to_owned(),
+            name: format!("{}.", intent.record_name.to_uppercase()),
+            content: intent.value.clone(),
+            record_type: "TXT".to_owned(),
+            comment: Some(intent.comment()),
+        };
+        assert!(record.matches_intent(&intent));
+        record.comment = Some(format!("LinkLake DNS-01 {}", uuid::Uuid::new_v4()));
+        assert!(!record.matches_intent(&intent));
+        record.comment = Some(intent.comment());
+        record.content = "B".repeat(43);
+        assert!(!record.matches_intent(&intent));
+        record.content = intent.value.clone();
+        record.record_type = "CNAME".to_owned();
+        assert!(!record.matches_intent(&intent));
     }
 }

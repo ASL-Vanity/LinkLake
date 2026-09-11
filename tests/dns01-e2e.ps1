@@ -17,6 +17,7 @@ $targetRoot = Join-Path $projectRoot 'target/dns01-e2e'
 $serverPath = Join-Path $targetRoot 'debug/linklake-server'
 $clientPath = Join-Path $targetRoot 'debug/linklake-client'
 $mockPath = Join-Path $PSScriptRoot 'cloudflare_dns_mock.py'
+$intentReaderPath = Join-Path $PSScriptRoot 'read_dns01_intents.py'
 $rootCaPath = Join-Path $PSScriptRoot 'pebble/pebble.minica.pem'
 $runRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('linklake-dns01-e2e-' + [guid]::NewGuid())
 $issuedRootCaPath = Join-Path $runRoot 'pebble-issued-root.pem'
@@ -28,6 +29,27 @@ $clientProcess = $null
 $backendProcess = $null
 $mockProcess = $null
 $containersStarted = $false
+
+function Get-Dns01Intents {
+    param([Parameter(Mandatory)][string]$DataDirectory)
+    $output = & python3 $intentReaderPath (Join-Path $DataDirectory 'linklake.sqlite3')
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Unable to read DNS-01 durable cleanup intents.'
+    }
+    return ($output | ConvertFrom-Json)
+}
+
+function Wait-Dns01Cleanup {
+    param([string]$MockBaseUrl, [string]$DataDirectory)
+    $deadline = [DateTime]::UtcNow.AddSeconds(120)
+    do {
+        $state = Get-MockState -MockBaseUrl $MockBaseUrl
+        $intents = @(Get-Dns01Intents -DataDirectory $DataDirectory)
+        if (@($state.records).Count -eq 0 -and $intents.Count -eq 0) { return }
+        Start-Sleep -Milliseconds 500
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw 'Background DNS-01 recovery did not drain provider records and durable intents.'
+}
 
 function Get-FreePort {
     $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
@@ -466,7 +488,7 @@ foreach ($command in @('docker', 'curl', 'python3', 'chmod')) {
         throw "$command is required for the DNS-01 E2E test."
     }
 }
-foreach ($requiredFile in @($rootCaPath, $mockPath)) {
+foreach ($requiredFile in @($rootCaPath, $mockPath, $intentReaderPath)) {
     if (-not (Test-Path -LiteralPath $requiredFile)) {
         throw "Required DNS-01 E2E file is missing: $requiredFile"
     }
@@ -869,8 +891,8 @@ try {
     Set-TestHttpRouteEnabled -BaseUrl $baseUrl -Session $webSession `
         -RouteId $routes['dns01-create-error'].id -Enabled $false
 
-    # 删除 envelope 失败时保留私密 journal；下一次订单必须先恢复并清除孤儿记录.
-    $null = Set-MockConfig -MockBaseUrl $mockBaseUrl -Config @{ delete_error_count = 1 }
+    # 持续注入删除失败，显式解除后应由后台恢复，无需新订单触发。
+    $null = Set-MockConfig -MockBaseUrl $mockBaseUrl -Config @{ delete_error_count = 100 }
     $stateBeforeDeleteFailure = Get-MockState -MockBaseUrl $mockBaseUrl
     $deleteFailureOffset = @($stateBeforeDeleteFailure.events).Count
     Set-TestHttpRouteEnabled -BaseUrl $baseUrl -Session $webSession `
@@ -902,20 +924,24 @@ try {
         $deleteFailureRecords[0].id -ne $deleteFailureCreated[0].record_id) {
         throw 'Injected Cloudflare delete failure was not observed.'
     }
-    $journalDirectory = Join-Path $dataDirectory 'acme/dns01-records'
-    $journalFiles = @(Get-ChildItem -LiteralPath $journalDirectory -Filter '*.json' -File -ErrorAction SilentlyContinue)
-    if ($journalFiles.Count -ne 1) {
-        throw 'DNS-01 cleanup journal was not retained after delete failure.'
+    $retainedIntents = @(Get-Dns01Intents -DataDirectory $dataDirectory | Where-Object {
+        $_.record_id -eq $deleteFailureRecords[0].id
+    })
+    if ($retainedIntents.Count -ne 1) {
+        throw 'DNS-01 durable intent was not retained after delete failure.'
     }
-    $deleteFailureJournal = Get-Content -LiteralPath $journalFiles[0].FullName -Raw | ConvertFrom-Json
+    $deleteFailureJournal = $retainedIntents[0]
     if ($deleteFailureJournal.zone_id -ne $deleteFailureRecords[0].zone_id -or
-        $deleteFailureJournal.record_id -ne $deleteFailureRecords[0].id) {
-        throw 'DNS-01 cleanup journal does not identify the rejected TXT deletion.'
+        -not $deleteFailureJournal.cleanup_requested -or
+        -not $deleteFailureJournal.creation_observed -or
+        $deleteFailureJournal.creation_rejected) {
+        throw 'DNS-01 durable intent does not retain ownership of the rejected TXT deletion.'
     }
     Set-TestHttpRouteEnabled -BaseUrl $baseUrl -Session $webSession `
         -RouteId $routes['dns01-delete-retry'].id -Enabled $false
 
     $null = Set-MockConfig -MockBaseUrl $mockBaseUrl -Config @{ delete_error_count = 0 }
+    Wait-Dns01Cleanup -MockBaseUrl $mockBaseUrl -DataDirectory $dataDirectory
     Set-TestHttpRouteEnabled -BaseUrl $baseUrl -Session $webSession `
         -RouteId $routes['dns01-recovery'].id -Enabled $true
     $null = Wait-HttpRouteOnline -BaseUrl $baseUrl -Session $webSession `
@@ -924,11 +950,7 @@ try {
         -RouteId $routes['dns01-recovery'].id
     $null = Wait-RouteTlsStatus -BaseUrl $baseUrl -Session $webSession `
         -RouteId $routes['dns01-recovery'].id -ExpectedStatus 'active' -ExpectedOnline $true
-    $recoveredState = Get-MockState -MockBaseUrl $mockBaseUrl
-    if (@($recoveredState.records).Count -ne 0 -or
-        @(Get-ChildItem -LiteralPath $journalDirectory -Filter '*.json' -File -ErrorAction SilentlyContinue).Count -ne 0) {
-        throw 'The next DNS-01 order did not recover the orphaned TXT record and journal.'
-    }
+    Wait-Dns01Cleanup -MockBaseUrl $mockBaseUrl -DataDirectory $dataDirectory
 
     $metrics = Invoke-RestMethod -Uri "$baseUrl/api/v1/metrics" -WebSession $webSession
     if ([uint64]$metrics.acme_dns01_challenges_total -lt

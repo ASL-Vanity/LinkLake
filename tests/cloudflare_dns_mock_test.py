@@ -147,6 +147,50 @@ class MockCloudflareFixtureTests(unittest.TestCase):
             ["/set-txt", "/clear-txt"],
         )
 
+    def test_exact_lookup_preserves_ownership_and_rejects_wrong_zone(self) -> None:
+        payload = {
+            "type": "TXT",
+            "name": "_acme-challenge.example.test",
+            "content": "owned-value",
+            "comment": "LinkLake DNS-01 publication-id",
+        }
+        _, created = self.request("POST", "/client/v4/zones/zone-example/dns_records", payload)
+        record_id = created["result"]["id"]
+        status, found = self.request("GET", f"/client/v4/zones/zone-example/dns_records/{record_id}")
+        self.assertEqual(status, 200)
+        for field, value in payload.items():
+            self.assertEqual(found["result"][field], value)
+        status, missing = self.request("GET", f"/client/v4/zones/zone-sub/dns_records/{record_id}")
+        self.assertEqual(status, 404)
+        self.assertFalse(missing["success"])
+        self.assertEqual(len(self.state.snapshot()["records"]), 1)
+        self.request("DELETE", f"/client/v4/zones/zone-example/dns_records/{record_id}")
+        status, missing = self.request("GET", f"/client/v4/zones/zone-example/dns_records/{record_id}")
+        self.assertEqual(status, 404)
+
+    def test_paginated_lookup_keeps_distinct_publication_markers(self) -> None:
+        record_ids = []
+        for index in range(3):
+            _, created = self.request("POST", "/client/v4/zones/zone-example/dns_records", {
+                "type": "TXT", "name": "_acme-challenge.example.test",
+                "content": "same-value", "comment": f"LinkLake DNS-01 {index}",
+            })
+            record_ids.append(created["result"]["id"])
+        seen = []
+        markers = []
+        for page in (1, 2, 3):
+            status, result = self.request("GET",
+                "/client/v4/zones/zone-example/dns_records"
+                f"?type=TXT&name=_acme-challenge.example.test&per_page=2&page={page}")
+            self.assertEqual(status, 200)
+            self.assertEqual(result["result_info"]["total_count"], 3)
+            self.assertEqual(result["result_info"]["total_pages"], 2)
+            self.assertEqual(len(result["result"]), (2, 1, 0)[page - 1])
+            seen.extend(record["id"] for record in result["result"])
+            markers.extend(record["comment"] for record in result["result"])
+        self.assertEqual(seen, record_ids)
+        self.assertEqual(markers, [f"LinkLake DNS-01 {index}" for index in range(3)])
+
     def test_wrong_authoritative_value_keeps_doh_value_correct_for_failure_cleanup(self) -> None:
         self.request("POST", "/__test/config", {"publish_mode": "wrong"}, authorized=False)
         _, created = self.request(

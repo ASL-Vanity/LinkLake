@@ -15,6 +15,7 @@ mod database;
 mod database_migrations;
 mod database_tools;
 mod disaster_recovery;
+mod dns01_store;
 mod dual_stack_udp;
 mod fleet;
 mod fleet_coordination;
@@ -5030,6 +5031,13 @@ async fn run_server(
     job_supervisor::spawn_leased_job(
         state.clone(),
         shutdown_rx.clone(),
+        "dns01_cleanup_monitor",
+        "dns01_cleanup_monitor",
+        run_dns01_cleanup_monitor,
+    );
+    job_supervisor::spawn_leased_job(
+        state.clone(),
+        shutdown_rx.clone(),
         "fleet_health_dns_monitor",
         "fleet_health_dns",
         run_fleet_health_monitor,
@@ -9679,6 +9687,29 @@ async fn restore_managed_certificates(state: &Arc<AppState>) -> anyhow::Result<(
         }
     }
     Ok(())
+}
+
+async fn run_dns01_cleanup_monitor(
+    state: Arc<AppState>,
+    mut stop: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        if *stop.borrow() {
+            return Ok(());
+        }
+        tokio::select! {
+            changed = stop.changed() => { if changed.is_err() || *stop.borrow() { return Ok(()); } }
+            _ = interval.tick() => {
+                if let Some(manager) = &state.certificate_manager {
+                    if let Err(error) = manager.recover_dns01_records(stop.clone()).await {
+                        tracing::warn!(%error, "DNS-01 cleanup recovery failed; durable intents retained");
+                    }
+                }
+            }
+        }
+    }
 }
 
 async fn run_certificate_maintenance(

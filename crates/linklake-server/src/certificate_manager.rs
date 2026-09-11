@@ -124,6 +124,13 @@ impl CertificateManager {
         storage: crate::storage::CoordinationStorage,
         runtime: Arc<crate::ha_runtime::HaRuntime>,
     ) -> anyhow::Result<Self> {
+        if let Some(client) = self.cloudflare_dns.take() {
+            let journal = Arc::new(crate::dns01_store::Dns01JournalStore::open(
+                storage.clone(),
+                runtime.clone(),
+            )?);
+            self.cloudflare_dns = Some(client.with_journal(journal));
+        }
         if storage.backend() != crate::storage::StorageBackend::Postgres {
             return Ok(self);
         }
@@ -161,6 +168,16 @@ impl CertificateManager {
         self.shared
             .as_ref()
             .is_none_or(|shared| shared.cipher.is_some())
+    }
+
+    pub(crate) async fn recover_dns01_records(
+        &self,
+        stop: tokio::sync::watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        if let Some(client) = &self.cloudflare_dns {
+            client.recover_pending(Some(stop)).await?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn commit_shared_issued_certificate(
@@ -452,7 +469,15 @@ impl CertificateManager {
                             .challenge(ChallengeType::Dns01)
                             .ok_or_else(|| anyhow::anyhow!("ACME server did not offer DNS-01"))?;
                         let value = challenge.key_authorization().dns_value();
-                        let guard = client.publish(hostname, value).await?;
+                        let guard = client
+                            .publish(
+                                hostname,
+                                value,
+                                lease.ok_or_else(|| {
+                                    anyhow::anyhow!("DNS-01 issuance requires a job lease")
+                                })?,
+                            )
+                            .await?;
                         dns01_guards.push(guard);
                         dns01_guards
                             .last()
