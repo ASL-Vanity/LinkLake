@@ -813,7 +813,11 @@ fn empty_state(route_id: Uuid, status: CertificateStatus) -> CertificateState {
     }
 }
 
-fn private_key_context(route_id: Uuid, identifier: &str, certificate_pem: &[u8]) -> String {
+pub(crate) fn private_key_context(
+    route_id: Uuid,
+    identifier: &str,
+    certificate_pem: &[u8],
+) -> String {
     // 绑定资源归属、域名和证书内容，拒绝跨行替换密文或混装证书与私钥。
     format!(
         "certificate-key:{route_id}:{identifier}:{:x}",

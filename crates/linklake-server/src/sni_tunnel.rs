@@ -329,11 +329,18 @@ pub(crate) async fn register_route(
         send_error(&mut stream, "invalid TLS SNI hostname").await;
         return;
     };
+    let mutation_guard = state.policy_mutation_lock.lock().await;
+    let fencing_token = match state.ha_runtime.fencing_token() {
+        Ok(token) if state.accepts_public_work() => token,
+        _ => {
+            send_error(&mut stream, "TLS SNI registration requires the HA leader").await;
+            return;
+        }
+    };
     let runtime = state
         .sni_route_catalog
-        .lock()
-        .expect("SNI route catalog lock poisoned")
         .runtime_policy(client_id, &name, &hostname, &target_addr)
+        .await
         .unwrap_or(None);
     let Some(runtime) = runtime else {
         send_error(
@@ -391,6 +398,15 @@ pub(crate) async fn register_route(
             .map(BandwidthLimiter::new)
             .map(Arc::new),
     });
+    if !state.accepts_public_work() || state.ha_runtime.fencing_token().ok() != Some(fencing_token)
+    {
+        send_error(
+            &mut stream,
+            "TLS SNI leadership changed during registration",
+        )
+        .await;
+        return;
+    }
     if let Some(previous) = state
         .sni_routes
         .lock()
@@ -406,6 +422,7 @@ pub(crate) async fn register_route(
     {
         let _ = previous.stop_tx.send(());
     }
+    drop(mutation_guard);
     record_audit(
         &state,
         "sni_route.registered",

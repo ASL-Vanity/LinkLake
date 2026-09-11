@@ -7,6 +7,9 @@ use uuid::Uuid;
 use crate::database::Database;
 use crate::http_route_catalog::normalize_hostname;
 
+#[path = "sni_route_catalog_postgres.rs"]
+pub(crate) mod postgres;
+
 const DEFAULT_MAX_CONNECTIONS: u16 = 64;
 const MIN_BANDWIDTH_LIMIT_BPS: u64 = 1_024;
 const MAX_BANDWIDTH_LIMIT_BPS: u64 = 1_000_000_000;
@@ -23,7 +26,8 @@ pub(crate) struct CreateSniRoutePolicy {
 
 pub(crate) type UpdateSniRoutePolicy = CreateSniRoutePolicy;
 
-#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SniRoutePolicy {
     pub(crate) id: Uuid,
     pub(crate) client_id: Uuid,
@@ -50,7 +54,9 @@ pub(crate) enum SniRoutePolicyError {
     InvalidConnectionLimit,
     InvalidBandwidthLimit,
     DuplicateHostname,
+    ManagedPolicy,
     Database(rusqlite::Error),
+    Storage(anyhow::Error),
 }
 
 impl SniRoutePolicyError {
@@ -62,7 +68,8 @@ impl SniRoutePolicyError {
             Self::InvalidConnectionLimit => "invalid_connection_limit",
             Self::InvalidBandwidthLimit => "invalid_bandwidth_limit",
             Self::DuplicateHostname => "duplicate_sni_hostname",
-            Self::Database(_) => "sni_route_policy_storage_error",
+            Self::ManagedPolicy => "fleet_managed_policy",
+            Self::Database(_) | Self::Storage(_) => "sni_route_policy_storage_error",
         }
     }
 }
@@ -77,6 +84,7 @@ impl Error for SniRoutePolicyError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Database(error) => Some(error),
+            Self::Storage(error) => Some(error.as_ref()),
             _ => None,
         }
     }
@@ -122,27 +130,15 @@ impl SniRouteCatalog {
         &mut self,
         request: CreateSniRoutePolicy,
     ) -> Result<SniRoutePolicy, SniRoutePolicyError> {
-        let hostname = normalize_hostname(&request.hostname)
-            .map_err(|_| SniRoutePolicyError::InvalidHostname)?;
-        validate_policy(&request)?;
+        let policy = requested_policy(Uuid::new_v4(), true, request)?;
         let exists: bool = self.database.query_row(
             "SELECT EXISTS(SELECT 1 FROM sni_route_policies WHERE hostname = ?1)",
-            [&hostname],
+            [&policy.hostname],
             |row| row.get(0),
         )?;
         if exists {
             return Err(SniRoutePolicyError::DuplicateHostname);
         }
-        let policy = SniRoutePolicy {
-            id: Uuid::new_v4(),
-            client_id: request.client_id,
-            name: request.name.trim().to_owned(),
-            hostname,
-            target_addr: request.target_addr.trim().to_owned(),
-            max_connections: request.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
-            bandwidth_limit_bps: request.bandwidth_limit_bps,
-            enabled: true,
-        };
         self.database.execute(
             "INSERT INTO sni_route_policies (id, client_id, name, hostname, target_addr, max_connections, bandwidth_limit_bps, enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
             params![policy.id.to_string(), policy.client_id.to_string(), policy.name, policy.hostname, policy.target_addr, policy.max_connections, policy.bandwidth_limit_bps],
@@ -177,30 +173,19 @@ impl SniRouteCatalog {
         id: Uuid,
         request: UpdateSniRoutePolicy,
     ) -> Result<Option<SniRoutePolicy>, SniRoutePolicyError> {
-        let hostname = normalize_hostname(&request.hostname)
-            .map_err(|_| SniRoutePolicyError::InvalidHostname)?;
-        validate_policy(&request)?;
+        let mut policy = requested_policy(id, true, request)?;
         let Some(current) = self.policy_by_id(id)? else {
             return Ok(None);
         };
         let duplicate: bool = self.database.query_row(
             "SELECT EXISTS(SELECT 1 FROM sni_route_policies WHERE hostname = ?1 AND id <> ?2)",
-            params![hostname, id.to_string()],
+            params![policy.hostname, id.to_string()],
             |row| row.get(0),
         )?;
         if duplicate {
             return Err(SniRoutePolicyError::DuplicateHostname);
         }
-        let policy = SniRoutePolicy {
-            id,
-            client_id: request.client_id,
-            name: request.name.trim().to_owned(),
-            hostname,
-            target_addr: request.target_addr.trim().to_owned(),
-            max_connections: request.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
-            bandwidth_limit_bps: request.bandwidth_limit_bps,
-            enabled: current.enabled,
-        };
+        policy.enabled = current.enabled;
         self.database.execute(
             "UPDATE sni_route_policies SET client_id = ?1, name = ?2, hostname = ?3, target_addr = ?4, max_connections = ?5, bandwidth_limit_bps = ?6 WHERE id = ?7",
             params![
@@ -269,6 +254,26 @@ impl SniRouteCatalog {
             .optional()
             .map_err(Into::into)
     }
+}
+
+fn requested_policy(
+    id: Uuid,
+    enabled: bool,
+    request: CreateSniRoutePolicy,
+) -> Result<SniRoutePolicy, SniRoutePolicyError> {
+    let hostname =
+        normalize_hostname(&request.hostname).map_err(|_| SniRoutePolicyError::InvalidHostname)?;
+    validate_policy(&request)?;
+    Ok(SniRoutePolicy {
+        id,
+        client_id: request.client_id,
+        name: request.name.trim().to_owned(),
+        hostname,
+        target_addr: request.target_addr.trim().to_owned(),
+        max_connections: request.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
+        bandwidth_limit_bps: request.bandwidth_limit_bps,
+        enabled,
+    })
 }
 
 fn read_policy(row: &rusqlite::Row<'_>) -> rusqlite::Result<SniRoutePolicy> {

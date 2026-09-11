@@ -47,7 +47,9 @@ mod public_port_ownership;
 mod public_port_policy;
 mod secret_tunnel;
 mod secret_tunnel_catalog;
+mod secret_tunnel_store;
 mod sni_route_catalog;
+mod sni_route_store;
 mod sni_tunnel;
 mod socks5_tunnel;
 mod storage;
@@ -475,9 +477,8 @@ pub(crate) async fn managed_config_for_client(
         .collect::<Vec<_>>();
     let tls_routes = state
         .sni_route_catalog
-        .lock()
-        .expect("SNI route catalog lock poisoned")
         .list()
+        .await
         .map_err(|error| anyhow::anyhow!(error))?
         .into_iter()
         .filter(|policy| policy.client_id == client_id)
@@ -490,9 +491,8 @@ pub(crate) async fn managed_config_for_client(
         .collect::<Vec<_>>();
     let secret_tunnels = state
         .secret_tunnel_catalog
-        .lock()
-        .expect("secret tunnel catalog lock poisoned")
         .list()
+        .await
         .map_err(|error| anyhow::anyhow!(error))?
         .into_iter()
         .filter(|policy| policy.provider_client_id == client_id)
@@ -591,12 +591,12 @@ struct AppState {
     http_routes: Mutex<HashMap<String, http_tunnel::HttpRouteRegistration>>,
     http_route_statistics: Mutex<HashMap<String, Arc<http_tunnel::HttpRouteStatistics>>>,
     seen_http_route_registrations: Mutex<HashSet<(Uuid, String)>>,
-    sni_route_catalog: Mutex<SniRouteCatalog>,
+    sni_route_catalog: sni_route_store::SniRouteStore,
     sni_routes: Mutex<HashMap<String, sni_tunnel::SniRouteRegistration>>,
     sni_route_statistics: Mutex<HashMap<String, Arc<sni_tunnel::SniRouteStatistics>>>,
     p2p_node_catalog: Mutex<P2pNodeCatalog>,
     p2p_sessions: Mutex<HashMap<Uuid, p2p_control::PendingP2pSession>>,
-    secret_tunnel_catalog: Mutex<SecretTunnelCatalog>,
+    secret_tunnel_catalog: secret_tunnel_store::SecretTunnelStore,
     secret_tunnels: Mutex<HashMap<Uuid, secret_tunnel::SecretTunnelRegistration>>,
     secret_tunnel_statistics: Mutex<HashMap<Uuid, Arc<secret_tunnel::SecretTunnelStatistics>>>,
     socks5_proxies: Mutex<HashMap<Uuid, socks5_tunnel::Socks5ProxyRegistration>>,
@@ -2052,8 +2052,10 @@ fn coded_udp_policy_error(error: UdpPolicyError) -> CodedApiError {
 
 fn coded_secret_policy_error(error: SecretPolicyError) -> CodedApiError {
     let status = match error {
-        SecretPolicyError::DuplicateName => StatusCode::CONFLICT,
-        SecretPolicyError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        SecretPolicyError::DuplicateName | SecretPolicyError::ManagedPolicy => StatusCode::CONFLICT,
+        SecretPolicyError::Database(_) | SecretPolicyError::Storage(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
         _ => StatusCode::BAD_REQUEST,
     };
     CodedApiError(status, error.code(), "secret tunnel policy is invalid")
@@ -2105,8 +2107,12 @@ fn coded_port_group_policy_error(error: PortGroupPolicyError) -> CodedApiError {
 
 fn coded_sni_route_policy_error(error: SniRoutePolicyError) -> CodedApiError {
     let status = match error {
-        SniRoutePolicyError::DuplicateHostname => StatusCode::CONFLICT,
-        SniRoutePolicyError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        SniRoutePolicyError::DuplicateHostname | SniRoutePolicyError::ManagedPolicy => {
+            StatusCode::CONFLICT
+        }
+        SniRoutePolicyError::Database(_) | SniRoutePolicyError::Storage(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
         _ => StatusCode::BAD_REQUEST,
     };
     CodedApiError(status, error.code(), "TLS SNI route policy is invalid")
@@ -4376,12 +4382,20 @@ async fn run_server(
         http_routes: Mutex::new(HashMap::new()),
         http_route_statistics: Mutex::new(HashMap::new()),
         seen_http_route_registrations: Mutex::new(HashSet::new()),
-        sni_route_catalog: Mutex::new(SniRouteCatalog::open_with_database(&database)?),
+        sni_route_catalog: sni_route_store::SniRouteStore::open(
+            &database,
+            coordination_storage.clone(),
+            ha_runtime.clone(),
+        )?,
         sni_routes: Mutex::new(HashMap::new()),
         sni_route_statistics: Mutex::new(HashMap::new()),
         p2p_node_catalog: Mutex::new(P2pNodeCatalog::open_with_database(&database)?),
         p2p_sessions: Mutex::new(HashMap::new()),
-        secret_tunnel_catalog: Mutex::new(SecretTunnelCatalog::open_with_database(&database)?),
+        secret_tunnel_catalog: secret_tunnel_store::SecretTunnelStore::open(
+            &database,
+            coordination_storage.clone(),
+            ha_runtime.clone(),
+        )?,
         secret_tunnels: Mutex::new(HashMap::new()),
         secret_tunnel_statistics: Mutex::new(HashMap::new()),
         socks5_proxies: Mutex::new(HashMap::new()),
@@ -7653,9 +7667,8 @@ async fn collect_unavailable_policy_signals(state: &AppState, signals: &mut Vec<
         .collect::<HashSet<_>>();
     for policy in state
         .sni_route_catalog
-        .lock()
-        .expect("SNI route catalog lock poisoned")
         .list()
+        .await
         .unwrap_or_default()
         .into_iter()
         .filter(|policy| policy.enabled && !online_sni.contains(&policy.hostname))
@@ -7671,9 +7684,8 @@ async fn collect_unavailable_policy_signals(state: &AppState, signals: &mut Vec<
         .collect::<HashSet<_>>();
     for policy in state
         .secret_tunnel_catalog
-        .lock()
-        .expect("secret tunnel catalog lock poisoned")
         .list()
+        .await
         .unwrap_or_default()
         .into_iter()
         .filter(|policy| policy.enabled && !online_secret.contains(&policy.id))
@@ -8147,9 +8159,8 @@ async fn collect_policy_history_counters(state: &AppState) -> HashMap<String, Hi
 
     let sni_policies = state
         .sni_route_catalog
-        .lock()
-        .expect("SNI route catalog lock poisoned")
         .list()
+        .await
         .unwrap_or_else(|error| {
             tracing::warn!("Could not list SNI policies for metrics history: {error}");
             Vec::new()
@@ -8171,9 +8182,8 @@ async fn collect_policy_history_counters(state: &AppState) -> HashMap<String, Hi
 
     let secret_policies = state
         .secret_tunnel_catalog
-        .lock()
-        .expect("secret tunnel catalog lock poisoned")
         .list()
+        .await
         .unwrap_or_else(|error| {
             tracing::warn!("Could not list Secret policies for metrics history: {error}");
             Vec::new()
@@ -10078,9 +10088,8 @@ async fn global_search(
     }
     for policy in state
         .sni_route_catalog
-        .lock()
-        .expect("SNI route catalog lock poisoned")
         .list()
+        .await
         .map_err(|error| coded_client_management_error(error.into()))?
     {
         add(
@@ -10093,9 +10102,8 @@ async fn global_search(
     }
     for policy in state
         .secret_tunnel_catalog
-        .lock()
-        .expect("secret tunnel catalog lock poisoned")
         .list()
+        .await
         .map_err(|error| coded_client_management_error(error.into()))?
     {
         add(
@@ -10299,18 +10307,16 @@ async fn client_policy_reference_count(
         .count();
     count += state
         .sni_route_catalog
-        .lock()
-        .expect("SNI route catalog lock poisoned")
         .list()
+        .await
         .map_err(|error| coded_client_management_error(error.into()))?
         .into_iter()
         .filter(|policy| policy.client_id == client_id)
         .count();
     count += state
         .secret_tunnel_catalog
-        .lock()
-        .expect("secret tunnel catalog lock poisoned")
         .list()
+        .await
         .map_err(|error| coded_client_management_error(error.into()))?
         .into_iter()
         .filter(|policy| {
@@ -12740,9 +12746,8 @@ async fn list_secret_tunnels(
         .map_err(coded_management_error)?;
     let policies = state
         .secret_tunnel_catalog
-        .lock()
-        .expect("secret tunnel catalog lock poisoned")
         .list()
+        .await
         .map_err(coded_secret_policy_error)?;
     let online = state
         .secret_tunnels
@@ -12805,9 +12810,8 @@ async fn create_secret_tunnel(
     }
     let created = state
         .secret_tunnel_catalog
-        .lock()
-        .expect("secret tunnel catalog lock poisoned")
         .create(request)
+        .await
         .map_err(coded_secret_policy_error)?;
     record_audit(
         &state,
@@ -12849,15 +12853,14 @@ async fn update_secret_tunnel(
         ));
     }
     let (old_policy, policy) = {
-        let mut catalog = state
-            .secret_tunnel_catalog
-            .lock()
-            .expect("secret tunnel catalog lock poisoned");
+        let catalog = &state.secret_tunnel_catalog;
         let old = catalog
             .policy_by_id(tunnel_id)
+            .await
             .map_err(coded_secret_policy_error)?;
         let updated = catalog
             .update(tunnel_id, request)
+            .await
             .map_err(coded_secret_policy_error)?;
         let old = old.ok_or(CodedApiError(
             StatusCode::NOT_FOUND,
@@ -12902,9 +12905,8 @@ async fn set_secret_tunnel_enabled(
         .map_err(coded_management_error)?;
     let updated = state
         .secret_tunnel_catalog
-        .lock()
-        .expect("secret tunnel catalog lock poisoned")
         .set_enabled(tunnel_id, request.enabled)
+        .await
         .map_err(coded_secret_policy_error)?;
     if !updated {
         return Err(CodedApiError(
@@ -12940,9 +12942,8 @@ async fn delete_secret_tunnel(
         .map_err(coded_management_error)?;
     let deleted = state
         .secret_tunnel_catalog
-        .lock()
-        .expect("secret tunnel catalog lock poisoned")
         .delete(tunnel_id)
+        .await
         .map_err(coded_secret_policy_error)?;
     if deleted.is_none() {
         return Err(CodedApiError(
@@ -14260,9 +14261,8 @@ async fn list_sni_routes(
         .map_err(coded_management_error)?;
     let policies = state
         .sni_route_catalog
-        .lock()
-        .expect("SNI route catalog lock poisoned")
         .list()
+        .await
         .map_err(coded_sni_route_policy_error)?;
     let online = state
         .sni_routes
@@ -14324,9 +14324,8 @@ async fn create_sni_route(
     }
     let policy = state
         .sni_route_catalog
-        .lock()
-        .expect("SNI route catalog lock poisoned")
         .create(request)
+        .await
         .map_err(coded_sni_route_policy_error)?;
     record_audit(
         &state,
@@ -14358,12 +14357,10 @@ async fn update_sni_route(
         ));
     }
     let (old_policy, policy) = {
-        let mut catalog = state
-            .sni_route_catalog
-            .lock()
-            .expect("SNI route catalog lock poisoned");
+        let catalog = &state.sni_route_catalog;
         let old = catalog
             .policy_by_id(route_id)
+            .await
             .map_err(coded_sni_route_policy_error)?
             .ok_or(CodedApiError(
                 StatusCode::NOT_FOUND,
@@ -14372,6 +14369,7 @@ async fn update_sni_route(
             ))?;
         let updated = catalog
             .update(route_id, request)
+            .await
             .map_err(coded_sni_route_policy_error)?
             .ok_or(CodedApiError(
                 StatusCode::NOT_FOUND,
@@ -14405,9 +14403,8 @@ async fn set_sni_route_enabled(
         .map_err(coded_management_error)?;
     let policy = state
         .sni_route_catalog
-        .lock()
-        .expect("SNI route catalog lock poisoned")
         .policy_by_id(route_id)
+        .await
         .map_err(coded_sni_route_policy_error)?
         .ok_or(CodedApiError(
             StatusCode::NOT_FOUND,
@@ -14416,9 +14413,8 @@ async fn set_sni_route_enabled(
         ))?;
     state
         .sni_route_catalog
-        .lock()
-        .expect("SNI route catalog lock poisoned")
         .set_enabled(route_id, request.enabled)
+        .await
         .map_err(coded_sni_route_policy_error)?;
     if !request.enabled {
         sni_tunnel::stop_hostname(&state, &policy.hostname);
@@ -14447,9 +14443,8 @@ async fn delete_sni_route(
         .map_err(coded_management_error)?;
     let policy = state
         .sni_route_catalog
-        .lock()
-        .expect("SNI route catalog lock poisoned")
         .delete(route_id)
+        .await
         .map_err(coded_sni_route_policy_error)?
         .ok_or(CodedApiError(
             StatusCode::NOT_FOUND,

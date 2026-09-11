@@ -68,11 +68,21 @@ pub(crate) async fn register_provider(
         reject(&state, &mut stream, "invalid client credentials").await;
         return;
     }
+    let mutation_guard = state.policy_mutation_lock.lock().await;
+    let fencing_token = state.ha_runtime.fencing_token().ok();
+    if fencing_token.is_none() || !state.accepts_public_work() {
+        reject(
+            &state,
+            &mut stream,
+            "secret tunnel registration requires the HA leader",
+        )
+        .await;
+        return;
+    }
     let runtime_policy = state
         .secret_tunnel_catalog
-        .lock()
-        .expect("secret tunnel catalog lock poisoned")
         .provider_runtime_policy(provider_client_id, &name, &target_addr)
+        .await
         .unwrap_or(None);
     let Some(runtime_policy) = runtime_policy else {
         reject(
@@ -83,6 +93,15 @@ pub(crate) async fn register_provider(
         .await;
         return;
     };
+    if state.ha_runtime.fencing_token().ok() != fencing_token || !state.accepts_public_work() {
+        reject(
+            &state,
+            &mut stream,
+            "secret tunnel leadership changed during registration",
+        )
+        .await;
+        return;
+    }
     if !supports_target_binding {
         reject(
             &state,
@@ -170,6 +189,7 @@ pub(crate) async fn register_provider(
     {
         let _ = previous.stop_tx.send(());
     }
+    drop(mutation_guard);
     state
         .metrics
         .tunnel_registrations_total
@@ -288,11 +308,21 @@ pub(crate) async fn connect_visitor(
         reject(&state, &mut visitor_stream, "invalid client credentials").await;
         return;
     }
+    let mutation_guard = state.policy_mutation_lock.lock().await;
+    let fencing_token = state.ha_runtime.fencing_token().ok();
+    if fencing_token.is_none() || !state.accepts_public_work() {
+        reject(
+            &state,
+            &mut visitor_stream,
+            "secret tunnel access requires the HA leader",
+        )
+        .await;
+        return;
+    }
     let runtime_policy = state
         .secret_tunnel_catalog
-        .lock()
-        .expect("secret tunnel catalog lock poisoned")
         .access_runtime_policy(visitor_client_id, &access_key)
+        .await
         .unwrap_or(None);
     let Some(runtime_policy) = runtime_policy else {
         reject(
@@ -398,6 +428,16 @@ pub(crate) async fn connect_visitor(
         .await;
         return;
     };
+    if state.ha_runtime.fencing_token().ok() != fencing_token || !state.accepts_public_work() {
+        reject(
+            &state,
+            &mut visitor_stream,
+            "secret tunnel leadership changed during access",
+        )
+        .await;
+        return;
+    }
+    drop(mutation_guard);
     let Ok(pending_permit) = state.pending_connection_permits.clone().try_acquire_owned() else {
         context
             .statistics

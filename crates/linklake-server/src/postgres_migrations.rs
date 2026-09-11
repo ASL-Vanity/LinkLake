@@ -4,8 +4,36 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tokio_postgres::{Client, Transaction};
 
-pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 17;
+pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 19;
 const ADVISORY_LOCK_ID: i64 = 0x4c4c_4841_4d49_4752;
+
+const MIGRATION_V19_NAME: &str = "shared_secret_tunnel_catalog";
+const MIGRATION_V19_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS linklake_secret_tunnel_policies (
+    id TEXT PRIMARY KEY,
+    provider_client_id TEXT NOT NULL,
+    name TEXT NOT NULL CHECK(octet_length(name) BETWEEN 1 AND 80),
+    access_key_hash TEXT NOT NULL UNIQUE CHECK(access_key_hash ~ '^[0-9a-f]{64}$'),
+    policy JSONB NOT NULL CHECK(octet_length(policy::text)<=16384),
+    UNIQUE(provider_client_id,name),
+    CHECK (policy->>'id' IS NOT NULL AND policy->>'id'=id),
+    CHECK (policy->>'provider_client_id' IS NOT NULL AND policy->>'provider_client_id'=provider_client_id),
+    CHECK (policy->>'name' IS NOT NULL AND policy->>'name'=name),
+    CHECK (NOT (policy ? 'access_key') AND NOT (policy ? 'access_key_hash'))
+);
+"#;
+
+const MIGRATION_V18_NAME: &str = "shared_sni_route_catalog";
+const MIGRATION_V18_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS linklake_sni_route_policies (
+    id TEXT PRIMARY KEY,
+    hostname TEXT NOT NULL UNIQUE,
+    revision TEXT NOT NULL,
+    policy JSONB NOT NULL CHECK(octet_length(policy::text)<=16384),
+    CHECK (policy->>'id' IS NOT NULL AND policy->>'id'=id),
+    CHECK (policy->>'hostname' IS NOT NULL AND policy->>'hostname'=hostname)
+);
+"#;
 
 const MIGRATION_V17_NAME: &str = "shared_fleet_policy_ledger";
 const MIGRATION_V17_SQL: &str = r#"
@@ -673,6 +701,16 @@ const MIGRATIONS: &[Migration] = &[
         name: MIGRATION_V17_NAME,
         sql: MIGRATION_V17_SQL,
     },
+    Migration {
+        version: 18,
+        name: MIGRATION_V18_NAME,
+        sql: MIGRATION_V18_SQL,
+    },
+    Migration {
+        version: 19,
+        name: MIGRATION_V19_NAME,
+        sql: MIGRATION_V19_SQL,
+    },
 ];
 
 pub(crate) async fn apply(client: &mut Client) -> anyhow::Result<()> {
@@ -764,6 +802,27 @@ pub(crate) async fn apply(client: &mut Client) -> anyhow::Result<()> {
 
 async fn verify_schema_structure(transaction: &Transaction<'_>) -> anyhow::Result<()> {
     const TABLES: &[TableExpectation] = &[
+        TableExpectation {
+            name: "linklake_secret_tunnel_policies",
+            primary_key: &["id"],
+            columns: &[
+                required("id", "text"),
+                required("provider_client_id", "text"),
+                required("name", "text"),
+                required("access_key_hash", "text"),
+                required("policy", "jsonb"),
+            ],
+        },
+        TableExpectation {
+            name: "linklake_sni_route_policies",
+            primary_key: &["id"],
+            columns: &[
+                required("id", "text"),
+                required("hostname", "text"),
+                required("revision", "text"),
+                required("policy", "jsonb"),
+            ],
+        },
         TableExpectation {
             name: "linklake_fleet_local_state",
             primary_key: &["singleton_id"],

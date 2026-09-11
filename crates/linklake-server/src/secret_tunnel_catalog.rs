@@ -7,6 +7,9 @@ use uuid::Uuid;
 
 use crate::database::Database;
 
+#[path = "secret_tunnel_catalog_postgres.rs"]
+pub(crate) mod postgres;
+
 const DEFAULT_MAX_CONNECTIONS: u16 = 32;
 const MAX_CONNECTIONS: u16 = 1_024;
 const MIN_BANDWIDTH_LIMIT_BPS: u64 = 1_024;
@@ -25,7 +28,8 @@ pub(crate) struct CreateSecretTunnelPolicy {
 // 更新接口不会重置已有 access key；密钥轮换应使用独立的安全操作。
 pub(crate) type UpdateSecretTunnelPolicy = CreateSecretTunnelPolicy;
 
-#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SecretTunnelPolicy {
     pub(crate) id: Uuid,
     pub(crate) provider_client_id: Uuid,
@@ -60,6 +64,8 @@ pub(crate) enum SecretPolicyError {
     InvalidConnectionLimit,
     InvalidBandwidthLimit,
     DuplicateName,
+    ManagedPolicy,
+    Storage(anyhow::Error),
     Database(rusqlite::Error),
 }
 
@@ -71,7 +77,8 @@ impl SecretPolicyError {
             Self::InvalidConnectionLimit => "invalid_connection_limit",
             Self::InvalidBandwidthLimit => "invalid_bandwidth_limit",
             Self::DuplicateName => "duplicate_secret_tunnel",
-            Self::Database(_) => "secret_policy_storage_error",
+            Self::ManagedPolicy => "fleet_managed_policy",
+            Self::Database(_) | Self::Storage(_) => "secret_policy_storage_error",
         }
     }
 }
@@ -86,6 +93,7 @@ impl std::error::Error for SecretPolicyError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Database(error) => Some(error),
+            Self::Storage(error) => Some(error.as_ref()),
             _ => None,
         }
     }
@@ -345,6 +353,24 @@ fn validate_policy(request: &CreateSecretTunnelPolicy) -> Result<(), SecretPolic
         return Err(SecretPolicyError::InvalidBandwidthLimit);
     }
     Ok(())
+}
+
+fn requested_policy(
+    id: Uuid,
+    enabled: bool,
+    request: CreateSecretTunnelPolicy,
+) -> Result<SecretTunnelPolicy, SecretPolicyError> {
+    validate_policy(&request)?;
+    Ok(SecretTunnelPolicy {
+        id,
+        provider_client_id: request.provider_client_id,
+        allowed_client_id: request.allowed_client_id,
+        name: request.name.trim().to_owned(),
+        target_addr: request.target_addr,
+        max_connections: request.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
+        bandwidth_limit_bps: request.bandwidth_limit_bps,
+        enabled,
+    })
 }
 
 fn valid_access_key(value: &str) -> bool {

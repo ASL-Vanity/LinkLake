@@ -288,6 +288,46 @@ pub(crate) async fn transaction_snapshot(
     ).await?.as_ref().map(read_snapshot).transpose()
 }
 
+pub(crate) async fn transaction_list(
+    transaction: &Transaction<'_>,
+) -> anyhow::Result<Vec<HttpRoutePolicy>> {
+    transaction.query("SELECT id,hostname,revision,policy::text FROM linklake_http_route_policies ORDER BY hostname", &[]).await?.iter().map(|row| Ok(read_snapshot(row)?.policy)).collect()
+}
+
+pub(crate) async fn transaction_put(
+    ledger: &crate::policy_service::postgres::FleetPolicyTransaction<'_, '_>,
+    policy: &HttpRoutePolicy,
+) -> anyhow::Result<()> {
+    ledger.assert_current().await?;
+    let revision = Uuid::new_v4().to_string();
+    let json = serde_json::to_string(policy)?;
+    decode_snapshot(&policy.id.to_string(), &policy.hostname, &revision, &json)?;
+    ledger.transaction().execute(
+        "INSERT INTO linklake_http_route_policies(id,hostname,revision,policy) VALUES($1,$2,$3,$4::text::jsonb)
+         ON CONFLICT(id) DO UPDATE SET hostname=EXCLUDED.hostname,revision=EXCLUDED.revision,policy=EXCLUDED.policy",
+        &[&policy.id.to_string(), &policy.hostname, &revision, &json],
+    ).await?;
+    Ok(())
+}
+
+pub(crate) async fn transaction_delete(
+    ledger: &crate::policy_service::postgres::FleetPolicyTransaction<'_, '_>,
+    id: Uuid,
+) -> anyhow::Result<Option<HttpRoutePolicy>> {
+    ledger.assert_current().await?;
+    let policy = transaction_snapshot(ledger.transaction(), id)
+        .await?
+        .map(|snapshot| snapshot.policy);
+    ledger
+        .transaction()
+        .execute(
+            "DELETE FROM linklake_http_route_policies WHERE id=$1",
+            &[&id.to_string()],
+        )
+        .await?;
+    Ok(policy)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
