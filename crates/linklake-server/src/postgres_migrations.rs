@@ -4,8 +4,61 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tokio_postgres::{Client, Transaction};
 
-pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 10;
+pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 11;
 const ADVISORY_LOCK_ID: i64 = 0x4c4c_4841_4d49_4752;
+
+const MIGRATION_V11_NAME: &str = "shared_alerts_and_notification_outbox";
+const MIGRATION_V11_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS linklake_alert_rules (
+    id TEXT PRIMARY KEY,
+    rule JSONB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS linklake_alert_events (
+    id BIGSERIAL PRIMARY KEY,
+    rule_id TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    active BOOLEAN NOT NULL,
+    updated_unix_seconds BIGINT NOT NULL,
+    event JSONB NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS linklake_alert_events_active_subject
+    ON linklake_alert_events(rule_id,subject) WHERE active;
+CREATE INDEX IF NOT EXISTS linklake_alert_events_updated
+    ON linklake_alert_events(updated_unix_seconds DESC,id DESC);
+CREATE TABLE IF NOT EXISTS linklake_alert_deliveries (
+    id BIGSERIAL PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    event_id BIGINT NOT NULL,
+    rule_name TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    resolved BOOLEAN NOT NULL,
+    channel TEXT NOT NULL CHECK(channel IN ('webhook','email')),
+    payload JSONB NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('pending','delivering','delivered','dead_letter')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+    next_attempt_unix_seconds BIGINT NOT NULL,
+    lease_expires_unix_seconds BIGINT,
+    lease_token TEXT,
+    last_error TEXT,
+    created_unix_seconds BIGINT NOT NULL,
+    updated_unix_seconds BIGINT NOT NULL,
+    delivered_unix_seconds BIGINT,
+    CHECK ((state='delivering' AND lease_token IS NOT NULL AND lease_expires_unix_seconds IS NOT NULL)
+        OR (state<>'delivering' AND lease_token IS NULL AND lease_expires_unix_seconds IS NULL))
+);
+CREATE INDEX IF NOT EXISTS linklake_alert_deliveries_due
+    ON linklake_alert_deliveries(state,next_attempt_unix_seconds,id);
+CREATE INDEX IF NOT EXISTS linklake_alert_deliveries_updated
+    ON linklake_alert_deliveries(updated_unix_seconds DESC,id DESC);
+CREATE TABLE IF NOT EXISTS linklake_alert_delivery_counters (
+    singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1),
+    defaults_initialized BOOLEAN NOT NULL DEFAULT FALSE,
+    delivered_total BIGINT NOT NULL DEFAULT 0,
+    failed_attempts_total BIGINT NOT NULL DEFAULT 0,
+    dead_letter_total BIGINT NOT NULL DEFAULT 0
+);
+INSERT INTO linklake_alert_delivery_counters(singleton_id) VALUES(1) ON CONFLICT DO NOTHING;
+"#;
 
 const MIGRATION_V1_NAME: &str = "ha_coordination_foundation";
 const MIGRATION_V1_SQL: &str = r#"
@@ -468,6 +521,11 @@ const MIGRATIONS: &[Migration] = &[
         name: MIGRATION_V10_NAME,
         sql: MIGRATION_V10_SQL,
     },
+    Migration {
+        version: 11,
+        name: MIGRATION_V11_NAME,
+        sql: MIGRATION_V11_SQL,
+    },
 ];
 
 pub(crate) async fn apply(client: &mut Client) -> anyhow::Result<()> {
@@ -559,6 +617,57 @@ pub(crate) async fn apply(client: &mut Client) -> anyhow::Result<()> {
 
 async fn verify_schema_structure(transaction: &Transaction<'_>) -> anyhow::Result<()> {
     const TABLES: &[TableExpectation] = &[
+        TableExpectation {
+            name: "linklake_alert_rules",
+            primary_key: &["id"],
+            columns: &[required("id", "text"), required("rule", "jsonb")],
+        },
+        TableExpectation {
+            name: "linklake_alert_events",
+            primary_key: &["id"],
+            columns: &[
+                required("id", "int8"),
+                required("rule_id", "text"),
+                required("subject", "text"),
+                required("active", "bool"),
+                required("updated_unix_seconds", "int8"),
+                required("event", "jsonb"),
+            ],
+        },
+        TableExpectation {
+            name: "linklake_alert_deliveries",
+            primary_key: &["id"],
+            columns: &[
+                required("id", "int8"),
+                required("idempotency_key", "text"),
+                required("event_id", "int8"),
+                required("rule_name", "text"),
+                required("subject", "text"),
+                required("resolved", "bool"),
+                required("channel", "text"),
+                required("payload", "jsonb"),
+                required("state", "text"),
+                required("attempts", "int4"),
+                required("next_attempt_unix_seconds", "int8"),
+                optional("lease_expires_unix_seconds", "int8"),
+                optional("lease_token", "text"),
+                optional("last_error", "text"),
+                required("created_unix_seconds", "int8"),
+                required("updated_unix_seconds", "int8"),
+                optional("delivered_unix_seconds", "int8"),
+            ],
+        },
+        TableExpectation {
+            name: "linklake_alert_delivery_counters",
+            primary_key: &["singleton_id"],
+            columns: &[
+                required("singleton_id", "int4"),
+                required("defaults_initialized", "bool"),
+                required("delivered_total", "int8"),
+                required("failed_attempts_total", "int8"),
+                required("dead_letter_total", "int8"),
+            ],
+        },
         TableExpectation {
             name: "linklake_metrics_history_recent",
             primary_key: &["timestamp_unix_seconds"],

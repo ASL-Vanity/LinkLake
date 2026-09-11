@@ -1,5 +1,6 @@
 mod admin_auth;
 mod alerting;
+mod alerting_store;
 mod api_tokens;
 mod audit_log;
 mod audit_store;
@@ -557,7 +558,7 @@ struct AppState {
     login_hash_permits: Arc<Semaphore>,
     audit: audit_store::AuditStore,
     server_update_authentication_audit_limiter: Mutex<ServerUpdateAuthenticationAuditLimiter>,
-    alerts: Mutex<AlertCatalog>,
+    alerts: alerting_store::AlertStore,
     fleet: fleet_store::FleetStore,
     policy_service: PolicyService,
     policy_mutation_lock: AsyncMutex<()>,
@@ -4282,7 +4283,11 @@ async fn run_server(
         server_update_authentication_audit_limiter: Mutex::new(
             ServerUpdateAuthenticationAuditLimiter::default(),
         ),
-        alerts: Mutex::new(AlertCatalog::open_with_database(&database)?),
+        alerts: alerting_store::AlertStore::open(
+            &database,
+            coordination_storage.clone(),
+            ha_runtime.clone(),
+        )?,
         fleet: fleet_store::FleetStore::open(
             &database,
             coordination_storage.clone(),
@@ -5890,9 +5895,8 @@ async fn metrics(
     );
     let notification_deliveries = state
         .alerts
-        .lock()
-        .expect("alert catalog lock poisoned")
         .notification_delivery_metrics(unix_seconds())
+        .await
         .map_err(|_| {
             ApiError(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -7141,9 +7145,8 @@ async fn deliver_due_alert_notifications(state: &Arc<AppState>, stop: &mut watch
     let claim_limit = NOTIFICATION_DELIVERY_BATCH_SIZE.min(NOTIFICATION_DELIVERY_CONCURRENCY);
     let deliveries = match state
         .alerts
-        .lock()
-        .expect("alert catalog lock poisoned")
         .claim_notification_deliveries(unix_seconds(), claim_limit)
+        .await
     {
         Ok(deliveries) => deliveries,
         Err(error) => {
@@ -7153,9 +7156,16 @@ async fn deliver_due_alert_notifications(state: &Arc<AppState>, stop: &mut watch
     };
     let mut jobs = tokio::task::JoinSet::new();
     for delivery in deliveries {
+        if *stop.borrow() {
+            return;
+        }
         let mut delivery_stop = stop.clone();
         jobs.spawn(async move {
+            if *delivery_stop.borrow() {
+                return None;
+            }
             let result = tokio::select! {
+                biased;
                 changed = delivery_stop.changed() => {
                     if changed.is_err() || *delivery_stop.borrow() {
                         return None;
@@ -7195,9 +7205,8 @@ async fn complete_alert_notification_delivery(
     match result {
         Ok(()) => match state
             .alerts
-            .lock()
-            .expect("alert catalog lock poisoned")
             .acknowledge_notification_delivery(delivery, now)
+            .await
         {
             Ok(true) => {}
             Ok(false) => tracing::warn!(
@@ -7214,9 +7223,8 @@ async fn complete_alert_notification_delivery(
             let safe_error = error.safe_code();
             let failed = state
                 .alerts
-                .lock()
-                .expect("alert catalog lock poisoned")
-                .fail_notification_delivery(delivery, now, &safe_error);
+                .fail_notification_delivery(delivery, now, &safe_error)
+                .await;
             match failed {
                 Ok(Some(NotificationDeliveryState::DeadLetter)) => {
                     tracing::error!(
@@ -7265,6 +7273,7 @@ async fn run_alert_evaluator(
     state: Arc<AppState>,
     mut stop: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    state.alerts.ensure_defaults().await?;
     let start = tokio::time::Instant::now() + Duration::from_secs(2);
     let mut interval = tokio::time::interval_at(
         start,
@@ -7287,12 +7296,7 @@ async fn evaluate_alerts(state: &Arc<AppState>, stop: &mut watch::Receiver<bool>
     if *stop.borrow() {
         return;
     }
-    let rules = match state
-        .alerts
-        .lock()
-        .expect("alert catalog lock poisoned")
-        .list_rules()
-    {
+    let rules = match state.alerts.list_rules().await {
         Ok(rules) => rules,
         Err(error) => {
             tracing::error!("Could not read alert rules: {error}");
@@ -7309,12 +7313,7 @@ async fn evaluate_alerts(state: &Arc<AppState>, stop: &mut watch::Receiver<bool>
     if *stop.borrow() {
         return;
     }
-    let notifications = match state
-        .alerts
-        .lock()
-        .expect("alert catalog lock poisoned")
-        .evaluate(&signals, unix_seconds())
-    {
+    let notifications = match state.alerts.evaluate(&signals, unix_seconds()).await {
         Ok(notifications) => notifications,
         Err(error) => {
             tracing::error!("Could not evaluate alerts: {error}");
@@ -10113,12 +10112,7 @@ async fn list_alert_rules(
     authorize_management(&state, &headers)
         .await
         .map_err(coded_management_error)?;
-    let rules = state
-        .alerts
-        .lock()
-        .expect("alert catalog lock poisoned")
-        .list_rules()
-        .map_err(coded_alert_error)?;
+    let rules = state.alerts.list_rules().await.map_err(coded_alert_error)?;
     Ok(Json(rules))
 }
 
@@ -10132,9 +10126,8 @@ async fn create_alert_rule(
         .map_err(coded_management_error)?;
     let rule = state
         .alerts
-        .lock()
-        .expect("alert catalog lock poisoned")
         .create_rule(request, unix_seconds())
+        .await
         .map_err(coded_alert_error)?;
     record_audit(
         &state,
@@ -10160,9 +10153,8 @@ async fn update_alert_rule(
         .map_err(coded_management_error)?;
     let rule = state
         .alerts
-        .lock()
-        .expect("alert catalog lock poisoned")
         .update_rule(rule_id, request, unix_seconds())
+        .await
         .map_err(coded_alert_error)?
         .ok_or(CodedApiError(
             StatusCode::NOT_FOUND,
@@ -10192,9 +10184,8 @@ async fn delete_alert_rule(
         .map_err(coded_management_error)?;
     let deleted = state
         .alerts
-        .lock()
-        .expect("alert catalog lock poisoned")
         .delete_rule(rule_id, unix_seconds())
+        .await
         .map_err(coded_alert_error)?;
     if !deleted {
         return Err(CodedApiError(
@@ -10223,9 +10214,8 @@ async fn list_alert_events(
         .map_err(coded_management_error)?;
     let events = state
         .alerts
-        .lock()
-        .expect("alert catalog lock poisoned")
         .list_events(query.active.unwrap_or(false), query.limit.unwrap_or(100))
+        .await
         .map_err(coded_alert_error)?;
     Ok(Json(events))
 }
@@ -10239,9 +10229,8 @@ async fn alert_notification_channels(
         .map_err(coded_management_error)?;
     let deliveries = state
         .alerts
-        .lock()
-        .expect("alert catalog lock poisoned")
         .notification_delivery_metrics(unix_seconds())
+        .await
         .map_err(coded_alert_error)?;
     Ok(Json(AlertNotificationChannelsResponse {
         channels: notifications::channel_view(),
@@ -10259,9 +10248,8 @@ async fn list_alert_notification_deliveries(
         .map_err(coded_management_error)?;
     let deliveries = state
         .alerts
-        .lock()
-        .expect("alert catalog lock poisoned")
         .list_notification_deliveries(query.limit.unwrap_or(100), query.state, query.channel)
+        .await
         .map_err(coded_alert_error)?;
     Ok(Json(deliveries))
 }
@@ -10276,9 +10264,8 @@ async fn retry_alert_notification_delivery(
         .map_err(coded_management_error)?;
     let outcome = state
         .alerts
-        .lock()
-        .expect("alert catalog lock poisoned")
         .retry_notification_delivery(delivery_id, unix_seconds())
+        .await
         .map_err(coded_alert_error)?;
     match outcome {
         NotificationDeliveryRetryOutcome::Retried(delivery) => {

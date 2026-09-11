@@ -7,6 +7,9 @@ use uuid::Uuid;
 
 use crate::database::Database;
 
+#[path = "alerting_postgres.rs"]
+pub(crate) mod postgres;
+
 const MAX_OUTSTANDING_NOTIFICATION_DELIVERIES: u64 = 10_000;
 const NOTIFICATION_DELIVERY_LEASE_SECONDS: u64 = 60;
 const NOTIFICATION_DELIVERY_MAX_ATTEMPTS: u32 = 10;
@@ -710,7 +713,8 @@ impl AlertCatalog {
              SET state = 'delivered', lease_expires_unix_seconds = NULL,
                  lease_token = NULL, last_error = NULL,
                  updated_unix_seconds = ?3, delivered_unix_seconds = ?3
-             WHERE id = ?1 AND state = 'delivering' AND lease_token = ?2",
+             WHERE id = ?1 AND state = 'delivering' AND lease_token = ?2
+               AND lease_expires_unix_seconds > ?3",
             params![delivery.id, delivery.lease_token, now as i64],
         )?;
         if updated == 0 {
@@ -736,8 +740,9 @@ impl AlertCatalog {
         let attempts = transaction
             .query_row(
                 "SELECT attempts FROM alert_notification_deliveries
-             WHERE id = ?1 AND state = 'delivering' AND lease_token = ?2",
-                params![delivery.id, delivery.lease_token],
+             WHERE id = ?1 AND state = 'delivering' AND lease_token = ?2
+               AND lease_expires_unix_seconds > ?3",
+                params![delivery.id, delivery.lease_token, now as i64],
                 |row| Ok(row.get::<_, i64>(0)?.max(0) as u32),
             )
             .optional()?;
@@ -805,6 +810,14 @@ impl AlertCatalog {
             transaction.commit()?;
             return Ok(NotificationDeliveryRetryOutcome::NotDeadLetter(state));
         }
+        let outstanding: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM alert_notification_deliveries WHERE state IN ('pending', 'delivering')",
+            [], |row| row.get(0),
+        )?;
+        anyhow::ensure!(
+            outstanding < MAX_OUTSTANDING_NOTIFICATION_DELIVERIES as i64,
+            "notification delivery queue is full"
+        );
         transaction.execute(
             "UPDATE alert_notification_deliveries
              SET state = 'pending', attempts = 0, next_attempt_unix_seconds = ?2,
@@ -942,91 +955,11 @@ impl AlertCatalog {
                 .query_row("SELECT COUNT(*) FROM alert_rules", [], |row| row.get(0))?;
         let now = crate::unix_seconds();
         if count == 0 {
-            for request in [
-                CreateAlertRule {
-                    name: "Client offline".to_owned(),
-                    metric: AlertMetric::ClientOffline,
-                    comparator: AlertComparator::GreaterOrEqual,
-                    threshold: 1.0,
-                    target: None,
-                    evaluation_window_seconds: 120,
-                    cooldown_seconds: 900,
-                    severity: AlertSeverity::Warning,
-                    notify_webhook: true,
-                    notify_email: false,
-                    enabled: true,
-                },
-                CreateAlertRule {
-                    name: "Policy unavailable".to_owned(),
-                    metric: AlertMetric::PolicyUnavailable,
-                    comparator: AlertComparator::GreaterOrEqual,
-                    threshold: 1.0,
-                    target: None,
-                    evaluation_window_seconds: 60,
-                    cooldown_seconds: 900,
-                    severity: AlertSeverity::Critical,
-                    notify_webhook: true,
-                    notify_email: true,
-                    enabled: true,
-                },
-                CreateAlertRule {
-                    name: "Authentication failures".to_owned(),
-                    metric: AlertMetric::AuthenticationFailures,
-                    comparator: AlertComparator::GreaterOrEqual,
-                    threshold: 10.0,
-                    target: None,
-                    evaluation_window_seconds: 300,
-                    cooldown_seconds: 900,
-                    severity: AlertSeverity::Warning,
-                    notify_webhook: true,
-                    notify_email: false,
-                    enabled: true,
-                },
-                CreateAlertRule {
-                    name: "Certificate expiry".to_owned(),
-                    metric: AlertMetric::CertificateDaysRemaining,
-                    comparator: AlertComparator::LessOrEqual,
-                    threshold: 30.0,
-                    target: None,
-                    evaluation_window_seconds: 300,
-                    cooldown_seconds: 86_400,
-                    severity: AlertSeverity::Warning,
-                    notify_webhook: true,
-                    notify_email: true,
-                    enabled: true,
-                },
-            ] {
+            for request in default_alert_rules() {
                 self.create_rule(request, now)?;
             }
         }
-        for request in [
-            CreateAlertRule {
-                name: "SLO fast burn (5m and 1h)".to_owned(),
-                metric: AlertMetric::SloFastBurnRate,
-                comparator: AlertComparator::GreaterOrEqual,
-                threshold: 14.4,
-                target: Some("global".to_owned()),
-                evaluation_window_seconds: 300,
-                cooldown_seconds: 3_600,
-                severity: AlertSeverity::Critical,
-                notify_webhook: true,
-                notify_email: true,
-                enabled: true,
-            },
-            CreateAlertRule {
-                name: "SLO slow burn (6h and 24h)".to_owned(),
-                metric: AlertMetric::SloSlowBurnRate,
-                comparator: AlertComparator::GreaterOrEqual,
-                threshold: 6.0,
-                target: Some("global".to_owned()),
-                evaluation_window_seconds: 21_600,
-                cooldown_seconds: 21_600,
-                severity: AlertSeverity::Warning,
-                notify_webhook: true,
-                notify_email: true,
-                enabled: true,
-            },
-        ] {
+        for request in default_slo_rules() {
             let exists: bool = self.database.query_row(
                 "SELECT EXISTS(SELECT 1 FROM alert_rules WHERE metric = ?1)",
                 [request.metric.to_string()],
@@ -1038,7 +971,6 @@ impl AlertCatalog {
         }
         Ok(())
     }
-
     fn rule(&self, id: Uuid) -> anyhow::Result<Option<AlertRule>> {
         self.database
             .query_row(
@@ -1588,6 +1520,42 @@ mod tests {
     }
 
     #[test]
+    fn expired_notification_lease_cannot_complete_before_reclaim() {
+        let mut catalog = AlertCatalog::open(None).expect("catalog should open");
+        enqueue_test_notification(&mut catalog, true, false, 100);
+        let delivery = catalog
+            .claim_notification_deliveries(100, 1)
+            .expect("claim should succeed")
+            .pop()
+            .expect("delivery should exist");
+        let expires = 100 + NOTIFICATION_DELIVERY_LEASE_SECONDS;
+        assert!(!catalog
+            .acknowledge_notification_delivery(&delivery, expires)
+            .expect("ack should classify expiry"));
+        assert_eq!(
+            catalog
+                .fail_notification_delivery(&delivery, expires, "webhook_timeout")
+                .expect("failure should classify expiry"),
+            None
+        );
+        let metrics = catalog
+            .notification_delivery_metrics(expires)
+            .expect("metrics should read");
+        assert_eq!(metrics.notification_deliveries_delivered_total, 0);
+        assert_eq!(metrics.notification_delivery_failures_total, 0);
+        let reclaimed = catalog
+            .claim_notification_deliveries(expires, 1)
+            .expect("expired delivery should reclaim")
+            .pop()
+            .expect("delivery should exist");
+        assert_eq!(reclaimed.idempotency_key, delivery.idempotency_key);
+        assert_ne!(reclaimed.lease_token, delivery.lease_token);
+        assert!(catalog
+            .acknowledge_notification_delivery(&reclaimed, expires + 1)
+            .expect("new lease should acknowledge"));
+    }
+
+    #[test]
     fn stale_notification_lease_cannot_complete_a_reclaimed_delivery() {
         let mut catalog = AlertCatalog::open(None).expect("catalog should open");
         enqueue_test_notification(&mut catalog, true, false, 100);
@@ -1715,4 +1683,92 @@ mod tests {
             NotificationDeliveryRetryOutcome::NotDeadLetter(NotificationDeliveryState::Pending)
         );
     }
+}
+
+fn default_alert_rules() -> [CreateAlertRule; 4] {
+    [
+        CreateAlertRule {
+            name: "Client offline".to_owned(),
+            metric: AlertMetric::ClientOffline,
+            comparator: AlertComparator::GreaterOrEqual,
+            threshold: 1.0,
+            target: None,
+            evaluation_window_seconds: 120,
+            cooldown_seconds: 900,
+            severity: AlertSeverity::Warning,
+            notify_webhook: true,
+            notify_email: false,
+            enabled: true,
+        },
+        CreateAlertRule {
+            name: "Policy unavailable".to_owned(),
+            metric: AlertMetric::PolicyUnavailable,
+            comparator: AlertComparator::GreaterOrEqual,
+            threshold: 1.0,
+            target: None,
+            evaluation_window_seconds: 60,
+            cooldown_seconds: 900,
+            severity: AlertSeverity::Critical,
+            notify_webhook: true,
+            notify_email: true,
+            enabled: true,
+        },
+        CreateAlertRule {
+            name: "Authentication failures".to_owned(),
+            metric: AlertMetric::AuthenticationFailures,
+            comparator: AlertComparator::GreaterOrEqual,
+            threshold: 10.0,
+            target: None,
+            evaluation_window_seconds: 300,
+            cooldown_seconds: 900,
+            severity: AlertSeverity::Warning,
+            notify_webhook: true,
+            notify_email: false,
+            enabled: true,
+        },
+        CreateAlertRule {
+            name: "Certificate expiry".to_owned(),
+            metric: AlertMetric::CertificateDaysRemaining,
+            comparator: AlertComparator::LessOrEqual,
+            threshold: 30.0,
+            target: None,
+            evaluation_window_seconds: 300,
+            cooldown_seconds: 86_400,
+            severity: AlertSeverity::Warning,
+            notify_webhook: true,
+            notify_email: true,
+            enabled: true,
+        },
+    ]
+}
+
+fn default_slo_rules() -> [CreateAlertRule; 2] {
+    [
+        CreateAlertRule {
+            name: "SLO fast burn (5m and 1h)".to_owned(),
+            metric: AlertMetric::SloFastBurnRate,
+            comparator: AlertComparator::GreaterOrEqual,
+            threshold: 14.4,
+            target: Some("global".to_owned()),
+            evaluation_window_seconds: 300,
+            cooldown_seconds: 3_600,
+            severity: AlertSeverity::Critical,
+            notify_webhook: true,
+            notify_email: true,
+            enabled: true,
+        },
+        CreateAlertRule {
+            name: "SLO slow burn (6h and 24h)".to_owned(),
+            metric: AlertMetric::SloSlowBurnRate,
+            comparator: AlertComparator::GreaterOrEqual,
+            threshold: 6.0,
+            target: Some("global".to_owned()),
+            evaluation_window_seconds: 21_600,
+            cooldown_seconds: 21_600,
+            severity: AlertSeverity::Warning,
+            notify_webhook: true,
+            notify_email: true,
+            enabled: true,
+        },
+    ]
 }
