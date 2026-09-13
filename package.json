@@ -8,6 +8,6 @@
     "test:webui": "pwsh -NoProfile -File ./scripts/run-webui-smoke.ps1"
   },
   "devDependencies": {
-    "playwright": "1.62.1"
+    "playwright": "1.63.0"
   }
 }
