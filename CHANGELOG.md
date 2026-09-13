@@ -6,6 +6,8 @@
 
 ### 兼容性补丁 / Compatibility patch
 
+- 修复持久 SQLite 服务强制终止后无法立即重启的问题：取得进程独占锁后仅执行一次旧租约恢复，保留单调递增的 fencing 序列；PostgreSQL 仍按共享租约判定接管。
+  Recover stale standalone SQLite leases once after acquiring the exclusive process lock, allowing immediate restart after forced termination while preserving monotonically increasing fencing tokens. PostgreSQL retains shared lease-based takeover.
 - 刷新 `h2` 与 `chacha20` 相关 Rust 依赖锁定和第三方许可证清单，固定安全更新后的传输与加密依赖；不改变应用协议或数据格式。
   Refresh the Rust lockfile and third-party license inventory for the `h2` and `chacha20` dependency paths, pinning the security-updated transport and encryption dependencies without changing application protocols or data formats.
 - 修复严格 Clippy 发布门禁反馈，并修正跨平台测试夹具的临时路径处理，使 Windows 与 Unix 验证使用同一套安全路径约束。
@@ -15,8 +17,8 @@
 
 ## 1.1.1 - 2026-09-13
 
-> 注：`v1.1.1` 仅保留为用于门禁流程的不可变标签，未创建 GitHub Release；最新公开稳定版本仍为 `v1.0.0`。
-> Note: `v1.1.1` remains only as an immutable tag used by release-gate attempts and has no GitHub Release; the latest public stable version remains `v1.0.0`.
+> 注：`v1.1.1` 仅保留为不可变源码标签，未创建 GitHub Release；其变更并入 `v1.1.2`。
+> Note: `v1.1.1` remains an immutable source tag without a GitHub Release; its changes are included in `v1.1.2`.
 
 ### 补丁发行 / Patch release
 

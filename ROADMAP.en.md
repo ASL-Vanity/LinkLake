@@ -12,7 +12,7 @@ This document separates the v1.1 feature line included in the current `v1.1.2` r
 - Explicit PostgreSQL initialization, SQLite migration, rollback-eligibility checks and offline material-key rotation have maintenance commands. Update procedures distinguish standalone SQLite from PostgreSQL clusters.
 - Helm shared-state and per-replica volume configuration, installation/update safeguards, the [user guide](docs/user-guide.en.md) and bilingual READMEs have been updated for this version.
 
-The repository version and release target are `v1.1.2`. The latest public stable GitHub Release remains `v1.0.0` (August 6, 2026); `v1.1.0` and `v1.1.1` are immutable tags without corresponding public Releases. Official builds, signatures and assets are produced by the `v1.1.2` tag workflow. Production-server upgrades are scheduled separately; repository implementation and version publication do not imply that production nodes have been upgraded.
+The repository version is `v1.1.2`. The tag workflow produces official builds, signatures and assets; consult GitHub Releases for downloadable versions. `v1.1.0` and `v1.1.1` remain immutable source tags without corresponding public Releases. Production-server upgrades are scheduled separately; version publication does not imply that production nodes have been upgraded.
 
 ## Continuing improvements
 

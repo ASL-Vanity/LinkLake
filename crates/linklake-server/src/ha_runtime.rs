@@ -195,6 +195,11 @@ impl HaRuntime {
     }
 
     pub(crate) async fn bootstrap(&self) -> anyhow::Result<(HaMember, LeadershipTransition)> {
+        if self.coordinator.recover_stale_sqlite_leases()? {
+            tracing::info!(
+                "Recovered stale SQLite HA member, leader, resource, and job leases at startup"
+            );
+        }
         let member = self.coordinator.register_or_renew_member().await?;
         let leadership = self.coordinator.try_acquire_leadership().await?;
         let transition = if leadership.is_some() {

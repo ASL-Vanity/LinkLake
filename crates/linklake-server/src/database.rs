@@ -10,7 +10,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -27,6 +30,9 @@ struct DatabaseInner {
     _memory_keeper: Option<Mutex<Connection>>,
     // 文件锁由操作系统持有；进程异常退出时会自动释放，不依赖删除锁文件。
     _process_lock: Option<File>,
+    // 进程内多个 Catalog/Runtime 共享同一 Database 句柄；仅首个持久
+    // SQLite HA runtime 可消费一次性启动接管资格。
+    sqlite_ha_recovery_claimed: AtomicBool,
 }
 
 enum DatabaseLocation {
@@ -72,6 +78,7 @@ impl Database {
                 location: DatabaseLocation::File(database_path),
                 _memory_keeper: None,
                 _process_lock: Some(process_lock),
+                sqlite_ha_recovery_claimed: AtomicBool::new(false),
             }),
         };
         // 启动时立即验证路径、权限和 PRAGMA，不能等到第一个 Catalog 才失败。
@@ -90,6 +97,7 @@ impl Database {
                 location: DatabaseLocation::Memory(uri),
                 _memory_keeper: Some(Mutex::new(keeper)),
                 _process_lock: None,
+                sqlite_ha_recovery_claimed: AtomicBool::new(false),
             }),
         })
     }
@@ -114,6 +122,18 @@ impl Database {
 
     pub(crate) fn is_persistent(&self) -> bool {
         matches!(self.inner.location, DatabaseLocation::File(_))
+    }
+
+    /// 获取持久 SQLite 的一次性启动恢复资格。DatabaseInner 保持的进程锁
+    /// 证明同一目录的旧进程已经退出；原子标记阻止同进程的第二个 runtime
+    /// 再次恢复并覆盖第一个 runtime 的活动租约。
+    pub(crate) fn claim_sqlite_ha_recovery(&self) -> bool {
+        self.is_persistent()
+            && self
+                .inner
+                .sqlite_ha_recovery_claimed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
     }
 
     pub(crate) fn with_connection<T>(

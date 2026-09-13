@@ -6,7 +6,7 @@ LinkLake is a cross-platform secure tunneling and service publishing platform wr
 
 The Server includes a Web UI. The optional Flutter desktop application, LinkLake Manager, manages servers and local clients. Server and Client can each run independently or as operating-system services.
 
-**The current repository version and release target are `1.1.2`.** The latest public stable GitHub Release remains `v1.0.0` (August 6, 2026); `v1.1.0` and `v1.1.1` are immutable tags without corresponding public Releases. Available versions and downloadable assets are listed in [GitHub Releases](https://github.com/ASL-Vanity/LinkLake/releases).
+**The current repository version is `1.1.2`.** Available versions and complete release assets are listed in [GitHub Releases](https://github.com/ASL-Vanity/LinkLake/releases). `v1.1.0` and `v1.1.1` remain source tags without corresponding public Releases.
 
 ## Core capabilities
 
@@ -109,7 +109,7 @@ See [update security](docs/update-security.md), [release supply chain](docs/rele
 
 | Topic | Documents |
 | --- | --- |
-| Installation and daily use | [User guide (Chinese)](docs/user-guide.zh-CN.md), [deployment guide](docs/deployment.md), [configuration example](examples/linklake-client.toml) |
+| Installation and daily use | [User guide](docs/user-guide.en.md), [deployment guide](docs/deployment.md), [configuration example](examples/linklake-client.toml) |
 | HTTP/2 and gRPC | [Routing and backend TLS](docs/http2-grpc.en.md) |
 | SOCKS5 | [Supported behavior and security boundaries](docs/socks5-supported-boundaries.en.md) |
 | Multiple entry points and Fleet | [Fleet Bundle v2](docs/adr/0003-fleet-bundle-v2.md), [health and DNS failover design](docs/adr/0004-fleet-health-dns-failover.md) |

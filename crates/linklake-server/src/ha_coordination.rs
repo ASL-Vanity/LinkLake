@@ -123,6 +123,33 @@ impl HaCoordinator {
         &self.storage
     }
 
+    /// 回收持久 SQLite 上一次异常退出留下的本机租约。
+    ///
+    /// `Database::persistent` 在整个 `DatabaseInner` 生命周期持有数据目录
+    /// 的独占文件锁，因此能证明同一目录的旧 Server 已退出。该恢复只允许
+    /// 首个进程内 runtime 执行，并且仅作用于 SQLite；PostgreSQL 仍由活动
+    /// member lease 和 incarnation 检查阻止冲突接管。fencing sequence 保留，
+    /// 让恢复后的新 Leader 继续使用严格递增的 token。
+    pub(crate) fn recover_stale_sqlite_leases(&self) -> anyhow::Result<bool> {
+        let CoordinationStorage::Sqlite(database) = &self.storage else {
+            return Ok(false);
+        };
+        if !database.claim_sqlite_ha_recovery() {
+            return Ok(false);
+        }
+        database.with_transaction(|transaction| {
+            transaction.execute("UPDATE ha_members SET lease_until_unix_seconds = 0", [])?;
+            transaction.execute("UPDATE ha_leader SET lease_until_unix_seconds = 0", [])?;
+            transaction.execute(
+                "UPDATE public_port_ownership SET lease_until_unix_seconds = 0",
+                [],
+            )?;
+            transaction.execute("UPDATE job_leases SET lease_until_unix_seconds = 0", [])?;
+            Ok(())
+        })?;
+        Ok(true)
+    }
+
     pub(crate) async fn register_or_renew_member(&self) -> anyhow::Result<HaMember> {
         match &self.storage {
             CoordinationStorage::Sqlite(database) => database.with_transaction(|transaction| {
