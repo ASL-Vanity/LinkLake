@@ -239,13 +239,14 @@ function Invoke-CurlRequest {
         [string]$Method = 'GET',
         [string]$HostHeader,
         [string]$Body,
+        [ValidateRange(1, 30)][int]$MaxTimeSeconds = 30,
         [switch]$ExpectFailure
     )
     $bodyPath = Join-Path $runRoot ('curl-body-' + [guid]::NewGuid())
     $headerPath = Join-Path $runRoot ('curl-headers-' + [guid]::NewGuid())
     $arguments = @(
         '--silent', '--show-error',
-        '--connect-timeout', '10', '--max-time', '30',
+        '--connect-timeout', '10', '--max-time', [string]$MaxTimeSeconds,
         '--resolve', "${ServerName}:${Port}:127.0.0.1",
         '--request', $Method,
         '--dump-header', $headerPath,
@@ -635,8 +636,21 @@ target = "127.0.0.1:$backendPort"
         -RouteId $route.id -Expected $true
     $restoredRoute = Wait-RouteTlsStatus -BaseUrl $baseUrl -Session $restartedSession `
         -RouteId $route.id -ExpectedStatus 'active' -ExpectedOnline $true -Seconds 30
-    $restoredResponse = Invoke-CurlRequest -Scheme https -Port $httpsPort -ServerName $hostname `
-        -Path '/restored'
+    # 路由在线仅代表控制会话已注册，重连后的首次目标健康探测尚可能未完成。
+    # 等待真实业务响应，并把每次请求限制在总期限内；只重试后端尚未就绪的 502。
+    $restoreDeadline = [DateTime]::UtcNow.AddSeconds(30)
+    $restoredResponse = $null
+    do {
+        $remainingSeconds = [int][Math]::Floor(($restoreDeadline - [DateTime]::UtcNow).TotalSeconds)
+        if ($remainingSeconds -lt 1) { break }
+        $restoredResponse = Invoke-CurlRequest -Scheme https -Port $httpsPort -ServerName $hostname `
+            -Path '/restored' -MaxTimeSeconds $remainingSeconds
+        if ([int]$restoredResponse.StatusCode -eq 200) { break }
+        if ([int]$restoredResponse.StatusCode -ne 502) { break }
+        if ([DateTime]::UtcNow -lt $restoreDeadline) {
+            Start-Sleep -Milliseconds 250
+        }
+    } while ([DateTime]::UtcNow -lt $restoreDeadline)
     Assert-Status -Response $restoredResponse -Expected 200 -Context 'HTTPS after server restart'
     if ((Get-FileHash -LiteralPath $certificatePath -Algorithm SHA256).Hash -ne $renewedCertificateHash) {
         throw 'Server restart did not reuse the persisted renewed certificate.'

@@ -37,7 +37,16 @@ public static class LinkLakeTcpLoadProbe
             tasks.Add(Task.Run(() => RunWorker(host, port, workerId, bytesPerConnection,
                 chunkBytes, delayMilliseconds, timeoutMilliseconds)));
         }
-        Task.WaitAll(tasks.ToArray(), timeoutMilliseconds);
+        try
+        {
+            Task.WaitAll(tasks.ToArray(), timeoutMilliseconds);
+        }
+        catch (AggregateException error)
+        {
+            var details = string.Join(" | ", error.Flatten().InnerExceptions.Select(inner =>
+                inner.GetType().Name + ": " + inner.Message));
+            throw new InvalidOperationException("TCP load probe worker failed: " + details, error);
+        }
         if (tasks.Any(task => !task.IsCompleted))
             throw new TimeoutException("TCP load probe timed out.");
         stopwatch.Stop();

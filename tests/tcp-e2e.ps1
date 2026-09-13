@@ -306,6 +306,7 @@ try {
     } finally {
         $tcp.Dispose()
     }
+    Wait-ActiveConnections -BaseUrl $baseUrl -Session $webSession -Expected 0
 
     $loadResult = & powershell.exe -NoProfile -ExecutionPolicy Bypass `
         -File (Join-Path $PSScriptRoot 'tcp-load-probe.ps1') -Port $publicPort `
