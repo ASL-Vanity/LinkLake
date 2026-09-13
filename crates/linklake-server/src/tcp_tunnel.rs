@@ -578,12 +578,31 @@ async fn register_tunnel(
         send_error(&mut stream, "public port is not allowed by server policy").await;
         return;
     }
-    let runtime_policy = state
+    let registration_token = state.ha_runtime.fencing_token().ok();
+    if registration_token.is_none() || !state.accepts_public_work() {
+        state
+            .metrics
+            .registration_rejections_total
+            .fetch_add(1, Ordering::Relaxed);
+        send_error(&mut stream, "active HA leader is required for registration").await;
+        return;
+    }
+    let runtime_policy = match state
         .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
         .runtime_policy(client_id, &name, public_port, &target_addr)
-        .unwrap_or(None);
+        .await
+    {
+        Ok(policy) => policy,
+        Err(error) => {
+            tracing::warn!(public_port, "Tunnel policy lookup failed: {error}");
+            state
+                .metrics
+                .registration_rejections_total
+                .fetch_add(1, Ordering::Relaxed);
+            send_error(&mut stream, "tunnel policy storage is unavailable").await;
+            return;
+        }
+    };
     let Some(runtime_policy) = runtime_policy else {
         state
             .metrics
@@ -656,6 +675,37 @@ async fn register_tunnel(
             return;
         }
     };
+    // 网络协商不持有策略门；安装本机注册时再读取完整策略并核对同一 Leader。
+    let registration_guard = state.policy_mutation_lock.lock().await;
+    let current_policy = state
+        .tunnel_catalog
+        .runtime_policy(client_id, &name, public_port, &target_addr)
+        .await;
+    let policy_matches = current_policy
+        .as_ref()
+        .ok()
+        .and_then(|policy| policy.as_ref())
+        == Some(&runtime_policy);
+    if !policy_matches
+        || !state.accepts_public_work()
+        || state.ha_runtime.fencing_token().ok() != registration_token
+    {
+        if let Err(error) = current_policy {
+            tracing::warn!(public_port, "Tunnel policy revalidation failed: {error}");
+        }
+        drop(registration_guard);
+        port_lease.release().await;
+        state
+            .metrics
+            .registration_rejections_total
+            .fetch_add(1, Ordering::Relaxed);
+        send_error(
+            &mut stream,
+            "tunnel policy or HA leadership changed during registration",
+        )
+        .await;
+        return;
+    }
     let (command_tx, command_rx) = mpsc::channel(64);
     let probe_command_tx = command_tx.clone();
     let (stop_tx, stop_rx) = watch::channel(());
@@ -701,6 +751,7 @@ async fn register_tunnel(
             },
         );
     }
+    drop(registration_guard);
     record_audit(
         &state,
         "tcp_tunnel.registered",
@@ -764,6 +815,10 @@ async fn register_tunnel(
     probe_task.abort();
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "注册生命周期显式持有身份、探测及独立控制通道"
+)]
 async fn run_registered_control(
     state: Arc<AppState>,
     public_port: u16,
@@ -857,10 +912,7 @@ async fn accept_public_connections(
                         drop(external);
                         continue;
                     }
-                    let decision = context.state.traffic_controls
-                        .lock()
-                        .expect("traffic control catalog lock poisoned")
-                        .authorize(context.policy_kind, context.policy_id, source.ip(), crate::unix_seconds());
+                    let decision = crate::traffic_control::usage_meter::authorize_traffic(&context.state, context.policy_kind, context.policy_id, source.ip()).await;
                     if !matches!(decision, Ok(TrafficDecision::Allowed)) {
                         context.statistics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                         tracing::debug!("TCP traffic control rejected {source}: {decision:?}");
@@ -974,7 +1026,7 @@ async fn serve_public_connection(
                 }
                 result = timeout(
                     CONNECTION_MAX_LIFETIME,
-                    copy_bidirectional_with_limit(&mut external, &mut agent_stream, bandwidth_limiter),
+                    copy_bidirectional_with_meter(&mut external, &mut agent_stream, bandwidth_limiter, &state, policy_kind, policy_id),
                 ) => result,
             };
             match transfer_result {
@@ -985,19 +1037,6 @@ async fn serve_public_connection(
                     statistics
                         .bytes_to_public
                         .fetch_add(to_public, Ordering::Relaxed);
-                    if let Err(error) = state
-                        .traffic_controls
-                        .lock()
-                        .expect("traffic control catalog lock poisoned")
-                        .record_bytes(
-                            policy_kind,
-                            policy_id,
-                            from_public.saturating_add(to_public),
-                            crate::unix_seconds(),
-                        )
-                    {
-                        tracing::warn!("Could not persist TCP traffic usage: {error}");
-                    }
                 }
                 Ok(Err(error)) => {
                     statistics
@@ -1043,6 +1082,27 @@ async fn serve_public_connection(
     statistics
         .active_connections
         .fetch_sub(1, Ordering::Relaxed);
+}
+
+pub(crate) async fn copy_bidirectional_with_meter<A, B>(
+    external: &mut A,
+    agent: &mut B,
+    limiter: Option<Arc<BandwidthLimiter>>,
+    state: &AppState,
+    kind: TrafficPolicyKind,
+    policy_id: Uuid,
+) -> std::io::Result<(u64, u64)>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let meter = crate::traffic_control::usage_meter::TrafficUsageMeter::new(
+        state.traffic_usage_spool.clone(),
+        kind,
+        policy_id,
+    );
+    let mut external = crate::traffic_control::usage_meter::MeteredIo::new(external, meter);
+    copy_bidirectional_with_limit(&mut external, agent, limiter).await
 }
 
 pub(crate) async fn copy_bidirectional_with_limit<A, B>(

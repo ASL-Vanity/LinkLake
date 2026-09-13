@@ -172,8 +172,7 @@
             "properties": {
               "postgres": {
                 "properties": {
-                  "existingSecret": { "minLength": 1 },
-                  "replicatedStateAcknowledged": { "const": true }
+                  "existingSecret": { "minLength": 1 }
                 }
               }
             }

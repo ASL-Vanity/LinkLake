@@ -5,7 +5,7 @@
 //! 具有外部副作用的循环都必须通过这里启动。
 
 use crate::{
-    ha_runtime::LeadershipLease,
+    ha_coordination::LeadershipLease,
     job_leases::{JobLease, JobLeases},
     AppState,
 };
@@ -109,34 +109,29 @@ async fn supervise<F, Fut>(
         let mut worker_task = tokio::spawn(worker(state.clone(), stop_rx));
         let mut renew = tokio::time::interval(renewal_interval);
         renew.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut reason = StopReason::WorkerExited;
         let mut worker_result = None;
 
-        loop {
+        let reason = loop {
             tokio::select! {
                 result = &mut worker_task => {
                     worker_result = Some(result);
-                    reason = StopReason::WorkerExited;
-                    break;
+                    break StopReason::WorkerExited;
                 }
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
-                        reason = StopReason::Shutdown;
-                        break;
+                        break StopReason::Shutdown;
                     }
                 }
                 changed = leadership.changed() => {
                     if changed.is_err() || !same_leadership(&leadership, fencing_token) {
-                        reason = StopReason::LeadershipLost;
-                        break;
+                        break StopReason::LeadershipLost;
                     }
                 }
                 _ = renew.tick() => {
                     if !same_leadership(&leadership, fencing_token)
                         || state.ha_runtime.fencing_token().ok() != Some(fencing_token)
                     {
-                        reason = StopReason::LeadershipLost;
-                        break;
+                        break StopReason::LeadershipLost;
                     }
                     match renew_with_interrupt(
                         jobs,
@@ -149,29 +144,25 @@ async fn supervise<F, Fut>(
                     ).await {
                         RenewalOutcome::LeadershipUnchanged => continue,
                         RenewalOutcome::LeadershipLost => {
-                            reason = StopReason::LeadershipLost;
-                            break;
+                            break StopReason::LeadershipLost;
                         }
                         RenewalOutcome::Shutdown => {
-                            reason = StopReason::Shutdown;
-                            break;
+                            break StopReason::Shutdown;
                         }
                         RenewalOutcome::Renewed(Ok(Some(_))) => {
                             tracing::debug!(job_key, job_kind, lease_id = %lease_id, "后台任务租约已续期");
                         }
                         RenewalOutcome::Renewed(Ok(None)) => {
-                            reason = StopReason::LeaseExpired;
-                            break;
+                            break StopReason::LeaseExpired;
                         }
                         RenewalOutcome::Renewed(Err(error)) => {
                             tracing::warn!(job_key, job_kind, lease_id = %lease_id, %error, "后台任务租约续期失败");
-                            reason = StopReason::LeaseRenewalFailed;
-                            break;
+                            break StopReason::LeaseRenewalFailed;
                         }
                     }
                 }
             }
-        }
+        };
 
         // 先广播取消，再立即 abort，确保网络请求和 JoinSet 子任务不会继续产生副作用。
         let _ = stop_tx.send(true);

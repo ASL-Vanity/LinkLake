@@ -4,8 +4,9 @@ use crate::{
 };
 use linklake_core::public_ports::PortRanges;
 use serde::Serialize;
+#[cfg(test)]
+use std::{collections::HashSet, sync::Mutex};
 use std::{
-    collections::HashSet,
     error::Error,
     fmt,
     future::Future,
@@ -13,7 +14,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     time::Duration,
 };
@@ -43,7 +44,7 @@ pub(crate) enum DynamicPortProtocol {
     Tcp,
 }
 
-/// 动态端口租约接口不假定存储位置；当前本地实现由单进程持有，HA 线可替换为分布式租约。
+/// 动态端口租约由 HA 协调器提供，独立本地实现仅用于租约接口测试。
 pub(crate) trait DynamicPortLease: Send + Sync {
     fn protocol(&self) -> DynamicPortProtocol;
     fn port(&self) -> u16;
@@ -88,11 +89,13 @@ impl fmt::Display for DynamicPortLeaseError {
 
 impl Error for DynamicPortLeaseError {}
 
+#[cfg(test)]
 #[derive(Clone, Default)]
 pub(crate) struct LocalDynamicPortLeaseProvider {
     state: Arc<Mutex<LocalDynamicPortLeaseState>>,
 }
 
+#[cfg(test)]
 #[derive(Default)]
 struct LocalDynamicPortLeaseState {
     tcp: HashSet<u16>,
@@ -100,6 +103,7 @@ struct LocalDynamicPortLeaseState {
     next_lease_id: u64,
 }
 
+#[cfg(test)]
 struct LocalDynamicPortLease {
     state: Arc<Mutex<LocalDynamicPortLeaseState>>,
     port: u16,
@@ -107,6 +111,7 @@ struct LocalDynamicPortLease {
     released: AtomicBool,
 }
 
+#[cfg(test)]
 impl DynamicPortLease for LocalDynamicPortLease {
     fn protocol(&self) -> DynamicPortProtocol {
         DynamicPortProtocol::Tcp
@@ -141,6 +146,7 @@ impl DynamicPortLease for LocalDynamicPortLease {
     }
 }
 
+#[cfg(test)]
 impl Drop for LocalDynamicPortLease {
     fn drop(&mut self) {
         if self.released.swap(true, Ordering::AcqRel) {
@@ -154,6 +160,7 @@ impl Drop for LocalDynamicPortLease {
     }
 }
 
+#[cfg(test)]
 impl DynamicPortLeaseProvider for LocalDynamicPortLeaseProvider {
     fn acquire_tcp<'a>(
         &'a self,

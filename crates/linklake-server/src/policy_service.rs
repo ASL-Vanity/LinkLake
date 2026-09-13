@@ -3,10 +3,10 @@
 use crate::{database::Database, public_port_policy::PublicPortPolicy};
 use linklake_core::{
     fleet_protocol::{
-        FleetBundleV2, FleetHttpProxyResource, FleetHttpRouteResource, FleetPortGroupProtocol,
-        FleetPortGroupResource, FleetResource, FleetResourceSpec, FleetSecretTunnelResource,
-        FleetSniRouteResource, FleetSocks5ProxyResource, FleetTcpResource, FleetTrafficControl,
-        FleetUdpResource,
+        FleetBundleV2, FleetGrpcBackendTransport, FleetHttpProxyResource, FleetHttpRouteResource,
+        FleetPortGroupProtocol, FleetPortGroupResource, FleetResource, FleetResourceSpec,
+        FleetSecretTunnelResource, FleetSniRouteResource, FleetSocks5ProxyResource,
+        FleetTcpResource, FleetTrafficControl, FleetUdpResource,
     },
     port_mapping::{parse_port_mappings, MAX_PORT_MAPPINGS},
 };
@@ -1130,7 +1130,7 @@ fn policy_matches_planned(
             let client_id = local_client_id(clients, value.agent_instance_id)?.to_string();
             transaction
             .query_row(
-                "SELECT client_id, name, hostname, target_addr, max_connections, enabled FROM http_route_policies WHERE id = ?1",
+                "SELECT client_id, name, hostname, target_addr, max_connections, enabled, grpc_backend_transport, grpc_backend_server_name, grpc_backend_trust_profile FROM http_route_policies WHERE id = ?1",
                 [&id],
                 |row| {
                     Ok(row.get::<_, String>(0)? == client_id
@@ -1138,7 +1138,10 @@ fn policy_matches_planned(
                         && row.get::<_, String>(2)? == value.hostname
                         && row.get::<_, String>(3)? == value.target_addr
                         && row.get::<_, u16>(4)? == value.max_connections
-                        && (row.get::<_, i64>(5)? != 0) == planned.resource.enabled)
+                        && (row.get::<_, i64>(5)? != 0) == planned.resource.enabled
+                        && row.get::<_, String>(6)? == value.grpc_backend_transport.as_str()
+                        && row.get::<_, Option<String>>(7)? == value.grpc_backend_server_name
+                        && row.get::<_, Option<String>>(8)? == value.grpc_backend_trust_profile)
                 },
             )
             .optional()?
@@ -1806,10 +1809,7 @@ fn delete_owned_policy(
         "DELETE FROM traffic_controls WHERE kind = ?1 AND policy_id = ?2",
         params![owned.kind.traffic_kind(), owned.policy_id.to_string()],
     )?;
-    transaction.execute(
-        "DELETE FROM traffic_daily_usage WHERE kind = ?1 AND policy_id = ?2",
-        params![owned.kind.traffic_kind(), owned.policy_id.to_string()],
-    )?;
+    // 保留历史用量，防止相同确定性策略 ID 被重新创建后重置每日配额。
     transaction.execute(
         "DELETE FROM fleet_credential_bindings WHERE source_instance_id = ?1 AND kind = ?2 AND policy_id = ?3",
         params![
@@ -1917,7 +1917,7 @@ fn upsert_planned_resource(
         }
         FleetResourceSpec::HttpRoute(value) => {
             transaction.execute(
-                "INSERT INTO http_route_policies (id, client_id, name, hostname, target_addr, max_connections, enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO http_route_policies (id, client_id, name, hostname, target_addr, max_connections, enabled, grpc_backend_transport, grpc_backend_server_name, grpc_backend_trust_profile) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     id,
                     local_client_id(clients, value.agent_instance_id)?.to_string(),
@@ -1926,6 +1926,9 @@ fn upsert_planned_resource(
                     value.target_addr,
                     value.max_connections,
                     planned.resource.enabled,
+                    value.grpc_backend_transport.as_str(),
+                    value.grpc_backend_server_name,
+                    value.grpc_backend_trust_profile,
                 ],
             )?;
         }
@@ -2053,7 +2056,7 @@ fn reconcile_traffic_controls(
                 serde_json::to_string(&control.allowed_cidrs)?,
                 serde_json::to_string(&control.denied_cidrs)?,
                 control.max_connections_per_minute,
-                control.daily_quota_bytes,
+                control.daily_quota_bytes.map(crate::traffic_control::encode_sqlite_u64),
                 serde_json::to_string(&control.active_weekdays_utc)?,
                 control.start_minute_utc,
                 control.end_minute_utc,
@@ -2085,7 +2088,7 @@ fn traffic_controls_match(
                         row.get(0)?,
                         row.get(1)?,
                         row.get(2)?,
-                        row.get(3)?,
+                        read_optional_sqlite_quota(row, 3)?,
                         row.get(4)?,
                         row.get(5)?,
                         row.get(6)?,
@@ -2328,7 +2331,7 @@ fn export_resources(
                     _ => anyhow::bail!("local port-group protocol is invalid"),
                 },
                 public_ports,
-                target_host,
+                target_host: canonical_fleet_target_host(&target_host),
                 target_ports,
                 max_connections,
                 max_sessions,
@@ -2340,7 +2343,7 @@ fn export_resources(
     drop(statement);
 
     let mut statement = transaction.prepare(
-        "SELECT id, client_id, name, hostname, target_addr, max_connections, enabled FROM http_route_policies",
+        "SELECT id, client_id, name, hostname, target_addr, max_connections, enabled, grpc_backend_transport, grpc_backend_server_name, grpc_backend_trust_profile FROM http_route_policies",
     )?;
     let rows = statement.query_map([], |row| {
         Ok((
@@ -2351,10 +2354,24 @@ fn export_resources(
             row.get::<_, String>(4)?,
             row.get::<_, u16>(5)?,
             row.get::<_, i64>(6)? != 0,
+            row.get::<_, String>(7)?,
+            row.get::<_, Option<String>>(8)?,
+            row.get::<_, Option<String>>(9)?,
         ))
     })?;
     for row in rows {
-        let (id, client, name, hostname, target, limit, enabled) = row?;
+        let (
+            id,
+            client,
+            name,
+            hostname,
+            target,
+            limit,
+            enabled,
+            grpc_transport,
+            grpc_name,
+            grpc_trust,
+        ) = row?;
         let id = Uuid::parse_str(&id)?;
         if excluded.contains(&(FleetPolicyKind::HttpRoute, id)) {
             continue;
@@ -2371,6 +2388,9 @@ fn export_resources(
                 hostname,
                 target_addr: target,
                 max_connections: limit,
+                grpc_backend_transport: FleetGrpcBackendTransport::parse(&grpc_transport)?,
+                grpc_backend_server_name: grpc_name,
+                grpc_backend_trust_profile: grpc_trust,
             }),
         });
     }
@@ -2537,6 +2557,16 @@ fn export_resources(
     Ok(resources)
 }
 
+fn read_optional_sqlite_quota(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<Option<u64>> {
+    match row.get_ref(index)? {
+        rusqlite::types::ValueRef::Null => Ok(None),
+        value => crate::traffic_control::decode_sqlite_u64(value).map(Some),
+    }
+}
+
 type StoredTrafficControl = (
     String,
     String,
@@ -2561,7 +2591,7 @@ fn export_traffic_controls(
                 params![kind.traffic_kind(), resource.resource_id.to_string()],
                 |row| {
                     Ok((
-                        row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+                        row.get(0)?, row.get(1)?, row.get(2)?, read_optional_sqlite_quota(row, 3)?,
                         row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?,
                     ))
                 },
@@ -2583,6 +2613,12 @@ fn export_traffic_controls(
         });
     }
     Ok(controls)
+}
+
+fn canonical_fleet_target_host(host: &str) -> String {
+    host.parse::<std::net::IpAddr>()
+        .map(|address| address.to_string())
+        .unwrap_or_else(|_| host.to_ascii_lowercase())
 }
 
 fn target_addr(host: &str, port: u16) -> String {
@@ -2702,6 +2738,111 @@ mod tests {
         request.bundle =
             FleetBundleV2::new(source, 2, 2, Vec::new(), Vec::new(), Vec::new()).unwrap();
         assert!(!validate_reconcile_precondition(&request, Some(&current)).unwrap());
+    }
+
+    #[test]
+    fn grpc_tls_and_full_unsigned_quota_survive_reconcile_and_replay() {
+        let state = setup();
+        let mut desired = bundle(&state, 1, 32001, 32005);
+        for resource in &mut desired.resources {
+            if let FleetResourceSpec::HttpRoute(route) = &mut resource.spec {
+                route.grpc_backend_transport = FleetGrpcBackendTransport::Tls;
+                route.grpc_backend_server_name = Some("backend.example.test".into());
+                route.grpc_backend_trust_profile = Some("private-ca".into());
+            }
+        }
+        desired.traffic_controls[0].daily_quota_bytes = Some(u64::MAX);
+        desired.refresh_integrity().unwrap();
+        let request = FleetReconcileRequest {
+            bundle: desired.clone(),
+            dry_run: false,
+            expected_generation: None,
+            expected_revision: None,
+        };
+        assert!(
+            state
+                .service
+                .reconcile(request.clone(), 10)
+                .unwrap()
+                .applied
+        );
+        assert!(
+            state
+                .service
+                .reconcile(request.clone(), 11)
+                .unwrap()
+                .idempotent
+        );
+        state
+            .database
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE http_route_policies SET grpc_backend_server_name='other.example.test'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let repaired = state.service.reconcile(request, 12).unwrap();
+        assert!(repaired.applied);
+        assert_eq!(repaired.updated, 1);
+        state
+            .database
+            .with_connection(|connection| {
+                let name: String = connection.query_row(
+                    "SELECT grpc_backend_server_name FROM http_route_policies",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(name, "backend.example.test");
+                let quota = connection.query_row(
+                    "SELECT daily_quota_bytes FROM traffic_controls LIMIT 1",
+                    [],
+                    |row| read_optional_sqlite_quota(row, 0),
+                )?;
+                assert_eq!(quota, Some(u64::MAX));
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn local_http_export_keeps_grpc_tls_identity() {
+        let state = setup();
+        let mut catalog = HttpRouteCatalog::open_with_database(&state.database).unwrap();
+        catalog
+            .create(crate::http_route_catalog::CreateHttpRoutePolicy {
+                client_id: state.client_id,
+                name: "local-grpc".into(),
+                hostname: "grpc.example.test".into(),
+                target_addr: "127.0.0.1:443".into(),
+                max_connections: Some(32),
+                grpc_backend_transport: crate::http_route_catalog::GrpcBackendTransport::Tls,
+                grpc_backend_server_name: Some("backend.example.test".into()),
+                grpc_backend_trust_profile: Some("private-ca".into()),
+            })
+            .unwrap();
+        let exported = state.service.export_bundle(10).unwrap();
+        let route = exported
+            .resources
+            .iter()
+            .find_map(|r| {
+                if let FleetResourceSpec::HttpRoute(route) = &r.spec {
+                    Some(route)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(route.grpc_backend_transport, FleetGrpcBackendTransport::Tls);
+        assert_eq!(
+            route.grpc_backend_server_name.as_deref(),
+            Some("backend.example.test")
+        );
+        assert_eq!(
+            route.grpc_backend_trust_profile.as_deref(),
+            Some("private-ca")
+        );
     }
 
     struct TestState {
@@ -2859,6 +3000,9 @@ mod tests {
                     hostname: "fleet-http.example.com".into(),
                     target_addr: "127.0.0.1:23005".into(),
                     max_connections: 64,
+                    grpc_backend_transport: FleetGrpcBackendTransport::H2c,
+                    grpc_backend_server_name: None,
+                    grpc_backend_trust_profile: None,
                 }),
             },
             FleetResource {

@@ -355,7 +355,7 @@ fn validate_policy(request: &CreateSecretTunnelPolicy) -> Result<(), SecretPolic
     Ok(())
 }
 
-fn requested_policy(
+pub(crate) fn requested_policy(
     id: Uuid,
     enabled: bool,
     request: CreateSecretTunnelPolicy,

@@ -110,7 +110,6 @@ impl CertificateStore {
     delegate!(get_certificate_state(route_id: Uuid) -> Option<CertificateState>);
     delegate!(list_certificate_states() -> Vec<CertificateState>);
     delegate!(update_certificate_status(route_id: Uuid, expected_status: Option<CertificateStatus>, new_status: CertificateStatus, attempted_at: Option<i64>) -> bool);
-    delegate!(record_certificate_success(route_id: Uuid, issuer: &str, not_before: i64, not_after: i64, completed_at: i64) -> CertificateState);
     delegate!(record_certificate_failure(route_id: Uuid, error_code: &str, error_message: &str, attempted_at: i64) -> CertificateState);
     delegate!(delete_certificate_state(route_id: Uuid) -> bool);
 }

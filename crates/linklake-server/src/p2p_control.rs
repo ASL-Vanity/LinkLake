@@ -118,9 +118,8 @@ pub(crate) async fn request_session(
     }
     let policy = state
         .secret_tunnel_catalog
-        .lock()
-        .expect("secret tunnel catalog lock poisoned")
         .access_runtime_policy(visitor_client_id, &access_key)
+        .await
         .unwrap_or(None);
     let Some(policy) = policy else {
         reject(&mut stream, "invalid or unauthorized P2P access key").await;

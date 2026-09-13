@@ -41,6 +41,13 @@ install -m 0644 packaging/iroh-relay/nginx-server.conf.example "$stage/iroh-rela
 install -m 0755 packaging/iroh-relay/install.sh "$stage/iroh-relay/"
 cp examples/* "$stage/examples/"
 cp README.md README.en.md CHANGELOG.md LICENSE NOTICE THIRD_PARTY_NOTICES.md THIRD_PARTY_LICENSES.html TRADEMARKS.md "$stage/"
+tracked_documents="$(git -c core.quotepath=false -C "$project_root" ls-files -- docs ':(exclude)docs/development-handoff.md')"
+printf '%s\n' "$tracked_documents" 'docs/user-guide.zh-CN.md' 'docs/user-guide.en.md' | sort -u |
+while IFS= read -r document; do
+  [ -n "$document" ] || continue
+  install -d "$stage/$(dirname -- "$document")"
+  install -m 0644 "$project_root/$document" "$stage/$document"
+done
 cat >"$stage/release.json" <<EOF
 {"product":"LinkLake","version":"$version","target":"linux-x86_64","built_unix_seconds":$source_date_epoch,"commit":"$commit"}
 EOF

@@ -10,7 +10,7 @@ targets = [
 [advisories]
 # 原因和到期日的唯一来源是 security/exceptions.toml，CI 会校验这里没有遗漏或扩大。
 ignore = [
-    { id = "RUSTSEC-2024-0436", reason = "Transitive through iroh 1.0.3 -> netwatch 0.19.1 -> netlink-packet-core 0.8.1, whose current release still uses the unmaintained paste 1.0.15 proc macro." },
+    { id = "RUSTSEC-2024-0436", reason = "Reviewed 2026-09-13 for LinkLake's current locked dependency graph: transitive through iroh 1.0.3 -> netwatch 0.19.1 -> netlink-packet-core 0.8.1. Official crates.io netlink-packet-core 0.8.2 still uses the unmaintained paste 1.0.15 proc macro; 0.9.0 removes paste but is outside netwatch 0.19.1's compatible range. Scope is limited to this advisory and dependency chain." },
 ]
 
 [licenses]

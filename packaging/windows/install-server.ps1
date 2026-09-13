@@ -30,6 +30,24 @@ Set-StrictMode -Version Latest
 $installerBoundParameters = @{} + $PSBoundParameters
 . (Join-Path $PSScriptRoot 'installer-common.ps1')
 
+function Assert-LinkLakeServerSqliteInstaller {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary[]]$StorageEnvironments,
+        [Parameter(Mandatory)][string]$DataDirectory
+    )
+    # 该安装事务的备份/恢复协议仅覆盖 SQLite；PG 集群不能被一个节点的本地快照回滚。
+    foreach ($storageEnvironment in $StorageEnvironments) {
+        if (($storageEnvironment.Contains('LINKLAKE_STORAGE_BACKEND') -and
+             ([string]$storageEnvironment['LINKLAKE_STORAGE_BACKEND']).Trim().ToLowerInvariant() -notin @('', 'sqlite')) -or
+            $storageEnvironment.Contains('LINKLAKE_POSTGRES_URL')) {
+            throw 'This installer supports standalone SQLite only. PostgreSQL deployments require a cluster upgrade with a verified PostgreSQL backup; see docs/postgres-upgrades.md.'
+        }
+    }
+    if (Test-Path -LiteralPath (Join-Path $DataDirectory 'postgres-storage.marker')) {
+        throw 'The data directory belongs to a PostgreSQL deployment; refusing SQLite installer backup or rollback. See docs/postgres-upgrades.md.'
+    }
+}
+
 function Get-LinkLakeServerInstallerSha256 {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Name)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
@@ -312,6 +330,7 @@ function Resolve-EnvironmentSetting {
 }
 
 $DataDirectory = Resolve-LinkLakeSafePath (Resolve-EnvironmentSetting 'DataDirectory' 'LINKLAKE_DATA_DIR' $DataDirectory) 'data directory' -RequireLocalDrive
+Assert-LinkLakeServerSqliteInstaller -StorageEnvironments @($existingEnvironment, [Environment]::GetEnvironmentVariables()) -DataDirectory $DataDirectory
 $LogDirectory = Resolve-LinkLakeSafePath (Resolve-EnvironmentSetting 'LogDirectory' 'LINKLAKE_LOG_DIR' $LogDirectory) 'log directory' -RequireLocalDrive
 $databaseSnapshotParent = Split-Path -Parent $DataDirectory
 if ([string]::IsNullOrWhiteSpace($databaseSnapshotParent)) {

@@ -2,7 +2,7 @@ use crate::{
     client_registry::Authentication,
     record_audit,
     target_probe::TargetProbeSet,
-    tcp_tunnel::{copy_bidirectional_with_limit, BandwidthLimiter},
+    tcp_tunnel::{copy_bidirectional_with_meter, BandwidthLimiter},
     traffic_control::{TrafficDecision, TrafficPolicyKind},
     AppState,
 };
@@ -333,16 +333,13 @@ pub(crate) async fn connect_visitor(
         .await;
         return;
     };
-    let traffic_decision = state
-        .traffic_controls
-        .lock()
-        .expect("traffic control catalog lock poisoned")
-        .authorize(
-            TrafficPolicyKind::Secret,
-            runtime_policy.policy_id,
-            source_ip,
-            crate::unix_seconds(),
-        );
+    let traffic_decision = crate::traffic_control::usage_meter::authorize_traffic(
+        &state,
+        TrafficPolicyKind::Secret,
+        runtime_policy.policy_id,
+        source_ip,
+    )
+    .await;
     match traffic_decision {
         Ok(TrafficDecision::Allowed) => {}
         Ok(decision) => {
@@ -505,15 +502,14 @@ pub(crate) async fn connect_visitor(
     match pair_result {
         Ok(Ok(mut provider_stream)) => {
             drop(pending_permit);
-            if write_control_frame(
-                &mut visitor_stream,
-                &ControlFrame::SecretTunnelConnected {
-                    tunnel_id: runtime_policy.policy_id,
-                },
-            )
-            .await
-            .is_err()
-            {
+            let connected_frame = ControlFrame::SecretTunnelConnected {
+                tunnel_id: runtime_policy.policy_id,
+            };
+            let connected = tokio::select! {
+                _ = stop.changed() => None,
+                result = write_control_frame(&mut visitor_stream, &connected_frame) => Some(result),
+            };
+            if !matches!(connected, Some(Ok(()))) {
                 context
                     .statistics
                     .active_connections
@@ -524,10 +520,11 @@ pub(crate) async fn connect_visitor(
                 _ = stop.changed() => None,
                 result = timeout(
                     CONNECTION_MAX_LIFETIME,
-                    copy_bidirectional_with_limit(
+                    copy_bidirectional_with_meter(
                         &mut visitor_stream,
                         &mut provider_stream,
                         context.bandwidth_limiter.clone(),
+                        &state, TrafficPolicyKind::Secret, runtime_policy.policy_id,
                     ),
                 ) => Some(result),
             };
@@ -541,19 +538,6 @@ pub(crate) async fn connect_visitor(
                         .statistics
                         .bytes_to_visitor
                         .fetch_add(to_visitor, Ordering::Relaxed);
-                    if let Err(error) = state
-                        .traffic_controls
-                        .lock()
-                        .expect("traffic control catalog lock poisoned")
-                        .record_bytes(
-                            TrafficPolicyKind::Secret,
-                            runtime_policy.policy_id,
-                            from_visitor.saturating_add(to_visitor),
-                            crate::unix_seconds(),
-                        )
-                    {
-                        tracing::warn!("Could not record Secret traffic usage: {error}");
-                    }
                 }
                 Some(Ok(Err(error))) => {
                     context

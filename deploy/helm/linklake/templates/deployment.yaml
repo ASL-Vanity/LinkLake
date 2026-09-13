@@ -37,8 +37,8 @@
 {{- $postgresSecret := "" -}}
 {{- if eq $backend "postgres" -}}
 {{- $postgresSecret = required "storage.postgres.existingSecret is required for PostgreSQL" .Values.storage.postgres.existingSecret -}}
-{{- if not .Values.storage.postgres.replicatedStateAcknowledged -}}
-{{- fail "storage.postgres.replicatedStateAcknowledged=true is required until all application state uses PostgreSQL" -}}
+{{- if not .Values.persistence.data.enabled -}}
+{{- fail "PostgreSQL requires persistence.data.enabled=true for durable per-instance accounting" -}}
 {{- end -}}
 {{- end -}}
 apiVersion: apps/v1

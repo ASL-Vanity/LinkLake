@@ -4,8 +4,91 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tokio_postgres::{Client, Transaction};
 
-pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 19;
+pub(crate) const CURRENT_POSTGRES_SCHEMA_VERSION: i64 = 22;
 const ADVISORY_LOCK_ID: i64 = 0x4c4c_4841_4d49_4752;
+
+const MIGRATION_V22_NAME: &str = "explicit_storage_migration_receipts";
+const MIGRATION_V22_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS linklake_storage_migration_receipts (
+    singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1),
+    source_fingerprint TEXT NOT NULL CHECK(source_fingerprint ~ '^[0-9a-f]{64}$'),
+    key_fingerprint TEXT NOT NULL CHECK(key_fingerprint ~ '^[0-9a-f]{64}$'),
+    manifest JSONB NOT NULL CHECK(jsonb_typeof(manifest)='object'),
+    committed_unix_seconds BIGINT NOT NULL CHECK(committed_unix_seconds>=0)
+);
+"#;
+
+const MIGRATION_V21_NAME: &str = "shared_traffic_control_and_usage_events";
+const MIGRATION_V21_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS linklake_traffic_controls (
+    kind TEXT NOT NULL CHECK(kind IN ('tcp','udp','http','sni','secret','socks5','http_proxy','port_group')),
+    policy_id TEXT NOT NULL,
+    settings JSONB NOT NULL CHECK(octet_length(settings::text)<=16384),
+    updated_unix_seconds BIGINT NOT NULL CHECK(updated_unix_seconds>=0),
+    PRIMARY KEY(kind,policy_id)
+);
+CREATE TABLE IF NOT EXISTS linklake_traffic_daily_usage (
+    kind TEXT NOT NULL CHECK(kind IN ('tcp','udp','http','sni','secret','socks5','http_proxy','port_group')),
+    policy_id TEXT NOT NULL,
+    utc_day BIGINT NOT NULL CHECK(utc_day>=0),
+    bytes NUMERIC(20,0) NOT NULL CHECK(bytes BETWEEN 0 AND 18446744073709551615),
+    PRIMARY KEY(kind,policy_id,utc_day)
+);
+CREATE TABLE IF NOT EXISTS linklake_traffic_connection_windows (
+    kind TEXT NOT NULL CHECK(kind IN ('tcp','udp','http','sni','secret','socks5','http_proxy','port_group')),
+    policy_id TEXT NOT NULL,
+    unix_second BIGINT NOT NULL CHECK(unix_second>=0),
+    connections INTEGER NOT NULL CHECK(connections BETWEEN 1 AND 1000000),
+    PRIMARY KEY(kind,policy_id,unix_second)
+);
+CREATE TABLE IF NOT EXISTS linklake_traffic_usage_events (
+    event_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK(kind IN ('tcp','udp','http','sni','secret','socks5','http_proxy','port_group')),
+    policy_id TEXT NOT NULL,
+    bytes NUMERIC(20,0) NOT NULL CHECK(bytes BETWEEN 0 AND 18446744073709551615),
+    utc_day BIGINT NOT NULL CHECK(utc_day>=0),
+    received_unix_seconds BIGINT NOT NULL CHECK(received_unix_seconds>=0),
+    applied BOOLEAN NOT NULL
+);
+CREATE INDEX IF NOT EXISTS linklake_traffic_usage_events_pending ON linklake_traffic_usage_events(received_unix_seconds,event_id) WHERE NOT applied;
+CREATE INDEX IF NOT EXISTS linklake_traffic_usage_events_pending_policy ON linklake_traffic_usage_events(kind,policy_id,utc_day) WHERE NOT applied;
+"#;
+
+const MIGRATION_V20_NAME: &str = "shared_tunnel_catalog";
+const MIGRATION_V20_SQL: &str = r#"
+CREATE TABLE linklake_tunnel_policies (
+    id TEXT PRIMARY KEY CHECK(length(id)=36),
+    kind TEXT NOT NULL CHECK(kind IN ('tcp','udp','socks5_proxy','http_proxy','port_group')),
+    client_id TEXT NOT NULL CHECK(length(client_id)=36),
+    name TEXT NOT NULL CHECK(octet_length(name) BETWEEN 1 AND 80),
+    protocol TEXT NOT NULL CHECK(protocol IN ('tcp','udp','both')),
+    policy JSONB NOT NULL CHECK(jsonb_typeof(policy)='object' AND octet_length(policy::text)<=16384),
+    password_hash TEXT,
+    CHECK(policy->>'id'=id AND policy->>'client_id'=client_id AND policy->>'name'=name),
+    CHECK(policy ?& ARRAY['id','client_id','name','enabled'] AND jsonb_typeof(policy->'enabled')='boolean'),
+    CHECK(NOT (policy ?| ARRAY['password','password_hash'])),
+    CHECK(
+        (kind IN ('tcp','http_proxy') AND protocol='tcp') OR
+        (kind='udp' AND protocol='udp') OR
+        (kind='socks5_proxy' AND protocol='both') OR
+        (kind='port_group' AND protocol IN ('tcp','udp') AND policy->>'protocol'=protocol)
+    ),
+    CHECK(
+        (kind IN ('socks5_proxy','http_proxy') AND password_hash IS NOT NULL AND password_hash ~ '^[0-9a-f]{64}$') OR
+        (kind NOT IN ('socks5_proxy','http_proxy') AND password_hash IS NULL)
+    )
+);
+CREATE UNIQUE INDEX linklake_tunnel_policies_unique_name
+    ON linklake_tunnel_policies(kind,client_id,protocol,name)
+    WHERE kind IN ('socks5_proxy','http_proxy','port_group');
+CREATE TABLE linklake_tunnel_ports (
+    protocol TEXT NOT NULL CHECK(protocol IN ('tcp','udp')),
+    public_port INTEGER NOT NULL CHECK(public_port BETWEEN 1 AND 65535),
+    policy_id TEXT NOT NULL REFERENCES linklake_tunnel_policies(id) ON DELETE CASCADE,
+    PRIMARY KEY(protocol,public_port)
+);
+CREATE INDEX linklake_tunnel_ports_policy_id ON linklake_tunnel_ports(policy_id);
+"#;
 
 const MIGRATION_V19_NAME: &str = "shared_secret_tunnel_catalog";
 const MIGRATION_V19_SQL: &str = r#"
@@ -711,13 +794,48 @@ const MIGRATIONS: &[Migration] = &[
         name: MIGRATION_V19_NAME,
         sql: MIGRATION_V19_SQL,
     },
+    Migration {
+        version: 20,
+        name: MIGRATION_V20_NAME,
+        sql: MIGRATION_V20_SQL,
+    },
+    Migration {
+        version: 21,
+        name: MIGRATION_V21_NAME,
+        sql: MIGRATION_V21_SQL,
+    },
+    Migration {
+        version: 22,
+        name: MIGRATION_V22_NAME,
+        sql: MIGRATION_V22_SQL,
+    },
 ];
 
 pub(crate) async fn apply(client: &mut Client) -> anyhow::Result<()> {
+    apply_internal(client, false).await
+}
+
+pub(crate) async fn initialize_empty(client: &mut Client) -> anyhow::Result<()> {
+    apply_internal(client, true).await
+}
+
+async fn apply_internal(client: &mut Client, require_empty: bool) -> anyhow::Result<()> {
     let transaction = client.transaction().await?;
+    transaction
+        .batch_execute("SET LOCAL lock_timeout = '10s'")
+        .await?;
     transaction
         .query_one("SELECT pg_advisory_xact_lock($1)", &[&ADVISORY_LOCK_ID])
         .await?;
+    if require_empty {
+        let tables: i64 = transaction.query_one(
+            "SELECT COUNT(*) FROM pg_tables WHERE schemaname=current_schema() AND left(tablename,9)='linklake_'", &[],
+        ).await?.get(0);
+        anyhow::ensure!(
+            tables == 0,
+            "PostgreSQL initialization requires an empty LinkLake schema"
+        );
+    }
     transaction
         .batch_execute(
             "CREATE TABLE IF NOT EXISTS linklake_postgres_schema_migrations (
@@ -800,8 +918,107 @@ pub(crate) async fn apply(client: &mut Client) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 维护命令仅校验已有数据库，不隐式执行升级。
+pub(crate) async fn verify_existing(client: &mut Client) -> anyhow::Result<()> {
+    let transaction = client.transaction().await?;
+    let rows = transaction.query(
+        "SELECT version,name,checksum_sha256 FROM linklake_postgres_schema_migrations ORDER BY version", &[],
+    ).await?;
+    anyhow::ensure!(
+        rows.len() == MIGRATIONS.len(),
+        "PostgreSQL maintenance requires the current complete schema"
+    );
+    for (row, migration) in rows.iter().zip(MIGRATIONS.iter()) {
+        anyhow::ensure!(
+            row.get::<_, i64>(0) == migration.version
+                && row.get::<_, String>(1) == migration.name
+                && row.get::<_, String>(2) == migration_checksum(migration),
+            "PostgreSQL maintenance schema ledger mismatch"
+        );
+    }
+    verify_schema_structure(&transaction).await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
 async fn verify_schema_structure(transaction: &Transaction<'_>) -> anyhow::Result<()> {
     const TABLES: &[TableExpectation] = &[
+        TableExpectation {
+            name: "linklake_storage_migration_receipts",
+            primary_key: &["singleton_id"],
+            columns: &[
+                required("singleton_id", "int4"),
+                required("source_fingerprint", "text"),
+                required("key_fingerprint", "text"),
+                required("manifest", "jsonb"),
+                required("committed_unix_seconds", "int8"),
+            ],
+        },
+        TableExpectation {
+            name: "linklake_traffic_controls",
+            primary_key: &["kind", "policy_id"],
+            columns: &[
+                required("kind", "text"),
+                required("policy_id", "text"),
+                required("settings", "jsonb"),
+                required("updated_unix_seconds", "int8"),
+            ],
+        },
+        TableExpectation {
+            name: "linklake_traffic_daily_usage",
+            primary_key: &["kind", "policy_id", "utc_day"],
+            columns: &[
+                required("kind", "text"),
+                required("policy_id", "text"),
+                required("utc_day", "int8"),
+                required("bytes", "numeric"),
+            ],
+        },
+        TableExpectation {
+            name: "linklake_traffic_connection_windows",
+            primary_key: &["kind", "policy_id", "unix_second"],
+            columns: &[
+                required("kind", "text"),
+                required("policy_id", "text"),
+                required("unix_second", "int8"),
+                required("connections", "int4"),
+            ],
+        },
+        TableExpectation {
+            name: "linklake_traffic_usage_events",
+            primary_key: &["event_id"],
+            columns: &[
+                required("event_id", "text"),
+                required("kind", "text"),
+                required("policy_id", "text"),
+                required("bytes", "numeric"),
+                required("utc_day", "int8"),
+                required("received_unix_seconds", "int8"),
+                required("applied", "bool"),
+            ],
+        },
+        TableExpectation {
+            name: "linklake_tunnel_policies",
+            primary_key: &["id"],
+            columns: &[
+                required("id", "text"),
+                required("kind", "text"),
+                required("client_id", "text"),
+                required("name", "text"),
+                required("protocol", "text"),
+                required("policy", "jsonb"),
+                optional("password_hash", "text"),
+            ],
+        },
+        TableExpectation {
+            name: "linklake_tunnel_ports",
+            primary_key: &["protocol", "public_port"],
+            columns: &[
+                required("protocol", "text"),
+                required("public_port", "int4"),
+                required("policy_id", "text"),
+            ],
+        },
         TableExpectation {
             name: "linklake_secret_tunnel_policies",
             primary_key: &["id"],

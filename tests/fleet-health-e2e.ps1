@@ -1,11 +1,12 @@
 param(
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [string]$TargetDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
 $PSDefaultParameterValues['Invoke-RestMethod:Headers'] = @{ 'X-LinkLake-CSRF' = '1' }
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$targetRoot = Join-Path $projectRoot 'target'
+$targetRoot = if ($TargetDir) { [IO.Path]::GetFullPath($TargetDir) } else { Join-Path $projectRoot 'target' }
 $serverPath = Join-Path $targetRoot 'debug\linklake-server.exe'
 $runRoot = Join-Path ([IO.Path]::GetTempPath()) ('linklake-fleet-health-e2e-' + [guid]::NewGuid())
 $serverProcess = $null

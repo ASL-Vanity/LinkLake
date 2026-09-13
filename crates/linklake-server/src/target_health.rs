@@ -244,15 +244,6 @@ impl TargetHealthCatalog {
         }
         Ok(health)
     }
-
-    pub(crate) async fn healthy(&self) -> anyhow::Result<Vec<TargetHealth>> {
-        Ok(self
-            .list()
-            .await?
-            .into_iter()
-            .filter(|health| health.effective_healthy && health.weight > 0)
-            .collect())
-    }
 }
 
 fn apply_staleness(health: &mut TargetHealth, now: u64, stale_after_seconds: u64) {

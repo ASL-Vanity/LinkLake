@@ -1,5 +1,6 @@
 param(
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [string]$TargetDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -12,7 +13,7 @@ $env:NO_PROXY = '*'
 $env:no_proxy = '*'
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$targetRoot = Join-Path $projectRoot 'target/udp-e2e'
+$targetRoot = if ($TargetDir) { [IO.Path]::GetFullPath($TargetDir) } else { Join-Path $projectRoot 'target/udp-e2e' }
 $binarySuffix = if ($env:OS -eq 'Windows_NT') { '.exe' } else { '' }
 $serverPath = Join-Path $targetRoot "debug/linklake-server$binarySuffix"
 $clientPath = Join-Path $targetRoot "debug/linklake-client$binarySuffix"

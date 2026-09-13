@@ -1,8 +1,7 @@
 //! HA 协调平面的存储入口。
 //!
-//! 业务 Catalog 在本批次仍使用现有 SQLite 数据库；只有需要跨实例共享的租约、
-//! fencing、业务健康和 Fleet 账本通过本模块选择 SQLite 或 PostgreSQL。显式选择
-//! PostgreSQL 时必须提供连接串，连接或迁移失败会阻止服务端启动。
+//! PostgreSQL 保存共享身份、策略和业务状态；本机 SQLite 保留独立实例标识、
+//! 更新暂存和待确认流量账务。数据库连接或迁移失败会阻止服务启动。
 
 use crate::{database::Database, postgres_migrations};
 use rustls::{ClientConfig, RootCertStore};
@@ -117,16 +116,13 @@ impl StorageConfig {
                     postgres_url.is_some(),
                     "{POSTGRES_URL_ENV} is required when {STORAGE_BACKEND_ENV}=postgres"
                 );
-                anyhow::ensure!(
-                    replicated_state,
-                    "{HA_REPLICATED_STATE_ENV}=true is required in PostgreSQL HA mode because application identities and policies still use externally replicated local state"
-                );
+                // 兼容旧环境变量；共享业务状态不再依赖外部逐副本复制。
             }
         }
         Ok(Self {
             backend,
             postgres_url,
-            replicated_state,
+            replicated_state: backend == StorageBackend::Postgres,
         })
     }
 
@@ -146,6 +142,37 @@ pub(crate) enum CoordinationStorage {
 }
 
 impl CoordinationStorage {
+    pub(crate) async fn initialize_empty_postgres(config: &StorageConfig) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            config.backend == StorageBackend::Postgres,
+            "initialization requires PostgreSQL storage"
+        );
+        let url = config
+            .postgres_url
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("PostgreSQL URL was not configured"))?;
+        let pool = Arc::new(PostgresPool::connect(url).await?);
+        let mut client = pool.acquire().await?;
+        postgres_migrations::initialize_empty(&mut client).await
+    }
+
+    /// 停服维护使用现有共享数据库，不启动 HA、创建本机目录或隐式迁移。
+    pub(crate) async fn open_existing_postgres(config: &StorageConfig) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            config.backend == StorageBackend::Postgres,
+            "maintenance requires PostgreSQL storage"
+        );
+        let url = config
+            .postgres_url
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("PostgreSQL URL was not configured"))?;
+        let pool = Arc::new(PostgresPool::connect(url).await?);
+        let mut client = pool.acquire().await?;
+        postgres_migrations::verify_existing(&mut client).await?;
+        drop(client);
+        Ok(Self::Postgres(pool))
+    }
+
     pub(crate) async fn open(config: &StorageConfig, sqlite: &Database) -> anyhow::Result<Self> {
         match config.backend {
             StorageBackend::Sqlite => Ok(Self::Sqlite(sqlite.clone())),
@@ -167,15 +194,6 @@ impl CoordinationStorage {
         match self {
             Self::Sqlite(_) => StorageBackend::Sqlite,
             Self::Postgres(_) => StorageBackend::Postgres,
-        }
-    }
-
-    pub(crate) fn sqlite(&self) -> anyhow::Result<&Database> {
-        match self {
-            Self::Sqlite(database) => Ok(database),
-            Self::Postgres(_) => {
-                anyhow::bail!("operation requires the SQLite coordination backend")
-            }
         }
     }
 
@@ -447,27 +465,18 @@ mod tests {
     use super::{StorageBackend, StorageConfig};
 
     #[test]
-    fn postgres_requires_explicit_replicated_application_state_acknowledgement() {
-        let error = StorageConfig::from_parts(
-            StorageBackend::Postgres,
-            Some("postgresql://example.invalid/linklake".to_owned()),
-            false,
-        )
-        .expect_err("PostgreSQL HA without replicated application state must fail closed");
-        assert!(error
-            .to_string()
-            .contains("LINKLAKE_HA_REPLICATED_STATE=true"));
-
-        let config = StorageConfig::from_parts(
-            StorageBackend::Postgres,
-            Some("postgresql://example.invalid/linklake".to_owned()),
-            true,
-        )
-        .expect("explicit acknowledgement should enable PostgreSQL coordination storage");
-        assert_eq!(config.backend(), StorageBackend::Postgres);
-        assert!(config.replicated_state());
+    fn postgres_uses_shared_application_state_without_external_replication_acknowledgement() {
+        for acknowledgement in [false, true] {
+            let config = StorageConfig::from_parts(
+                StorageBackend::Postgres,
+                Some("postgresql://example.invalid/linklake".to_owned()),
+                acknowledgement,
+            )
+            .unwrap();
+            assert_eq!(config.backend(), StorageBackend::Postgres);
+            assert!(config.replicated_state());
+        }
     }
-
     #[test]
     fn sqlite_rejects_postgres_only_configuration() {
         assert!(StorageConfig::from_parts(

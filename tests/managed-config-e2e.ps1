@@ -1,10 +1,11 @@
 param(
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [string]$TargetDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$targetRoot = Join-Path $projectRoot 'target\e2e'
+$targetRoot = if ($TargetDir) { [IO.Path]::GetFullPath($TargetDir) } else { Join-Path $projectRoot 'target\e2e' }
 $serverPath = Join-Path $targetRoot 'debug\linklake-server.exe'
 $clientPath = Join-Path $targetRoot 'debug\linklake-client.exe'
 $runRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('linklake-managed-e2e-' + [guid]::NewGuid())

@@ -38,6 +38,13 @@ cp "$project_root/README.md" "$project_root/README.en.md" "$project_root/LICENSE
   "$project_root/THIRD_PARTY_NOTICES.md" "$project_root/THIRD_PARTY_LICENSES.html" \
   "$project_root/TRADEMARKS.md" "$stage/"
 cp "$manager_root/README.md" "$stage/MANAGER_README.md"
+tracked_documents="$(git -c core.quotepath=false -C "$project_root" ls-files -- docs ':(exclude)docs/development-handoff.md')"
+printf '%s\n' "$tracked_documents" 'docs/user-guide.zh-CN.md' 'docs/user-guide.en.md' | sort -u |
+while IFS= read -r document; do
+  [ -n "$document" ] || continue
+  install -d "$stage/$(dirname -- "$document")"
+  install -m 0644 "$project_root/$document" "$stage/$document"
+done
 printf '{"product":"LinkLake Manager","component":"manager","version":"%s","target":"linux-x86_64","built_unix_seconds":%s,"commit":"%s"}\n' \
   "$version" "$source_date_epoch" "$commit" >"$stage/release.json"
 find "$stage" -exec touch -d "@$source_date_epoch" {} +

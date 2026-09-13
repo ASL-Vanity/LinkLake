@@ -1,17 +1,33 @@
 # LinkLake 更新日志
 
-本项目采用语义化版本号。候选版本用于完整验收，不代表已对外发布。
+本项目采用语义化版本号；已发布版本与发行资产以 GitHub Releases 为准。
 
-## 未发布 / Unreleased（目标 `v1.1.0`）
+## 1.1.0 - 2026-09-13
 
-### 开发计划 / Development plan
+### 共享存储与高可用 / Shared storage and HA
 
-- 中文：不再单独发布 `v1.0.1`；管理界面完善、安全远程更新、协议补全、业务健康与 Fleet、PostgreSQL 高可用、平台安装器和依赖现代化统一纳入 `v1.1.0`。
-  English: The project will not publish a separate `v1.0.1`; management-surface completion, secure remote updates, protocol completion, application health and Fleet, PostgreSQL high availability, platform installers, and dependency modernization are consolidated into `v1.1.0`.
-- 中文：开发阶段不创建版本标签或部署半成品；全部功能冻结后再统一执行完整测试、集中修复、上海灰度、新加坡升级和正式发布。
-  English: No version tag or partial deployment will be created during development; after the complete feature set is frozen, the project will run full testing and consolidated remediation, stage in Shanghai, upgrade Singapore, and publish the formal release.
-- 中文：本节只记录已批准的版本范围，不声明相关功能已经实现；实际完成状态以对应 Issue、合入提交和最终验收证据为准。
-  English: This section records only the approved release scope and does not claim that the listed capabilities are implemented; the corresponding issues, merged commits, and final acceptance evidence remain the source of truth for completion status.
+- PostgreSQL 共享管理员、会话、客户端、八类协议策略、Fleet、证书/ACME 账户、审计、历史指标、告警与更新任务；业务读失败不回退到各实例 SQLite。
+  PostgreSQL now stores shared identities, sessions, clients, all eight policy kinds, Fleet, certificate/ACME material, audit, historical metrics, alerts and update tasks. Failed shared reads never fall back to instance-local SQLite.
+- Fleet Bundle v2 通过同一事务处理归属、凭据引用、generation、策略交换与流量规则；共享端口预留和精确租约检查阻止旧 Leader 继续注册或修改策略。
+  Fleet Bundle v2 reconciles ownership, credential references, generations, policy swaps and traffic rules atomically. Shared port reservations and exact leases fence stale leaders.
+- 七种转发协议接入持久流量计量，共享速率窗口、完整 u64 配额和 UUID 去重；各实例保留持久 spool，关闭前排空账务。
+  Seven forwarding protocols use durable metering, shared rate windows, full-range u64 quotas and UUID deduplication. Each instance retains a persistent spool and drains accounting during shutdown.
+
+### 证书与维护 / Certificates and maintenance
+
+- WebUI 和 Flutter Manager 可配置 HTTP-01 / Cloudflare DNS-01、查看配置状态与按权限操作；共享证书签发、DNS 清理和故障恢复遵循任务租约与策略版本。
+  WebUI and Flutter Manager expose HTTP-01 / Cloudflare DNS-01 configuration, status and role-based controls. Shared issuance and DNS cleanup honor task leases and policy revisions.
+- 新增显式 PostgreSQL 初始化、SQLite 迁移、回滚资格检查及停机证书材料密钥轮换；维护命令保留原身份、凭据和完整流量值。
+  New maintenance commands initialize PostgreSQL, migrate SQLite, verify rollback eligibility and rotate certificate material keys while all instances are stopped, preserving identities, credentials and full-range traffic values.
+- PostgreSQL 标记阻止误用 SQLite 单机备份/升级；Linux 候选程序启动后升级失败保留诊断和恢复文件，不自动降级数据库已变化的服务。
+  PostgreSQL markers prevent misuse of standalone SQLite backup/update flows. Failed Linux activation preserves recovery artifacts instead of automatically downgrading after candidate startup.
+- 修复动态出口策略的 IPv6 云元数据地址匹配；开放私网访问仍拒绝元数据端点。
+  Correct IPv6 cloud-metadata matching in dynamic egress policy; enabling private networks still denies metadata endpoints.
+
+### 使用与部署 / Usage and deployment
+
+- 更新 v1.1 使用说明和中英文 README；Helm 使用 PostgreSQL 共享业务及各 Pod 独立持久卷，旧复制确认开关保留兼容但不再必需。
+  Refresh the v1.1 user guide and bilingual README. Helm uses shared PostgreSQL application state and independent per-Pod volumes; the legacy replication acknowledgement is no longer required.
 
 ## 1.0.0 - 2026-08-06
 

@@ -616,6 +616,10 @@ async fn read_postgres_job_for_update(
         .transpose()
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "续期SQL必须同时匹配任务、实例、incarnation、租约和fencing token"
+)]
 async fn renew_postgres_job(
     transaction: &PostgresTransaction<'_>,
     job_key: &str,
@@ -658,6 +662,10 @@ async fn renew_postgres_job(
         .transpose()
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "替换SQL显式记录任务、实例、incarnation、租约和fencing token"
+)]
 async fn replace_postgres_job(
     transaction: &PostgresTransaction<'_>,
     job_key: &str,

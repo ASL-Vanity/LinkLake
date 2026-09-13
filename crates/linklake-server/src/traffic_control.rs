@@ -11,6 +11,21 @@ use uuid::Uuid;
 
 use crate::database::Database;
 
+#[path = "traffic_control_postgres.rs"]
+pub(crate) mod postgres;
+#[path = "traffic_usage_meter.rs"]
+pub(crate) mod usage_meter;
+#[path = "traffic_usage_spool.rs"]
+pub(crate) mod usage_spool;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TrafficUsageEvent {
+    pub(crate) event_id: Uuid,
+    pub(crate) kind: TrafficPolicyKind,
+    pub(crate) policy_id: Uuid,
+    pub(crate) bytes: u64,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TrafficPolicyKind {
@@ -53,7 +68,8 @@ impl TrafficPolicyKind {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct UpsertTrafficControl {
     #[serde(default)]
     pub(crate) allowed_cidrs: Vec<String>,
@@ -127,6 +143,13 @@ impl TrafficControlCatalog {
                 utc_day INTEGER NOT NULL,
                 bytes INTEGER NOT NULL,
                 PRIMARY KEY(kind, policy_id, utc_day)
+            );
+            CREATE TABLE IF NOT EXISTS traffic_usage_events (
+                event_id TEXT PRIMARY KEY NOT NULL,
+                kind TEXT NOT NULL,
+                policy_id TEXT NOT NULL,
+                bytes TEXT NOT NULL,
+                utc_day INTEGER NOT NULL
             );",
         )?;
         Ok(Self {
@@ -148,7 +171,7 @@ impl TrafficControlCatalog {
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<u32>>(2)?,
-                        row.get::<_, Option<u64>>(3)?, row.get::<_, String>(4)?, row.get::<_, Option<u16>>(5)?,
+                        if row.get_ref(3)?.data_type() == rusqlite::types::Type::Null { None } else { Some(read_usage_bytes(row, 3)?) }, row.get::<_, String>(4)?, row.get::<_, Option<u16>>(5)?,
                         row.get::<_, Option<u16>>(6)?, row.get::<_, i64>(7)? != 0, row.get::<_, u64>(8)?,
                     ))
                 },
@@ -182,23 +205,12 @@ impl TrafficControlCatalog {
         request: UpsertTrafficControl,
         now: u64,
     ) -> anyhow::Result<TrafficControlRecord> {
-        validate(&request)?;
-        let allowed = normalize_cidrs(&request.allowed_cidrs)?;
-        let denied = normalize_cidrs(&request.denied_cidrs)?;
-        let mut weekdays = request.active_weekdays_utc.clone();
-        weekdays.sort_unstable();
-        weekdays.dedup();
-        let settings = UpsertTrafficControl {
-            allowed_cidrs: allowed,
-            denied_cidrs: denied,
-            active_weekdays_utc: weekdays,
-            ..request
-        };
+        let settings = normalized_settings(request)?;
         self.database.execute(
             "INSERT INTO traffic_controls (kind, policy_id, allowed_cidrs, denied_cidrs, max_connections_per_minute, daily_quota_bytes, active_weekdays_utc, start_minute_utc, end_minute_utc, enabled, updated_unix_seconds)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(kind, policy_id) DO UPDATE SET allowed_cidrs=excluded.allowed_cidrs, denied_cidrs=excluded.denied_cidrs, max_connections_per_minute=excluded.max_connections_per_minute, daily_quota_bytes=excluded.daily_quota_bytes, active_weekdays_utc=excluded.active_weekdays_utc, start_minute_utc=excluded.start_minute_utc, end_minute_utc=excluded.end_minute_utc, enabled=excluded.enabled, updated_unix_seconds=excluded.updated_unix_seconds",
-            params![kind.as_str(), policy_id.to_string(), serde_json::to_string(&settings.allowed_cidrs)?, serde_json::to_string(&settings.denied_cidrs)?, settings.max_connections_per_minute, settings.daily_quota_bytes, serde_json::to_string(&settings.active_weekdays_utc)?, settings.start_minute_utc, settings.end_minute_utc, settings.enabled, now],
+            params![kind.as_str(), policy_id.to_string(), serde_json::to_string(&settings.allowed_cidrs)?, serde_json::to_string(&settings.denied_cidrs)?, settings.max_connections_per_minute, settings.daily_quota_bytes.map(encode_sqlite_u64), serde_json::to_string(&settings.active_weekdays_utc)?, settings.start_minute_utc, settings.end_minute_utc, settings.enabled, now],
         )?;
         self.connection_windows.remove(&(kind, policy_id));
         self.get(kind, policy_id, now)?
@@ -276,6 +288,7 @@ impl TrafficControlCatalog {
         Ok(TrafficDecision::Allowed)
     }
 
+    #[cfg(test)]
     pub(crate) fn record_bytes(
         &mut self,
         kind: TrafficPolicyKind,
@@ -283,14 +296,59 @@ impl TrafficControlCatalog {
         bytes: u64,
         now: u64,
     ) -> anyhow::Result<()> {
-        if bytes == 0 {
-            return Ok(());
+        self.record_usage_event(
+            &TrafficUsageEvent {
+                event_id: Uuid::new_v4(),
+                kind,
+                policy_id,
+                bytes,
+            },
+            now,
+        )
+    }
+
+    pub(crate) fn record_usage_event(
+        &mut self,
+        event: &TrafficUsageEvent,
+        now: u64,
+    ) -> anyhow::Result<()> {
+        let TrafficUsageEvent {
+            event_id,
+            kind,
+            policy_id,
+            bytes,
+        } = event;
+        anyhow::ensure!(!event_id.is_nil(), "Traffic usage event ID is nil");
+        let transaction = self
+            .database
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let inserted = transaction.execute("INSERT OR IGNORE INTO traffic_usage_events(event_id,kind,policy_id,bytes,utc_day) VALUES(?1,?2,?3,?4,?5)", params![event_id.to_string(), kind.as_str(), policy_id.to_string(), bytes.to_string(), utc_day(now)])? != 0;
+        let (stored_kind, stored_policy, stored_bytes): (String, String, String) = transaction
+            .query_row(
+                "SELECT kind,policy_id,bytes FROM traffic_usage_events WHERE event_id=?1",
+                [event_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        anyhow::ensure!(
+            stored_kind == kind.as_str()
+                && stored_policy == policy_id.to_string()
+                && stored_bytes == bytes.to_string(),
+            "Traffic usage event identity mismatch"
+        );
+        if inserted {
+            let used: u64 = transaction.query_row("SELECT COALESCE((SELECT bytes FROM traffic_daily_usage WHERE kind=?1 AND policy_id=?2 AND utc_day=?3),0)", params![kind.as_str(),policy_id.to_string(),utc_day(now)], |row| {
+                read_usage_bytes(row, 0)
+            })?;
+            let total = used.saturating_add(*bytes);
+            // INTEGER affinity会将超i64十进制串转REAL；完整u64用无损8字节编码。
+            let stored = if let Ok(value) = i64::try_from(total) {
+                rusqlite::types::Value::Integer(value)
+            } else {
+                rusqlite::types::Value::Blob(total.to_be_bytes().to_vec())
+            };
+            transaction.execute("INSERT INTO traffic_daily_usage(kind,policy_id,utc_day,bytes) VALUES(?1,?2,?3,?4) ON CONFLICT(kind,policy_id,utc_day) DO UPDATE SET bytes=excluded.bytes", params![kind.as_str(),policy_id.to_string(),utc_day(now),stored])?;
         }
-        self.database.execute(
-            "INSERT INTO traffic_daily_usage (kind, policy_id, utc_day, bytes) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(kind, policy_id, utc_day) DO UPDATE SET bytes = bytes + excluded.bytes",
-            params![kind.as_str(), policy_id.to_string(), utc_day(now), bytes],
-        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -298,9 +356,50 @@ impl TrafficControlCatalog {
         Ok(self.database.query_row(
             "SELECT COALESCE((SELECT bytes FROM traffic_daily_usage WHERE kind = ?1 AND policy_id = ?2 AND utc_day = ?3), 0)",
             params![kind.as_str(), policy_id.to_string(), day],
-            |row| row.get(0),
+            |row| read_usage_bytes(row, 0),
         )?)
     }
+}
+
+pub(crate) fn encode_sqlite_u64(value: u64) -> rusqlite::types::Value {
+    if let Ok(value) = i64::try_from(value) {
+        rusqlite::types::Value::Integer(value)
+    } else {
+        rusqlite::types::Value::Blob(value.to_be_bytes().to_vec())
+    }
+}
+
+pub(crate) fn decode_sqlite_u64(value: rusqlite::types::ValueRef<'_>) -> rusqlite::Result<u64> {
+    match value {
+        rusqlite::types::ValueRef::Integer(value) => {
+            u64::try_from(value).map_err(|_| rusqlite::Error::InvalidQuery)
+        }
+        rusqlite::types::ValueRef::Blob(value) => <[u8; 8]>::try_from(value)
+            .map(u64::from_be_bytes)
+            .map_err(|_| rusqlite::Error::InvalidQuery),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
+fn read_usage_bytes(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
+    decode_sqlite_u64(row.get_ref(index)?)
+}
+
+pub(crate) fn normalized_settings(
+    request: UpsertTrafficControl,
+) -> anyhow::Result<UpsertTrafficControl> {
+    validate(&request)?;
+    let allowed_cidrs = normalize_cidrs(&request.allowed_cidrs)?;
+    let denied_cidrs = normalize_cidrs(&request.denied_cidrs)?;
+    let mut active_weekdays_utc = request.active_weekdays_utc.clone();
+    active_weekdays_utc.sort_unstable();
+    active_weekdays_utc.dedup();
+    Ok(UpsertTrafficControl {
+        allowed_cidrs,
+        denied_cidrs,
+        active_weekdays_utc,
+        ..request
+    })
 }
 
 fn validate(request: &UpsertTrafficControl) -> anyhow::Result<()> {
@@ -476,6 +575,65 @@ mod tests {
                 .authorize(TrafficPolicyKind::Tcp, id, "10.2.2.6".parse().unwrap(), 161)
                 .unwrap(),
             TrafficDecision::QuotaExceeded
+        );
+    }
+
+    #[test]
+    fn usage_event_replay_is_idempotent_and_conflicting_reuse_is_rejected() {
+        let mut catalog = TrafficControlCatalog::open(None).unwrap();
+        let id = Uuid::new_v4();
+        let mut control = settings();
+        control.daily_quota_bytes = Some(u64::MAX);
+        catalog
+            .upsert(TrafficPolicyKind::Tcp, id, control, 100)
+            .unwrap();
+        let event = TrafficUsageEvent {
+            event_id: Uuid::new_v4(),
+            kind: TrafficPolicyKind::Tcp,
+            policy_id: id,
+            bytes: u64::MAX - 1,
+        };
+        catalog.record_usage_event(&event, 100).unwrap();
+        catalog.record_usage_event(&event, 101).unwrap();
+        assert_eq!(
+            catalog
+                .get(TrafficPolicyKind::Tcp, id, 101)
+                .unwrap()
+                .unwrap()
+                .used_today_bytes,
+            u64::MAX - 1
+        );
+        let conflicting = TrafficUsageEvent {
+            bytes: 10,
+            ..event.clone()
+        };
+        assert!(catalog.record_usage_event(&conflicting, 101).is_err());
+        catalog
+            .record_usage_event(
+                &TrafficUsageEvent {
+                    event_id: Uuid::new_v4(),
+                    ..conflicting
+                },
+                102,
+            )
+            .unwrap();
+        assert_eq!(
+            catalog
+                .get(TrafficPolicyKind::Tcp, id, 102)
+                .unwrap()
+                .unwrap()
+                .used_today_bytes,
+            u64::MAX
+        );
+        // 日切后的重试仍属于原来的已提交事件，不重复计入新一天。
+        catalog.record_usage_event(&event, 86_400).unwrap();
+        assert_eq!(
+            catalog
+                .get(TrafficPolicyKind::Tcp, id, 86_400)
+                .unwrap()
+                .unwrap()
+                .used_today_bytes,
+            0
         );
     }
 }

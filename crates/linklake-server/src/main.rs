@@ -6,6 +6,7 @@ mod audit_log;
 mod audit_store;
 mod certificate_catalog;
 mod certificate_http01;
+mod certificate_key_maintenance;
 mod certificate_manager;
 mod certificate_material;
 mod certificate_store;
@@ -21,6 +22,7 @@ mod fleet;
 mod fleet_coordination;
 mod fleet_health;
 mod fleet_health_store;
+mod fleet_policy_legacy;
 mod fleet_store;
 mod ha_coordination;
 mod ha_management;
@@ -35,16 +37,22 @@ mod job_execution;
 mod job_leases;
 mod job_supervisor;
 mod lifecycle;
+mod maintenance_storage_guard;
 mod metrics_history_store;
 mod notifications;
 mod p2p_control;
 mod p2p_node_catalog;
 mod policy_service;
+mod policy_store;
 mod postgres_application;
 mod postgres_migrations;
 mod public_port_lease;
 mod public_port_ownership;
 mod public_port_policy;
+#[cfg(test)]
+mod real_postgres_maintenance_tests;
+#[cfg(test)]
+mod real_postgres_traffic_tests;
 mod secret_tunnel;
 mod secret_tunnel_catalog;
 mod secret_tunnel_store;
@@ -53,11 +61,14 @@ mod sni_route_store;
 mod sni_tunnel;
 mod socks5_tunnel;
 mod storage;
+mod storage_migration;
 mod target_health;
 mod target_probe;
 mod tcp_tunnel;
 mod traffic_control;
+mod traffic_control_store;
 mod tunnel_catalog;
+mod tunnel_store;
 mod udp_data_plane;
 mod udp_tunnel;
 mod update_api;
@@ -102,8 +113,8 @@ use fleet_coordination::{
     FleetConflictInput, FleetConflictState, FleetGenerationInput, FleetSyncState,
 };
 use fleet_health::{
-    FleetDnsChangeResult, FleetDnsFailover, FleetDnsSwitchEvent, FleetHealthCatalog,
-    FleetHealthConfig, FleetHealthMetrics, FleetHealthSnapshot, FleetHealthState, FleetPeerHealth,
+    FleetDnsChangeResult, FleetDnsFailover, FleetDnsSwitchEvent, FleetHealthConfig,
+    FleetHealthMetrics, FleetHealthSnapshot, FleetHealthState, FleetPeerHealth,
     FleetProbeObservation, FreezeFleetDnsFailover, UpdateFleetHealthConfig, UpsertFleetDnsFailover,
 };
 use ha_runtime::{HaRuntime, HaRuntimeConfig};
@@ -395,9 +406,8 @@ pub(crate) async fn managed_config_for_client(
 ) -> anyhow::Result<ManagedClientConfig> {
     let mut tcp_tunnels = state
         .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
-        .list()?
+        .list()
+        .await?
         .into_iter()
         .filter(|policy| policy.client_id == client_id)
         .map(|policy| ManagedTcpTunnel {
@@ -409,9 +419,8 @@ pub(crate) async fn managed_config_for_client(
         .collect::<Vec<_>>();
     let mut udp_tunnels = state
         .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
         .list_udp()
+        .await
         .map_err(|error| anyhow::anyhow!(error))?
         .into_iter()
         .filter(|policy| policy.client_id == client_id)
@@ -423,22 +432,22 @@ pub(crate) async fn managed_config_for_client(
         })
         .collect::<Vec<_>>();
     let port_groups = {
-        let catalog = state
-            .tunnel_catalog
-            .lock()
-            .expect("tunnel catalog lock poisoned");
-        catalog
+        let tunnel_store = &state.tunnel_catalog;
+        let mut groups = Vec::new();
+        for policy in tunnel_store
             .list_port_groups()
+            .await
             .map_err(|error| anyhow::anyhow!(error))?
             .into_iter()
             .filter(|policy| policy.client_id == client_id)
-            .map(|policy| {
-                let mappings = catalog
-                    .port_group_mappings(policy.id)
-                    .map_err(|error| anyhow::anyhow!(error))?;
-                Ok((policy, mappings))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?
+        {
+            let mappings = tunnel_store
+                .port_group_mappings(policy.id)
+                .await
+                .map_err(|error| anyhow::anyhow!(error))?;
+            groups.push((policy, mappings));
+        }
+        groups
     };
     for (policy, mappings) in port_groups {
         match policy.protocol {
@@ -504,9 +513,8 @@ pub(crate) async fn managed_config_for_client(
         .collect::<Vec<_>>();
     let socks5_proxies = state
         .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
         .list_socks5()
+        .await
         .map_err(|error| anyhow::anyhow!(error))?
         .into_iter()
         .filter(|policy| policy.client_id == client_id)
@@ -519,9 +527,8 @@ pub(crate) async fn managed_config_for_client(
         .collect::<Vec<_>>();
     let http_proxies = state
         .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
         .list_http_proxies()
+        .await
         .map_err(|error| anyhow::anyhow!(error))?
         .into_iter()
         .filter(|policy| policy.client_id == client_id)
@@ -565,13 +572,14 @@ struct AppState {
     server_update_authentication_audit_limiter: Mutex<ServerUpdateAuthenticationAuditLimiter>,
     alerts: alerting_store::AlertStore,
     fleet: fleet_store::FleetStore,
-    policy_service: PolicyService,
+    policy_service: policy_store::PolicyStore,
     policy_mutation_lock: AsyncMutex<()>,
     server_update_data_directory: Option<PathBuf>,
     server_update_operation_lock: AsyncMutex<()>,
     update_tasks: Arc<dyn UpdateTaskCoordinationStorage>,
     fleet_health: fleet_health_store::FleetHealthStore,
-    traffic_controls: Mutex<TrafficControlCatalog>,
+    traffic_controls: traffic_control_store::TrafficControlStore,
+    traffic_usage_spool: Arc<traffic_control::usage_spool::TrafficUsageSpool>,
     management_cookies_secure: bool,
     public_port_policy: PublicPortPolicy,
     dynamic_port_leases: Arc<dyn DynamicPortLeaseProvider>,
@@ -579,7 +587,7 @@ struct AppState {
     socks5_fragment_budget: Arc<Socks5FragmentGlobalBudget>,
     udp_public_bind_mode: PublicUdpBindMode,
     clients: AsyncMutex<ClientRegistryStore>,
-    tunnel_catalog: Mutex<TunnelCatalog>,
+    tunnel_catalog: tunnel_store::TunnelStore,
     tunnels: Mutex<HashMap<u16, tcp_tunnel::TunnelRegistration>>,
     tunnel_statistics: Mutex<HashMap<u16, Arc<tcp_tunnel::TunnelStatistics>>>,
     seen_tunnel_registrations: Mutex<HashSet<(Uuid, u16)>>,
@@ -1970,6 +1978,24 @@ fn coded_management_error(error: ApiError) -> CodedApiError {
 }
 
 fn coded_tcp_policy_error(error: anyhow::Error) -> CodedApiError {
+    if let Some(error) = error.downcast_ref::<tunnel_catalog::postgres::TunnelMutationError>() {
+        let code = match error {
+            tunnel_catalog::postgres::TunnelMutationError::FleetManaged => "fleet_managed_policy",
+            tunnel_catalog::postgres::TunnelMutationError::DuplicatePublicPort => {
+                "duplicate_public_port"
+            }
+            _ => "tcp_policy_storage_error",
+        };
+        return CodedApiError(
+            if code == "tcp_policy_storage_error" {
+                StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                StatusCode::CONFLICT
+            },
+            code,
+            "TCP tunnel policy operation failed",
+        );
+    }
     let message = error.to_string();
     let code = if message.contains("tunnel name is invalid") {
         "invalid_name"
@@ -2044,7 +2070,10 @@ fn coded_http_route_creation_error(error: CreateHttpRouteError) -> CodedApiError
 fn coded_udp_policy_error(error: UdpPolicyError) -> CodedApiError {
     let status = match error {
         UdpPolicyError::DuplicatePublicPort => StatusCode::CONFLICT,
-        UdpPolicyError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        UdpPolicyError::Database(_) | UdpPolicyError::Storage(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        UdpPolicyError::FleetManaged => StatusCode::CONFLICT,
         _ => StatusCode::BAD_REQUEST,
     };
     CodedApiError(status, error.code(), "UDP tunnel policy is invalid")
@@ -2066,7 +2095,10 @@ fn coded_socks5_policy_error(error: Socks5PolicyError) -> CodedApiError {
         Socks5PolicyError::DuplicateName | Socks5PolicyError::DuplicatePublicPort => {
             StatusCode::CONFLICT
         }
-        Socks5PolicyError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Socks5PolicyError::Database(_) | Socks5PolicyError::Storage(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        Socks5PolicyError::FleetManaged => StatusCode::CONFLICT,
         _ => StatusCode::BAD_REQUEST,
     };
     CodedApiError(status, error.code(), "SOCKS5 proxy policy is invalid")
@@ -2088,7 +2120,10 @@ fn coded_http_proxy_policy_error(error: HttpProxyPolicyError) -> CodedApiError {
         HttpProxyPolicyError::DuplicateName | HttpProxyPolicyError::DuplicatePublicPort => {
             StatusCode::CONFLICT
         }
-        HttpProxyPolicyError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        HttpProxyPolicyError::Database(_) | HttpProxyPolicyError::Storage(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        HttpProxyPolicyError::FleetManaged => StatusCode::CONFLICT,
         _ => StatusCode::BAD_REQUEST,
     };
     CodedApiError(status, error.code(), "HTTP proxy policy is invalid")
@@ -2099,7 +2134,10 @@ fn coded_port_group_policy_error(error: PortGroupPolicyError) -> CodedApiError {
         PortGroupPolicyError::DuplicateName | PortGroupPolicyError::DuplicatePublicPort => {
             StatusCode::CONFLICT
         }
-        PortGroupPolicyError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        PortGroupPolicyError::Database(_) | PortGroupPolicyError::Storage(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        PortGroupPolicyError::FleetManaged => StatusCode::CONFLICT,
         _ => StatusCode::BAD_REQUEST,
     };
     CodedApiError(status, error.code(), "port group policy is invalid")
@@ -2310,6 +2348,45 @@ struct ServerCli {
 
 #[derive(Subcommand)]
 enum ServerMaintenanceCommand {
+    /// Initialize a new PostgreSQL schema without starting a server instance.
+    InitializePostgres,
+    /// Import a stopped SQLite deployment into a prepared empty PostgreSQL schema.
+    MigrateSqliteToPostgres {
+        #[command(flatten)]
+        data: DataDirectoryArgs,
+        #[arg(long, value_name = "PATH")]
+        certificate_key_file: PathBuf,
+        #[arg(long, value_name = "URL")]
+        account_directory: Vec<String>,
+        #[arg(long, default_value_t = 512)]
+        max_snapshot_mib: usize,
+        #[arg(long)]
+        preview: bool,
+        #[arg(long, required = true)]
+        all_instances_stopped: bool,
+    },
+    /// Verify that PostgreSQL is unchanged before reverting deployment to the preserved SQLite source.
+    VerifySqliteRollback {
+        #[command(flatten)]
+        data: DataDirectoryArgs,
+        #[arg(long, value_name = "PATH")]
+        certificate_key_file: PathBuf,
+        #[arg(long, value_name = "URL")]
+        account_directory: Vec<String>,
+        #[arg(long, default_value_t = 512)]
+        max_snapshot_mib: usize,
+        #[arg(long, required = true)]
+        all_instances_stopped: bool,
+    },
+    /// Re-encrypt shared certificate material after stopping every server instance.
+    RotateCertificateKey {
+        #[arg(long, value_name = "PATH")]
+        previous_key_file: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        next_key_file: PathBuf,
+        #[arg(long, required = true)]
+        all_instances_stopped: bool,
+    },
     CheckUpdate {
         #[arg(long, default_value = "ASL-Vanity/LinkLake")]
         repository: String,
@@ -2871,7 +2948,7 @@ mod maintenance_cli_tests {
                 Connection::open(&database_path)
                     .unwrap()
                     .execute_batch(
-                        "DELETE FROM schema_migrations WHERE version = 13;
+                        "DELETE FROM schema_migrations WHERE version > 12;
                          PRAGMA user_version = 12;",
                     )
                     .unwrap();
@@ -3409,8 +3486,154 @@ enum ServerUpdateAction {
     },
 }
 
+fn run_storage_migration_command(
+    data: DataDirectoryArgs,
+    key_file: PathBuf,
+    account_directories: Vec<String>,
+    max_snapshot_mib: usize,
+    preview: bool,
+    rollback: bool,
+    all_instances_stopped: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        all_instances_stopped,
+        "stop source and target instances before storage migration"
+    );
+    anyhow::ensure!(
+        (1..=4096).contains(&max_snapshot_mib),
+        "max snapshot size must be between 1 and 4096 MiB"
+    );
+    // 与服务启动相同的监听器保留端口；此处只解析配置，不绑定监听器或打开业务 Catalog。
+    let mut tcp_listeners = vec![
+        std::env::var("LINKLAKE_BIND")
+            .unwrap_or_else(|_| "127.0.0.1:32100".into())
+            .parse::<SocketAddr>()?,
+        std::env::var("LINKLAKE_CONTROL_BIND")
+            .unwrap_or_else(|_| "127.0.0.1:32101".into())
+            .parse::<SocketAddr>()?,
+    ];
+    for name in [
+        "LINKLAKE_HTTP_BIND",
+        "LINKLAKE_HTTPS_BIND",
+        "LINKLAKE_TLS_PASSTHROUGH_BIND",
+    ] {
+        if let Ok(value) = std::env::var(name) {
+            if !value.trim().is_empty() {
+                tcp_listeners.push(value.parse()?);
+            }
+        }
+    }
+    let udp = std::env::var("LINKLAKE_UDP_RELAY_BIND")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| v.parse::<SocketAddr>())
+        .transpose()?;
+    let options = storage_migration::source::MigrationSourceOptions {
+        max_snapshot_bytes: max_snapshot_mib
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| anyhow::anyhow!("snapshot size overflow"))?,
+        account_directories,
+        public_port_policy: PublicPortPolicy::from_environment(tcp_listeners, udp)?,
+    };
+    let plan =
+        storage_migration::source::prepare_sqlite_migration(&data.resolve()?, &key_file, &options)?;
+    let summary = if preview {
+        plan.preview()
+    } else {
+        tokio::runtime::Runtime::new()?.block_on(async {
+            let config = StorageConfig::from_environment()?;
+            let storage = CoordinationStorage::open_existing_postgres(&config)
+                .await
+                .map_err(|_| anyhow::anyhow!("storage_migration_target_preflight_failed"))?;
+            if rollback {
+                storage_migration::verify_sqlite_rollback(&storage, &plan).await
+            } else {
+                storage_migration::import_sqlite_plan(&storage, &plan).await
+            }
+            .map_err(anyhow::Error::from)
+        })?
+    };
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
+}
+
 fn run_maintenance_command(command: ServerMaintenanceCommand) -> anyhow::Result<()> {
     match command {
+        ServerMaintenanceCommand::InitializePostgres => {
+            tokio::runtime::Runtime::new()?.block_on(async {
+                CoordinationStorage::initialize_empty_postgres(&StorageConfig::from_environment()?)
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("postgres_initialization_failed_or_target_not_empty")
+                    })
+            })?;
+            println!(
+                "{{\"initialized\":true,\"schema_version\":{}}}",
+                postgres_migrations::CURRENT_POSTGRES_SCHEMA_VERSION
+            );
+        }
+        ServerMaintenanceCommand::MigrateSqliteToPostgres {
+            data,
+            certificate_key_file,
+            account_directory,
+            max_snapshot_mib,
+            preview,
+            all_instances_stopped,
+        } => {
+            run_storage_migration_command(
+                data,
+                certificate_key_file,
+                account_directory,
+                max_snapshot_mib,
+                preview,
+                false,
+                all_instances_stopped,
+            )?;
+        }
+        ServerMaintenanceCommand::VerifySqliteRollback {
+            data,
+            certificate_key_file,
+            account_directory,
+            max_snapshot_mib,
+            all_instances_stopped,
+        } => {
+            run_storage_migration_command(
+                data,
+                certificate_key_file,
+                account_directory,
+                max_snapshot_mib,
+                false,
+                true,
+                all_instances_stopped,
+            )?;
+        }
+        ServerMaintenanceCommand::RotateCertificateKey {
+            previous_key_file,
+            next_key_file,
+            all_instances_stopped,
+        } => {
+            anyhow::ensure!(
+                all_instances_stopped,
+                "stop every server instance before certificate key rotation"
+            );
+            let summary = tokio::runtime::Runtime::new()?.block_on(async {
+                let config = StorageConfig::from_environment()?;
+                let storage = CoordinationStorage::open_existing_postgres(&config)
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("certificate_rotation_database_preflight_failed")
+                    })?;
+                Ok::<_, anyhow::Error>(
+                    certificate_key_maintenance::rotate_postgres_certificate_key(
+                        &storage,
+                        &previous_key_file,
+                        &next_key_file,
+                    )
+                    .await?,
+                )
+            })?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
         ServerMaintenanceCommand::CheckUpdate {
             repository,
             channel,
@@ -3549,11 +3772,13 @@ fn run_maintenance_command(command: ServerMaintenanceCommand) -> anyhow::Result<
         }
         ServerMaintenanceCommand::Backup { data, output } => {
             let data_directory = data.resolve()?;
+            maintenance_storage_guard::ensure_sqlite_maintenance(&data_directory)?;
             let output = disaster_recovery::backup_database(&data_directory, &output)?;
             println!("LinkLake backup created: {}", output.display());
         }
         ServerMaintenanceCommand::Restore { data, input } => {
             let data_directory = data.resolve()?;
+            maintenance_storage_guard::ensure_sqlite_maintenance(&data_directory)?;
             let previous = disaster_recovery::restore_database(&data_directory, &input)?;
             println!("LinkLake database restored from: {}", input.display());
             if let Some(previous) = previous {
@@ -3566,6 +3791,7 @@ fn run_maintenance_command(command: ServerMaintenanceCommand) -> anyhow::Result<
             password,
         } => {
             let data_directory = data.resolve()?;
+            maintenance_storage_guard::ensure_sqlite_maintenance(&data_directory)?;
             let password = read_full_backup_password(&password, &data_directory)?;
             let report = disaster_recovery::backup_full(&data_directory, &output, &password)?;
             println!(
@@ -3583,6 +3809,7 @@ fn run_maintenance_command(command: ServerMaintenanceCommand) -> anyhow::Result<
             password,
         } => {
             let data_directory = data.resolve()?;
+            maintenance_storage_guard::ensure_sqlite_maintenance(&data_directory)?;
             let password = read_full_backup_password(&password, &data_directory)?;
             let report = disaster_recovery::restore_full(&data_directory, &input, &password)?;
             println!(
@@ -3605,6 +3832,7 @@ fn run_maintenance_command(command: ServerMaintenanceCommand) -> anyhow::Result<
 }
 
 fn inspect_update_database(data_dir: &FsPath) -> anyhow::Result<UpdateDatabaseInspectReport> {
+    maintenance_storage_guard::ensure_sqlite_maintenance(data_dir)?;
     let canonical_data_dir = canonical_update_directory(data_dir, "data directory")?;
     let database_path = canonical_data_dir.join("linklake.sqlite3");
     let canonical_database_path = canonical_update_file(&database_path, "database")?;
@@ -4237,7 +4465,19 @@ async fn run_server(
     if let Some(data_dir) = data_dir.as_deref() {
         database_migrations::recover_interrupted_startup_migration(data_dir)?;
     }
+    let storage_config = StorageConfig::from_environment()?;
+    if let Some(directory) = data_dir.as_deref() {
+        if storage_config.backend() == StorageBackend::Sqlite {
+            maintenance_storage_guard::ensure_sqlite_maintenance(directory)?;
+        }
+    }
     let database = Database::open(data_dir.as_deref())?;
+    if storage_config.backend() == StorageBackend::Postgres {
+        let directory = data_dir
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("PostgreSQL requires LINKLAKE_DATA_DIR"))?;
+        maintenance_storage_guard::mark_postgres_data_directory(directory)?;
+    }
     let migration_plan = database
         .is_persistent()
         .then(|| database_migrations::prepare(&database))
@@ -4267,7 +4507,10 @@ async fn run_server(
     let management_cookies_secure = management_tls.is_some();
     let policy_service = PolicyService::open_with_database(&database, public_port_policy.clone())?;
     let instance_id = policy_service.local_instance_id()?.to_string();
-    let storage_config = StorageConfig::from_environment()?;
+    anyhow::ensure!(
+        storage_config.backend() != StorageBackend::Postgres || database.is_persistent(),
+        "PostgreSQL requires LINKLAKE_DATA_DIR for durable local accounting and instance identity"
+    );
     let coordination_storage = CoordinationStorage::open(&storage_config, &database).await?;
     let ha_runtime = Arc::new(HaRuntime::open(
         coordination_storage.clone(),
@@ -4343,7 +4586,12 @@ async fn run_server(
             coordination_storage.clone(),
             ha_runtime.clone(),
         )?,
-        policy_service,
+        policy_service: policy_store::PolicyStore::open(
+            &database,
+            coordination_storage.clone(),
+            ha_runtime.clone(),
+            public_port_policy.clone(),
+        )?,
         policy_mutation_lock: AsyncMutex::new(()),
         server_update_data_directory: data_dir.clone(),
         server_update_operation_lock: AsyncMutex::new(()),
@@ -4353,7 +4601,14 @@ async fn run_server(
             coordination_storage.clone(),
             ha_runtime.clone(),
         )?,
-        traffic_controls: Mutex::new(TrafficControlCatalog::open_with_database(&database)?),
+        traffic_controls: traffic_control_store::TrafficControlStore::open(
+            &database,
+            coordination_storage.clone(),
+            ha_runtime.clone(),
+        )?,
+        traffic_usage_spool: Arc::new(traffic_control::usage_spool::TrafficUsageSpool::open(
+            &database,
+        )?),
         management_cookies_secure,
         public_port_policy: public_port_policy.clone(),
         dynamic_port_leases,
@@ -4363,10 +4618,12 @@ async fn run_server(
         clients: AsyncMutex::new(
             ClientRegistryStore::open(&coordination_storage, &database).await?,
         ),
-        tunnel_catalog: Mutex::new(TunnelCatalog::open_with_database(
+        tunnel_catalog: tunnel_store::TunnelStore::open(
             &database,
+            coordination_storage.clone(),
+            ha_runtime.clone(),
             public_port_policy,
-        )?),
+        )?,
         tunnels: Mutex::new(HashMap::new()),
         tunnel_statistics: Mutex::new(HashMap::new()),
         seen_tunnel_registrations: Mutex::new(HashSet::new()),
@@ -4433,6 +4690,7 @@ async fn run_server(
             },
         ),
     });
+    state.tunnel_catalog.validate_existing().await?;
     restore_managed_certificates(&state).await?;
     let _remote_update_task_sweeper = update_worker::spawn_update_task_sweeper(state.clone());
     let app = Router::new()
@@ -4813,8 +5071,9 @@ async fn run_server(
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let ha_supervisor = state.ha_runtime.clone();
-    let ha_shutdown = shutdown_rx.clone();
-    tokio::spawn(async move {
+    // 成员必须保持有效，直到旧 Leader 的最后账务上传得到确认。
+    let (ha_shutdown_tx, ha_shutdown) = watch::channel(false);
+    let ha_task = tokio::spawn(async move {
         ha_supervisor.supervise(ha_shutdown).await;
     });
     let leadership_state = state.clone();
@@ -5030,6 +5289,28 @@ async fn run_server(
     }
     tracing::info!("{PRODUCT_NAME} startup completed; lifecycle is ready");
 
+    let (usage_stop_tx, usage_stop_rx) = watch::channel(false);
+    let usage_state = state.clone();
+    let usage_shutdown = shutdown_tx.clone();
+    let usage_task = tokio::spawn(async move {
+        let result = usage_state
+            .traffic_usage_spool
+            .run(
+                &usage_state.traffic_controls,
+                usage_stop_rx,
+                Duration::from_secs(30),
+            )
+            .await;
+        if result.is_err() {
+            tracing::error!("Traffic accounting worker failed; stopping new traffic and retaining durable events");
+            usage_state.lifecycle.begin_stopping(unix_seconds());
+            stop_udp_data_plane(&usage_state);
+            stop_all_public_work(&usage_state);
+            let _ = usage_shutdown.send(true);
+        }
+        result
+    });
+
     job_supervisor::spawn_leased_job(
         state.clone(),
         shutdown_rx.clone(),
@@ -5074,25 +5355,63 @@ async fn run_server(
     );
 
     let management_name = management_task.listener_name;
-    let management_result = management_task.task.await.map_err(|error| {
-        anyhow::anyhow!("{management_name} listener task terminated unexpectedly: {error}")
-    })?;
-    if let Err(error) = management_result {
-        state.lifecycle.begin_stopping(unix_seconds());
-        stop_udp_data_plane(&state);
-        let _ = shutdown_tx.send(true);
-        abort_listener_tasks(&listener_tasks);
-        return Err(error.context("management listener stopped with an error"));
-    }
-    if !*shutdown_rx.borrow() {
-        state.lifecycle.begin_stopping(unix_seconds());
-        stop_udp_data_plane(&state);
-        let _ = shutdown_tx.send(true);
-        abort_listener_tasks(&listener_tasks);
-        anyhow::bail!("management listener stopped before the server shutdown signal");
-    }
+    let management_result = management_task
+        .task
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("{management_name} listener task terminated unexpectedly: {error}")
+        })
+        .and_then(|result| result);
+    let expected_shutdown = *shutdown_rx.borrow();
+    state.lifecycle.begin_stopping(unix_seconds());
     stop_udp_data_plane(&state);
+    stop_all_public_work(&state);
+    let _ = shutdown_tx.send(true);
     abort_listener_tasks(&listener_tasks);
+    let accounting_result = finish_traffic_accounting(&state, usage_stop_tx, usage_task).await;
+    let _ = ha_shutdown_tx.send(true);
+    // 不因心跳网络请求无限阻塞退出；账务已在前面完成或明确报告未完成。
+    let _ = tokio::time::timeout(Duration::from_secs(10), ha_task).await;
+    accounting_result?;
+    management_result.context("management listener stopped with an error")?;
+    anyhow::ensure!(
+        expected_shutdown,
+        "management listener stopped before the server shutdown signal"
+    );
+    Ok(())
+}
+
+async fn finish_traffic_accounting(
+    state: &AppState,
+    stop: watch::Sender<bool>,
+    mut worker: tokio::task::JoinHandle<anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    state.traffic_usage_spool.close_admission();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let meters_finished = loop {
+        match state.traffic_usage_spool.active_meter_count() {
+            Ok(0) => break true,
+            Err(_) => break false,
+            _ if tokio::time::Instant::now() >= deadline => break false,
+            _ => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    };
+    let checkpoint = state.traffic_usage_spool.checkpoint_active();
+    let _ = stop.send(true);
+    let result = match tokio::time::timeout(Duration::from_secs(35), &mut worker).await {
+        Ok(result) => result.context("traffic accounting worker terminated")?,
+        Err(_) => {
+            worker.abort();
+            let _ = worker.await;
+            anyhow::bail!("traffic accounting shutdown timed out; durable events retained");
+        }
+    };
+    checkpoint?;
+    result?;
+    anyhow::ensure!(
+        meters_finished,
+        "traffic sessions did not finish before shutdown; final accounting is incomplete"
+    );
     Ok(())
 }
 
@@ -5512,14 +5831,19 @@ async fn check_server_update(
     let principal =
         require_interactive_update_administrator(&state, &headers, &request_host, operation)
             .await?;
-    let _operation = state.server_update_operation_lock.try_lock().map_err(|_| {
-        record_server_update_rejection(&state, operation, &principal, "operation_lock_busy").await;
-        server_update_busy_error()
-    })?;
+    let _operation = match state.server_update_operation_lock.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            record_server_update_rejection(&state, operation, &principal, "operation_lock_busy")
+                .await;
+            return Err(server_update_busy_error());
+        }
+    };
     let update_state = linklake_update::default_state_directory(UpdateProduct::Server);
-    ensure_server_update_idle(&update_state).inspect_err(|_| {
+    if let Err(error) = ensure_server_update_idle(&update_state) {
         record_server_update_rejection(&state, operation, &principal, "active_update").await;
-    })?;
+        return Err(error);
+    }
     let result = match linklake_update::check(
         UpdateProduct::Server,
         UPDATE_REPOSITORY,
@@ -5557,19 +5881,26 @@ async fn download_server_update(
     let principal =
         require_interactive_update_administrator(&state, &headers, &request_host, operation)
             .await?;
-    require_server_update_confirmation(&request.confirmation, UPDATE_DOWNLOAD_CONFIRMATION)
-        .inspect_err(|_| {
-            record_server_update_rejection(&state, operation, &principal, "confirmation_mismatch")
+    if let Err(error) =
+        require_server_update_confirmation(&request.confirmation, UPDATE_DOWNLOAD_CONFIRMATION)
+    {
+        record_server_update_rejection(&state, operation, &principal, "confirmation_mismatch")
+            .await;
+        return Err(error);
+    }
+    let _operation = match state.server_update_operation_lock.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            record_server_update_rejection(&state, operation, &principal, "operation_lock_busy")
                 .await;
-        })?;
-    let _operation = state.server_update_operation_lock.try_lock().map_err(|_| {
-        record_server_update_rejection(&state, operation, &principal, "operation_lock_busy").await;
-        server_update_busy_error()
-    })?;
+            return Err(server_update_busy_error());
+        }
+    };
     let update_state = linklake_update::default_state_directory(UpdateProduct::Server);
-    ensure_server_update_idle(&update_state).inspect_err(|_| {
+    if let Err(error) = ensure_server_update_idle(&update_state) {
         record_server_update_rejection(&state, operation, &principal, "active_update").await;
-    })?;
+        return Err(error);
+    }
     let staged = match linklake_update::download(
         UpdateProduct::Server,
         UPDATE_REPOSITORY,
@@ -5616,11 +5947,13 @@ async fn apply_server_update(
     let principal =
         require_interactive_update_administrator(&state, &headers, &request_host, operation)
             .await?;
-    require_server_update_confirmation(&request.confirmation, UPDATE_APPLY_CONFIRMATION)
-        .inspect_err(|_| {
-            record_server_update_rejection(&state, operation, &principal, "confirmation_mismatch")
-                .await;
-        })?;
+    if let Err(error) =
+        require_server_update_confirmation(&request.confirmation, UPDATE_APPLY_CONFIRMATION)
+    {
+        record_server_update_rejection(&state, operation, &principal, "confirmation_mismatch")
+            .await;
+        return Err(error);
+    }
     let Some(data_directory) = state.server_update_data_directory.as_deref() else {
         record_server_update_rejection(
             &state,
@@ -5635,14 +5968,19 @@ async fn apply_server_update(
             "server update requires a persistent LINKLAKE_DATA_DIR",
         ));
     };
-    let _operation = state.server_update_operation_lock.try_lock().map_err(|_| {
-        record_server_update_rejection(&state, operation, &principal, "operation_lock_busy").await;
-        server_update_busy_error()
-    })?;
+    let _operation = match state.server_update_operation_lock.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            record_server_update_rejection(&state, operation, &principal, "operation_lock_busy")
+                .await;
+            return Err(server_update_busy_error());
+        }
+    };
     let update_state = linklake_update::default_state_directory(UpdateProduct::Server);
-    ensure_server_update_idle(&update_state).inspect_err(|_| {
+    if let Err(error) = ensure_server_update_idle(&update_state) {
         record_server_update_rejection(&state, operation, &principal, "active_update").await;
-    })?;
+        return Err(error);
+    }
     let scheduled = match linklake_update::server_apply(
         UPDATE_REPOSITORY,
         UpdateChannel::Stable,
@@ -5809,6 +6147,17 @@ async fn status(
         .count()
         .await
         .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "could not count clients"))?;
+    let port_groups = state
+        .tunnel_catalog
+        .list_port_groups()
+        .await
+        .map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not read port groups",
+            )
+        })?
+        .len();
     let tunnels = state.tunnels.lock().expect("tunnel registry lock poisoned");
     let udp_tunnels = state
         .udp_tunnels
@@ -5834,18 +6183,6 @@ async fn status(
         .sni_routes
         .lock()
         .expect("SNI route registry lock poisoned");
-    let port_groups = state
-        .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
-        .list_port_groups()
-        .map_err(|_| {
-            ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "could not read port groups",
-            )
-        })?
-        .len();
     let p2p_node_records = state
         .p2p_node_catalog
         .lock()
@@ -7584,21 +7921,22 @@ async fn collect_unavailable_policy_signals(state: &AppState, signals: &mut Vec<
         .map(|(port, registration)| (*port, registration.policy_id))
         .collect::<HashMap<_, _>>();
     let (tcp, udp, groups) = {
-        let catalog = state
-            .tunnel_catalog
-            .lock()
-            .expect("tunnel catalog lock poisoned");
-        let tcp = catalog.list().unwrap_or_default();
-        let udp = catalog.list_udp().unwrap_or_default();
-        let groups = catalog
+        let tunnel_store = &state.tunnel_catalog;
+        let tcp = tunnel_store.list().await.unwrap_or_default();
+        let udp = tunnel_store.list_udp().await.unwrap_or_default();
+        let mut groups = Vec::new();
+        for policy in tunnel_store
             .list_port_groups()
+            .await
             .unwrap_or_default()
             .into_iter()
-            .map(|policy| {
-                let mappings = catalog.port_group_mappings(policy.id).unwrap_or_default();
-                (policy, mappings)
-            })
-            .collect::<Vec<_>>();
+        {
+            let mappings = tunnel_store
+                .port_group_mappings(policy.id)
+                .await
+                .unwrap_or_default();
+            groups.push((policy, mappings));
+        }
         (tcp, udp, groups)
     };
     for policy in tcp
@@ -7706,20 +8044,19 @@ async fn collect_unavailable_policy_signals(state: &AppState, signals: &mut Vec<
         .keys()
         .copied()
         .collect::<HashSet<_>>();
-    let catalog = state
-        .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned");
-    for policy in catalog
+    let tunnel_store = &state.tunnel_catalog;
+    for policy in tunnel_store
         .list_socks5()
+        .await
         .unwrap_or_default()
         .into_iter()
         .filter(|policy| policy.enabled && !online_socks5.contains(&policy.id))
     {
         push_policy_unavailable(signals, "socks5", policy.id, &policy.name, 1.0);
     }
-    for policy in catalog
+    for policy in tunnel_store
         .list_http_proxies()
+        .await
         .unwrap_or_default()
         .into_iter()
         .filter(|policy| policy.enabled && !online_http_proxy.contains(&policy.id))
@@ -8024,38 +8361,37 @@ async fn collect_metrics_history_sample(
 async fn collect_policy_history_counters(state: &AppState) -> HashMap<String, HistoryCounters> {
     let mut policies = HashMap::new();
     let (tcp_policies, udp_policies, port_groups) = {
-        let catalog = state
-            .tunnel_catalog
-            .lock()
-            .expect("tunnel catalog lock poisoned");
-        let tcp = catalog.list().unwrap_or_else(|error| {
+        let tunnel_store = &state.tunnel_catalog;
+        let tcp = tunnel_store.list().await.unwrap_or_else(|error| {
             tracing::warn!("Could not list TCP policies for metrics history: {error}");
             Vec::new()
         });
-        let udp = catalog.list_udp().unwrap_or_else(|error| {
+        let udp = tunnel_store.list_udp().await.unwrap_or_else(|error| {
             tracing::warn!("Could not list UDP policies for metrics history: {error}");
             Vec::new()
         });
-        let groups = catalog
+        let mut groups = Vec::new();
+        for policy in tunnel_store
             .list_port_groups()
+            .await
             .unwrap_or_else(|error| {
                 tracing::warn!("Could not list port groups for metrics history: {error}");
                 Vec::new()
             })
             .into_iter()
-            .map(|policy| {
-                let mappings = catalog
-                    .port_group_mappings(policy.id)
-                    .unwrap_or_else(|error| {
-                        tracing::warn!(
-                            "Could not list mappings for port group {}: {error}",
-                            policy.id
-                        );
-                        Vec::new()
-                    });
-                (policy, mappings)
-            })
-            .collect::<Vec<_>>();
+        {
+            let mappings = tunnel_store
+                .port_group_mappings(policy.id)
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(
+                        "Could not list mappings for port group {}: {error}",
+                        policy.id
+                    );
+                    Vec::new()
+                });
+            groups.push((policy, mappings));
+        }
         (tcp, udp, groups)
     };
     {
@@ -8204,19 +8540,21 @@ async fn collect_policy_history_counters(state: &AppState) -> HashMap<String, Hi
     }
 
     let (socks5_policies, http_proxy_policies) = {
-        let catalog = state
-            .tunnel_catalog
-            .lock()
-            .expect("tunnel catalog lock poisoned");
+        let tunnel_store = &state.tunnel_catalog;
         (
-            catalog.list_socks5().unwrap_or_else(|error| {
+            tunnel_store.list_socks5().await.unwrap_or_else(|error| {
                 tracing::warn!("Could not list SOCKS5 policies for metrics history: {error}");
                 Vec::new()
             }),
-            catalog.list_http_proxies().unwrap_or_else(|error| {
-                tracing::warn!("Could not list HTTP proxy policies for metrics history: {error}");
-                Vec::new()
-            }),
+            tunnel_store
+                .list_http_proxies()
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(
+                        "Could not list HTTP proxy policies for metrics history: {error}"
+                    );
+                    Vec::new()
+                }),
         )
     };
     {
@@ -9152,6 +9490,10 @@ fn release_certificate_job_slot(jobs: &mut HashMap<String, Uuid>, hostname: &str
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "签发任务持有准备阶段的租约、版本、预留及取消信号"
+)]
 async fn run_certificate_operation(
     state: Arc<AppState>,
     manager: CertificateManager,
@@ -9223,6 +9565,10 @@ async fn run_certificate_operation(
     drop(reservation);
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "签发流程必须保留准备阶段的租约及TLS和HTTP策略快照"
+)]
 async fn run_certificate_operation_inner(
     state: Arc<AppState>,
     manager: CertificateManager,
@@ -9412,6 +9758,10 @@ fn certificate_target_matches(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "证书提交显式检查签发时租约、策略版本与签发材料"
+)]
 async fn record_certificate_success_if_current(
     state: &AppState,
     expected: &HttpRoutePolicy,
@@ -9486,6 +9836,10 @@ async fn record_certificate_success_if_current(
     Ok(true)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "签发失败同样必须核对租约、策略版本以及失败状态"
+)]
 async fn record_certificate_failure_if_current(
     state: &AppState,
     expected: &HttpRoutePolicy,
@@ -9746,6 +10100,7 @@ async fn run_certificate_maintenance(
     state: Arc<AppState>,
     mut stop: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    state.tunnel_catalog.validate_existing().await?;
     restore_managed_certificates(&state).await?;
     let start = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut interval = tokio::time::interval_at(start, Duration::from_secs(60));
@@ -9861,23 +10216,20 @@ async fn scan_certificate_maintenance(
             if *stop.borrow() {
                 return;
             }
-            match prepare_certificate_operation(&state, route.id, operation).await {
-                Ok(prepared) => {
-                    operations.spawn(run_certificate_operation(
-                        state.clone(),
-                        prepared.manager,
-                        prepared.route,
-                        prepared.certificate_identifier,
-                        prepared.acme_config,
-                        prepared.operation,
-                        prepared.lease,
-                        prepared.tls_revision,
-                        prepared.route_revision,
-                        prepared.reservation,
-                        Some(stop.clone()),
-                    ));
-                }
-                Err(_) => {}
+            if let Ok(prepared) = prepare_certificate_operation(&state, route.id, operation).await {
+                operations.spawn(run_certificate_operation(
+                    state.clone(),
+                    prepared.manager,
+                    prepared.route,
+                    prepared.certificate_identifier,
+                    prepared.acme_config,
+                    prepared.operation,
+                    prepared.lease,
+                    prepared.tls_revision,
+                    prepared.route_revision,
+                    prepared.reservation,
+                    Some(stop.clone()),
+                ));
             }
         }
     }
@@ -10007,11 +10359,12 @@ async fn global_search(
         );
     }
     {
-        let catalog = state
-            .tunnel_catalog
-            .lock()
-            .expect("tunnel catalog lock poisoned");
-        for policy in catalog.list().map_err(coded_client_management_error)? {
+        let tunnel_store = &state.tunnel_catalog;
+        for policy in tunnel_store
+            .list()
+            .await
+            .map_err(coded_client_management_error)?
+        {
             add(
                 "tcp",
                 policy.id.to_string(),
@@ -10020,8 +10373,9 @@ async fn global_search(
                 "#/services/tcp",
             );
         }
-        for policy in catalog
+        for policy in tunnel_store
             .list_udp()
+            .await
             .map_err(|error| coded_client_management_error(error.into()))?
         {
             add(
@@ -10032,8 +10386,9 @@ async fn global_search(
                 "#/services/udp",
             );
         }
-        for policy in catalog
+        for policy in tunnel_store
             .list_port_groups()
+            .await
             .map_err(|error| coded_client_management_error(error.into()))?
         {
             add(
@@ -10047,8 +10402,9 @@ async fn global_search(
                 "#/services/ports",
             );
         }
-        for policy in catalog
+        for policy in tunnel_store
             .list_socks5()
+            .await
             .map_err(|error| coded_client_management_error(error.into()))?
         {
             add(
@@ -10059,8 +10415,9 @@ async fn global_search(
                 "#/services/socks5",
             );
         }
-        for policy in catalog
+        for policy in tunnel_store
             .list_http_proxies()
+            .await
             .map_err(|error| coded_client_management_error(error.into()))?
         {
             add(
@@ -10261,36 +10618,38 @@ async fn client_policy_reference_count(
     client_id: Uuid,
 ) -> Result<usize, CodedApiError> {
     let mut count = {
-        let tunnel_catalog = state
-            .tunnel_catalog
-            .lock()
-            .expect("tunnel catalog lock poisoned");
+        let tunnel_catalog = &state.tunnel_catalog;
         let mut count = tunnel_catalog
             .list()
+            .await
             .map_err(coded_client_management_error)?
             .into_iter()
             .filter(|policy| policy.client_id == client_id)
             .count();
         count += tunnel_catalog
             .list_udp()
+            .await
             .map_err(|error| coded_client_management_error(error.into()))?
             .into_iter()
             .filter(|policy| policy.client_id == client_id)
             .count();
         count += tunnel_catalog
             .list_port_groups()
+            .await
             .map_err(|error| coded_client_management_error(error.into()))?
             .into_iter()
             .filter(|policy| policy.client_id == client_id)
             .count();
         count += tunnel_catalog
             .list_socks5()
+            .await
             .map_err(|error| coded_client_management_error(error.into()))?
             .into_iter()
             .filter(|policy| policy.client_id == client_id)
             .count();
         count += tunnel_catalog
             .list_http_proxies()
+            .await
             .map_err(|error| coded_client_management_error(error.into()))?
             .into_iter()
             .filter(|policy| policy.client_id == client_id)
@@ -11172,6 +11531,7 @@ async fn export_fleet_bundle_v2(
     state
         .policy_service
         .export_bundle_with_clients(unix_seconds(), &clients)
+        .await
         .map(Json)
         .map_err(coded_policy_service_error)
 }
@@ -11212,37 +11572,37 @@ async fn reconcile_fleet_bundle_v2(
         .summaries()
         .await
         .map_err(coded_client_management_error)?;
-    let result =
-        match state
-            .policy_service
-            .reconcile_with_clients(request.clone(), unix_seconds(), &clients)
-        {
-            Ok(result) => result,
-            Err(error) => {
-                state
-                    .metrics
-                    .fleet_reconcile_failures_total
-                    .fetch_add(1, Ordering::Relaxed);
-                if track_generation {
-                    record_fleet_generation(
-                        &state,
-                        &request.bundle,
-                        FleetSyncState::Failed,
-                        0,
-                        fencing_token,
-                    )
-                    .await?;
-                }
-                record_audit(
+    let result = match state
+        .policy_service
+        .reconcile_with_clients(request.clone(), unix_seconds(), &clients)
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            state
+                .metrics
+                .fleet_reconcile_failures_total
+                .fetch_add(1, Ordering::Relaxed);
+            if track_generation {
+                record_fleet_generation(
                     &state,
-                    "fleet.v2.reconcile.failed",
-                    &source_instance_id.to_string(),
-                    &format!("actor={}; {}", principal.username, error),
+                    &request.bundle,
+                    FleetSyncState::Failed,
+                    0,
+                    fencing_token,
                 )
-                .await;
-                return Err(coded_policy_service_error(error));
+                .await?;
             }
-        };
+            record_audit(
+                &state,
+                "fleet.v2.reconcile.failed",
+                &source_instance_id.to_string(),
+                &format!("actor={}; {}", principal.username, error),
+            )
+            .await;
+            return Err(coded_policy_service_error(error));
+        }
+    };
     if !result.conflicts.is_empty() {
         if track_generation {
             record_fleet_generation(
@@ -11281,9 +11641,9 @@ async fn reconcile_fleet_bundle_v2(
         apply_fleet_runtime_invalidations(&state, &result.runtime_invalidations);
         state
             .traffic_controls
-            .lock()
-            .expect("traffic control catalog lock poisoned")
-            .reset_runtime_state();
+            .reset_runtime_state()
+            .await
+            .map_err(coded_traffic_storage_error)?;
         state
             .metrics
             .fleet_reconcile_successes_total
@@ -11498,6 +11858,7 @@ async fn list_fleet_sources_v2(
     state
         .policy_service
         .list_sources()
+        .await
         .map(Json)
         .map_err(coded_policy_service_error)
 }
@@ -11511,6 +11872,7 @@ async fn reset_fleet_source_v2(
     if !state
         .policy_service
         .reset_source_state(source_instance_id)
+        .await
         .map_err(coded_policy_service_error)?
     {
         return Err(CodedApiError(
@@ -11543,6 +11905,7 @@ async fn list_fleet_credential_bindings(
     state
         .policy_service
         .list_credential_bindings()
+        .await
         .map(Json)
         .map_err(coded_policy_service_error)
 }
@@ -11556,6 +11919,7 @@ async fn bind_fleet_credential(
     let binding = state
         .policy_service
         .bind_credential(request, unix_seconds())
+        .await
         .map_err(coded_policy_service_error)?;
     record_audit(
         &state,
@@ -11583,6 +11947,7 @@ async fn delete_fleet_credential_binding(
     if !state
         .policy_service
         .delete_credential_binding(source_instance_id, kind, credential_ref)
+        .await
         .map_err(coded_policy_service_error)?
     {
         return Err(CodedApiError(
@@ -11648,15 +12013,13 @@ async fn import_fleet_policies(
         .summaries()
         .await
         .map_err(coded_client_management_error)?;
-    let result = fleet::import_policy_bundle(
+    let result = fleet_policy_legacy::import(
         &request.bundle,
         &clients,
-        &mut state
-            .tunnel_catalog
-            .lock()
-            .expect("tunnel catalog lock poisoned"),
+        &state.tunnel_catalog,
         request.dry_run,
     )
+    .await
     .map_err(coded_fleet_error)?;
     record_audit(
         &state,
@@ -11691,17 +12054,13 @@ async fn sync_fleet_policies(
         .summaries()
         .await
         .map_err(coded_client_management_error)?;
-    let legacy_bundle = fleet::export_policy_bundle(
-        &clients,
-        &state
-            .tunnel_catalog
-            .lock()
-            .expect("tunnel catalog lock poisoned"),
-    )
-    .map_err(coded_fleet_error)?;
+    let legacy_bundle = fleet_policy_legacy::export(&clients, &state.tunnel_catalog)
+        .await
+        .map_err(coded_fleet_error)?;
     let bundle = state
         .policy_service
         .export_bundle_with_clients(unix_seconds(), &clients)
+        .await
         .map_err(coded_policy_service_error)?;
     let peers = state
         .fleet
@@ -11906,10 +12265,9 @@ async fn get_traffic_control(
     let kind = TrafficPolicyKind::parse(&kind).map_err(coded_traffic_control_error)?;
     state
         .traffic_controls
-        .lock()
-        .expect("traffic control catalog lock poisoned")
         .get(kind, policy_id, unix_seconds())
-        .map_err(coded_traffic_control_error)?
+        .await
+        .map_err(coded_traffic_storage_error)?
         .map(Json)
         .ok_or(CodedApiError(
             StatusCode::NOT_FOUND,
@@ -11926,12 +12284,13 @@ async fn upsert_traffic_control(
 ) -> Result<Json<traffic_control::TrafficControlRecord>, CodedApiError> {
     let principal = require_administrator(&state, &headers).await?;
     let kind = TrafficPolicyKind::parse(&kind).map_err(coded_traffic_control_error)?;
+    let request =
+        traffic_control::normalized_settings(request).map_err(coded_traffic_control_error)?;
     let record = state
         .traffic_controls
-        .lock()
-        .expect("traffic control catalog lock poisoned")
         .upsert(kind, policy_id, request, unix_seconds())
-        .map_err(coded_traffic_control_error)?;
+        .await
+        .map_err(coded_traffic_storage_error)?;
     record_audit(
         &state,
         "traffic_control.updated",
@@ -11951,10 +12310,9 @@ async fn delete_traffic_control(
     let kind = TrafficPolicyKind::parse(&kind).map_err(coded_traffic_control_error)?;
     if !state
         .traffic_controls
-        .lock()
-        .expect("traffic control catalog lock poisoned")
         .delete(kind, policy_id)
-        .map_err(coded_traffic_control_error)?
+        .await
+        .map_err(coded_traffic_storage_error)?
     {
         return Err(CodedApiError(
             StatusCode::NOT_FOUND,
@@ -12464,17 +12822,12 @@ async fn list_tcp_tunnels(
     headers: HeaderMap,
 ) -> Result<Json<Vec<TcpTunnelView>>, ApiError> {
     authorize_management(&state, &headers).await?;
-    let policies = state
-        .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
-        .list()
-        .map_err(|_| {
-            ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "could not read tunnel policies",
-            )
-        })?;
+    let policies = state.tunnel_catalog.list().await.map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not read tunnel policies",
+        )
+    })?;
     let online_ports = state
         .tunnels
         .lock()
@@ -12556,9 +12909,8 @@ async fn create_tcp_tunnel(
     }
     let policy = state
         .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
         .create(request)
+        .await
         .map_err(coded_tcp_policy_error)?;
     record_audit(
         &state,
@@ -12590,19 +12942,17 @@ async fn update_tcp_tunnel(
         ));
     }
     let (old_policy, policy) = {
-        let mut catalog = state
-            .tunnel_catalog
-            .lock()
-            .expect("tunnel catalog lock poisoned");
-        let old = catalog.policy_by_id(tunnel_id).map_err(|_| {
+        let tunnel_store = &state.tunnel_catalog;
+        let old = tunnel_store.policy_by_id(tunnel_id).await.map_err(|_| {
             CodedApiError(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "tcp_policy_storage_error",
                 "could not read tunnel policy",
             )
         })?;
-        let updated = catalog
+        let updated = tunnel_store
             .update(tunnel_id, request)
+            .await
             .map_err(coded_tcp_policy_error)?;
         let old = old.ok_or(CodedApiError(
             StatusCode::NOT_FOUND,
@@ -12640,9 +12990,8 @@ async fn set_tcp_tunnel_enabled(
     authorize_management(&state, &headers).await?;
     let public_port = state
         .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
         .list()
+        .await
         .map_err(|_| {
             ApiError(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -12654,9 +13003,8 @@ async fn set_tcp_tunnel_enabled(
         .map(|policy| policy.public_port);
     let updated = state
         .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
         .set_enabled(tunnel_id, request.enabled)
+        .await
         .map_err(|_| {
             ApiError(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -12693,9 +13041,8 @@ async fn delete_tcp_tunnel(
     authorize_management(&state, &headers).await?;
     let public_port = state
         .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
         .list()
+        .await
         .map_err(|_| {
             ApiError(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -12705,17 +13052,12 @@ async fn delete_tcp_tunnel(
         .into_iter()
         .find(|policy| policy.id == tunnel_id)
         .map(|policy| policy.public_port);
-    let deleted = state
-        .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
-        .delete(tunnel_id)
-        .map_err(|_| {
-            ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "could not delete tunnel policy",
-            )
-        })?;
+    let deleted = state.tunnel_catalog.delete(tunnel_id).await.map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not delete tunnel policy",
+        )
+    })?;
     if !deleted {
         return Err(ApiError(StatusCode::NOT_FOUND, "unknown tunnel policy"));
     }
@@ -12977,9 +13319,8 @@ async fn list_socks5_proxies(
         .map_err(coded_management_error)?;
     let policies = state
         .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
         .list_socks5()
+        .await
         .map_err(coded_socks5_policy_error)?;
     let online = state
         .socks5_proxies
@@ -13145,9 +13486,8 @@ async fn create_socks5_proxy(
     }
     let created = state
         .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
         .create_socks5(request)
+        .await
         .map_err(coded_socks5_policy_error)?;
     record_audit(
         &state,
@@ -13183,15 +13523,14 @@ async fn update_socks5_proxy(
         ));
     }
     let (old_policy, policy) = {
-        let mut catalog = state
-            .tunnel_catalog
-            .lock()
-            .expect("tunnel catalog lock poisoned");
-        let old = catalog
+        let tunnel_store = &state.tunnel_catalog;
+        let old = tunnel_store
             .socks5_policy_by_id(proxy_id)
+            .await
             .map_err(coded_socks5_policy_error)?;
-        let updated = catalog
+        let updated = tunnel_store
             .update_socks5(proxy_id, request)
+            .await
             .map_err(coded_socks5_policy_error)?;
         let old = old.ok_or(CodedApiError(
             StatusCode::NOT_FOUND,
@@ -13234,9 +13573,8 @@ async fn set_socks5_proxy_enabled(
         .map_err(coded_management_error)?;
     let updated = state
         .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
         .set_socks5_enabled(proxy_id, request.enabled)
+        .await
         .map_err(coded_socks5_policy_error)?;
     if !updated {
         return Err(CodedApiError(
@@ -13272,9 +13610,8 @@ async fn delete_socks5_proxy(
         .map_err(coded_management_error)?;
     let deleted = state
         .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
         .delete_socks5(proxy_id)
+        .await
         .map_err(coded_socks5_policy_error)?;
     if deleted.is_none() {
         return Err(CodedApiError(
@@ -13308,9 +13645,8 @@ async fn list_http_proxies(
         .map_err(coded_management_error)?;
     let policies = state
         .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
         .list_http_proxies()
+        .await
         .map_err(coded_http_proxy_policy_error)?;
     let online = state
         .http_proxies
@@ -13381,9 +13717,8 @@ async fn create_http_proxy(
     }
     let created = state
         .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
         .create_http_proxy(request)
+        .await
         .map_err(coded_http_proxy_policy_error)?;
     record_audit(
         &state,
@@ -13419,15 +13754,14 @@ async fn update_http_proxy(
         ));
     }
     let (old_policy, policy) = {
-        let mut catalog = state
-            .tunnel_catalog
-            .lock()
-            .expect("tunnel catalog lock poisoned");
-        let old = catalog
+        let tunnel_store = &state.tunnel_catalog;
+        let old = tunnel_store
             .http_proxy_policy_by_id(proxy_id)
+            .await
             .map_err(coded_http_proxy_policy_error)?;
-        let updated = catalog
+        let updated = tunnel_store
             .update_http_proxy(proxy_id, request)
+            .await
             .map_err(coded_http_proxy_policy_error)?;
         let old = old.ok_or(CodedApiError(
             StatusCode::NOT_FOUND,
@@ -13470,9 +13804,8 @@ async fn set_http_proxy_enabled(
         .map_err(coded_management_error)?;
     let updated = state
         .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
         .set_http_proxy_enabled(proxy_id, request.enabled)
+        .await
         .map_err(coded_http_proxy_policy_error)?;
     if !updated {
         return Err(CodedApiError(
@@ -13508,9 +13841,8 @@ async fn delete_http_proxy(
         .map_err(coded_management_error)?;
     let deleted = state
         .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
         .delete_http_proxy(proxy_id)
+        .await
         .map_err(coded_http_proxy_policy_error)?;
     if deleted.is_none() {
         return Err(CodedApiError(
@@ -13544,9 +13876,8 @@ async fn list_udp_tunnels(
         .map_err(coded_management_error)?;
     let policies = state
         .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
         .list_udp()
+        .await
         .map_err(coded_udp_policy_error)?;
     let online = state
         .udp_tunnels
@@ -13617,9 +13948,8 @@ async fn create_udp_tunnel(
     }
     let policy = state
         .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
         .create_udp(request)
+        .await
         .map_err(coded_udp_policy_error)?;
     record_audit(
         &state,
@@ -13658,15 +13988,14 @@ async fn update_udp_tunnel(
         ));
     }
     let (old_policy, policy) = {
-        let mut catalog = state
-            .tunnel_catalog
-            .lock()
-            .expect("tunnel catalog lock poisoned");
-        let old = catalog
+        let tunnel_store = &state.tunnel_catalog;
+        let old = tunnel_store
             .udp_policy_by_id(tunnel_id)
+            .await
             .map_err(coded_udp_policy_error)?;
-        let updated = catalog
+        let updated = tunnel_store
             .update_udp(tunnel_id, request)
+            .await
             .map_err(coded_udp_policy_error)?;
         let old = old.ok_or(CodedApiError(
             StatusCode::NOT_FOUND,
@@ -13705,9 +14034,8 @@ async fn set_udp_tunnel_enabled(
         .map_err(coded_management_error)?;
     let policy = state
         .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
         .list_udp()
+        .await
         .map_err(coded_udp_policy_error)?
         .into_iter()
         .find(|policy| policy.id == tunnel_id)
@@ -13718,9 +14046,8 @@ async fn set_udp_tunnel_enabled(
         ))?;
     let updated = state
         .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
         .set_udp_enabled(tunnel_id, request.enabled)
+        .await
         .map_err(coded_udp_policy_error)?;
     if !updated {
         return Err(CodedApiError(
@@ -13756,9 +14083,8 @@ async fn delete_udp_tunnel(
         .map_err(coded_management_error)?;
     let policy = state
         .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
         .list_udp()
+        .await
         .map_err(coded_udp_policy_error)?
         .into_iter()
         .find(|policy| policy.id == tunnel_id)
@@ -13769,9 +14095,8 @@ async fn delete_udp_tunnel(
         ))?;
     if !state
         .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
         .delete_udp(tunnel_id)
+        .await
         .map_err(coded_udp_policy_error)?
     {
         return Err(CodedApiError(
@@ -13804,21 +14129,20 @@ async fn list_port_groups(
         .await
         .map_err(coded_management_error)?;
     let groups = {
-        let catalog = state
-            .tunnel_catalog
-            .lock()
-            .expect("tunnel catalog lock poisoned");
-        catalog
+        let tunnel_store = &state.tunnel_catalog;
+        let mut groups = Vec::new();
+        for policy in tunnel_store
             .list_port_groups()
+            .await
             .map_err(coded_port_group_policy_error)?
-            .into_iter()
-            .map(|policy| {
-                let mappings = catalog
-                    .port_group_mappings(policy.id)
-                    .map_err(coded_port_group_policy_error)?;
-                Ok((policy, mappings))
-            })
-            .collect::<Result<Vec<_>, CodedApiError>>()?
+        {
+            let mappings = tunnel_store
+                .port_group_mappings(policy.id)
+                .await
+                .map_err(coded_port_group_policy_error)?;
+            groups.push((policy, mappings));
+        }
+        groups
     };
     let tcp_online = state.tunnels.lock().expect("tunnel registry lock poisoned");
     let tcp_statistics = state
@@ -13924,9 +14248,8 @@ async fn create_port_group(
     }
     let policy = state
         .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
         .create_port_group(request)
+        .await
         .map_err(coded_port_group_policy_error)?;
     record_audit(
         &state,
@@ -13970,23 +14293,23 @@ async fn update_port_group(
         ));
     }
     let (old_policy, old_mappings, policy) = {
-        let mut catalog = state
-            .tunnel_catalog
-            .lock()
-            .expect("tunnel catalog lock poisoned");
-        let old = catalog
+        let tunnel_store = &state.tunnel_catalog;
+        let old = tunnel_store
             .port_group_by_id(group_id)
+            .await
             .map_err(coded_port_group_policy_error)?
             .ok_or(CodedApiError(
                 StatusCode::NOT_FOUND,
                 "unknown_port_group",
                 "port group policy does not exist",
             ))?;
-        let old_mappings = catalog
+        let old_mappings = tunnel_store
             .port_group_mappings(group_id)
+            .await
             .map_err(coded_port_group_policy_error)?;
-        let updated = catalog
+        let updated = tunnel_store
             .update_port_group(group_id, request)
+            .await
             .map_err(coded_port_group_policy_error)?
             .ok_or(CodedApiError(
                 StatusCode::NOT_FOUND,
@@ -14042,23 +14365,23 @@ async fn set_port_group_enabled(
         .await
         .map_err(coded_management_error)?;
     let (policy, mappings) = {
-        let mut catalog = state
-            .tunnel_catalog
-            .lock()
-            .expect("tunnel catalog lock poisoned");
-        let policy = catalog
+        let tunnel_store = &state.tunnel_catalog;
+        let policy = tunnel_store
             .port_group_by_id(group_id)
+            .await
             .map_err(coded_port_group_policy_error)?
             .ok_or(CodedApiError(
                 StatusCode::NOT_FOUND,
                 "unknown_port_group",
                 "port group policy does not exist",
             ))?;
-        let mappings = catalog
+        let mappings = tunnel_store
             .port_group_mappings(group_id)
+            .await
             .map_err(coded_port_group_policy_error)?;
-        catalog
+        tunnel_store
             .set_port_group_enabled(group_id, request.enabled)
+            .await
             .map_err(coded_port_group_policy_error)?;
         (policy, mappings)
     };
@@ -14088,15 +14411,14 @@ async fn delete_port_group(
         .await
         .map_err(coded_management_error)?;
     let (policy, mappings) = {
-        let mut catalog = state
-            .tunnel_catalog
-            .lock()
-            .expect("tunnel catalog lock poisoned");
-        let mappings = catalog
+        let tunnel_store = &state.tunnel_catalog;
+        let mappings = tunnel_store
             .port_group_mappings(group_id)
+            .await
             .map_err(coded_port_group_policy_error)?;
-        let policy = catalog
+        let policy = tunnel_store
             .delete_port_group(group_id)
+            .await
             .map_err(coded_port_group_policy_error)?
             .ok_or(CodedApiError(
                 StatusCode::NOT_FOUND,
@@ -14625,19 +14947,20 @@ async fn update_http_route(
             .await
             .map_err(coded_certificate_catalog_error)?;
     }
-    let mut redirects = state
-        .https_redirect_hosts
-        .lock()
-        .expect("HTTPS redirect registry lock poisoned");
-    redirects.remove(&old_policy.hostname);
-    if policy.enabled
-        && tls_policy
-            .as_ref()
-            .is_some_and(|tls| tls.mode == RouteTlsMode::Acme && tls.redirect_http_to_https)
     {
-        redirects.insert(policy.hostname.clone());
+        let mut redirects = state
+            .https_redirect_hosts
+            .lock()
+            .expect("HTTPS redirect registry lock poisoned");
+        redirects.remove(&old_policy.hostname);
+        if policy.enabled
+            && tls_policy
+                .as_ref()
+                .is_some_and(|tls| tls.mode == RouteTlsMode::Acme && tls.redirect_http_to_https)
+        {
+            redirects.insert(policy.hostname.clone());
+        }
     }
-    drop(redirects);
     record_audit(
         &state,
         "http_route.policy.updated",
@@ -15899,7 +16222,7 @@ async fn require_interactive_server_update_administrator(
         ));
     };
     let authentication = {
-        let admin_auth = state.admin_auth.lock().await;
+        let mut admin_auth = state.admin_auth.lock().await;
         admin_auth.authenticate_session(&session).await
     };
     let identity = match authentication {
@@ -15973,10 +16296,11 @@ async fn require_interactive_update_administrator(
 ) -> Result<ManagementPrincipal, CodedApiError> {
     let principal =
         require_interactive_server_update_administrator(state, headers, operation).await?;
-    require_same_origin_update_request(headers, request_host).inspect_err(|_| {
+    if let Err(error) = require_same_origin_update_request(headers, request_host) {
         record_server_update_rejection(state, operation, &principal, "same_origin_check_failed")
             .await;
-    })?;
+        return Err(error);
+    }
     Ok(principal)
 }
 
@@ -16246,7 +16570,11 @@ async fn enforce_fleet_ownership(
     // 持锁直到处理器完成，使 ownership 检查与随后写入成为进程内原子序列。
     let _mutation_guard = state.policy_mutation_lock.lock().await;
 
-    match state.policy_service.is_policy_managed(kind, policy_id) {
+    match state
+        .policy_service
+        .is_policy_managed(kind, policy_id)
+        .await
+    {
         Ok(false) => next.run(request).await,
         Ok(true) => CodedApiError(
             StatusCode::CONFLICT,
@@ -16461,6 +16789,23 @@ fn coded_policy_service_error(error: anyhow::Error) -> CodedApiError {
             StatusCode::INTERNAL_SERVER_ERROR,
             "fleet_policy_storage_error",
             "Fleet policy operation failed",
+        )
+    }
+}
+
+fn coded_traffic_storage_error(error: anyhow::Error) -> CodedApiError {
+    if error.is::<traffic_control::postgres::ManagedTrafficPolicy>() {
+        CodedApiError(
+            StatusCode::CONFLICT,
+            "fleet_managed_policy",
+            "Fleet-managed traffic settings must be changed by the owning source",
+        )
+    } else {
+        tracing::error!("Traffic control storage operation failed");
+        CodedApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "traffic_control_storage_error",
+            "traffic control storage operation failed",
         )
     }
 }
@@ -17862,7 +18207,7 @@ mod tests {
 
     #[test]
     fn server_update_authentication_audit_has_fixed_bounded_keys_and_coalesces() {
-        assert_eq!(SERVER_UPDATE_AUTH_AUDIT_BUCKET_COUNT, 32);
+        assert_eq!(SERVER_UPDATE_AUTH_AUDIT_BUCKET_COUNT, 64);
         let mut limiter = ServerUpdateAuthenticationAuditLimiter::default();
         let started = Instant::now();
         let operation = ServerUpdateOperation::Overview;

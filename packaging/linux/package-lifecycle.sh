@@ -51,6 +51,7 @@ clear_pending() {
   done
   rm -f -- "$state_file" "$pending_root/prepared"
   rm -f -- "$pending_root/rolled-back"
+  rm -f -- "$pending_root/candidate-started"
   rmdir "$pending_root/bin" "$pending_root/units" "$pending_root" 2>/dev/null || true
 }
 
@@ -72,6 +73,10 @@ restore_recorded_services() {
 
 rollback_upgrade() {
   [ -f "$pending_root/prepared" ] || return 0
+  # 候选进程可能已提交 SQLite 或共享 PG 迁移及新业务写入，不能自动降级旧二进制。
+  if [ -e "$pending_root/candidate-started" ]; then
+    fail "candidate service activation has started; preserving runtime and backup files for explicit schema-aware recovery; see docs/postgres-upgrades.md"
+  fi
   for name in $managed_binaries; do
     if [ -f "$pending_root/bin/$name" ]; then
       install -o root -g root -m 0755 "$pending_root/bin/$name" "$binary_root/$name"
@@ -154,9 +159,12 @@ activate() {
     fi
     fail "new package validation failed; the previous runtime files were restored when available"
   fi
-  if [ "$mode" = upgrade ] && ! restore_recorded_services; then
-    rollback_upgrade
-    fail "new package service activation failed; the previous runtime files were restored"
+  if [ "$mode" = upgrade ]; then
+    : >"$pending_root/candidate-started"
+    chmod 0600 "$pending_root/candidate-started"
+    if ! restore_recorded_services; then
+      fail "candidate service activation failed; runtime and backup files are preserved; automatic binary rollback is unsafe after a database migration"
+    fi
   fi
   clear_pending
 }

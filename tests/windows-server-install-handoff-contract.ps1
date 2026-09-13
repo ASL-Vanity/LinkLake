@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
@@ -59,6 +59,16 @@ $serverSource = [IO.File]::ReadAllText($serverInstallerPath, [Text.Encoding]::UT
 [void][scriptblock]::Create($commonSource)
 [void][scriptblock]::Create($serverSource)
 . $commonPath
+
+# 仅加载存储边界函数；整个安装器仍不会被执行，也不会触碰真实服务。
+$serverAst = [Management.Automation.Language.Parser]::ParseInput($serverSource, [ref]$null, [ref]$null)
+$storageGuard = $serverAst.Find({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Assert-LinkLakeServerSqliteInstaller'
+}, $true)
+Assert-Contract ($null -ne $storageGuard) 'The installer SQLite storage guard is missing.'
+. ([scriptblock]::Create($storageGuard.Extent.Text))
 
 $events = [Collections.Generic.List[string]]::new()
 try {
@@ -143,6 +153,30 @@ try {
     $installDirectory = Join-Path $temporaryRoot 'install'
     $handoffDirectory = Join-Path $temporaryRoot ".linklake-server-upgrade-$([guid]::NewGuid().ToString('N'))"
     New-Item -ItemType Directory -Force -Path $dataDirectory, $installDirectory, $handoffDirectory | Out-Null
+    Assert-LinkLakeServerSqliteInstaller -StorageEnvironments @(@{}, @{}) -DataDirectory $dataDirectory
+    Assert-LinkLakeServerSqliteInstaller -StorageEnvironments @(
+        @{ LINKLAKE_STORAGE_BACKEND = ' SqlItE ' }, @{ LINKLAKE_STORAGE_BACKEND = '' }
+    ) -DataDirectory $dataDirectory
+    foreach ($environmentIndex in @(0, 1)) {
+        foreach ($rejectedEnvironment in @(
+            @{ LINKLAKE_STORAGE_BACKEND = 'postgres' },
+            @{ LINKLAKE_STORAGE_BACKEND = 'unsupported' },
+            @{ LINKLAKE_POSTGRES_URL = '' },
+            @{ LINKLAKE_STORAGE_BACKEND = 'sqlite'; LINKLAKE_POSTGRES_URL = 'postgresql://fixture.invalid/test' }
+        )) {
+            $storageEnvironments = @(@{}, @{})
+            $storageEnvironments[$environmentIndex] = $rejectedEnvironment
+            Assert-Rejected {
+                Assert-LinkLakeServerSqliteInstaller -StorageEnvironments $storageEnvironments -DataDirectory $dataDirectory
+            } 'An existing-service or inherited PostgreSQL environment reached the SQLite installer.'
+        }
+    }
+    $postgresMarker = Join-Path $dataDirectory 'postgres-storage.marker'
+    [IO.File]::WriteAllText($postgresMarker, 'postgres fixture', [Text.Encoding]::UTF8)
+    Assert-Rejected {
+        Assert-LinkLakeServerSqliteInstaller -StorageEnvironments @(@{}, @{}) -DataDirectory $dataDirectory
+    } 'A PostgreSQL data directory reached the SQLite installer after its environment was removed.'
+    Remove-Item -LiteralPath $postgresMarker -Force
     Write-HandoffRecordFixture $handoffDirectory $dataDirectory $installDirectory
     $record = Read-LinkLakeServerCandidateHandoffRecord `
         -HandoffDirectory $handoffDirectory -ExpectedDataDirectory $dataDirectory `
@@ -219,6 +253,10 @@ Assert-Contract ($serverSource.Contains('-RecoverCandidateHandoffDirectory') -an
     'The explicit candidate handoff recovery parameters are missing.'
 Assert-Contract ($commonSource.Contains('$CandidateHandoffStarted') -and $commonSource.Contains('automatic rollback is intentionally disabled')) `
     'The transactional framework does not expose candidate handoff protection.'
+$guardIndex = $serverSource.IndexOf('Assert-LinkLakeServerSqliteInstaller -StorageEnvironments @($existingEnvironment, [Environment]::GetEnvironmentVariables()) -DataDirectory $DataDirectory', [StringComparison]::Ordinal)
+$transactionIndex = $serverSource.IndexOf('Invoke-LinkLakeTransactionalChange', [StringComparison]::Ordinal)
+Assert-Contract ($guardIndex -ge 0 -and $transactionIndex -gt $guardIndex) `
+    'The installer must reject shared storage before changing the installed service.'
 
 [ordered]@{
     ok = $true
@@ -226,4 +264,5 @@ Assert-Contract ($commonSource.Contains('$CandidateHandoffStarted') -and $common
     explicit_double_confirmation_required = $true
     unsafe_record_paths_rejected = $true
     service_remains_stopped_after_handoff = $true
+    postgres_environment_and_marker_rejected = $true
 } | ConvertTo-Json -Compress

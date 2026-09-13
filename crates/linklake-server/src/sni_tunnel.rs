@@ -164,16 +164,13 @@ async fn serve_connection(
         }
         anyhow::bail!("unknown or offline TLS SNI hostname")
     };
-    let decision = state
-        .traffic_controls
-        .lock()
-        .expect("traffic control catalog lock poisoned")
-        .authorize(
-            TrafficPolicyKind::Sni,
-            context.policy_id,
-            peer.ip(),
-            crate::unix_seconds(),
-        )?;
+    let decision = crate::traffic_control::usage_meter::authorize_traffic(
+        &state,
+        TrafficPolicyKind::Sni,
+        context.policy_id,
+        peer.ip(),
+    )
+    .await?;
     if decision != TrafficDecision::Allowed {
         context
             .statistics
@@ -208,6 +205,14 @@ async fn serve_connection(
         _route_permit: route_permit,
         _global_permit: global_permit,
     };
+    let usage_meter = crate::traffic_control::usage_meter::TrafficUsageMeter::new(
+        state.traffic_usage_spool.clone(),
+        TrafficPolicyKind::Sni,
+        context.policy_id,
+    );
+    usage_meter.ensure_open()?;
+    usage_meter.add(client_hello.len() as u64)?;
+    let mut public = crate::traffic_control::usage_meter::MeteredIo::new(public, usage_meter);
     let mut agent = match request_client_stream(&state, &context).await {
         Ok(stream) => stream,
         Err(pairing_timeout) => {
@@ -220,7 +225,11 @@ async fn serve_connection(
             anyhow::bail!("TLS SNI backend is unavailable")
         }
     };
-    agent.write_all(&client_hello).await?;
+    let mut hello_stop = context.stop.clone();
+    tokio::select! {
+        _ = hello_stop.changed() => return Ok(()),
+        result = agent.write_all(&client_hello) => result?,
+    }
     context
         .statistics
         .bytes_from_public
@@ -243,18 +252,6 @@ async fn serve_connection(
                 .statistics
                 .bytes_to_public
                 .fetch_add(to_public, Ordering::Relaxed);
-            state
-                .traffic_controls
-                .lock()
-                .expect("traffic control catalog lock poisoned")
-                .record_bytes(
-                    TrafficPolicyKind::Sni,
-                    context.policy_id,
-                    from_public
-                        .saturating_add(to_public)
-                        .saturating_add(client_hello.len() as u64),
-                    crate::unix_seconds(),
-                )?;
             Ok(())
         }
         Ok(Err(error)) => {
@@ -467,6 +464,10 @@ pub(crate) async fn register_route(
     probe_task.abort();
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "注册生命周期显式持有身份、探测及独立控制通道"
+)]
 async fn run_registered_control(
     state: Arc<AppState>,
     hostname: String,

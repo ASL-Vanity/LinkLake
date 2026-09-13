@@ -14,6 +14,8 @@ const MAX_METADATA_JSON_BYTES: usize = 16 * 1024;
 const MAX_MEMBER_LEASE_SECONDS: u64 = 5 * 60;
 const MAX_LEADER_LEASE_SECONDS: u64 = 2 * 60;
 const POSTGRES_INSTANCE_LOCK_SEED: i64 = 0x4c4c_4841_494e_5354;
+const EXPIRED_LEASE_BATCH_SIZE: i64 = 128;
+const EXPIRED_LEASE_POSTGRES_TIMEOUT: Duration = Duration::from_millis(500);
 
 const SQLITE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS ha_members (
@@ -198,7 +200,7 @@ impl HaCoordinator {
                                 "UPDATE linklake_ha_members
                                  SET last_seen_at = to_timestamp($3::bigint),
                                      lease_until = to_timestamp($4::bigint),
-                                     metadata_json = $5::jsonb
+                                     metadata_json = $5::text::jsonb
                                  WHERE instance_id = $1 AND incarnation_id = $2
                                  RETURNING instance_id, incarnation_id,
                                      CAST(EXTRACT(EPOCH FROM started_at) AS BIGINT),
@@ -226,7 +228,7 @@ impl HaCoordinator {
                                      started_at = to_timestamp($3::bigint),
                                      last_seen_at = to_timestamp($3::bigint),
                                      lease_until = to_timestamp($4::bigint),
-                                     metadata_json = $5::jsonb
+                                     metadata_json = $5::text::jsonb
                                  WHERE instance_id = $1
                                  RETURNING instance_id, incarnation_id,
                                      CAST(EXTRACT(EPOCH FROM started_at) AS BIGINT),
@@ -251,7 +253,7 @@ impl HaCoordinator {
                                      lease_until, metadata_json
                                  ) VALUES ($1, $2, to_timestamp($3::bigint),
                                      to_timestamp($3::bigint), to_timestamp($4::bigint),
-                                     $5::jsonb)
+                                     $5::text::jsonb)
                                  RETURNING instance_id, incarnation_id,
                                      CAST(EXTRACT(EPOCH FROM started_at) AS BIGINT),
                                      CAST(EXTRACT(EPOCH FROM last_seen_at) AS BIGINT),
@@ -316,24 +318,24 @@ impl HaCoordinator {
     }
 
     pub(crate) async fn prune_expired_members(&self) -> anyhow::Result<u64> {
-        match &self.storage {
-            CoordinationStorage::Sqlite(database) => database.with_connection(|connection| {
-                Ok(connection.execute(
-                    "DELETE FROM ha_members
-                     WHERE lease_until_unix_seconds <= CAST(unixepoch('now') AS INTEGER)",
-                    [],
-                )? as u64)
-            }),
-            CoordinationStorage::Postgres(_) => {
-                let client = self.storage.postgres_client().await?;
-                Ok(client
-                    .execute(
-                        "DELETE FROM linklake_ha_members WHERE lease_until <= clock_timestamp()",
-                        &[],
-                    )
-                    .await?)
-            }
-        }
+        prune_expired_lease_batch(
+            &self.storage,
+            "DELETE FROM ha_members
+             WHERE rowid IN (
+                 SELECT rowid FROM ha_members
+                 WHERE lease_until_unix_seconds <= CAST(unixepoch('now') AS INTEGER)
+                 ORDER BY lease_until_unix_seconds, instance_id LIMIT ?1
+             ) AND lease_until_unix_seconds <= CAST(unixepoch('now') AS INTEGER)",
+            "WITH expired AS (
+                 SELECT instance_id FROM linklake_ha_members
+                 WHERE lease_until <= clock_timestamp()
+                 ORDER BY lease_until, instance_id LIMIT $1
+                 FOR UPDATE SKIP LOCKED
+             ) DELETE FROM linklake_ha_members AS member USING expired
+               WHERE member.instance_id = expired.instance_id
+                 AND member.lease_until <= clock_timestamp()",
+        )
+        .await
     }
 
     pub(crate) async fn try_acquire_leadership(&self) -> anyhow::Result<Option<LeadershipLease>> {
@@ -729,6 +731,50 @@ impl HaCoordinator {
     }
 }
 
+/// 维护不能占住心跳执行线程；每批只处理少量行，遇到正在续租的写入就让行。
+pub(crate) async fn prune_expired_lease_batch(
+    storage: &CoordinationStorage,
+    sqlite_query: &'static str,
+    postgres_query: &'static str,
+) -> anyhow::Result<u64> {
+    match storage {
+        CoordinationStorage::Sqlite(database) => {
+            let database = database.clone();
+            // 必须收尾此 blocking 任务，不能在外层超时后将其遗留在后台写数据库。
+            tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+                let mut connection = database.connect()?;
+                connection.busy_timeout(Duration::ZERO)?;
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let deleted = transaction.execute(sqlite_query, [EXPIRED_LEASE_BATCH_SIZE])?;
+                transaction.commit()?;
+                Ok(deleted as u64)
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("SQLite expired lease maintenance task failed"))?
+        }
+        CoordinationStorage::Postgres(_) => {
+            tokio::time::timeout(EXPIRED_LEASE_POSTGRES_TIMEOUT, async {
+                let mut client = storage.postgres_client().await?;
+                let transaction = client.transaction().await?;
+                transaction
+                    .batch_execute(
+                        "SET LOCAL statement_timeout = '250ms';
+                         SET LOCAL lock_timeout = '25ms'",
+                    )
+                    .await?;
+                let deleted = transaction
+                    .execute(postgres_query, &[&EXPIRED_LEASE_BATCH_SIZE])
+                    .await?;
+                transaction.commit().await?;
+                Ok(deleted)
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("PostgreSQL expired lease maintenance timed out"))?
+        }
+    }
+}
+
 fn read_sqlite_member(
     transaction: &SqliteTransaction<'_>,
     instance_id: &str,
@@ -1002,4 +1048,95 @@ fn sqlite_text_error(column: usize, error: anyhow::Error) -> rusqlite::Error {
             error.to_string(),
         )),
     )
+}
+
+#[cfg(test)]
+mod maintenance_tests {
+    use super::*;
+    use crate::database::Database;
+
+    fn coordinator(database: &Database, instance_id: &str) -> HaCoordinator {
+        HaCoordinator::open(
+            CoordinationStorage::Sqlite(database.clone()),
+            instance_id,
+            "{}",
+            Duration::from_secs(300),
+            Duration::from_secs(120),
+        )
+        .expect("coordinator should open")
+    }
+
+    #[tokio::test]
+    async fn member_maintenance_is_bounded_and_preserves_renewed_members() {
+        let database = Database::memory().expect("database should open");
+        let active = coordinator(&database, "active");
+        let renewed = coordinator(&database, "renewed");
+        active
+            .register_or_renew_member()
+            .await
+            .expect("active member should register");
+        let original = renewed
+            .register_or_renew_member()
+            .await
+            .expect("renewed member should register");
+        database
+            .with_transaction(|transaction| {
+                transaction.execute(
+                    "UPDATE ha_members SET lease_until_unix_seconds = 0
+                     WHERE instance_id = 'renewed'",
+                    [],
+                )?;
+                for index in 0..EXPIRED_LEASE_BATCH_SIZE + 3 {
+                    transaction.execute(
+                        "INSERT INTO ha_members(instance_id, incarnation_id,
+                             started_unix_seconds, last_seen_unix_seconds,
+                             lease_until_unix_seconds, metadata_json)
+                         VALUES (?1, ?2, 0, 0, 0, '{}')",
+                        params![format!("expired-{index}"), Uuid::new_v4().to_string()],
+                    )?;
+                }
+                Ok(())
+            })
+            .expect("expired members should seed");
+        let current = renewed
+            .register_or_renew_member()
+            .await
+            .expect("member should renew before maintenance");
+        assert_eq!(current.incarnation_id, original.incarnation_id);
+        assert_eq!(
+            active
+                .prune_expired_members()
+                .await
+                .expect("first maintenance batch should succeed"),
+            EXPIRED_LEASE_BATCH_SIZE as u64
+        );
+        assert_eq!(
+            active
+                .prune_expired_members()
+                .await
+                .expect("second maintenance batch should succeed"),
+            3
+        );
+        assert_eq!(
+            active
+                .prune_expired_members()
+                .await
+                .expect("empty maintenance batch should succeed"),
+            0
+        );
+        let members = active
+            .active_members()
+            .await
+            .expect("active members should list");
+        assert_eq!(members.len(), 2);
+        assert!(members.iter().any(|member| member == &current));
+        let stored: i64 =
+            database
+                .with_connection(|connection| {
+                    Ok(connection
+                        .query_row("SELECT COUNT(*) FROM ha_members", [], |row| row.get(0))?)
+                })
+                .expect("remaining members should count");
+        assert_eq!(stored, 2);
+    }
 }

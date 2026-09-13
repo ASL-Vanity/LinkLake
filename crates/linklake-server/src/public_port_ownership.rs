@@ -1,6 +1,9 @@
 //! TCP/UDP 公网监听端口的跨实例所有权租约。
 
-use crate::{ha_coordination::HaCoordinator, storage::CoordinationStorage};
+use crate::{
+    ha_coordination::{prune_expired_lease_batch, HaCoordinator},
+    storage::CoordinationStorage,
+};
 use rusqlite::{params, OptionalExtension, Transaction as SqliteTransaction};
 use serde::Serialize;
 use std::{fmt, str::FromStr, time::Duration};
@@ -393,25 +396,26 @@ impl PublicPortOwnership {
     }
 
     pub(crate) async fn prune_expired(&self) -> anyhow::Result<u64> {
-        match self.coordinator.storage() {
-            CoordinationStorage::Sqlite(database) => database.with_connection(|connection| {
-                Ok(connection.execute(
-                    "DELETE FROM public_port_ownership
-                     WHERE lease_until_unix_seconds <= CAST(unixepoch('now') AS INTEGER)",
-                    [],
-                )? as u64)
-            }),
-            CoordinationStorage::Postgres(_) => {
-                let client = self.coordinator.storage().postgres_client().await?;
-                Ok(client
-                    .execute(
-                        "DELETE FROM linklake_public_port_ownership
-                         WHERE lease_until <= clock_timestamp()",
-                        &[],
-                    )
-                    .await?)
-            }
-        }
+        prune_expired_lease_batch(
+            self.coordinator.storage(),
+            "DELETE FROM public_port_ownership
+             WHERE rowid IN (
+                 SELECT rowid FROM public_port_ownership
+                 WHERE lease_until_unix_seconds <= CAST(unixepoch('now') AS INTEGER)
+                 ORDER BY lease_until_unix_seconds, protocol, public_port LIMIT ?1
+             ) AND lease_until_unix_seconds <= CAST(unixepoch('now') AS INTEGER)",
+            "WITH expired AS (
+                 SELECT protocol, public_port, lease_id FROM linklake_public_port_ownership
+                 WHERE lease_until <= clock_timestamp()
+                 ORDER BY lease_until, protocol, public_port LIMIT $1
+                 FOR UPDATE SKIP LOCKED
+             ) DELETE FROM linklake_public_port_ownership AS ownership USING expired
+               WHERE ownership.protocol = expired.protocol
+                 AND ownership.public_port = expired.public_port
+                 AND ownership.lease_id = expired.lease_id
+                 AND ownership.lease_until <= clock_timestamp()",
+        )
+        .await
     }
 }
 
@@ -593,6 +597,10 @@ async fn read_postgres_lease_for_update(
         .transpose()
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "续租必须显式核对端口、租约身份、进程身份、fence 和策略身份"
+)]
 async fn renew_postgres_lease(
     transaction: &PostgresTransaction<'_>,
     protocol: PublicPortProtocol,
@@ -635,6 +643,10 @@ async fn renew_postgres_lease(
         .transpose()
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "新租约写入必须明确携带端口、租约身份、进程身份、fence 和策略身份"
+)]
 async fn replace_postgres_lease(
     transaction: &PostgresTransaction<'_>,
     protocol: PublicPortProtocol,
@@ -779,4 +791,144 @@ fn sqlite_error(error: anyhow::Error) -> rusqlite::Error {
             error.to_string(),
         )),
     )
+}
+
+#[cfg(test)]
+mod maintenance_tests {
+    use super::*;
+    use crate::database::Database;
+
+    #[tokio::test]
+    async fn port_maintenance_preserves_renewed_and_reacquired_leases() {
+        let database = Database::memory().expect("database should open");
+        let coordinator = HaCoordinator::open(
+            CoordinationStorage::Sqlite(database.clone()),
+            "port-maintenance",
+            "{}",
+            Duration::from_secs(300),
+            Duration::from_secs(120),
+        )
+        .expect("coordinator should open");
+        coordinator
+            .register_or_renew_member()
+            .await
+            .expect("member should register");
+        let leadership = coordinator
+            .try_acquire_leadership()
+            .await
+            .expect("leadership should acquire")
+            .expect("one leader should exist");
+        let ownership = PublicPortOwnership::open(coordinator, Duration::from_secs(60))
+            .expect("port ownership should open");
+        let policy_id = Uuid::new_v4();
+        let mut leases = Vec::new();
+        for public_port in 41_000..=41_002 {
+            leases.push(
+                ownership
+                    .acquire(
+                        PublicPortProtocol::Tcp,
+                        public_port,
+                        policy_id,
+                        leadership.fencing_token,
+                    )
+                    .await
+                    .expect("port should acquire")
+                    .expect("port should be available"),
+            );
+        }
+        let renewed = ownership
+            .renew(
+                PublicPortProtocol::Tcp,
+                41_000,
+                policy_id,
+                leases[0].lease_id,
+                leadership.fencing_token,
+            )
+            .await
+            .expect("active port should renew")
+            .expect("current lease should remain valid");
+        database
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE public_port_ownership SET lease_until_unix_seconds = 0
+                     WHERE public_port IN (41001, 41002)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .expect("old leases should expire");
+        let replacement = ownership
+            .acquire(
+                PublicPortProtocol::Tcp,
+                41_001,
+                policy_id,
+                leadership.fencing_token,
+            )
+            .await
+            .expect("expired port should reacquire")
+            .expect("replacement lease should exist");
+        assert_ne!(replacement.lease_id, leases[1].lease_id);
+        assert_eq!(
+            ownership
+                .prune_expired()
+                .await
+                .expect("maintenance should prune only expired lease"),
+            1
+        );
+        let current = ownership.active().await.expect("ports should list");
+        assert_eq!(current.len(), 2);
+        assert!(current
+            .iter()
+            .any(|lease| lease.lease_id == renewed.lease_id));
+        assert!(current
+            .iter()
+            .any(|lease| lease.lease_id == replacement.lease_id));
+        assert!(ownership
+            .renew(
+                PublicPortProtocol::Tcp,
+                41_001,
+                policy_id,
+                leases[1].lease_id,
+                leadership.fencing_token,
+            )
+            .await
+            .expect("old renewal should be classified")
+            .is_none());
+        assert!(!ownership
+            .release(
+                PublicPortProtocol::Tcp,
+                41_001,
+                policy_id,
+                leases[1].lease_id,
+                leadership.fencing_token,
+            )
+            .await
+            .expect("old release should be classified"));
+        let recovered = ownership
+            .acquire(
+                PublicPortProtocol::Tcp,
+                41_002,
+                policy_id,
+                leadership.fencing_token,
+            )
+            .await
+            .expect("pruned port should reacquire")
+            .expect("pruned port should be free");
+        assert_ne!(recovered.lease_id, leases[2].lease_id);
+        assert_eq!(
+            ownership
+                .prune_expired()
+                .await
+                .expect("new leases should survive later maintenance"),
+            0
+        );
+        assert_eq!(
+            ownership
+                .active()
+                .await
+                .expect("new ports should list")
+                .len(),
+            3
+        );
+    }
 }

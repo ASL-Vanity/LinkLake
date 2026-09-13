@@ -128,7 +128,7 @@ fn classify_ipv6(address: Ipv6Addr) -> EgressAddressClass {
         ));
     }
 
-    if address == Ipv6Addr::new(0xfd00, 0x00ec, 0x0002, 0, 0, 0, 0, 0x0254) {
+    if address == Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254) {
         return EgressAddressClass::CloudMetadata;
     }
 

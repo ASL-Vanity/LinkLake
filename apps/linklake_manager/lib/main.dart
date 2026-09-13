@@ -1190,8 +1190,11 @@ class _DashboardPageState extends State<DashboardPage> {
       'socks5': (Icons.route_outlined, 'SOCKS5'),
       'proxy': (Icons.language_outlined, 'HTTP Proxy'),
       'p2p': (Icons.hub_outlined, 'P2P'),
-      'ha': (Icons.lan_outlined, t('HA 绠＄悊', 'HA management')),
-      'fleetLedger': (Icons.account_tree_outlined, t('Fleet 鍏变韩璐︽湰', 'Fleet ledger')),
+      'ha': (Icons.lan_outlined, t('HA 管理', 'HA management')),
+      'fleetLedger': (
+        Icons.account_tree_outlined,
+        t('Fleet 共享账本', 'Fleet ledger'),
+      ),
       'fleet': (Icons.cloud_sync_outlined, t('多云', 'Multi-cloud')),
       'updates': (Icons.system_update_alt, t('更新', 'Updates')),
       'alerts': (Icons.warning_amber_outlined, t('告警', 'Alerts')),
@@ -1215,7 +1218,11 @@ class _DashboardPageState extends State<DashboardPage> {
     'udp' => _policyPage(PolicyKind.udp),
     'group' => _policyPage(PolicyKind.group),
     'http' => _policyPage(PolicyKind.http),
-    'acme' => AcmeSettingsPage(api: widget.api, chinese: zh, editable: _capabilities.canWritePolicies),
+    'acme' => AcmeSettingsPage(
+      api: widget.api,
+      chinese: zh,
+      editable: _capabilities.canWritePolicies,
+    ),
     'sni' => _policyPage(PolicyKind.sni),
     'secret' => _policyPage(PolicyKind.secret),
     'socks5' => _policyPage(PolicyKind.socks5),
@@ -1457,7 +1464,10 @@ class _DashboardPageState extends State<DashboardPage> {
             members.isEmpty
                 ? [
                     _emptyHaLine(
-                      t('\u6682\u65e0\u6d3b\u52a8\u6210\u5458', 'No active HA members'),
+                      t(
+                        '\u6682\u65e0\u6d3b\u52a8\u6210\u5458',
+                        'No active HA members',
+                      ),
                     ),
                   ]
                 : [
@@ -1497,7 +1507,10 @@ class _DashboardPageState extends State<DashboardPage> {
             jobs.isEmpty
                 ? [
                     _emptyHaLine(
-                      t('\u6682\u65e0\u6d3b\u52a8\u4efb\u52a1\u79df\u7ea6', 'No active job leases'),
+                      t(
+                        '\u6682\u65e0\u6d3b\u52a8\u4efb\u52a1\u79df\u7ea6',
+                        'No active job leases',
+                      ),
                     ),
                   ]
                 : [
@@ -1516,9 +1529,7 @@ class _DashboardPageState extends State<DashboardPage> {
                         trailing: job['last_error_code'] == null
                             ? null
                             : Chip(
-                                label: Text(
-                                  job['last_error_code'].toString(),
-                                ),
+                                label: Text(job['last_error_code'].toString()),
                               ),
                         isThreeLine: true,
                       ),
@@ -1530,7 +1541,10 @@ class _DashboardPageState extends State<DashboardPage> {
             ports.isEmpty
                 ? [
                     _emptyHaLine(
-                      t('\u6682\u65e0\u516c\u7f51\u7aef\u53e3\u79df\u7ea6', 'No active public port ownership'),
+                      t(
+                        '\u6682\u65e0\u516c\u7f51\u7aef\u53e3\u79df\u7ea6',
+                        'No active public port ownership',
+                      ),
                     ),
                   ]
                 : [
@@ -1559,7 +1573,10 @@ class _DashboardPageState extends State<DashboardPage> {
             targets.isEmpty
                 ? [
                     _emptyHaLine(
-                      t('\u6682\u65e0\u76ee\u6807\u5065\u5eb7\u8bb0\u5f55', 'No target health records'),
+                      t(
+                        '\u6682\u65e0\u76ee\u6807\u5065\u5eb7\u8bb0\u5f55',
+                        'No target health records',
+                      ),
                     ),
                   ]
                 : [
@@ -1597,7 +1614,10 @@ class _DashboardPageState extends State<DashboardPage> {
           ),
           const SizedBox(height: 14),
           _haSection(
-            t('\u6700\u8fd1\u63a5\u7ba1\u4e0e\u5f02\u5e38', 'Recent takeover and anomalies'),
+            t(
+              '\u6700\u8fd1\u63a5\u7ba1\u4e0e\u5f02\u5e38',
+              'Recent takeover and anomalies',
+            ),
             events.isEmpty
                 ? [
                     _emptyHaLine(
@@ -1617,9 +1637,7 @@ class _DashboardPageState extends State<DashboardPage> {
                         ),
                         title: Text(_haEventLabel(event['code'])),
                         subtitle: Text(event['message']?.toString() ?? ''),
-                        trailing: Text(
-                          _haTimestamp(event['at_unix_seconds']),
-                        ),
+                        trailing: Text(_haTimestamp(event['at_unix_seconds'])),
                       ),
                   ],
           ),
@@ -1644,8 +1662,7 @@ class _DashboardPageState extends State<DashboardPage> {
         ? 0
         : generations.fold<int>(
                 0,
-                (total, generation) =>
-                    total + _fleetProgress(generation),
+                (total, generation) => total + _fleetProgress(generation),
               ) ~/
               generations.length;
     final cards = <(String, String, IconData)>[
@@ -1659,11 +1676,7 @@ class _DashboardPageState extends State<DashboardPage> {
         '$average%',
         Icons.stacked_line_chart,
       ),
-      (
-        t('\u5df2\u5c31\u7eea', 'Ready'),
-        '$ready',
-        Icons.check_circle_outline,
-      ),
+      (t('\u5df2\u5c31\u7eea', 'Ready'), '$ready', Icons.check_circle_outline),
       (
         t('\u672a\u89e3\u51b3\u51b2\u7a81', 'Open conflicts'),
         '${open.length}',
@@ -1693,7 +1706,10 @@ class _DashboardPageState extends State<DashboardPage> {
             generations.isEmpty
                 ? [
                     _emptyHaLine(
-                      t('\u6682\u65e0 generation \u8bb0\u5f55', 'No Fleet generations'),
+                      t(
+                        '\u6682\u65e0 generation \u8bb0\u5f55',
+                        'No Fleet generations',
+                      ),
                     ),
                   ]
                 : [
@@ -1707,7 +1723,10 @@ class _DashboardPageState extends State<DashboardPage> {
             open.isEmpty
                 ? [
                     _emptyHaLine(
-                      t('\u6ca1\u6709\u672a\u89e3\u51b3\u51b2\u7a81', 'No open Fleet conflicts'),
+                      t(
+                        '\u6ca1\u6709\u672a\u89e3\u51b3\u51b2\u7a81',
+                        'No open Fleet conflicts',
+                      ),
                     ),
                   ]
                 : [
@@ -1721,7 +1740,10 @@ class _DashboardPageState extends State<DashboardPage> {
             resolved.isEmpty
                 ? [
                     _emptyHaLine(
-                      t('\u6ca1\u6709\u5df2\u89e3\u51b3\u51b2\u7a81', 'No resolved Fleet conflicts'),
+                      t(
+                        '\u6ca1\u6709\u5df2\u89e3\u51b3\u51b2\u7a81',
+                        'No resolved Fleet conflicts',
+                      ),
                     ),
                   ]
                 : [
@@ -1853,7 +1875,10 @@ class _DashboardPageState extends State<DashboardPage> {
             minLines: 3,
             maxLines: 7,
             decoration: InputDecoration(
-              labelText: t('\u4eba\u5de5\u5904\u7406\u7ed3\u679c', 'Manual resolution'),
+              labelText: t(
+                '\u4eba\u5de5\u5904\u7406\u7ed3\u679c',
+                'Manual resolution',
+              ),
               helperText: t(
                 '\u53ea\u8bb0\u5f55\u5904\u7406\u7ed3\u679c\uff0c\u4e0d\u8981\u586b\u5199\u5bc6\u94a5\u3001\u4ee4\u724c\u6216\u8fde\u63a5\u4e32\u3002',
                 'Record the outcome only; do not enter keys, tokens, or connection strings.',
@@ -1888,7 +1913,10 @@ class _DashboardPageState extends State<DashboardPage> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            t('Fleet \u51b2\u7a81\u5df2\u89e3\u51b3\u3002', 'Fleet conflict resolved.'),
+            t(
+              'Fleet \u51b2\u7a81\u5df2\u89e3\u51b3\u3002',
+              'Fleet conflict resolved.',
+            ),
           ),
         ),
       );
@@ -1897,26 +1925,25 @@ class _DashboardPageState extends State<DashboardPage> {
     }
   }
 
-  Widget _managementMetricWrap(
-    List<(String, String, IconData)> cards,
-  ) => LayoutBuilder(
-    builder: (context, constraints) {
-      final columns = constraints.maxWidth >= 1100
-          ? 5
-          : constraints.maxWidth >= 700
-          ? 3
-          : 1;
-      final width = (constraints.maxWidth - (columns - 1) * 12) / columns;
-      return Wrap(
-        spacing: 12,
-        runSpacing: 12,
-        children: [
-          for (final card in cards)
-            SizedBox(width: width, child: _metricCard(card)),
-        ],
+  Widget _managementMetricWrap(List<(String, String, IconData)> cards) =>
+      LayoutBuilder(
+        builder: (context, constraints) {
+          final columns = constraints.maxWidth >= 1100
+              ? 5
+              : constraints.maxWidth >= 700
+              ? 3
+              : 1;
+          final width = (constraints.maxWidth - (columns - 1) * 12) / columns;
+          return Wrap(
+            spacing: 12,
+            runSpacing: 12,
+            children: [
+              for (final card in cards)
+                SizedBox(width: width, child: _metricCard(card)),
+            ],
+          );
+        },
       );
-    },
-  );
 
   Widget _updatesPage() => RemoteUpdateManagementPage(
     key: const Key('remote-update-management-page'),
@@ -3784,16 +3811,15 @@ class _DashboardPageState extends State<DashboardPage> {
     ).toLocal().toString().split('.').first;
   }
 
-  String _haBool(dynamic value) => value == true
-      ? t('鍋ュ悍', 'healthy')
-      : t('寮傚父', 'unhealthy');
+  String _haBool(dynamic value) =>
+      value == true ? t('健康', 'healthy') : t('异常', 'unhealthy');
 
   String _haEventLabel(dynamic value) => switch (value?.toString()) {
-    'leader_acquired' => t('宸插彇寰?Leader', 'Leadership acquired'),
-    'follower_started' => t('宸蹭綔涓?Follower 鍚姩', 'Follower started'),
-    'leader_lost' => t('Leader 宸蹭涪澶?, 'Leadership lost'),
-    'heartbeat_failed' => t('蹇冭烦澶辫触', 'Heartbeat failed'),
-    'heartbeat_timeout' => t('蹇冭烦瓒呮椂', 'Heartbeat timed out'),
+    'leader_acquired' => t('已取得 Leader', 'Leadership acquired'),
+    'follower_started' => t('已作为 Follower 启动', 'Follower started'),
+    'leader_lost' => t('Leader 已丢失', 'Leadership lost'),
+    'heartbeat_failed' => t('心跳失败', 'Heartbeat failed'),
+    'heartbeat_timeout' => t('心跳超时', 'Heartbeat timed out'),
     final code => code ?? '-',
   };
 

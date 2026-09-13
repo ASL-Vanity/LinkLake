@@ -1522,13 +1522,20 @@ mod tests {
     #[test]
     fn expired_notification_lease_cannot_complete_before_reclaim() {
         let mut catalog = AlertCatalog::open(None).expect("catalog should open");
-        enqueue_test_notification(&mut catalog, true, false, 100);
+        let rule_created_at = 100;
+        enqueue_test_notification(&mut catalog, true, false, rule_created_at);
+        // 辅助函数在规则创建后的下一秒求值，交付只从该时刻起到期可领取。
+        let claimed_at = rule_created_at + 1;
+        assert!(catalog
+            .claim_notification_deliveries(rule_created_at, 1)
+            .expect("claim before enqueue time should succeed")
+            .is_empty());
         let delivery = catalog
-            .claim_notification_deliveries(100, 1)
+            .claim_notification_deliveries(claimed_at, 1)
             .expect("claim should succeed")
             .pop()
             .expect("delivery should exist");
-        let expires = 100 + NOTIFICATION_DELIVERY_LEASE_SECONDS;
+        let expires = claimed_at + NOTIFICATION_DELIVERY_LEASE_SECONDS;
         assert!(!catalog
             .acknowledge_notification_delivery(&delivery, expires)
             .expect("ack should classify expiry"));

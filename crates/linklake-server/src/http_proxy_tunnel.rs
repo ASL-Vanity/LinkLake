@@ -181,12 +181,28 @@ pub(crate) async fn register_proxy(
         reject(&state, &mut stream, "invalid client credentials").await;
         return;
     }
-    let runtime_policy = state
+    let registration_token = state.ha_runtime.fencing_token().ok();
+    if registration_token.is_none() || !state.accepts_public_work() {
+        reject(
+            &state,
+            &mut stream,
+            "active HA leader is required for registration",
+        )
+        .await;
+        return;
+    }
+    let runtime_policy = match state
         .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
         .http_proxy_runtime_policy(client_id, &name, public_port)
-        .unwrap_or(None);
+        .await
+    {
+        Ok(policy) => policy,
+        Err(error) => {
+            tracing::warn!(public_port, "Tunnel policy lookup failed: {error}");
+            reject(&state, &mut stream, "tunnel policy storage is unavailable").await;
+            return;
+        }
+    };
     let Some(runtime_policy) = runtime_policy else {
         reject(
             &state,
@@ -236,6 +252,34 @@ pub(crate) async fn register_proxy(
             return;
         }
     };
+    // 网络协商不持有策略门；安装本机注册时再读取完整策略并核对同一 Leader。
+    let registration_guard = state.policy_mutation_lock.lock().await;
+    let current_policy = state
+        .tunnel_catalog
+        .http_proxy_runtime_policy(client_id, &name, public_port)
+        .await;
+    let policy_matches = current_policy
+        .as_ref()
+        .ok()
+        .and_then(|policy| policy.as_ref())
+        == Some(&runtime_policy);
+    if !policy_matches
+        || !state.accepts_public_work()
+        || state.ha_runtime.fencing_token().ok() != registration_token
+    {
+        if let Err(error) = current_policy {
+            tracing::warn!(public_port, "Tunnel policy revalidation failed: {error}");
+        }
+        drop(registration_guard);
+        port_lease.release().await;
+        reject(
+            &state,
+            &mut stream,
+            "tunnel policy or HA leadership changed during registration",
+        )
+        .await;
+        return;
+    }
     let (command_tx, command_rx) = mpsc::channel(64);
     let (stop_tx, stop_rx) = watch::channel(());
     port_lease.spawn_supervisor(stop_rx.clone(), stop_tx.clone());
@@ -278,6 +322,7 @@ pub(crate) async fn register_proxy(
         .metrics
         .tunnel_registrations_total
         .fetch_add(1, Ordering::Relaxed);
+    drop(registration_guard);
     record_audit(
         &state,
         "http_proxy.registered",
@@ -394,7 +439,7 @@ async fn accept_public_connections(
                         drop(stream);
                         continue;
                     }
-                    let decision = context.state.traffic_controls.lock().expect("traffic control catalog lock poisoned").authorize(TrafficPolicyKind::HttpProxy, context.policy_id, source.ip(), crate::unix_seconds());
+                    let decision = crate::traffic_control::usage_meter::authorize_traffic(&context.state, TrafficPolicyKind::HttpProxy, context.policy_id, source.ip()).await;
                     if !matches!(decision, Ok(TrafficDecision::Allowed)) {
                         context.statistics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                         continue;
@@ -440,7 +485,14 @@ async fn serve_public_connection(
         .statistics
         .connections_total
         .fetch_add(1, Ordering::Relaxed);
-    let mut external = BufReader::new(external);
+    let meter = crate::traffic_control::usage_meter::TrafficUsageMeter::new(
+        context.state.traffic_usage_spool.clone(),
+        TrafficPolicyKind::HttpProxy,
+        context.policy_id,
+    );
+    let mut external = BufReader::new(crate::traffic_control::usage_meter::MeteredIo::new(
+        external, meter,
+    ));
     let lifetime_deadline = Instant::now() + CONNECTION_MAX_LIFETIME;
     let mut requests = 0_usize;
     loop {
@@ -749,7 +801,7 @@ async fn pair_target(
 }
 
 async fn write_pair_error(
-    external: &mut BufReader<TcpStream>,
+    external: &mut BufReader<crate::traffic_control::usage_meter::MeteredIo<TcpStream>>,
     context: &PublicConnectionContext,
     error: PairTargetError,
 ) {
@@ -777,20 +829,6 @@ fn record_transfer(context: &PublicConnectionContext, from_public: u64, to_publi
         .statistics
         .bytes_to_public
         .fetch_add(to_public, Ordering::Relaxed);
-    if let Err(error) = context
-        .state
-        .traffic_controls
-        .lock()
-        .expect("traffic control catalog lock poisoned")
-        .record_bytes(
-            TrafficPolicyKind::HttpProxy,
-            context.policy_id,
-            from_public.saturating_add(to_public),
-            crate::unix_seconds(),
-        )
-    {
-        tracing::warn!("Could not persist HTTP proxy traffic usage: {error}");
-    }
 }
 
 async fn forward_http_exchange<E>(
@@ -1330,7 +1368,7 @@ where
 }
 
 async fn read_proxy_request(
-    stream: &mut BufReader<TcpStream>,
+    stream: &mut BufReader<crate::traffic_control::usage_meter::MeteredIo<TcpStream>>,
     expected_username: &str,
     expected_password_hash: &str,
 ) -> Result<ProxyRequest, RequestError> {
@@ -1855,6 +1893,18 @@ mod tests {
         TlsAcceptor, TlsConnector,
     };
 
+    fn traffic_meter() -> Arc<crate::traffic_control::usage_meter::TrafficUsageMeter> {
+        let database = crate::database::Database::open(None).unwrap();
+        let spool = Arc::new(
+            crate::traffic_control::usage_spool::TrafficUsageSpool::open(&database).unwrap(),
+        );
+        crate::traffic_control::usage_meter::TrafficUsageMeter::new(
+            spool,
+            crate::traffic_control::TrafficPolicyKind::HttpProxy,
+            uuid::Uuid::new_v4(),
+        )
+    }
+
     fn password() -> (String, String) {
         let password = format!("llh_{}", "a".repeat(64));
         let hash = format!("{:x}", Sha256::digest(password.as_bytes()));
@@ -2016,7 +2066,10 @@ mod tests {
                 .unwrap();
         });
         let exchange = tokio::spawn(async move {
-            let mut external = BufReader::new(external);
+            let mut external = BufReader::new(crate::traffic_control::usage_meter::MeteredIo::new(
+                external,
+                traffic_meter(),
+            ));
             let mut agent: BoxedIo = Box::new(agent);
             super::forward_http_exchange(
                 &mut external,
@@ -2201,7 +2254,10 @@ mod tests {
                 .expect("public response should read");
             response
         });
-        let mut external = BufReader::new(external);
+        let mut external = BufReader::new(crate::traffic_control::usage_meter::MeteredIo::new(
+            external,
+            traffic_meter(),
+        ));
         let result = tokio::time::timeout(
             Duration::from_secs(2),
             super::forward_http_exchange(
@@ -2217,10 +2273,21 @@ mod tests {
         .await
         .expect("forward exchange should not hang");
         assert!(result.is_ok(), "forward exchange failed: {result:?}");
+        let outcome = result.unwrap();
+        assert!(!outcome.backend_reusable);
+        assert!(!outcome.client_reusable);
+        // exchange 只报告连接能否复用，测试调用方也必须收尾不再复用的数据通道。
+        agent
+            .shutdown()
+            .await
+            .expect("backend TLS should shut down");
         let response = response.await.expect("response task should finish");
         assert!(response.ends_with(b"\r\n\r\nok"));
         target.await.expect("target task should finish");
-        client.await.expect("client relay task should finish");
+        tokio::time::timeout(Duration::from_secs(2), client)
+            .await
+            .expect("discarded backend must release the client relay promptly")
+            .expect("client relay task should finish");
     }
 
     #[tokio::test]

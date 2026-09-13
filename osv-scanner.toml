@@ -1,5 +1,5 @@
 # 与 security/exceptions.toml 保持逐项一致；OSV 会同时忽略同一漏洞的 GHSA 别名。
 [[IgnoredVulns]]
 id = "RUSTSEC-2024-0436"
-reason = "Transitive through iroh 1.0.3 -> netwatch 0.19.1 -> netlink-packet-core 0.8.1, whose current release still uses the unmaintained paste 1.0.15 proc macro."
-ignoreUntil = 2026-09-03
+reason = "Reviewed 2026-09-13 for LinkLake's current locked dependency graph: transitive through iroh 1.0.3 -> netwatch 0.19.1 -> netlink-packet-core 0.8.1. Official crates.io netlink-packet-core 0.8.2 still uses the unmaintained paste 1.0.15 proc macro; 0.9.0 removes paste but is outside netwatch 0.19.1's compatible range. Scope is limited to this advisory and dependency chain."
+ignoreUntil = 2026-10-12

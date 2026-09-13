@@ -1,7 +1,7 @@
 replicaCount: 1
 
 storage:
-  # PostgreSQL 当前承载协调、健康、Fleet 与更新账本；其余应用状态仍需由外部系统逐副本复制。
+  # PostgreSQL 保存共享业务状态；每个副本的 PVC 保存独立实例标识及待确认流量账务。
   backend: sqlite
   postgres:
     existingSecret: ""
@@ -11,6 +11,7 @@ storage:
     connectTimeoutSeconds: 10
     healthTimeoutSeconds: 5
     allowInsecureLoopback: false
+    # 兼容旧 values 的弃用开关；不再要求外部复制本机数据库。
     replicatedStateAcknowledged: false
 
 ha:

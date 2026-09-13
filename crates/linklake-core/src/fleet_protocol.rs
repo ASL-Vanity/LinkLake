@@ -91,6 +91,41 @@ pub struct FleetHttpRouteResource {
     pub hostname: String,
     pub target_addr: String,
     pub max_connections: u16,
+    // 省略默认值，保持旧 v2 bundle 的摘要及 revision 不变。
+    #[serde(default, skip_serializing_if = "FleetGrpcBackendTransport::is_h2c")]
+    pub grpc_backend_transport: FleetGrpcBackendTransport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grpc_backend_server_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grpc_backend_trust_profile: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetGrpcBackendTransport {
+    #[default]
+    H2c,
+    Tls,
+}
+impl FleetGrpcBackendTransport {
+    fn is_h2c(&self) -> bool {
+        *self == Self::H2c
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::H2c => "h2c",
+            Self::Tls => "tls",
+        }
+    }
+    pub fn parse(value: &str) -> Result<Self, FleetBundleError> {
+        match value {
+            "h2c" => Ok(Self::H2c),
+            "tls" => Ok(Self::Tls),
+            _ => Err(FleetBundleError::InvalidField(
+                "resources.grpc_backend_transport",
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -530,7 +565,8 @@ impl FleetResourceSpec {
                 validate_policy_name(&resource.name, MAX_NAME_BYTES)?;
                 validate_hostname(&resource.hostname)?;
                 validate_target_pool(&resource.target_addr)?;
-                validate_connections(resource.max_connections)
+                validate_connections(resource.max_connections)?;
+                validate_grpc_backend(resource)
             }
             Self::SniRoute(resource) => {
                 validate_agent_id(resource.agent_instance_id)?;
@@ -759,6 +795,43 @@ fn validate_hostname(value: &str) -> Result<(), FleetBundleError> {
     }
 }
 
+fn validate_grpc_backend(resource: &FleetHttpRouteResource) -> Result<(), FleetBundleError> {
+    let invalid = || FleetBundleError::InvalidField("resources.grpc_backend");
+    match resource.grpc_backend_transport {
+        FleetGrpcBackendTransport::H2c => {
+            if resource.grpc_backend_server_name.is_some()
+                || resource.grpc_backend_trust_profile.is_some()
+            {
+                return Err(invalid());
+            }
+        }
+        FleetGrpcBackendTransport::Tls => {
+            let name = resource
+                .grpc_backend_server_name
+                .as_deref()
+                .ok_or_else(invalid)?;
+            validate_hostname(name).map_err(|_| invalid())?;
+            if name.parse::<IpAddr>().is_ok() {
+                return Err(invalid());
+            }
+            if resource
+                .grpc_backend_trust_profile
+                .as_deref()
+                .is_some_and(|v| {
+                    v.is_empty()
+                        || v.len() > 64
+                        || !v
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+                })
+            {
+                return Err(invalid());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_target_host(value: &str) -> Result<(), FleetBundleError> {
     if value.is_empty()
         || value.len() > 253
@@ -947,6 +1020,9 @@ mod tests {
                     hostname: "www.example.test".to_owned(),
                     target_addr: "127.0.0.1:8080".to_owned(),
                     max_connections: 64,
+                    grpc_backend_transport: FleetGrpcBackendTransport::H2c,
+                    grpc_backend_server_name: None,
+                    grpc_backend_trust_profile: None,
                 }),
             },
             FleetResource {
@@ -1004,6 +1080,72 @@ mod tests {
             },
         ];
         (clients, resources)
+    }
+
+    #[test]
+    fn default_grpc_fields_keep_the_legacy_bundle_wire_shape() {
+        let original = bundle();
+        let wire = serde_json::to_value(&original).unwrap();
+        let http = wire["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["spec"]["kind"] == "http_route")
+            .unwrap();
+        let settings = http["spec"]["settings"].as_object().unwrap();
+        assert!(!settings.contains_key("grpc_backend_transport"));
+        assert!(!settings.contains_key("grpc_backend_server_name"));
+        assert!(!settings.contains_key("grpc_backend_trust_profile"));
+        let decoded: FleetBundleV2 = serde_json::from_value(wire).unwrap();
+        assert_eq!(original.revision, decoded.revision);
+    }
+
+    #[test]
+    fn grpc_tls_identity_is_covered_by_bundle_integrity() {
+        let mut original = bundle();
+        let baseline = original.revision.clone();
+        if let FleetResourceSpec::HttpRoute(route) = &mut original
+            .resources
+            .iter_mut()
+            .find(|r| matches!(r.spec, FleetResourceSpec::HttpRoute(_)))
+            .unwrap()
+            .spec
+        {
+            route.grpc_backend_transport = FleetGrpcBackendTransport::Tls;
+            route.grpc_backend_server_name = Some("backend.example.test".into());
+            route.grpc_backend_trust_profile = Some("internal-ca".into());
+        }
+        original.refresh_integrity().unwrap();
+        assert_ne!(baseline, original.revision);
+        assert_eq!(
+            serde_json::from_value::<FleetBundleV2>(serde_json::to_value(&original).unwrap())
+                .unwrap(),
+            original
+        );
+        let mut altered = serde_json::to_value(&original).unwrap();
+        let route = altered["resources"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|r| r["spec"]["kind"] == "http_route")
+            .unwrap();
+        route["spec"]["settings"]["grpc_backend_server_name"] = json!("other.example.test");
+        assert!(serde_json::from_value::<FleetBundleV2>(altered).is_err());
+    }
+
+    #[test]
+    fn plaintext_grpc_cannot_carry_tls_identity_or_trust_profile() {
+        let mut original = bundle();
+        if let FleetResourceSpec::HttpRoute(route) = &mut original
+            .resources
+            .iter_mut()
+            .find(|r| matches!(r.spec, FleetResourceSpec::HttpRoute(_)))
+            .unwrap()
+            .spec
+        {
+            route.grpc_backend_server_name = Some("backend.example.test".into());
+        }
+        assert!(original.refresh_integrity().is_err());
     }
 
     fn bundle() -> FleetBundleV2 {

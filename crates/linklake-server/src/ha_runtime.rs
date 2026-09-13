@@ -11,6 +11,7 @@ use crate::{
 use std::{
     collections::VecDeque,
     env,
+    future::Future,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
@@ -42,6 +43,7 @@ const DEFAULT_TARGET_SUCCESS_THRESHOLD: u32 = 2;
 const DEFAULT_TARGET_FAILURE_THRESHOLD: u32 = 3;
 const DEFAULT_TARGET_STALE_AFTER_SECONDS: u64 = 30;
 const RUNTIME_EVENT_CAPACITY: usize = 64;
+const EXPIRED_LEASE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug)]
 pub(crate) struct HaRuntimeEvent {
@@ -259,48 +261,111 @@ impl HaRuntime {
         Ok(transition)
     }
 
-    pub(crate) async fn supervise(&self, mut shutdown: watch::Receiver<bool>) {
+    pub(crate) async fn supervise(&self, shutdown: watch::Receiver<bool>) {
+        self.supervise_with_maintenance(
+            shutdown.clone(),
+            self.maintain_expired_leases(shutdown, EXPIRED_LEASE_MAINTENANCE_INTERVAL),
+        )
+        .await;
+    }
+
+    async fn supervise_with_maintenance(
+        &self,
+        shutdown: watch::Receiver<bool>,
+        maintenance: impl Future<Output = ()>,
+    ) {
+        // 两条分支独立推进；join 保证停机时收尾维护，不遗留后台数据库写入。
+        tokio::join!(self.supervise_heartbeats(shutdown), maintenance);
+    }
+
+    async fn supervise_heartbeats(&self, shutdown: watch::Receiver<bool>) {
+        tokio::select! {
+            biased;
+            _ = wait_for_shutdown(shutdown) => {}
+            _ = self.run_heartbeats() => {}
+        }
+        // 先退出租约状态，再由外层 join 等待当前有界维护批次完成。
+        self.clear_leadership();
+    }
+
+    async fn run_heartbeats(&self) {
         let mut heartbeat = interval_at(Instant::now() + self.heartbeat, self.heartbeat);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
-            tokio::select! {
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        self.clear_leadership();
-                        break;
+            heartbeat.tick().await;
+            match timeout(self.heartbeat, self.refresh()).await {
+                Ok(Ok(transition)) => {
+                    if matches!(
+                        transition,
+                        LeadershipTransition::Gained | LeadershipTransition::Lost
+                    ) {
+                        tracing::info!(?transition, "HA leadership changed");
                     }
                 }
-                _ = heartbeat.tick() => {
-                    match timeout(self.heartbeat, self.refresh()).await {
-                        Ok(Ok(transition)) => {
-                            if matches!(transition, LeadershipTransition::Gained | LeadershipTransition::Lost) {
-                                tracing::info!(?transition, "HA leadership changed");
-                            }
-                        }
-                        Ok(Err(error)) => {
-                            let lost = self.clear_leadership();
-                            self.record_event(
-                                "heartbeat_failed",
-                                "warning",
-                                "HA heartbeat failed; leadership was cleared",
-                                None,
-                            );
-                            tracing::warn!(lost_leadership = lost, "HA heartbeat failed closed: {error}");
-                        }
-                        Err(_) => {
-                            let lost = self.clear_leadership();
-                            self.record_event(
-                                "heartbeat_timeout",
-                                "warning",
-                                "HA heartbeat timed out; leadership was cleared",
-                                None,
-                            );
-                            tracing::warn!(lost_leadership = lost, "HA heartbeat timed out and leadership was cleared");
-                        }
-                    }
+                Ok(Err(error)) => {
+                    let lost = self.clear_leadership();
+                    self.record_event(
+                        "heartbeat_failed",
+                        "warning",
+                        "HA heartbeat failed; leadership was cleared",
+                        None,
+                    );
+                    tracing::warn!(
+                        lost_leadership = lost,
+                        "HA heartbeat failed closed: {error}"
+                    );
+                }
+                Err(_) => {
+                    let lost = self.clear_leadership();
+                    self.record_event(
+                        "heartbeat_timeout",
+                        "warning",
+                        "HA heartbeat timed out; leadership was cleared",
+                        None,
+                    );
+                    tracing::warn!(
+                        lost_leadership = lost,
+                        "HA heartbeat timed out and leadership was cleared"
+                    );
                 }
             }
         }
+    }
+
+    async fn maintain_expired_leases(&self, shutdown: watch::Receiver<bool>, period: Duration) {
+        let mut maintenance = interval_at(Instant::now() + period, period);
+        maintenance.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(shutdown.clone()) => break,
+                _ = maintenance.tick() => {}
+            }
+            if !self.is_leader() {
+                continue;
+            }
+            if self.coordinator.prune_expired_members().await.is_err() {
+                self.record_maintenance_failure("members");
+            }
+            // 停机或失去 Leader 后不再启动下一批；正在运行的批次必须完成收尾。
+            if shutdown_requested(&shutdown) {
+                break;
+            }
+            if self.is_leader() && self.public_ports.prune_expired().await.is_err() {
+                self.record_maintenance_failure("public_ports");
+            }
+        }
+    }
+
+    fn record_maintenance_failure(&self, resource: &'static str) {
+        self.record_event(
+            "lease_maintenance_failed",
+            "warning",
+            "Expired HA lease maintenance batch failed",
+            None,
+        );
+        // 不记录数据库错误正文，避免泄露连接信息或存储路径。
+        tracing::warn!(resource, "Expired HA lease maintenance batch failed");
     }
 
     pub(crate) fn clear_leadership(&self) -> bool {
@@ -397,6 +462,18 @@ impl HaRuntime {
     }
 }
 
+fn shutdown_requested(shutdown: &watch::Receiver<bool>) -> bool {
+    *shutdown.borrow() || shutdown.has_changed().is_err()
+}
+
+async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
+    while !shutdown_requested(&shutdown) {
+        if shutdown.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
 fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -434,4 +511,199 @@ fn parse_u32(name: &str, default_value: u32, minimum: u32, maximum: u32) -> anyh
         "{name} must be between {minimum} and {maximum}"
     );
     Ok(value)
+}
+
+#[cfg(test)]
+mod maintenance_tests {
+    use super::*;
+    use crate::database::Database;
+    use tokio::sync::oneshot;
+
+    async fn runtime_fixture() -> (Database, HaRuntime) {
+        let database = Database::memory().expect("database should open");
+        let runtime = HaRuntime::open(
+            CoordinationStorage::Sqlite(database.clone()),
+            HaRuntimeConfig {
+                instance_id: "maintenance-runtime".to_owned(),
+                metadata_json: "{}".to_owned(),
+                member_lease: Duration::from_secs(300),
+                leader_lease: Duration::from_secs(120),
+                heartbeat: Duration::from_millis(20),
+                resource_lease: Duration::from_secs(60),
+                job_lease: Duration::from_secs(60),
+                target_success_threshold: 2,
+                target_failure_threshold: 3,
+                target_stale_after: Duration::from_secs(30),
+            },
+        )
+        .expect("runtime should open");
+        runtime.bootstrap().await.expect("runtime should bootstrap");
+        assert!(runtime.is_leader());
+        database
+            .with_connection(|connection| {
+                connection.execute_batch(
+                    "CREATE TABLE maintenance_heartbeat_probe (renewals INTEGER NOT NULL);
+                     INSERT INTO maintenance_heartbeat_probe VALUES (0);
+                     CREATE TRIGGER maintenance_heartbeat_probe_count
+                     AFTER UPDATE ON ha_members BEGIN
+                         UPDATE maintenance_heartbeat_probe SET renewals = renewals + 1;
+                     END;",
+                )?;
+                Ok(())
+            })
+            .expect("heartbeat probe should install");
+        (database, runtime)
+    }
+
+    async fn wait_for_heartbeats(database: &Database) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let renewals: i64 = database
+                    .with_connection(|connection| {
+                        Ok(connection.query_row(
+                            "SELECT renewals FROM maintenance_heartbeat_probe",
+                            [],
+                            |row| row.get(0),
+                        )?)
+                    })
+                    .expect("heartbeat probe should read");
+                if renewals >= 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("heartbeats should continue during maintenance");
+    }
+
+    #[tokio::test]
+    async fn slow_maintenance_does_not_block_heartbeats_or_leadership_exit() {
+        let (database, runtime) = runtime_fixture().await;
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (started_tx, started_rx) = oneshot::channel();
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let completed = Arc::new(AtomicBool::new(false));
+        let worker = runtime.clone();
+        let worker_completed = completed.clone();
+        let supervision = tokio::spawn(async move {
+            worker
+                .supervise_with_maintenance(shutdown_rx, async move {
+                    started_tx
+                        .send(())
+                        .expect("maintenance should announce start");
+                    finish_rx
+                        .await
+                        .expect("maintenance should finish its batch");
+                    worker_completed.store(true, Ordering::SeqCst);
+                })
+                .await;
+        });
+        started_rx.await.expect("maintenance should start");
+        wait_for_heartbeats(&database).await;
+        assert!(runtime.is_leader());
+        let mut leadership = runtime.subscribe_leadership();
+        shutdown_tx.send(true).expect("shutdown should signal");
+        drop(
+            timeout(
+                Duration::from_secs(2),
+                leadership.wait_for(|lease| lease.is_none()),
+            )
+            .await
+            .expect("leadership should exit before maintenance finishes")
+            .expect("leadership channel should stay open"),
+        );
+        assert!(runtime.fencing_token().is_err());
+        assert!(!supervision.is_finished());
+        assert!(!completed.load(Ordering::SeqCst));
+        finish_tx
+            .send(())
+            .expect("maintenance should be allowed to finish");
+        timeout(Duration::from_secs(2), supervision)
+            .await
+            .expect("shutdown should join completed maintenance")
+            .expect("supervision should finish cleanly");
+        assert!(completed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn maintenance_failure_keeps_heartbeats_and_does_not_clear_leadership() {
+        let (database, runtime) = runtime_fixture().await;
+        database
+            .with_connection(|connection| {
+                connection.execute_batch(
+                    "INSERT INTO ha_members(instance_id, incarnation_id,
+                         started_unix_seconds, last_seen_unix_seconds,
+                         lease_until_unix_seconds, metadata_json)
+                     VALUES ('expired-maintenance', 'expired-incarnation', 0, 0, 0, '{}');
+                     DROP TABLE public_port_ownership;",
+                )?;
+                Ok(())
+            })
+            .expect("maintenance success and failure cases should seed");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let worker = runtime.clone();
+        let supervision = tokio::spawn(async move {
+            worker
+                .supervise_with_maintenance(
+                    shutdown_rx.clone(),
+                    worker.maintain_expired_leases(shutdown_rx, Duration::from_millis(10)),
+                )
+                .await;
+        });
+        timeout(Duration::from_secs(5), async {
+            while !runtime
+                .recent_events(64)
+                .iter()
+                .any(|event| event.code == "lease_maintenance_failed")
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("maintenance should record its failure");
+        wait_for_heartbeats(&database).await;
+        assert!(runtime.is_leader());
+        assert!(!runtime
+            .recent_events(64)
+            .iter()
+            .any(|event| event.code == "heartbeat_failed" || event.code == "heartbeat_timeout"));
+        let members: i64 =
+            database
+                .with_connection(|connection| {
+                    Ok(connection
+                        .query_row("SELECT COUNT(*) FROM ha_members", [], |row| row.get(0))?)
+                })
+                .expect("members should count");
+        assert_eq!(
+            members, 1,
+            "the working cleanup batch should remove the expired member"
+        );
+        shutdown_tx.send(true).expect("shutdown should signal");
+        timeout(Duration::from_secs(2), supervision)
+            .await
+            .expect("maintenance should stop on shutdown")
+            .expect("supervision should finish cleanly");
+        assert!(!runtime.is_leader());
+    }
+
+    #[tokio::test]
+    async fn already_requested_shutdown_starts_no_maintenance() {
+        let (database, runtime) = runtime_fixture().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(true);
+        timeout(Duration::from_secs(2), runtime.supervise(shutdown_rx))
+            .await
+            .expect("existing shutdown should be observed immediately");
+        assert!(!runtime.is_leader());
+        let renewals: i64 = database
+            .with_connection(|connection| {
+                Ok(connection.query_row(
+                    "SELECT renewals FROM maintenance_heartbeat_probe",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .expect("heartbeat probe should read");
+        assert_eq!(renewals, 0);
+    }
 }

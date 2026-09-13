@@ -299,7 +299,7 @@ impl HttpRouteCatalog {
     }
 }
 
-fn requested_policy(
+pub(crate) fn requested_policy(
     id: Uuid,
     enabled: bool,
     request: CreateHttpRoutePolicy,

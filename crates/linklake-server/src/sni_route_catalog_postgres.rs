@@ -14,7 +14,11 @@ pub(crate) struct PostgresSniRouteCatalog {
     pub(crate) runtime: Arc<HaRuntime>,
 }
 
-fn decode_policy(id: &str, hostname: &str, json: &str) -> anyhow::Result<SniRoutePolicy> {
+pub(crate) fn decode_policy(
+    id: &str,
+    hostname: &str,
+    json: &str,
+) -> anyhow::Result<SniRoutePolicy> {
     let policy: SniRoutePolicy = serde_json::from_str(json)?;
     anyhow::ensure!(
         serde_json::from_str::<serde_json::Value>(json)? == serde_json::to_value(&policy)?,

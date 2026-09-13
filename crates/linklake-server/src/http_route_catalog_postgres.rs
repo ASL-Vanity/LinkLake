@@ -32,7 +32,7 @@ fn read_snapshot(row: &Row) -> anyhow::Result<HttpRouteSnapshot> {
     )
 }
 
-fn decode_snapshot(
+pub(crate) fn decode_snapshot(
     id: &str,
     hostname: &str,
     revision: &str,

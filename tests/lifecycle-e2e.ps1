@@ -1,12 +1,13 @@
 param(
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [string]$TargetDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Net.Http
 $PSDefaultParameterValues['Invoke-RestMethod:Headers'] = @{ 'X-LinkLake-CSRF' = '1' }
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$targetRoot = Join-Path $projectRoot 'target\lifecycle-e2e'
+$targetRoot = if ($TargetDir) { [IO.Path]::GetFullPath($TargetDir) } else { Join-Path $projectRoot 'target\lifecycle-e2e' }
 $serverPath = Join-Path $targetRoot 'debug\linklake-server.exe'
 $clientPath = Join-Path $targetRoot 'debug\linklake-client.exe'
 $runRoot = Join-Path ([IO.Path]::GetTempPath()) ('linklake-lifecycle-e2e-' + [guid]::NewGuid())

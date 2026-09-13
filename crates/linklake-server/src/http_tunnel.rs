@@ -305,6 +305,51 @@ struct TrackedBody {
     stop: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
 }
 
+struct MeteredHttpBody {
+    inner: ProxyBody,
+    usage: Arc<crate::traffic_control::usage_meter::TrafficUsageMeter>,
+    statistics: Arc<HttpRouteStatistics>,
+    from_public: bool,
+}
+
+impl Body for MeteredHttpBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        if let Err(error) = self.usage.ensure_open() {
+            return Poll::Ready(Some(Err(Box::new(error))));
+        }
+        let result = Pin::new(&mut self.inner).poll_frame(context);
+        if let Poll::Ready(Some(Ok(frame))) = &result {
+            if let Some(data) = frame.data_ref() {
+                if self.from_public {
+                    self.statistics
+                        .bytes_from_public
+                        .fetch_add(data.len() as u64, Ordering::Relaxed);
+                } else {
+                    self.statistics
+                        .bytes_to_public
+                        .fetch_add(data.len() as u64, Ordering::Relaxed);
+                }
+                if let Err(error) = self.usage.add(data.len() as u64) {
+                    return Poll::Ready(Some(Err(Box::new(error))));
+                }
+            }
+        }
+        result
+    }
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 struct GrpcBodyState {
     statistics: Arc<HttpRouteStatistics>,
     status_seen: bool,
@@ -313,9 +358,8 @@ struct GrpcBodyState {
 }
 
 struct ConnectionActivity {
-    state: Arc<AppState>,
     policy_id: Uuid,
-    usage: Arc<AtomicU64>,
+    usage: Arc<crate::traffic_control::usage_meter::TrafficUsageMeter>,
     statistics: Arc<HttpRouteStatistics>,
     http2: bool,
     grpc: bool,
@@ -494,16 +538,14 @@ impl GrpcBodyState {
 
 impl ConnectionActivity {
     fn new(
-        state: Arc<AppState>,
         policy_id: Uuid,
-        usage: Arc<AtomicU64>,
+        usage: Arc<crate::traffic_control::usage_meter::TrafficUsageMeter>,
         statistics: Arc<HttpRouteStatistics>,
         protocols: RequestProtocols,
         route_permit: OwnedSemaphorePermit,
         global_permit: OwnedSemaphorePermit,
     ) -> Self {
         Self {
-            state,
             policy_id,
             usage,
             statistics,
@@ -580,20 +622,8 @@ impl Drop for ConnectionActivity {
                 .grpc_active_streams
                 .fetch_sub(1, Ordering::Relaxed);
         }
-        let bytes = self.usage.load(Ordering::Relaxed);
-        if let Err(error) = self
-            .state
-            .traffic_controls
-            .lock()
-            .expect("traffic control catalog lock poisoned")
-            .record_bytes(
-                TrafficPolicyKind::Http,
-                self.policy_id,
-                bytes,
-                crate::unix_seconds(),
-            )
-        {
-            tracing::warn!("Could not persist HTTP traffic usage: {error}");
+        if let Err(error) = self.usage.checkpoint() {
+            tracing::error!(policy_id=%self.policy_id, "Final HTTP checkpoint failed; forwarding blocked: {error}");
         }
     }
 }
@@ -984,16 +1014,13 @@ async fn proxy_request(
             TrackedBody::plain(StatusCode::NOT_FOUND, "unknown HTTP route")
         };
     };
-    let decision = state
-        .traffic_controls
-        .lock()
-        .expect("traffic control catalog lock poisoned")
-        .authorize(
-            TrafficPolicyKind::Http,
-            context.policy_id,
-            peer.ip(),
-            crate::unix_seconds(),
-        );
+    let decision = crate::traffic_control::usage_meter::authorize_traffic(
+        &state,
+        TrafficPolicyKind::Http,
+        context.policy_id,
+        peer.ip(),
+    )
+    .await;
     if !matches!(decision, Ok(TrafficDecision::Allowed)) {
         return TrackedBody::plain(
             StatusCode::FORBIDDEN,
@@ -1066,9 +1093,12 @@ async fn proxy_request(
             .grpc_requests_total
             .fetch_add(1, Ordering::Relaxed);
     }
-    let usage = Arc::new(AtomicU64::new(0));
+    let usage = crate::traffic_control::usage_meter::TrafficUsageMeter::new(
+        state.traffic_usage_spool.clone(),
+        TrafficPolicyKind::Http,
+        context.policy_id,
+    );
     let activity = ConnectionActivity::new(
-        state.clone(),
         context.policy_id,
         usage.clone(),
         context.statistics.clone(),
@@ -1133,25 +1163,25 @@ async fn proxy_request(
     let (parts, body) = request.into_parts();
     let request_statistics = context.statistics.clone();
     let request_usage = usage.clone();
-    let body = body
-        .inspect_frame(move |frame| {
-            if let Some(data) = frame.data_ref() {
-                request_statistics
-                    .bytes_from_public
-                    .fetch_add(data.len() as u64, Ordering::Relaxed);
-                request_usage.fetch_add(data.len() as u64, Ordering::Relaxed);
-            }
-        })
-        .map_err(|error| -> BoxError { Box::new(error) })
-        .boxed_unsync();
+    let body = MeteredHttpBody {
+        inner: body
+            .map_err(|error| -> BoxError { Box::new(error) })
+            .boxed_unsync(),
+        usage: request_usage,
+        statistics: request_statistics,
+        from_public: true,
+    }
+    .boxed_unsync();
     let request = Request::from_parts(parts, body);
 
+    let mut response_stop = context.stop.clone();
     let (mut response, backend_lease) = if native_grpc {
         let statistics = context.statistics.clone();
         let pool = context.http2_backend.clone();
         let grpc_backend = context.grpc_backend.clone();
-        let acquire = pool
-            .acquire_or_connect(|| async {
+        let acquire = tokio::select! {
+            _ = response_stop.changed() => return TrackedBody::plain(StatusCode::SERVICE_UNAVAILABLE, "HTTP route stopped"),
+            result = pool.acquire_or_connect(|| async {
                 match request_client_stream(&state, &context).await {
                     Ok(stream) => grpc_backend
                         .connect(stream)
@@ -1172,7 +1202,8 @@ async fn proxy_request(
                     }
                 }
             })
-            .await;
+            => result,
+        };
         let mut lease = match acquire {
             Ok(lease) => lease,
             Err(error) => {
@@ -1197,12 +1228,10 @@ async fn proxy_request(
             }
         };
         let connection_id = lease.connection_id();
-        let response = match timeout(
-            BACKEND_RESPONSE_TIMEOUT,
-            lease.send_request(request, grpc_replay_policy),
-        )
-        .await
-        {
+        let response = match tokio::select! {
+            _ = response_stop.changed() => return TrackedBody::plain(StatusCode::SERVICE_UNAVAILABLE, "HTTP route stopped"),
+            result = timeout(BACKEND_RESPONSE_TIMEOUT, lease.send_request(request, grpc_replay_policy)) => result,
+        } {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => {
                 tracing::warn!(
@@ -1283,12 +1312,19 @@ async fn proxy_request(
                 );
             }
         };
+        let mut driver_stop = context.stop.clone();
         tokio::spawn(async move {
-            if let Err(error) = connection.with_upgrades().await {
-                tracing::debug!("HTTP backend connection ended: {error}");
+            tokio::select! {
+                _ = driver_stop.changed() => {},
+                result = connection.with_upgrades() => {
+                    if let Err(error) = result { tracing::debug!("HTTP backend connection ended: {error}"); }
+                }
             }
         });
-        let response = match timeout(BACKEND_RESPONSE_TIMEOUT, sender.send_request(request)).await {
+        let response = match tokio::select! {
+            _ = response_stop.changed() => return TrackedBody::plain(StatusCode::SERVICE_UNAVAILABLE, "HTTP route stopped"),
+            result = timeout(BACKEND_RESPONSE_TIMEOUT, sender.send_request(request)) => result,
+        } {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => {
                 tracing::warn!("HTTP backend request failed for {hostname}: {error}");
@@ -1373,7 +1409,15 @@ async fn proxy_request(
                 };
                 // Hyper 的 Upgraded 持有协议解析器已经预读的缓冲区；TokioIo 接管后
                 // 缓冲字节与底层连接由同一个任务独占，不会遗漏 HTTP/2 preface。
-                let mut client = TokioIo::new(client);
+                let meter = crate::traffic_control::usage_meter::TrafficUsageMeter::new(
+                    h2c_state.traffic_usage_spool.clone(),
+                    TrafficPolicyKind::Http,
+                    h2c_policy_id,
+                );
+                let mut client = crate::traffic_control::usage_meter::MeteredIo::new(
+                    TokioIo::new(client),
+                    meter,
+                );
                 let mut backend = TokioIo::new(backend);
                 let transfer = tokio::select! {
                     _ = stop.changed() => None,
@@ -1407,19 +1451,6 @@ async fn proxy_request(
                         h2c_statistics
                             .bytes_to_public
                             .fetch_add(to_public, Ordering::Relaxed);
-                        if let Err(error) = h2c_state
-                            .traffic_controls
-                            .lock()
-                            .expect("traffic control catalog lock poisoned")
-                            .record_bytes(
-                                TrafficPolicyKind::Http,
-                                h2c_policy_id,
-                                from_public.saturating_add(to_public),
-                                crate::unix_seconds(),
-                            )
-                        {
-                            tracing::warn!("Could not persist h2c upgrade traffic usage: {error}");
-                        }
                     }
                     Some(Err(H2cTransferError::Timeout)) => {
                         h2c_statistics
@@ -1448,15 +1479,14 @@ async fn proxy_request(
     let response_statistics = context.statistics.clone();
     let response_usage = usage;
     let response = response.map(|body| {
-        body.inspect_frame(move |frame| {
-            if let Some(data) = frame.data_ref() {
-                response_statistics
-                    .bytes_to_public
-                    .fetch_add(data.len() as u64, Ordering::Relaxed);
-                response_usage.fetch_add(data.len() as u64, Ordering::Relaxed);
-            }
-        })
-        .map_err(|error| -> BoxError { Box::new(error) })
+        MeteredHttpBody {
+            inner: body
+                .map_err(|error| -> BoxError { Box::new(error) })
+                .boxed_unsync(),
+            usage: response_usage,
+            statistics: response_statistics,
+            from_public: false,
+        }
         .boxed_unsync()
     });
     let stop = activity.as_ref().map(|_| context.stop.clone());
@@ -1723,6 +1753,10 @@ pub(crate) async fn register_route(
     probe_task.abort();
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "注册生命周期显式持有身份、探测及独立控制通道"
+)]
 async fn run_registered_control(
     state: Arc<AppState>,
     hostname: String,

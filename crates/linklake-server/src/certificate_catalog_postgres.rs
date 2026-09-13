@@ -101,6 +101,10 @@ impl PostgresCertificateCatalog {
             }).collect()
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "显式核对任务租约、TLS与路由版本以及失败状态"
+    )]
     pub(crate) async fn record_failure_if_tls_current(
         &self,
         lease: &JobLease,
@@ -213,6 +217,10 @@ impl PostgresCertificateCatalog {
     }
 
     /// 证书、私钥密文和成功状态必须共同提交，不能留下只有 active 状态的空证书。
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "同一事务显式核对证书材料、任务租约和两种策略版本"
+    )]
     pub(crate) async fn commit_certificate_if_tls_current(
         &self,
         cipher: &CertificateMaterialCipher,
@@ -362,26 +370,6 @@ impl PostgresCertificateCatalog {
             certificate_pem,
             private_key_pem,
         }))
-    }
-
-    pub(crate) async fn delete_certificate_material(
-        &self,
-        route_id: Uuid,
-        identifier: &str,
-    ) -> anyhow::Result<bool> {
-        let identifier = normalize_certificate_identifier(identifier)?;
-        let mut client = self.storage.postgres_client().await?;
-        let transaction = client.transaction().await?;
-        self.fence(&transaction).await?;
-        let changed = transaction
-            .execute(
-                "DELETE FROM linklake_certificate_materials WHERE route_id=$1 AND identifier=$2",
-                &[&route_id.to_string(), &identifier],
-            )
-            .await?
-            > 0;
-        transaction.commit().await?;
-        Ok(changed)
     }
 
     pub(crate) async fn read_account_credentials(
@@ -645,47 +633,6 @@ impl PostgresCertificateCatalog {
         save_state(&transaction, &state).await?;
         transaction.commit().await?;
         Ok(true)
-    }
-
-    pub(crate) async fn record_certificate_success(
-        &self,
-        route_id: Uuid,
-        issuer: &str,
-        not_before: i64,
-        not_after: i64,
-        _completed_at: i64,
-    ) -> anyhow::Result<CertificateState> {
-        let issuer = issuer.trim();
-        if issuer.is_empty() || issuer.len() > 255 {
-            return Err(CertificateCatalogError::InvalidIssuer.into());
-        }
-        let mut client = self.storage.postgres_client().await?;
-        let transaction = client.transaction().await?;
-        self.fence(&transaction).await?;
-        let now = database_now(&transaction).await?;
-        if not_before >= not_after || now >= not_after {
-            return Err(CertificateCatalogError::InvalidCertificateValidity.into());
-        }
-        let config = read_acme_config(&transaction).await?;
-        let next_renewal = not_after
-            .saturating_sub(i64::from(config.renew_before_days) * SECONDS_PER_DAY)
-            .max(not_before);
-        let state = CertificateState {
-            route_id,
-            status: CertificateStatus::Active,
-            issuer: Some(issuer.to_owned()),
-            not_before: Some(not_before),
-            not_after: Some(not_after),
-            next_renewal: Some(next_renewal),
-            last_attempt: Some(now),
-            last_success: Some(now),
-            failure_count: 0,
-            last_error_code: None,
-            last_error_message: None,
-        };
-        save_state(&transaction, &state).await?;
-        transaction.commit().await?;
-        Ok(state)
     }
 
     pub(crate) async fn record_certificate_failure(

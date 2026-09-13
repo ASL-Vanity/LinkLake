@@ -94,6 +94,7 @@ void main() {
         'name',
         'public_port',
         'username',
+        'allow_private_networks',
         'max_connections',
         'bandwidth_limit_bps',
       },
@@ -102,6 +103,7 @@ void main() {
         'name',
         'public_port',
         'username',
+        'allow_private_networks',
         'max_connections',
         'bandwidth_limit_bps',
       },
@@ -130,6 +132,14 @@ void main() {
     expect(PolicyKind.socks5.oneTimeCredentialField, 'password');
     expect(PolicyKind.proxy.oneTimeCredentialField, 'password');
     expect(PolicyKind.tcp.oneTimeCredentialField, isNull);
+    for (final kind in [PolicyKind.socks5, PolicyKind.proxy]) {
+      expect(
+        kind.fields
+            .firstWhere((field) => field.name == 'allow_private_networks')
+            .defaultValue,
+        isFalse,
+      );
+    }
   });
 
   testWidgets('TCP create uses the WebUI-compatible payload', (tester) async {

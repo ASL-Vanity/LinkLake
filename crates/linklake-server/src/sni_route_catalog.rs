@@ -256,7 +256,7 @@ impl SniRouteCatalog {
     }
 }
 
-fn requested_policy(
+pub(crate) fn requested_policy(
     id: Uuid,
     enabled: bool,
     request: CreateSniRoutePolicy,

@@ -2,6 +2,13 @@
 
 本目录提供 Docker Compose、Prometheus、Grafana、systemd、launchd 和 Windows 服务模板。生产环境必须为管理端和控制端配置受信 TLS，令牌通过环境变量或容器 secret 注入，不写入仓库。
 
+第一次使用参见 [使用说明](user-guide.zh-CN.md)。单实例默认使用 SQLite；v1.1 多实例可使用
+PostgreSQL 共享业务状态，部署参数见 [Helm 指南](../deploy/helm/linklake/README.md)。
+PostgreSQL 各实例仍需独立持久数据目录保存身份与未上传流量，并配置 Leader 入口。
+下文 `backup-full` / `restore-full` 只适用于 SQLite；PostgreSQL 使用数据库备份工具，
+参见 [迁移](storage-migration.md)、[密钥维护](certificate-key-maintenance.md)及
+[PostgreSQL 升级](postgres-upgrades.md)。
+
 ## Docker Compose
 
 1. 复制 `deploy/linklake.env.example` 为 `deploy/linklake.env` 并替换所有令牌、密码、域名和证书。

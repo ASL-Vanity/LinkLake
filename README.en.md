@@ -1,517 +1,125 @@
 # LinkLake
 
-[中文](README.md) | English | [Roadmap](ROADMAP.en.md)
+[中文](README.md) | English | [User guide](docs/user-guide.en.md) | [Roadmap](ROADMAP.en.md) | [Releases](https://github.com/ASL-Vanity/LinkLake/releases)
 
-LinkLake is a cross-platform secure tunnel platform implemented from scratch in Rust, with independent core, server, client, and management-plane components.
+LinkLake is a cross-platform secure tunneling and service publishing platform written in Rust. Run a Client on a machine that can reach your target service and a Server at the public entry point to publish TCP, UDP and web services, or access them through private Secret tunnels.
 
-LinkLake's code implementation, automated tests, and project documentation were produced by OpenAI GPT-5.6; the project owner is responsible for requirements, infrastructure authorization, and final acceptance.
+The Server includes a Web UI. The optional Flutter desktop application, LinkLake Manager, manages servers and local clients. Server and Client can each run independently or as operating-system services.
 
-The current formal version is `1.0.0`. Official Windows assets are intentionally unsigned under the personal open-source release policy; verify SHA-256, GitHub attestations, and the LinkLake Ed25519 update manifest before installation.
+**The current repository version is `1.1.0`.** This page describes repository capabilities. Available versions and downloadable assets are listed in [GitHub Releases](https://github.com/ASL-Vanity/LinkLake/releases).
 
-The current release completes production TCP and UDP, multi-port/range forwarding, secret tunnels, byte-preserving TLS SNI pass-through, multi-node P2P direct paths with explicit server-relay fallback, SOCKS5 TCP/UDP, HTTP forward proxy/CONNECT, HTTP host routing, and the first stage of native HTTPS with ACME certificate automation.
+## Core capabilities
 
-## Advanced networking and security
+| Scenario | Capabilities |
+| --- | --- |
+| Service publishing | TCP, UDP, port groups/ranges, private Secret tunnels and byte-preserving TLS SNI passthrough; weighted target pools select new connections using client health probes |
+| Web and APIs | HTTP/HTTPS host routing, WebSocket, HTTP/2 and native gRPC; gRPC backends support h2c or TLS with certificate verification |
+| Proxy egress | Authenticated SOCKS5 CONNECT/BIND, optional UDP ASSOCIATE and bounded FRAG reassembly; HTTP forward proxy/CONNECT with explicit private-network egress permissions |
+| Certificate automation | ACME HTTP-01, Cloudflare DNS-01, wildcard certificates and renewal; challenge selection and readiness in Web UI/Manager |
+| Access control | Administrator/operator/auditor roles, TOTP, session revocation and scoped API tokens; CIDRs, connection rates, bandwidth, time windows and UTC daily traffic quotas |
+| Multiple entry points and HA | Clients connect to multiple independent servers; encrypted Secret P2P with controlled relay fallback; Fleet v2 generations, ownership and conflict checks, health monitoring and Cloudflare DNS failover |
+| Shared state | PostgreSQL shares identities, policies, certificates, Fleet, traffic and operational state; leases and fencing constrain stale leader writes |
+| Management and operations | Chinese/English web and desktop interfaces and themes, auditing, metrics and SLOs, Prometheus/Grafana, and server-coordinated remote client update tasks |
 
-- TCP, UDP, HTTP, TLS SNI, and Secret targets accept weighted pools such as `127.0.0.1:2333@2,127.0.0.1:2444@1`. Weights select new connections or sessions without expanding the list; one pool supports up to 16 targets. Every protocol first uses client-side application probes and shared server-side health state, so new traffic fails closed before the first successful probe, after health expires, or when every target is unhealthy. Secret relay connections and P2P tickets are bound to one verified concrete target.
-- Secret providers must use a target-binding-capable client. Older clients receive an explicit upgrade error and are refused registration instead of bypassing server-side health selection.
-- Every policy can define allow/deny CIDRs, new connections per minute, UTC weekday/time windows, and a persistent UTC daily byte quota. Web UI and Flutter Manager can edit these controls; TCP, UDP, port groups, HTTP, SNI, Secret relay, SOCKS5 TCP/UDP, and HTTP Proxy usage is accounted.
-- Secret visitors should use `path_policy = "prefer_direct"`; `direct_only` and `relay_only` are also supported. Legacy `prefer_direct = true/false` remains compatible.
-- The management plane supports RFC 6238 TOTP, active-session revocation, and one-time `llapi_` API tokens stored only as SHA-256 digests. Scopes are `read`, `write`, and `administrator`.
-- Multi-cloud management monitors health, priority, weight, and failover order, and can preview or apply TCP/UDP policy synchronization. Enabled clients are mapped by a unique name; only missing policies are created, while incompatible same-name policies are reported without overwrite.
+UDP relay must be enabled separately and datagrams remain best effort. Direct P2P connectivity depends on NAT and network conditions. Existing connections may need to reconnect after a node takeover or entry-point change.
 
-## Deployment and observability
+## Quick start
 
-- [Docker Compose](deploy/docker-compose.yml) includes LinkLake, Prometheus, and Grafana. `/api/v1/metrics/prometheus` requires Bearer authentication and exports `linklake_` metrics.
-- The [deployment guide](docs/deployment.md) covers Nginx, Caddy, Cloudflare DNS-only/proxy boundaries, least-privilege DNS tokens, DEB/RPM, and container certificate requirements.
-- The [SOCKS5 supported-boundaries guide](docs/socks5-supported-boundaries.en.md) documents CONNECT, optional UDP ASSOCIATE, constrained BIND, and bounded UDP FRAG reassembly.
-- Linux release assets include `.deb`, `.rpm`, and SHA-256 files. The idempotent Cloudflare DNS helper is `scripts/cloudflare-dns-upsert.ps1`.
+The [user guide (Chinese)](docs/user-guide.zh-CN.md) covers release packages, TLS, system services and clusters. This local source example runs in **PowerShell 7** from the Rust repository root; `rust-toolchain.toml` pins Rust `1.91.0`. First prepare a working target service, such as `127.0.0.1:8080`.
 
-## Production TCP capabilities
-
-- TLS control channel, Argon2 client tokens, and exact policy authorization
-- Application-level heartbeats, half-open connection detection, and client TLS session reuse
-- Reconnects with exponential backoff and jitter
-- Per-policy, global, and pending-pair connection limits
-- Aggregate bidirectional bandwidth limit per policy
-- Immediate listener and active-connection shutdown on policy disable/delete
-- Traffic, failure, rejection, timeout, reconnect, and authentication metrics
-- SQLite persistence, audit, online backup, and integrity-checked restore
-- Bilingual Web UI, password login, secure cookies, and five-second refresh
-- Native Windows services and Linux systemd units
-- Hourly server/client log rotation with 168 files retained by default
-
-## Production UDP capabilities
-
-The current UDP implementation includes:
-
-- Persistent UDP policies with create, enable, disable, delete, exact client authorization, and online state
-- Public UDP-to-local UDP session mapping with datagrams carried over a QUIC relay data channel
-- Per-policy session limits, idle session expiration, a global session limit, and aggregate bandwidth limits
-- Datagram fragmentation/reassembly protection and counters for oversized, malformed, rate-limited, and session-limited drops
-- QUIC Retry address validation, one-time short-lived tickets, attachment timeouts, and global/per-source pending and active attachment limits
-- Per-source active-session caps, source/policy/global new-session rate limits, and a shared client queue-memory budget
-- Bidirectional packet and byte counters, reassembly/session timeouts, and transport errors
-- Bilingual Web UI management and multi-policy `[[udp_tunnels]]` client configuration
-
-TCP and UDP have separate operating-system port namespaces, so TCP `32001` and UDP `32001` may coexist. A UDP public port can belong to only one UDP policy. The default public range is `32000-32999`; the server can independently configure TCP and UDP with single ports or multiple ranges anywhere in `1-65535`.
-
-The UDP relay is disabled by default. Setting `LINKLAKE_UDP_RELAY_BIND` enables it and also requires an externally reachable `LINKLAKE_UDP_RELAY_ENDPOINT` plus `LINKLAKE_UDP_RELAY_SERVER_NAME` matching the control-channel certificate. UDP has completed automated local acceptance and end-to-end acceptance across an independent public test host, a Linux server, and a Windows client.
-
-Public service UDP ports default to `LINKLAKE_UDP_PUBLIC_BIND_MODE=auto`. The server creates separate IPv4 and `IPV6_V6ONLY` sockets for the same port; it falls back to IPv4 only when the host explicitly lacks usable IPv6 support, while real deployment errors such as port conflicts or insufficient permissions fail closed. Set `ipv4_only` to request IPv4 explicitly, or `dual_stack_required` to probe dual-stack capability during server startup and require every later public UDP listener to bind both families. The QUIC relay address family remains independently controlled by `LINKLAKE_UDP_RELAY_BIND`. The client creates its local-target socket in the target address family, so the local target can be IPv4 or IPv6. Expose only the relay and policy UDP ports that are needed, and retain cloud-firewall or upstream DDoS protection.
-
-UDP and QUIC DATAGRAM are both best-effort transports; LinkLake does not turn UDP into a reliable byte stream. Automated local tests cover datagrams up to `65507` bytes, but Internet MTU, IP fragmentation, carrier networks, proxies, and firewalls can discard larger original UDP datagrams. When the application controls packet size, `1200` bytes or less is a conservative Internet-facing default; add application-level retries, sequence numbers, or loss tolerance when required.
-
-## Multi-port and port-range forwarding
-
-- TCP and UDP port groups accept single ports, comma-separated lists, ascending inclusive ranges, and mixed expressions such as `32001,32010-32012`
-- Public and target expressions map one-to-one in expansion order. For example, public `32001,32010-32012` maps to target `2333,2400-2402`; the expanded counts must match
-- Expressions are normalized before persistence. Descending ranges, duplicate ports, out-of-range values, and ambiguous syntax are rejected; one group may expand to at most 256 mappings
-- Public ports must be allowed by the server policy and must not be reserved. Target ports may use `1-65535`. The target host is entered separately as a domain, IPv4 address, or IPv6 address without a port
-- TCP groups share the TCP namespace with regular TCP tunnels, SOCKS5, HTTP forward proxies, and other TCP groups. UDP groups share the UDP namespace with regular UDP tunnels, SOCKS5 UDP, and other UDP groups
-- TCP and UDP may use the same numeric public ports. Group creation is transactional, so any conflicting mapping rejects the entire group
-- Server-managed mode expands a group into the existing TCP/UDP client tasks. The Web UI manages whole-group lifecycle and reports online mappings, connections or sessions, and traffic
-
-Local and report-only modes may also declare:
-
-```toml
-[[port_groups]]
-name = "game-range"
-protocol = "tcp"
-public_ports = "32001,32010-32012"
-target_host = "127.0.0.1"
-target_ports = "2333,2400-2402"
-```
-
-### Public port policy
-
-The compatible default permits only `32000-32999`. Servers support these environment variables:
-
-```text
-# Shared TCP/UDP default. Single ports, comma-separated lists, and ascending ranges are accepted.
-LINKLAKE_PUBLIC_PORT_RANGES=80,443,10000-19999,30000-65535
-# Optional protocol-specific overrides.
-LINKLAKE_TCP_PUBLIC_PORTS=80,443,10000-65535
-LINKLAKE_UDP_PUBLIC_PORTS=10000-65535
-# TCP port 22 is reserved by default; add host SSH, database, or other service ports here.
-LINKLAKE_RESERVED_TCP_PORTS=22,25,3306
-LINKLAKE_RESERVED_UDP_PORTS=53
-```
-
-The actual management API, control, HTTP/HTTPS, TLS-SNI, and UDP-relay listener ports are automatically added to the corresponding reserved set. The Web UI reads `GET /api/v1/public-port-policy` and displays the active policy in forwarding forms. If a new range excludes a policy already stored in the database, startup fails with the conflicting policy instead of silently leaving it offline. Linux needs root or `CAP_NET_BIND_SERVICE` for `1-1023`; the packaged systemd unit grants only that capability, while manual runs must arrange it separately. Cloud security groups, host firewalls, and other listeners still determine actual reachability.
-
-## Secret tunnels
-
-- The visitor listens only on a local address and reaches the provider through the LinkLake TLS control channel; no public business port is opened on the server
-- The Web UI selects the provider client and local target and may restrict access to one visitor client
-- Policy creation returns a high-entropy `lls_...` access key once; SQLite stores only its SHA-256 hash
-- Provider-side `[[secret_tunnels]]` entries can be delivered through server-managed configuration, while visitor-side `[[secret_visitors]]` entries and access keys always remain local
-- Policy lifecycle, provider reconnects, per-policy/global/pending connection limits, and aggregate bandwidth limits are enforced
-- The Web UI reports online state, active/total/rejected connections, bidirectional traffic, pairing timeouts, transfer errors, and lifetime timeouts
-
-Typical uses include RDP, SSH, databases, internal administration panels, and temporary TCP services that should not expose a public port. Remote deployments must configure control-channel TLS. An access key does not replace client identity: the visitor must still authenticate with an enrolled client ID and token.
-
-## Multi-node P2P direct paths
-
-- A provider uses `p2p_bind` in `[client]` for both TCP and Iroh QUIC/UDP and `p2p_endpoint` for its reachable TCP address; both settings are required together. `p2p_tcp_enabled` and `p2p_iroh_enabled` can disable either transport, but at least one must remain enabled
-- Iroh QUIC candidates automatically publish local, STUN/QAD public-mapping, and router port-mapping addresses. With `p2p_relay_url`, a self-hosted Iroh rendezvous service assists address discovery, NAT mapping detection, and UDP hole punching
-- The server persists a node directory. Providers refresh every 30 seconds and records remain fresh for 120 seconds; the Web UI and `GET /api/v1/p2p/nodes` show candidates, UDP capability, mapping behavior, port mapping, rendezvous URL, and age
-- `[[secret_visitors]]` defaults to `path_policy = "prefer_direct"`, so the visitor first requests an HMAC-SHA256 ticket bound to the provider, visitor, target address, and protocol version; `direct_only` and `relay_only` are also available
-- Tickets expire after 30 seconds and are single-use. The provider validates them online over its authenticated control connection, rejecting expiration, replay, signature changes, and provider mismatch
-- Missing candidates, timeout, refusal, authentication failure, and protocol failure are reported explicitly before the visitor falls back to the existing secret-tunnel server relay; offers, direct successes, and relay fallbacks have separate metrics and audit events
-- Visitors race all Iroh QUIC/UDP and TCP candidates concurrently and send the single-use ticket only over the first transport-layer connection that succeeds; losing attempts are cancelled immediately
-- Iroh carries business bytes only after its path becomes `Direct` or `Mixed`. A relay-only Iroh path is closed and falls back to the LinkLake secret-tunnel server relay so policy, metrics, and limits cannot be bypassed
-
-After short-lived ticket authentication, TCP direct paths use `Noise_NNpsk0_25519_ChaChaPoly_SHA256`. The server creates an independent 32-byte PSK per session, ChaCha20-Poly1305 encrypts all business bytes, and both peers rekey every `2^20` messages. Iroh paths use end-to-end QUIC/TLS 1.3 encryption. PSKs are delivered only through each peer's existing authenticated control channel and never appear in public candidates or direct tickets.
-
-```toml
-[client]
-p2p_bind = "0.0.0.0:40000"
-p2p_endpoint = "203.0.113.10:40000"
-p2p_relay_url = "https://relay.example.com"
-p2p_tcp_enabled = true
-p2p_iroh_enabled = true
-
-[[secret_visitors]]
-name = "private-rdp-access"
-local_bind = "127.0.0.1:13389"
-access_key = "lls_replace-with-the-one-time-access-key"
-path_policy = "prefer_direct"
-```
-
-Self-hosted rendezvous uses pinned `iroh-relay 1.0.3`. Production configuration, a systemd unit, an Nginx WebSocket reverse-proxy snippet, and an installer are under `packaging/iroh-relay/`. Supply a publicly trusted certificate for the relay hostname and expose public `443/tcp` and `7842/udp`. The default configuration binds the Relay to high loopback ports so it can coexist with the Web UI's Nginx listener. This service assists discovery and hole punching; it does not replace LinkLake's policy-controlled business relay.
-
-## SOCKS5 TCP/UDP proxy
-
-- The server listens for SOCKS5 TCP and UDP on the same numeric public port, while the selected LinkLake client resolves target domains and creates outbound connections
-- SOCKS5 `CONNECT` and `BIND` are supported, with `UDP ASSOCIATE` and UDP `FRAG` reassembly available when the UDP relay is enabled
-- RFC 1929 username/password authentication is mandatory; anonymous and no-auth modes are rejected
-- Policy creation returns a high-entropy `llp_...` password once; SQLite stores only its SHA-256 hash
-- Usernames contain 1 to 64 ASCII letters, digits, dots, underscores, or hyphens
-- TCP and UDP support IPv4, IPv6, and domain targets, with domains resolved by the exit client; each UDP association remembers at most 256 contacted targets and accepts responses only from those targets
-- A UDP association is bound to its authenticated TCP control connection, client source IP, and first UDP endpoint, and is revoked when the control connection closes
-- The public transport for `UDP ASSOCIATE` follows `LINKLAKE_UDP_PUBLIC_BIND_MODE`; replies use the actual receiving family, and `BND.ADDR` always describes the server side instead of echoing the client-requested address
-- A `BIND` listener leases a temporary TCP port only from the server's allowed, non-reserved public range. The requested address/port constrains the inbound peer; the first reply advertises the listener and the second success reply is sent only after a matching peer arrives. The 120-second wait and its lease end on cancellation, timeout, policy stop, or session completion
-- UDP `FRAG` is reassembled only inside an authenticated `UDP ASSOCIATE`. The default contract starts at sequence 1 and requires strict ordering, with at most 64 fragments and `65507` bytes per datagram and a five-second incomplete-datagram timeout. Per-session and process-wide inflight, fragment-count, and memory budgets also apply
-- TCP and UDP share the policy aggregate bandwidth limit, alongside per-policy/global/pending connection limits, handshake and pairing timeouts, policy lifecycle, and client reconnects
-- The Web UI and metrics report connections and CONNECT requests; BIND requests, active leases, two-stage replies, timeouts, and peer rejections; plus UDP FRAG receive, completion, duplicate, budget-rejection, timeout, source-rejection, and buffered-usage counters
-
-SOCKS5 TCP and regular TCP tunnels share the TCP public-port namespace. Temporary BIND ports come from that same allowed TCP range and must also pass a real bind check. When the UDP relay is enabled, SOCKS5 occupies the same numeric UDP port, so a regular UDP policy cannot use that port either. Without a configured UDP relay, `CONNECT` and `BIND` remain available while the `UDP ASSOCIATE` and UDP `FRAG` capabilities are false. SOCKS5 UDP reuses the QUIC DATAGRAM relay described above, remains best effort, and has the same Internet MTU risks; internal QUIC fragmentation may still occur after SOCKS5 reassembly. A public SOCKS5 service is a general network exit: protect credentials, restrict source access, and retain cloud firewall, host firewall, and upstream abuse controls.
-
-## HTTP forward proxy / CONNECT
-
-- The server listens on a dedicated public HTTP proxy port while the selected LinkLake client resolves target domains and creates outbound TCP connections
-- HTTP Basic `Proxy-Authorization` is mandatory; policy creation returns a high-entropy `llh_...` password once and SQLite stores only its SHA-256 hash
-- Plain HTTP requests must use `http://` absolute-form; the server verifies URI/Host consistency, rewrites the target to origin-form, and strips proxy credentials and hop-by-hop request headers
-- HTTPS, WebSocket, and arbitrary TCP protocols use `CONNECT host:port`; the tunnel terminates and releases its permit when either direction closes
-- Duplicate Host, duplicate Content-Length, Content-Length plus Transfer-Encoding, non-chunked Transfer-Encoding, and other request-smuggling ambiguities are rejected
-- Request bodies support no body, Content-Length, and strict chunked framing; responses support HEAD, 1xx, 204/304, Content-Length, chunked, and EOF framing without guessing message boundaries from connection timing
-- IPv4, IPv6, and strict ASCII domain targets, per-policy/global/pending connection limits, aggregate bidirectional bandwidth limits, lifecycle controls, exit reconnects, auditing, and metrics are supported
-
-HTTP forward proxies, SOCKS5 proxies, and regular TCP tunnels share the TCP public-port namespace and cannot use the same port. Each plain HTTP public connection handles one proxy request and closes after the origin response; use CONNECT for long-lived connections, protocol upgrades, or HTTPS. A public forward proxy is a general network exit: protect credentials, restrict source access, and retain cloud firewall, host firewall, and upstream abuse controls.
-
-## HTTP/HTTPS host routing
-
-- Routes requests by HTTP Host and TLS SNI to a selected client and its local HTTP service
-- Persists HTTP/HTTPS route policies in SQLite with create, enable, disable, delete, and online-state management
-- Configures a maximum concurrent connection count per route and records requests, failures, traffic, and pairing timeouts
-- Terminates TLS natively, selects certificates by exact SNI, and rejects missing or unknown SNI and SNI/Host mismatches
-- Supports Let's Encrypt production, staging, and custom ACME directories with backward-compatible HTTP-01 or Cloudflare DNS-01 issuance and automatic renewal
-- DNS-01 supports wildcard identifiers such as `certificate_identifier=*.example.com`; a wildcard must cover the route hostname and is rejected under HTTP-01
-- The Cloudflare token is read only from `LINKLAKE_CLOUDFLARE_API_TOKEN` or `LINKLAKE_CLOUDFLARE_API_TOKEN_FILE`; management APIs, SQLite, audit events, and status responses never accept or echo the raw token
-- Provides bilingual ACME settings, per-route TLS controls, immediate issue/renew actions, certificate status, and errors in the Web UI
-- Can return a `308` HTTP-to-HTTPS redirect after the certificate is active; the HTTP-01 challenge path always remains reachable over plain HTTP
-- The public cleartext listener auto-detects HTTP/1.1 and HTTP/2 prior knowledge and accepts a constrained HTTP/1.1 `Upgrade: h2c`. Upgrade requests must have no request body and exactly one valid `Upgrade`/`Connection`/`HTTP2-Settings` combination, and they are bounded by global concurrency, handshake, and maximum-lifetime limits. Native HTTPS prefers `h2` through ALPN and retains `http/1.1` fallback
-- Regular HTTP/2 requests are translated to pooled HTTP/1.1 backend requests for compatibility with existing websites. Native `Content-Type: application/grpc` requests use a persistent HTTP/2 backend pool
-- gRPC supports long-lived and bidirectional streams, trailers, cancellation, connection reuse, GOAWAY draining, and subsequent connection recovery. Route concurrency limits apply per HTTP/2 stream
-- Each route selects `grpc_backend_transport = "h2c"` (default) or `"tls"`. TLS requires a DNS-form `grpc_backend_server_name` and enforces SNI, certificate validation, and ALPN `h2`. It uses system roots when `grpc_backend_trust_profile` is absent, or loads a bounded CA set from `LINKLAKE_GRPC_TRUST_PROFILE_DIR/<profile>.pem`; see the [HTTP/2 and gRPC guide](docs/http2-grpc.en.md)
-- WebSocket/WSS continues to use HTTP/1.1 Upgrade. Cloudflare DNS-01 and wildcard certificates are supported, and both HTTP-01 and DNS-01 retain the existing route and certificate lifecycle
-
-Before using a route, point its DNS record to the LinkLake server. HTTP-01 requires public port 80 to reach `LINKLAKE_HTTP_BIND` with the original Host, while public port 443 must deliver the TLS stream unchanged to `LINKLAKE_HTTPS_BIND` so LinkLake can select the certificate by SNI and terminate TLS.
-
-DNS-01 does not require public port 80. Scope the Cloudflare token to the target zone with read and DNS-edit access and preferably inject it through a `0600` secret file. The server exposes only `cloudflare_token_configured`; never put the token in an ACME API request, command-line argument, repository, or database.
-
-If an upstream Nginx instance already terminates business TLS on port 443, LinkLake-managed certificates are not used. Let LinkLake bind port 443 directly, or use Nginx `stream` SNI routing for TCP pass-through; the management UI can remain on a separate management TLS entry point. Port 80 may use a regular reverse proxy, but it must preserve Host and must not intercept `/.well-known/acme-challenge/`.
-
-## Byte-preserving TLS SNI pass-through
-
-TLS SNI pass-through is for HTTPS, SMTPS, IMAPS, POP3S, and other TLS services where the client-side target owns the certificate and terminates TLS. The server reads only a bounded, timed ClientHello to normalize SNI. It does not decrypt or modify TLS and forwards the already-read original ClientHello plus every following byte unchanged.
-
-- Enable a separate listener with `LINKLAKE_TLS_PASSTHROUGH_BIND`, for example `0.0.0.0:443`
-- Routes match exact SNI; missing, unknown, malformed, or timed-out ClientHello messages are rejected and counted
-- Server-managed and local `[[tls_routes]]` entries support lifecycle controls, per-route/global/pending limits, aggregate bandwidth limits, maximum connection lifetime, auditing, and metrics
-- `LINKLAKE_TLS_PASSTHROUGH_BIND` cannot share the same IP:port with native HTTPS `LINKLAKE_HTTPS_BIND`. A public 443 endpoint must choose LinkLake TLS termination or byte-preserving pass-through, unless an upstream layer-4 proxy splits SNI to different backends
-- Pass-through routes never use LinkLake ACME certificates; certificate policy, TLS versions, ALPN, and the application protocol belong to the local target
-
-```toml
-[[tls_routes]]
-name = "mail-tls"
-hostname = "mail.example.com"
-target = "127.0.0.1:465"
-```
-
-## Run locally
+Start the Server:
 
 ```powershell
-$env:LINKLAKE_ENROLLMENT_TOKEN = "choose-a-long-random-token"
+$env:LINKLAKE_BIND = "127.0.0.1:32100"
+$env:LINKLAKE_CONTROL_BIND = "127.0.0.1:32101"
+$env:LINKLAKE_DATA_DIR = Join-Path $PWD "data"
 $env:LINKLAKE_ADMIN_USERNAME = "admin"
-$env:LINKLAKE_ADMIN_PASSWORD = "choose-a-password-with-at-least-12-characters"
-$env:LINKLAKE_DATA_DIR = "C:\LinkLake\data"
-$env:LINKLAKE_HTTP_BIND = "127.0.0.1:32102"
-$env:LINKLAKE_HTTPS_BIND = "127.0.0.1:32103"
-$env:LINKLAKE_TLS_PASSTHROUGH_BIND = "127.0.0.1:32105"
-cargo run -p linklake-server
+$env:LINKLAKE_ADMIN_PASSWORD = Read-Host "Initial administrator password (12+ characters)" -MaskInput
+$env:LINKLAKE_ENROLLMENT_TOKEN = Read-Host "Set a separate long random enrollment token" -MaskInput
+cargo run --locked -p linklake-server
 ```
 
-Open `http://127.0.0.1:32100`. The administrator password is only used during initial setup; SQLite stores its Argon2 hash.
+Open `http://127.0.0.1:32100`, sign in and complete the initial password change when prompted. The administrator password environment variable initializes a new account; it does not reset an existing account.
 
-For loopback development only, `LINKLAKE_ALLOW_INSECURE_DEFAULT_ADMIN=1` creates `admin / 123456` and forces an immediate password change. Public binds reject this option and require TLS for both management and control listeners.
-
-## Enroll and run a client
+In another terminal, enroll the Client using the same enrollment token:
 
 ```powershell
-cargo run -p linklake-client -- enroll `
+$enrollmentToken = Read-Host "Server enrollment token" -MaskInput
+cargo run --locked -p linklake-client -- enroll `
   --server http://127.0.0.1:32100 `
-  --token $env:LINKLAKE_ENROLLMENT_TOKEN `
-  --name dev-machine
+  --token $enrollmentToken `
+  --name local-demo `
+  --identity-file ./client-state/agent-identity.json
 ```
 
-The client token is shown once. For a TCP tunnel, create an exactly matching policy in the Web UI, then run:
-
-```powershell
-cargo run -p linklake-client -- agent `
-  --control 127.0.0.1:32101 `
-  --client-id <client-id> `
-  --token <client-token> `
-  --public-port 32001 `
-  --target 127.0.0.1:8080 `
-  --name development-tcp
-```
-
-Production clients should use the server-managed mode shown in [examples/linklake-client.toml](examples/linklake-client.toml). Use `[client]` for one cloud, or multiple `[[servers]]` entries from [examples/linklake-client-multi-server.toml](examples/linklake-client-multi-server.toml). Each identity keeps an independent control endpoint, CA, client ID/token, and optional P2P settings. Every server independently delivers SHA-256-revisioned TCP/UDP/port-group/HTTP/TLS-SNI, secret-provider, SOCKS5-exit, and HTTP-forward-proxy configuration:
-
-```powershell
-cargo run -p linklake-client -- run --config .\linklake-client.toml
-```
-
-Three `config_mode` values are supported:
-
-- `server_managed`: the Web UI is authoritative. The client validates and writes `managed.toml`, keeps the previous version in `managed.toml.backup`, and dynamically starts, stops, or replaces only changed agents.
-- `report_only`: local `[[tcp_tunnels]]`, `[[udp_tunnels]]`, `[[port_groups]]`, `[[http_routes]]`, `[[tls_routes]]`, `[[secret_tunnels]]`, `[[socks5_proxies]]`, and `[[http_proxies]]` continue to run; the client only reports whether they match the server policy.
-- `local`: local entries run and cannot be overwritten, while conflicts are still reported to the Web UI.
-
-The server never delivers or modifies the client token, CA, control endpoint, P2P listener/candidate, log path, service settings, or `[[secret_visitors]]` access keys. A temporary file is validated before replacement and the last valid configuration is retained as a backup. If delivery fails, the configuration is damaged, or the server is offline, the client continues using the last valid configuration. Client selectors in the Web UI show the mode, sync status, and apply error.
-
-The Linux systemd service stores managed state in `/var/lib/linklake-client/managed.toml` by default. Windows stores it beside the bootstrap configuration. Override the location with `managed_config_path` or `LINKLAKE_STATE_DIR`.
-
-In multi-cloud mode, identities without an explicit `managed_config_path` use separate `managed.<server-name>.toml` files. A failed cloud entry does not stop the others. The same local-mode or report-only policy set is replicated to every entry. In server-managed mode, create policies on both servers that point to the same local target to publish one game or other local service through cloud A and cloud B. Multi-cloud secret visitors must select their entry with `server = "cloud-a"` in `[[secret_visitors]]`.
-
-Remote control connections also require `control_ca_cert` and `control_server_name`. Each cloud independently defines its public port policy, so cloud A and cloud B may use different public ports; TCP and UDP may still use the same numeric port.
-
-Official binary and automatic-update targets are limited to `windows-x86_64` and `linux-x86_64`. macOS remains source- and CI-compatible, but has no GitHub Release asset, Ed25519 updater-manifest entry, or automatic-update channel. Windows/Linux clients check GitHub releases with semantic-version ordering. Prerelease builds follow prereleases by default, while stable builds follow stable releases unless a channel is selected explicitly:
-
-```powershell
-linklake-client check-update --channel auto
-linklake-client check-update --channel stable
-linklake-client check-update --channel prerelease
-```
-
-The JSON result contains the current version, resolved channel, latest version, update availability, and release URL. The network request has a 15-second timeout.
-
-### Build identity, secure automatic update, and rollback
-
-The server and client share a side-effect-free build identity format. `--version` does not read configuration, initialize logging, bind sockets, or require administrator state:
-
-```powershell
-linklake-server --version
-linklake-client --version
-linklake-server --version-json
-```
-
-The result contains the product, semantic version, target platform, and the optional commit injected through `LINKLAKE_GIT_COMMIT` for release builds.
-
-The client can continue from an update check to trusted download, atomic installation, and rollback:
-
-```powershell
-linklake-client update download
-linklake-client update apply --yes
-linklake-client update status
-linklake-client update rollback --yes
-```
-
-The server exposes the same contract:
-
-```powershell
-linklake-server check-update
-linklake-server update download
-linklake-server update apply --yes --data-dir <server-data-directory>
-linklake-server update status
-linklake-server update rollback --yes --data-dir <server-data-directory>
-linklake-server update recover --yes --data-dir <server-data-directory>
-```
-
-- `download` downloads and verifies an update without changing the installed program.
-- `apply` downloads the latest compatible release, creates a backup, and starts a detached helper to replace the client. Replacing a system installation normally requires administrator/root privileges.
-- `status` reports the last `scheduled/installing/succeeded/rolled_back/failed` state.
-- `rollback` selects the newest valid local backup that differs from the current installation. Production signature policy forbids network downgrades; `--allow-downgrade` is effective only with the explicit `--development-signature` test path.
-- Automatic targets must support the unified `--version` contract. Packages predating 0.8.0-rc.1 are not installed automatically, while a verified legacy binary may still be restored from a local backup.
-- Client and Manager state defaults to the current user's local state directory. Server state defaults to `%ProgramData%\LinkLake\updates\server` on Windows and `/var/lib/linklake-updater/server` on Linux; every product accepts an explicit `--state-dir`.
-
-This automatic-update verification chain applies only to official Windows/Linux assets. It covers HTTPS and repository-path restrictions, GitHub's asset SHA-256, the independent `.sha256` asset, an Ed25519-signed release manifest, download limits, safe ZIP/TAR entries, `release.json` product/version/platform, the staged binary digest, a hashed helper plan, the pre-install target digest, installed `--version`, and systemd/Windows service recovery. Client updates replace only the selected executable. Before a server replacement, LinkLake binds an old-binary SQLite snapshot to the operation, rehearses the candidate migration in isolation, and on a failed candidate restores the authenticated database snapshot before restoring the old binary. Configuration, certificates, managed state, and logs remain outside the replacement set.
-
-The independent trust root is `security/release-keys.json`. Every tagged Release, whether stable or a SemVer prerelease, requires an Ed25519 private key supplied by CI secrets and matching a production public key in the repository; otherwise the workflow fails closed. The repository contains only public keys, formats, and an explicitly labeled RFC 8032 test fixture. Development testing requires `--development-signature`; production policy never accepts a development key. Rotation registers old and new public keys concurrently with semantic-version validity ranges. See `docs/update-security.md`.
-
-Manager never replaces its own files from Flutter. `linklake-client manager-update download/apply/status/rollback` is the stable JSON contract; `apply` and `rollback` require `--manager-pid <pid>`. After the command returns schema v2 with `requires_manager_exit=true`, Manager exits and a detached helper waits for that PID, verifies complete staged/installed directory-tree digests, performs a same-volume directory switch, and rolls back failures. The contract schema is `docs/manager-update-json-schema.json`, and the Flutter adapter is `apps/linklake_manager/lib/update_protocol.dart`.
-
-### Server-coordinated client remote updates
-
-The client remote-update worker is disabled by default. It must be enabled explicitly for the client identity, and a service manager or external supervisor must interpret exit code `75` as a safe restart request:
+Save the returned `client_id`, one-time `client_token` and machine identity file. Create `linklake-client.toml`:
 
 ```toml
-[client.remote_update]
-enabled = true
-api_base_url = "https://link.example.com"
-poll_interval_seconds = 30
-lease_seconds = 60
-restart_supervisor_enabled = true
+config_version = 2
+
+[client]
+control = "127.0.0.1:32101"
+client_id = "replace-with-the-enrolled-UUID"
+client_token = "replace-with-the-enrolled-client-token"
+config_mode = "server_managed"
+managed_config_path = "managed.toml"
 ```
-
-- `api_base_url` must be an HTTPS origin without credentials, path, query, or fragment. The worker refuses redirects and uses that client's own Bearer token to claim, renew, and report tasks.
-- The server can request only six closed actions: `check`, `download`, `apply`, `status`, `recover`, and `rollback`. It cannot supply commands, scripts, a repository, a download URL, a signature policy, or a downgrade switch. The client fixes the official repository, Stable channel, Production Ed25519 verification, and no-network-downgrade policy locally.
-- Task creation accepts only an interactive administrator Cookie session; Bearer/API tokens are rejected even with administrator scope. Creation and cancellation both require same-origin/CSRF validation and the exact confirmation phrase: `CHECK`, `DOWNLOAD`, `UPDATE`, `STATUS`, `RECOVER`, or `ROLLBACK`; cancellation uses `CANCEL`. Task creation additionally requires an idempotency key.
-- A target has at most one active task. Leases are 15–300 seconds (60 seconds by default), all cloud identities in one client process share a single-install lock, and the updater adds a cross-process lock. After lease loss, `check`, `download`, and `status` may be requeued safely; a mutating installation action that already started fails closed instead of being guessed or replayed.
-- `apply` and `rollback` use two-phase restart continuation. Before replacement, the client persists a receipt binding the task, worker, lease, operation ID, versions, and management origin. After restart it must verify and report the local result within a fixed 30-minute window. The server persists the task, events, result, and recovery state for audit.
-
-The current boundary is one LinkLake server coordinating its registered clients. It is not a complete PostgreSQL application-state HA implementation and does not promise automatic consensus between multiple servers updating the same client.
-
-## Management and metrics
-
-- Compatibility health endpoint: `GET /api/v1/health`
-- Public probes: `GET /livez|readyz|startupz`, also available as `GET /api/v1/health/live|ready|startup`
-- Lifecycle status: `GET /api/v1/lifecycle`, including phase, new-work admission, active TCP, pending pairings, active UDP, pending P2P sessions, drain deadline, and drained state
-- Administrator drain and resume: `POST /api/v1/lifecycle/drain` with optional JSON `{"timeout_seconds":30}`, and `POST /api/v1/lifecycle/resume`
-- Authenticated metrics endpoint: `GET /api/v1/metrics`
-- Metrics history: `GET /api/v1/metrics/history?range=1h|12h|1d|7d|30d`; 5-second samples are retained for 12 hours and minute archives for up to 30 days
-- User management: `GET/POST /api/v1/users` and `PUT/DELETE /api/v1/users/:username`
-- Password reset and session revocation: `POST /api/v1/users/:username/reset-password|revoke-sessions`
-- Active sessions: `GET /api/v1/sessions` and `DELETE /api/v1/sessions/:session_id`
-- Public port policy: `GET /api/v1/public-port-policy`
-- TCP policies: `GET/POST /api/v1/tcp-tunnels`
-- UDP policies: `GET/POST /api/v1/udp-tunnels`
-- Enable or disable a UDP policy: `POST /api/v1/udp-tunnels/:id/enabled`
-- Delete a UDP policy: `DELETE /api/v1/udp-tunnels/:id`
-- Port groups: `GET/POST /api/v1/port-groups`
-- Enable or disable a port group: `POST /api/v1/port-groups/:id/enabled`
-- Delete a port group: `DELETE /api/v1/port-groups/:id`
-- HTTP/HTTPS routes: `GET/POST /api/v1/http-routes`
-- TLS SNI pass-through routes: `GET/POST /api/v1/sni-routes`
-- Enable or disable a TLS SNI route: `POST /api/v1/sni-routes/:id/enabled`
-- Delete a TLS SNI route: `DELETE /api/v1/sni-routes/:id`
-- Secret tunnels: `GET/POST /api/v1/secret-tunnels`
-- Enable or disable a secret policy: `POST /api/v1/secret-tunnels/:id/enabled`
-- Delete a secret policy: `DELETE /api/v1/secret-tunnels/:id`
-- SOCKS5 proxies: `GET/POST /api/v1/socks5-proxies`
-- Enable or disable a SOCKS5 policy: `POST /api/v1/socks5-proxies/:id/enabled`
-- Delete a SOCKS5 policy: `DELETE /api/v1/socks5-proxies/:id`
-- HTTP forward proxies: `GET/POST /api/v1/http-proxies`
-- Enable or disable an HTTP proxy: `POST /api/v1/http-proxies/:id/enabled`
-- Delete an HTTP proxy: `DELETE /api/v1/http-proxies/:id`
-- Enable or disable a route: `POST /api/v1/http-routes/:id/enabled`
-- Route TLS settings: `PUT /api/v1/http-routes/:id/tls`
-- Immediate issue or renewal: `POST /api/v1/http-routes/:id/certificate/issue|renew`
-- ACME settings: `GET/PUT /api/v1/acme/config`
-- Delete a route: `DELETE /api/v1/http-routes/:id`
-- P2P node directory: `GET /api/v1/p2p/nodes`
-- The Web UI configures TCP/TLS-SNI/secret/SOCKS5/HTTP-forward-proxy aggregate bandwidth, UDP aggregate bandwidth/session limits/idle timeouts, TCP/HTTP/TLS-SNI/secret/SOCKS5/HTTP-proxy connection limits, secret visitor restrictions, proxy usernames, the ACME environment, and HTTPS per route
-- Metrics and policy views cover P2P freshness/direct/fallback paths, TLS SNI ClientHello/unknown-host/connection/traffic events, secret connections and traffic, SOCKS5 requests/authentication/connections/traffic, HTTP proxy requests/CONNECT/authentication/malformed messages/traffic, UDP sessions/packets/traffic/drops/timeouts, HTTP/HTTPS route traffic and failures, TLS handshake failures, managed/expiring/expired certificates, ACME orders, renewals, and HTTP-01 challenges
-- `LINKLAKE_MANAGEMENT_TOKEN` is an optional automation Bearer token, not a Web login credential
-- The Web UI supports administrator, operator, and auditor roles. Administrators have full access, operators manage clients and forwarding policies, and auditors are read-only. The current user and the last enabled administrator are protected.
-- Aurora, minimal ocean, jade paper, restrained neon, and high contrast are complete visual styles. Each style defines its own background, material, radius, border, shadow, and chart treatment, while system mode switches the light/dark scheme automatically.
-
-Set logs with `LINKLAKE_LOG_DIR`. The server defaults to `LINKLAKE_DATA_DIR/logs`; the client writes to the console when unset, while service installers configure a rotating log directory.
-
-## Database backup and restore
-
-Online backup:
 
 ```powershell
-linklake-server backup --data-dir C:\LinkLake\data --output D:\Backups\linklake.sqlite3
+cargo run --locked -p linklake-client -- run --config ./linklake-client.toml
 ```
 
-Stop the service before restoring:
+Confirm that `local-demo` is online in the Web UI. Create and enable a TCP policy using this client, public port `32080` and target `127.0.0.1:8080`. The client receives the managed configuration; connect to port `32080` on the Server to reach the service. Targets are reached from the Client, so `127.0.0.1` here refers to the Client's machine.
 
-```powershell
-linklake-server restore --data-dir C:\LinkLake\data --input D:\Backups\linklake.sqlite3
-```
+This example restricts management and control listeners to loopback; policies create separate service listeners. Before connecting machines across a network, configure trusted management/control TLS, bind addresses and firewalls using the [deployment guide](docs/deployment.md). The default allocatable service port range is `32000–32999`. See the [single-server](examples/linklake-client.toml) and [multi-server](examples/linklake-client-multi-server.toml) examples for more configuration.
 
-Restore first acquires the exclusive `linklake.sqlite3.lock` and validates SQLite integrity. It fails immediately while the service is still running and preserves the old database as `linklake.sqlite3.pre-restore-<timestamp>`.
+## Platforms and installation
 
-Encrypted `backup-full` / `restore-full` protects LinkLake-managed state: the online SQLite snapshot, `acme/`, and `certificates/`. Logs are deliberately excluded:
+The release workflow covers these targets. Package names, checksums and signatures depend on the selected Release.
 
-```powershell
-linklake-server backup-full --data-dir C:\LinkLake\data --output D:\Backups\linklake-full.llb --password-file D:\Secrets\linklake-backup.pass
+| Platform | Release assets and deployment |
+| --- | --- |
+| Windows x86_64 | Server/Client ZIP and Windows service scripts; separate Manager ZIP |
+| Linux x86_64 | Server/Client tar.gz, DEB/RPM and systemd; separate Manager tar.gz |
+| Containers and Kubernetes | Server OCI image for `linux/amd64`; [Docker Compose](deploy/docker-compose.yml) and [Helm chart](deploy/helm/linklake) |
+| macOS | Source builds and CI compatibility; no official release assets or automatic-update channel |
 
-# Stop the LinkLakeServer service before restore.
-linklake-server restore-full --data-dir C:\LinkLake\data --input D:\Backups\linklake-full.llb --password-file D:\Secrets\linklake-backup.pass
-```
+## SQLite and PostgreSQL
 
-Passwords must contain at least 16 bytes and may be supplied only through `--password-stdin` or `--password-file`; they never belong in arguments, logs, or errors. `--password-stdin` refuses an interactive terminal and requires a pipe or redirection. The format uses fixed bounded Argon2id parameters and 64 KiB XChaCha20-Poly1305 chunks. The header, sequence, lengths, and explicit terminator are authenticated, so wrong passwords, tampering, truncation, unknown versions, and trailing bytes fail closed. Restore does not touch current state until decryption, TAR path/link/count/size validation, the SHA-256 manifest, SQLite `integrity_check`, schema compatibility, and the migration ledger all pass. Supported older databases are migrated inside staging; backups from a newer LinkLake build or newer database schema fail closed. Previous database, ACME, and certificate state is retained together under `.pre-restore-<timestamp>-<random>` and automatically rolled back if replacement fails.
+| Mode | State and deployment | Maintenance |
+| --- | --- | --- |
+| Standalone SQLite | One Server process exclusively owns its data directory; suitable for an independent entry point | Back up the complete data directory and configuration; use SQLite-specific inspection, backup, recovery and update procedures |
+| PostgreSQL HA | Replicas share the business database; each still needs an independent persistent directory for instance identity, unacknowledged traffic accounting and staging | PostgreSQL backup/PITR plus separate instance state, material key and external credentials; plan upgrades around cluster compatibility |
 
-The `--data-dir` must already have been created securely by the installer or an administrator. It must not be a symbolic link, reparse point, or arbitrary directory created by the backup command. On Linux, make it service-owned with mode `0700`; on Windows, grant only SYSTEM, Administrators, LocalService, and the directory owner. Unix restore separately preserves the existing database-file, `acme/`, and `certificates/` uid/gid and applies each owner recursively to its restored tree; only a target that did not exist falls back to the data-directory owner. Backup and restore reject a missing or unsafe data directory rather than guessing its trust boundary.
+PostgreSQL leases and fencing coordinate leadership. The deployment still provides database availability, public ingress routing and load balancing. Shared database failures do not fall back to local SQLite, and existing TCP/QUIC sessions are not migrated to another replica. Multiple independent servers connected through client `[[servers]]`/Fleet are a separate deployment model from replicas sharing one PostgreSQL database.
 
-Every plaintext staging artifact remains inside the data-directory security boundary. Activity locks keep cleanup away from a live backup, while stale staging is removed on the next server startup or backup. A durable restore journal makes process or power failure deterministic: before its commit marker, startup idempotently restores the old database/ACME/certificate set; after the marker, startup validates and finalizes the complete new set instead of accepting a mixed generation.
+SQLite → PostgreSQL uses an [explicit offline migration](docs/storage-migration.md) with the source process and all target replicas stopped. After the target accepts new writes, switching back to the old SQLite database is not a lossless rollback. PostgreSQL upgrades do not use the standalone SQLite snapshot update protocol; reverting an image does not revert the database. Follow [cluster upgrades and recovery](docs/postgres-upgrades.md).
 
-For an online backup, SQLite is a point-in-time snapshot and ACME/certificate files are collected afterward. ACME credentials use atomic file commits. When a committed certificate generation exists, backup retains only generations with a valid commit marker and matching certificate/private key, and excludes the top-level compatibility PEM files that may be between updates. A legacy installation without generations must first pass certificate/private-key matching. The archive is still not a globally simultaneous snapshot across all three components, so stop the service before backup when strict cross-component consistency is required.
+PostgreSQL certificate material requires the same independent **32-byte raw key file** on every replica. Back up this key separately; replacing a deployment Secret does not re-encrypt existing material. [Key rotation](docs/certificate-key-maintenance.md) requires all replicas stopped before running the maintenance command.
 
-The archive does not contain logs, service environment variables or the enrollment token, management/control TLS private keys stored outside the data directory, systemd/Windows service/launchd definitions, firewall, reverse-proxy, DNS, container-orchestration configuration, or production signing keys. It cannot rebuild an entire host by itself; protect those external settings and secrets with a separate infrastructure recovery process.
+## Secure updates
 
-Backup inputs and outputs must be outside `LINKLAKE_DATA_DIR`. Protect both password files and `.llb` archives with backup-operator-only ACLs, and store the recovery secret separately from the archive.
+Before installation, verify SHA-256, GitHub build attestations and the production Ed25519 update manifest. Linux packages also have OpenPGP signatures; verify OCI signatures and provenance against the image digest. Official Windows packages intentionally omit Authenticode signing under the current personal open-source release policy.
 
-## Production installation
+Client, standalone Server and Manager have their own secure update procedures; the Server can also coordinate remote client updates. Development builds and signatures are not production update trust. Recovery depends on database state and whether the candidate has started or accepted writes; retaining an old binary alone does not establish a safe rollback.
 
-Windows release package:
+See [update security](docs/update-security.md), [release supply chain](docs/release-supply-chain.md) and [PostgreSQL cluster upgrades](docs/postgres-upgrades.md) for procedures and boundaries.
 
-- `windows/install-server.ps1` installs or transactionally upgrades `LinkLakeServer` as `LocalService`; TLS certificates and keys are copied into a read-only managed directory, and startup or validation failure restores the previous binary, service configuration, and runtime state
-- `windows/install-client.ps1` installs or transactionally upgrades `LinkLakeClient` as `LocalService`; the existing configuration is preserved unless `-ReplaceConfig` is explicit
-- `windows/uninstall.ps1` transactionally removes the selected services and program binaries while preserving configuration, state, logs, and server data by default; permanent cleanup additionally requires `-PurgeData -ConfirmPurge LINKLAKE-PURGE`
+## Documentation
 
-Windows installers accept only local absolute destination paths and reject reparse points, overlapping privilege boundaries, malformed service environments, and package contents that do not match the internal SHA-256 inventory. Only one install, upgrade, or uninstall transaction can run at a time. For a package obtained over the network, first obtain its trusted SHA-256 from the signed release manifest, then run:
+| Topic | Documents |
+| --- | --- |
+| Installation and daily use | [User guide (Chinese)](docs/user-guide.zh-CN.md), [deployment guide](docs/deployment.md), [configuration example](examples/linklake-client.toml) |
+| HTTP/2 and gRPC | [Routing and backend TLS](docs/http2-grpc.en.md) |
+| SOCKS5 | [Supported behavior and security boundaries](docs/socks5-supported-boundaries.en.md) |
+| Multiple entry points and Fleet | [Fleet Bundle v2](docs/adr/0003-fleet-bundle-v2.md), [health and DNS failover design](docs/adr/0004-fleet-health-dns-failover.md) |
+| Observability | [Metrics, alerts and SLOs](docs/slo-observability.en.md) |
+| Data and key maintenance | [Storage migration](docs/storage-migration.md), [cluster upgrades and recovery](docs/postgres-upgrades.md), [certificate material keys](docs/certificate-key-maintenance.md) |
+| Updates and supply chain | [Update security](docs/update-security.md), [release verification](docs/release-supply-chain.md) |
+| Contributing | [Roadmap](ROADMAP.en.md), [contributing guide](CONTRIBUTING.md), [security reports](SECURITY.md) |
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-windows-package.ps1 -ExpectedSha256 <64-hex-SHA-256-from-signed-manifest>
-```
+## License and brand
 
-Linux release package:
+Copyright 2026 ASL-Vanity and LinkLake contributors. Source code is licensed under [Apache License 2.0](LICENSE). The LinkLake name, Twin Shores logo and visual identity follow the [brand policy](TRADEMARKS.md).
 
-```sh
-sudo ./systemd/install-linux.sh server
-sudo ./systemd/install-linux.sh client
-```
-
-The installer enables but does not start services with placeholder configuration. Edit `/etc/linklake/server.env` or `/etc/linklake/client.toml`, then run `systemctl start`.
-
-Example server configuration for enabling the UDP relay:
-
-```text
-LINKLAKE_UDP_RELAY_BIND=0.0.0.0:32104
-LINKLAKE_UDP_RELAY_ENDPOINT=udp.example.com:32104
-LINKLAKE_UDP_RELAY_SERVER_NAME=udp.example.com
-LINKLAKE_UDP_PUBLIC_BIND_MODE=auto
-```
-
-Relay QUIC TLS reuses `LINKLAKE_CONTROL_CERT_PATH` and `LINKLAKE_CONTROL_KEY_PATH`. Open the relay UDP port and the UDP ports actually assigned to policies in both the cloud security group and the host firewall; do not expose the complete allowed range unless it is required.
-
-`LINKLAKE_UDP_PUBLIC_BIND_MODE` accepts `auto` (default), `ipv4_only`, or `dual_stack_required`. Business UDP and relay address families are independent: binding the relay to IPv6 does not alter policy-port behavior, and vice versa. Runtime metrics count IPv4/IPv6 bind successes, automatic fallbacks, and bind failures.
-
-## Build and verify
-
-The repository pins Rust `1.91.0` through `rust-toolchain.toml` and dependencies through `Cargo.lock`. Install the toolchain with rustup; CI uses the same version on Windows, Linux, and macOS.
-
-```powershell
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\tcp-e2e.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\udp-e2e.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\http-e2e.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\windows-installer-contract.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\package-windows.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-windows-package.ps1
-$env:FLUTTER_BIN = 'F:\Tools\flutter\bin\flutter.bat'
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\package-manager-windows.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-manager-windows.ps1
-```
-
-On Linux:
-
-```sh
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
-pwsh -NoProfile -File ./tests/https-e2e.ps1
-bash scripts/package-linux.sh
-bash scripts/verify-linux-package.sh
-sh scripts/package-manager-linux.sh
-sh scripts/verify-manager-linux.sh
-```
-
-The TCP E2E suite covers real binary echo traffic, bandwidth limits, connection limits, reconnects, policy lifecycle, pairing timeout, and metrics. The UDP E2E suite covers IPv4 and IPv6 echo on the same public service port, real datagram echo from `0` through `65507` bytes, multiple sessions, rate-limit drops, idle expiration, fragmentation/reassembly, policy lifecycle, reconnects, same-numbered TCP/UDP ports, every mapping in contiguous TCP and UDP port groups, and metrics. Production acceptance additionally covers an independent public test host, a Linux server, and a Windows client. TLS SNI E2E uses a real self-signed target and .NET `SslStream` to verify original ClientHello forwarding, a real TLS handshake/echo, unknown-SNI rejection, lifecycle recovery, deletion, and metrics. Secret E2E covers a managed provider, single-use access-key isolation, visitor authorization, wrong keys, connection limits, lifecycle recovery, deletion, statistics, a real direct path between two client processes, explicit relay fallback for an unreachable candidate, and the absence of a public business listener. SOCKS5 E2E covers a managed exit, single-use credential isolation, mandatory and failed authentication, domain/IPv4 CONNECT, source-port-constrained two-reply BIND, real UDP ASSOCIATE echo over IPv4 and IPv6 public transport, bounded UDP FRAG reassembly and missing-initial-fragment rejection, TCP control-connection lifecycle, connection limits, lifecycle recovery, and metrics. HTTP E2E covers both Host routing and forward-proxy single-use credentials, mandatory/failed authentication, absolute-form rewriting, credential isolation, GET/POST bodies, smuggling rejection, a real CONNECT tunnel, connection limits, client reconnects, policy lifecycle, and metrics. Linux CI runs HTTPS/ACME E2E against local Pebble plus Cloudflare/DoH fixtures, covering HTTP-01, DNS-01, wildcard SNI, TXT lifecycle, issuance and renewal, HTTPS forwarding, redirects, persistence, failure recovery, and certificate metrics without contacting a public CA or the real Cloudflare API.
-
-macOS developers can use `scripts/package-macos.sh`, `scripts/verify-macos-package.sh`, `scripts/package-manager-macos.sh`, and `scripts/verify-manager-macos.sh` to build and verify the core services and Flutter manager from source. These are source/CI compatibility checks only and do not become GitHub Release, attestation, Ed25519 updater-manifest, or automatic-update assets.
-
-Packaging scripts honor `SOURCE_DATE_EPOCH`. With the same timestamp, source, toolchain, target platform, and locked dependencies, archive ordering, timestamps, and release metadata remain stable. Windows produces ZIP archives plus SHA-256 and Linux produces tar.gz archives plus SHA-256; both publish LinkLake core and Manager packages. macOS archives are local source-compatibility output only and are not part of the official release set.
-
-`.github/workflows/ci.yml` runs formatting, Clippy, unit tests, script syntax checks, a real browser smoke test with locked Playwright and Chromium, Windows TCP/UDP/HTTP/TLS-SNI/secret-P2P/SOCKS5 E2E, Linux Pebble HTTP-01/Cloudflare DNS-01 E2E, and Flutter Manager analysis, tests, and build-compatibility checks on Windows, Linux, and macOS. The WebUI job generates an ephemeral localhost certificate at runtime, preserves screenshots and server logs on failure, and does not depend on a developer-specific Node path, browser module cache, or committed test private key. `.github/workflows/soak.yml` runs the long-running weak-network, crash, restart, concurrency, and throughput matrix weekly or on demand. Under the personal open-source policy for `v1.0.0`, official Windows assets are intentionally unsigned and may show an Unknown Publisher or SmartScreen warning; obtain them only from the official Release and verify SHA-256, GitHub attestations, and the production Ed25519 updater manifest. Every SemVer tag, stable or prerelease, still requires Linux OpenPGP, GHCR OCI SBOM/provenance, Cosign digest signing, GitHub file attestations, and updater signing; every SemVer prerelease is published as a GitHub prerelease. Windows PFX credentials are never injected into the formal release job; the retained PFX backend is for a future approved explicit workflow and cloud signing is unimplemented and fail-closed. macOS is not an official release asset, automatic-update target, or signing gate. Every GitHub Action is pinned to a full commit SHA, privileged release jobs restore but never save caches, and checkout credentials are not persisted. See [`docs/release-supply-chain.md`](docs/release-supply-chain.md) for the required Secret inventory.
-
-## Roadmap
-
-`v1.0.0` completed the core protocols and the first cross-platform management release. The project will not publish a separate `v1.0.1`; management-surface completion, secure remote updates, protocol completion, application health and Fleet, PostgreSQL high availability, platform installers, and dependency modernization are consolidated into `v1.1.0`. Complete testing, staging, and release begin only after the feature set is frozen. See [`ROADMAP.en.md`](ROADMAP.en.md) for scope, acceptance criteria, and continuing support boundaries.
-
-## License
-
-LinkLake is licensed under the Apache License 2.0. Copyright belongs to ASL-Vanity and LinkLake contributors; see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE) for the complete terms and attribution notice.
-
-- Third-party components and licenses: [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) and [`THIRD_PARTY_LICENSES.html`](THIRD_PARTY_LICENSES.html)
-- LinkLake name, Twin Shores logo, and brand assets: [`TRADEMARKS.md`](TRADEMARKS.md)
-- Contribution, provenance, and DCO sign-off requirements: [`CONTRIBUTING.md`](CONTRIBUTING.md)
-
-The Apache License 2.0 does not grant rights to LinkLake branding or trademarks. Modified distributions, forks, and hosted services may accurately describe themselves as based on LinkLake, but must not imply official maintenance or endorsement.
+Code, tests, documentation and release engineering were developed with OpenAI GPT-5.6 assistance under the project owner's requirements, review, infrastructure authorization and acceptance. See [NOTICE](NOTICE) for attribution and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) / [THIRD_PARTY_LICENSES.html](THIRD_PARTY_LICENSES.html) for third-party components.

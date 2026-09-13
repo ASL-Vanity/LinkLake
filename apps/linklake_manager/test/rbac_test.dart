@@ -94,6 +94,7 @@ void main() {
       expect(find.byKey(const Key('current-user-identity')), findsOneWidget);
       expect(find.text('Test User'), findsOneWidget);
       expect(find.byKey(const Key('nav-users')), findsOneWidget);
+      expect(find.byKey(const Key('nav-acme')), findsOneWidget);
       expect(
         find.byKey(const Key('nav-fleet')),
         isAdmin ? findsOneWidget : findsNothing,
@@ -133,6 +134,14 @@ void main() {
         find.byKey(const Key('create-tcp')),
         role == 'auditor' ? findsNothing : findsOneWidget,
       );
+
+      await tester.tap(find.byKey(const Key('nav-acme')));
+      await tester.pumpAndSettle();
+      expect(find.text('ACME certificate settings'), findsOneWidget);
+      expect(api.calls, contains('/api/v1/acme/config'));
+      final save = tester.widget<FilledButton>(find.byType(FilledButton));
+      expect(save.onPressed == null, role == 'auditor');
+      expect(api.puts, isEmpty);
     });
   }
 
@@ -321,6 +330,12 @@ void main() {
           initialIdentity: const {'role': 'administrator'},
         ),
       ),
+    );
+    await tester.pumpAndSettle();
+    await tester.scrollUntilVisible(
+      find.byKey(const Key('nav-users')),
+      150,
+      scrollable: find.byType(Scrollable).first,
     );
     await tester.pumpAndSettle();
     expect(find.byKey(const Key('nav-users')), findsOneWidget);

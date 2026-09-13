@@ -1,5 +1,6 @@
 param(
     [string]$ServerExe = "",
+    [string]$CertificateGeneratorExe = "",
     [int]$ManagementPort = 39210,
     [int]$ControlPort = 39211,
     [int]$UdpRelayPort = 39212,
@@ -8,11 +9,15 @@ param(
     [string]$BrowserLabel = 'Playwright Chromium',
     [ValidatePattern('^[A-Za-z0-9._-]+$')][string]$OutputName = 'webui-smoke',
     [switch]$KeepData,
-    [switch]$KeepServer
+    [switch]$KeepServer,
+    [switch]$PrepareOnly
 )
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+if ($PrepareOnly -and -not $KeepServer) {
+    throw 'PrepareOnly requires KeepServer so the isolated fixture remains available for browser validation.'
+}
 if ([string]::IsNullOrWhiteSpace($ServerExe)) {
     $ServerExe = Join-Path $projectRoot 'target\debug\linklake-server.exe'
     if (-not (Test-Path -LiteralPath $ServerExe -PathType Leaf)) {
@@ -21,6 +26,14 @@ if ([string]::IsNullOrWhiteSpace($ServerExe)) {
     }
 }
 $ServerExe = (Resolve-Path -LiteralPath $ServerExe).Path
+if ([string]::IsNullOrWhiteSpace($CertificateGeneratorExe)) {
+    $compiledExample = Join-Path (Split-Path -Parent $ServerExe) 'examples\generate_localhost_certificate.exe'
+    if (Test-Path -LiteralPath $compiledExample -PathType Leaf) {
+        $CertificateGeneratorExe = $compiledExample
+    }
+} else {
+    $CertificateGeneratorExe = (Resolve-Path -LiteralPath $CertificateGeneratorExe).Path
+}
 $dataDir = Join-Path $projectRoot '.tmp-webui-smoke-data'
 $tlsDir = Join-Path $projectRoot '.tmp-webui-smoke-tls'
 $outputDir = Join-Path $projectRoot "target\$OutputName"
@@ -81,7 +94,11 @@ try {
     New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
     Remove-SmokeDirectory -Path $tlsDir -ExpectedName '.tmp-webui-smoke-tls'
     New-Item -ItemType Directory -Force -Path $tlsDir | Out-Null
-    & cargo run --quiet --locked -p linklake-server --example generate_localhost_certificate -- $tlsDir
+    if ([string]::IsNullOrWhiteSpace($CertificateGeneratorExe)) {
+        & cargo run --quiet --locked -p linklake-server --example generate_localhost_certificate -- $tlsDir
+    } else {
+        & $CertificateGeneratorExe $tlsDir
+    }
     if ($LASTEXITCODE -ne 0 -or
         -not (Test-Path -LiteralPath $controlCertificate -PathType Leaf) -or
         -not (Test-Path -LiteralPath $controlPrivateKey -PathType Leaf)) {
@@ -196,9 +213,23 @@ try {
         $env:LINKLAKE_SMOKE_CHROME = (Resolve-Path -LiteralPath $BrowserPath).Path
     }
     $env:LINKLAKE_SMOKE_OUTPUT = $outputDir
+    if ($PrepareOnly) {
+        [ordered]@{
+            base_url = $baseUrl
+            server_pid = $serverProcess.Id
+            server_exe = $ServerExe
+            data_dir = $dataDir
+            tls_dir = $tlsDir
+            output_dir = $outputDir
+        } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $outputDir 'prepared-fixture.json') -Encoding utf8
+        Write-Host 'Isolated WebUI fixture is ready for browser validation.'
+        return
+    }
     $node = (Get-Command node -ErrorAction Stop).Source
     & $node (Join-Path $PSScriptRoot 'webui-smoke.mjs')
     if ($LASTEXITCODE -ne 0) { throw "WebUI $BrowserLabel smoke test failed with exit code $LASTEXITCODE" }
+    & $node (Join-Path $PSScriptRoot 'webui-v11-smoke.mjs')
+    if ($LASTEXITCODE -ne 0) { throw "WebUI v1.1 $BrowserLabel management smoke test failed with exit code $LASTEXITCODE" }
 } finally {
     if (-not $KeepServer -and $serverProcess -and -not $serverProcess.HasExited) {
         $serverProcess.Kill()

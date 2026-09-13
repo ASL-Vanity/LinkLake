@@ -180,6 +180,10 @@ impl CertificateManager {
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "共享提交须携带签发材料及签发开始时的完整租约和版本"
+    )]
     pub(crate) async fn commit_shared_issued_certificate(
         &self,
         lease: &crate::job_leases::JobLease,
@@ -1268,9 +1272,10 @@ fn replace_file_atomically(temporary: &Path, destination: &Path) -> anyhow::Resu
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_certificate, validate_challenge_token, write_secret_file, AcmeChallengeType,
-        AcmeIssueConfig, CertificateManager, DynamicCertResolver, Http01ChallengeStore,
-        CERTIFICATE_COMMIT_MARKER, CERTIFICATE_GENERATIONS_DIRECTORY, MAX_PARALLEL_ORDERS,
+        committed_certificate_pairs, validate_certificate, validate_challenge_token,
+        write_secret_file, AcmeChallengeType, AcmeIssueConfig, CertificateIssueResult,
+        CertificateManager, DynamicCertResolver, Http01ChallengeStore, CERTIFICATE_COMMIT_MARKER,
+        CERTIFICATE_GENERATIONS_DIRECTORY, MAX_PARALLEL_ORDERS,
     };
     use rcgen::{generate_simple_self_signed, CertifiedKey};
     use std::{
@@ -1282,6 +1287,7 @@ mod tests {
         thread,
         time::Duration,
     };
+    use zeroize::Zeroizing;
 
     #[test]
     fn challenge_tokens_accept_only_base64url_characters() {

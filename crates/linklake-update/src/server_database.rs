@@ -137,6 +137,7 @@ pub fn inspect_server_database(
     server_executable: &Path,
     data_dir: &Path,
 ) -> Result<ServerDatabaseInspectReport> {
+    ensure_standalone_sqlite(data_dir)?;
     let executable = canonical_existing_file(server_executable, "server executable")?;
     let executable_sha256 = sha256_file(&executable)?;
     let canonical_data_dir = canonical_existing_directory(data_dir, "server data directory")?;
@@ -161,6 +162,18 @@ pub fn inspect_server_database(
     Ok(report)
 }
 
+// helper 可能未继承服务的环境；PG 启动时的持久标记必须独立检查。
+fn ensure_standalone_sqlite(data_dir: &Path) -> Result<()> {
+    let backend = std::env::var("LINKLAKE_STORAGE_BACKEND").unwrap_or_else(|_| "sqlite".to_owned());
+    anyhow::ensure!(
+        matches!(backend.trim().to_ascii_lowercase().as_str(), "" | "sqlite")
+            && std::env::var_os("LINKLAKE_POSTGRES_URL").is_none()
+            && !data_dir.join("postgres-storage.marker").try_exists()?,
+        "single-server SQLite updates cannot back up or roll back a PostgreSQL cluster; use a schema-compatible cluster upgrade with a verified PostgreSQL backup"
+    );
+    Ok(())
+}
+
 /// 使用旧二进制副本创建数据库快照，并把快照、路径和摘要写入元数据。
 ///
 /// 调用方必须先停止服务。`rollback_binary` 应当是目标二进制的已校验副本，不能
@@ -172,6 +185,7 @@ pub fn backup_server_database(
     operation_id: Uuid,
     plan_sha256: &str,
 ) -> Result<ServerDatabaseSnapshotMetadata> {
+    ensure_standalone_sqlite(&context.canonical_data_dir)?;
     validate_update_context(context)?;
     let plan_sha256 = normalize_sha256(plan_sha256, "update plan SHA-256")?;
     let rollback_binary = canonical_existing_file(rollback_binary, "rollback server binary")?;
@@ -236,6 +250,7 @@ pub fn preflight_server_database(
     scratch_dir: &Path,
     operation_directory: &Path,
 ) -> Result<ServerDatabasePreflightReport> {
+    ensure_standalone_sqlite(&context.canonical_data_dir)?;
     validate_update_context(context)?;
     validate_snapshot_metadata(snapshot, snapshot.operation_id, &snapshot.plan_sha256)?;
     anyhow::ensure!(
@@ -287,6 +302,7 @@ pub fn restore_server_database(
     rollback_binary: &Path,
     snapshot: &ServerDatabaseSnapshotMetadata,
 ) -> Result<ServerDatabaseInspectReport> {
+    ensure_standalone_sqlite(&snapshot.canonical_data_dir)?;
     validate_snapshot_metadata(snapshot, snapshot.operation_id, &snapshot.plan_sha256)?;
     let rollback_binary = canonical_existing_file(rollback_binary, "rollback server binary")?;
     anyhow::ensure!(

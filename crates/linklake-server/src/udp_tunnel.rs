@@ -396,12 +396,28 @@ pub(crate) async fn register_tunnel(
         .await;
         return;
     }
-    let runtime_policy = state
+    let registration_token = state.ha_runtime.fencing_token().ok();
+    if registration_token.is_none() || !state.accepts_public_work() {
+        reject_registration(
+            &state,
+            &mut stream,
+            "active HA leader is required for registration",
+        )
+        .await;
+        return;
+    }
+    let runtime_policy = match state
         .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
         .udp_runtime_policy(client_id, &name, public_port, &target_addr)
-        .unwrap_or(None);
+        .await
+    {
+        Ok(policy) => policy,
+        Err(error) => {
+            tracing::warn!(public_port, "Tunnel policy lookup failed: {error}");
+            reject_registration(&state, &mut stream, "tunnel policy storage is unavailable").await;
+            return;
+        }
+    };
     let Some(runtime_policy) = runtime_policy else {
         reject_registration(
             &state,
@@ -479,13 +495,15 @@ pub(crate) async fn register_tunnel(
     // ticket 等待期间策略可能已被管理员禁用或删除，启动运行时前必须再次确认。
     let policy_still_enabled = state
         .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
         .udp_runtime_policy(client_id, &name, public_port, &target_addr)
+        .await
         .ok()
         .flatten()
-        .is_some_and(|current| current.policy_id == runtime_policy.policy_id);
-    if !policy_still_enabled {
+        .is_some_and(|current| current == runtime_policy);
+    if !policy_still_enabled
+        || !state.accepts_public_work()
+        || state.ha_runtime.fencing_token().ok() != registration_token
+    {
         authenticated
             .connection
             .close(5_u8.into(), b"UDP policy was disabled");
@@ -584,6 +602,37 @@ pub(crate) async fn register_tunnel(
         return;
     }
 
+    // 网络协商不持有策略门；安装本机注册时再读取完整策略并核对同一 Leader。
+    let registration_guard = state.policy_mutation_lock.lock().await;
+    let current_policy = state
+        .tunnel_catalog
+        .udp_runtime_policy(client_id, &name, public_port, &target_addr)
+        .await;
+    let policy_matches = current_policy
+        .as_ref()
+        .ok()
+        .and_then(|policy| policy.as_ref())
+        == Some(&runtime_policy);
+    if !policy_matches
+        || !state.accepts_public_work()
+        || state.ha_runtime.fencing_token().ok() != registration_token
+    {
+        if let Err(error) = current_policy {
+            tracing::warn!(public_port, "Tunnel policy revalidation failed: {error}");
+        }
+        drop(registration_guard);
+        authenticated
+            .connection
+            .close(5_u8.into(), b"UDP policy or leadership changed");
+        port_lease.release().await;
+        reject_registration(
+            &state,
+            &mut stream,
+            "tunnel policy or HA leadership changed during registration",
+        )
+        .await;
+        return;
+    }
     let statistics = statistics_for(&state, runtime_policy.policy_id);
     let (stop_tx, stop_rx) = watch::channel(());
     let (probe_command_tx, probe_commands) = mpsc::channel(64);
@@ -592,6 +641,7 @@ pub(crate) async fn register_tunnel(
             Ok(task) => task,
             Err(error) => {
                 tracing::warn!("Could not start UDP target probes: {error}");
+                drop(registration_guard);
                 port_lease.release().await;
                 authenticated
                     .connection
@@ -631,6 +681,7 @@ pub(crate) async fn register_tunnel(
             .tunnel_reconnects_total
             .fetch_add(1, Ordering::Relaxed);
     }
+    drop(registration_guard);
     record_audit(
         &state,
         "udp_tunnel.registered",
@@ -768,7 +819,15 @@ async fn run_tunnel_loop(
         .expect("the built-in UDP reassembly configuration is valid");
     let mut limiter = policy.bandwidth_limit_bps.map(TokenBucket::new);
     let mut datagram_id = 0_u64;
-    let mut usage_pending = 0_u64;
+    let usage_meter = crate::traffic_control::usage_meter::TrafficUsageMeter::new(
+        state.traffic_usage_spool.clone(),
+        policy.policy_kind,
+        policy.policy_id,
+    );
+    if usage_meter.ensure_open().is_err() {
+        probe_recorder.abort();
+        return RuntimeStop::ControlClosed;
+    }
     let mut public_buffer = vec![0_u8; UDP_RECEIVE_BUFFER_BYTES];
     let mut sweep = interval(SESSION_SWEEP_INTERVAL);
     sweep.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -892,10 +951,7 @@ async fn run_tunnel_loop(
                             statistics.dropped_packets.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
-                        let decision = state.traffic_controls
-                            .lock()
-                            .expect("traffic control catalog lock poisoned")
-                            .authorize(policy.policy_kind, policy.policy_id, external_address.ip(), crate::unix_seconds());
+                        let decision = crate::traffic_control::usage_meter::authorize_traffic(state, policy.policy_kind, policy.policy_id, external_address.ip()).await;
                         if !matches!(decision, Ok(TrafficDecision::Allowed)) {
                             record_drop(statistics, &statistics.dropped_policy_limit);
                             tracing::debug!("UDP traffic control rejected {external_address}: {decision:?}");
@@ -980,7 +1036,7 @@ async fn run_tunnel_loop(
                     }
                     statistics.packets_from_public.fetch_add(1, Ordering::Relaxed);
                     statistics.bytes_from_public.fetch_add(length as u64, Ordering::Relaxed);
-                    usage_pending = usage_pending.saturating_add(length as u64);
+                    if let Err(error) = usage_meter.add(length as u64) { tracing::error!("UDP accounting failed: {error}"); break RuntimeStop::ControlClosed; }
                 }
                 Err(error) => {
                     statistics.transport_errors.fetch_add(1, Ordering::Relaxed);
@@ -1022,7 +1078,7 @@ async fn run_tunnel_loop(
                                     }
                                     statistics.packets_to_public.fetch_add(1, Ordering::Relaxed);
                                     statistics.bytes_to_public.fetch_add(sent as u64, Ordering::Relaxed);
-                                    usage_pending = usage_pending.saturating_add(sent as u64);
+                                    if let Err(error) = usage_meter.add(sent as u64) { tracing::error!("UDP accounting failed: {error}"); break RuntimeStop::ControlClosed; }
                                 }
                                 Ok(_) | Err(_) => {
                                     statistics.transport_errors.fetch_add(1, Ordering::Relaxed);
@@ -1040,17 +1096,6 @@ async fn run_tunnel_loop(
             },
             _ = sweep.tick() => {
                 let now = Instant::now();
-                if usage_pending != 0 {
-                    if let Err(error) = state.traffic_controls
-                        .lock()
-                        .expect("traffic control catalog lock poisoned")
-                        .record_bytes(policy.policy_kind, policy.policy_id, usage_pending, crate::unix_seconds())
-                    {
-                        tracing::warn!("Could not persist UDP traffic usage: {error}");
-                    } else {
-                        usage_pending = 0;
-                    }
-                }
                 if now >= control_deadline {
                     statistics.transport_errors.fetch_add(1, Ordering::Relaxed);
                     break RuntimeStop::ControlClosed;
@@ -1114,21 +1159,7 @@ async fn run_tunnel_loop(
         }
     };
     probe_recorder.abort();
-    if usage_pending != 0 {
-        if let Err(error) = state
-            .traffic_controls
-            .lock()
-            .expect("traffic control catalog lock poisoned")
-            .record_bytes(
-                policy.policy_kind,
-                policy.policy_id,
-                usage_pending,
-                crate::unix_seconds(),
-            )
-        {
-            tracing::warn!("Could not persist final UDP traffic usage: {error}");
-        }
-    }
+
     let session_ids = sessions_by_external
         .values()
         .map(|session| session.session_id)

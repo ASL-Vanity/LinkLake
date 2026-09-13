@@ -1746,7 +1746,7 @@ fn insert_probe_event(
     Ok(())
 }
 
-fn read_snapshot(
+pub(crate) fn read_snapshot(
     connection: &Connection,
     peer_id: Uuid,
 ) -> anyhow::Result<Option<FleetHealthSnapshot>> {
@@ -1963,7 +1963,7 @@ fn read_dns_targets(
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
-fn read_dns_failover(
+pub(crate) fn read_dns_failover(
     connection: &Connection,
     id: Uuid,
 ) -> anyhow::Result<Option<FleetDnsFailover>> {

@@ -6,7 +6,7 @@ use crate::{
     public_port_ownership::PublicPortProtocol,
     public_port_policy::{DynamicPortLease, DynamicPortProtocol},
     record_audit,
-    tcp_tunnel::{copy_bidirectional_with_limit, BandwidthLimiter},
+    tcp_tunnel::{copy_bidirectional_with_meter, BandwidthLimiter},
     tunnel_catalog::socks5_password_matches,
     udp_data_plane::AuthenticatedUdpConnection,
     AppState,
@@ -207,12 +207,28 @@ pub(crate) async fn register_proxy(
         reject(&state, &mut stream, "invalid client credentials").await;
         return;
     }
-    let runtime_policy = state
+    let registration_token = state.ha_runtime.fencing_token().ok();
+    if registration_token.is_none() || !state.accepts_public_work() {
+        reject(
+            &state,
+            &mut stream,
+            "active HA leader is required for registration",
+        )
+        .await;
+        return;
+    }
+    let runtime_policy = match state
         .tunnel_catalog
-        .lock()
-        .expect("tunnel catalog lock poisoned")
         .socks5_runtime_policy(client_id, &name, public_port)
-        .unwrap_or(None);
+        .await
+    {
+        Ok(policy) => policy,
+        Err(error) => {
+            tracing::warn!(public_port, "Tunnel policy lookup failed: {error}");
+            reject(&state, &mut stream, "tunnel policy storage is unavailable").await;
+            return;
+        }
+    };
     let Some(runtime_policy) = runtime_policy else {
         reject(
             &state,
@@ -385,6 +401,43 @@ pub(crate) async fn register_proxy(
     } else {
         None
     };
+    // 网络协商不持有策略门；安装本机注册时再读取完整策略并核对同一 Leader。
+    let registration_guard = state.policy_mutation_lock.lock().await;
+    let current_policy = state
+        .tunnel_catalog
+        .socks5_runtime_policy(client_id, &name, public_port)
+        .await;
+    let policy_matches = current_policy
+        .as_ref()
+        .ok()
+        .and_then(|policy| policy.as_ref())
+        == Some(&runtime_policy);
+    if !policy_matches
+        || !state.accepts_public_work()
+        || state.ha_runtime.fencing_token().ok() != registration_token
+    {
+        if let Err(error) = current_policy {
+            tracing::warn!(public_port, "Tunnel policy revalidation failed: {error}");
+        }
+        drop(registration_guard);
+        if let Some(runtime) = udp_runtime.as_ref() {
+            runtime
+                .2
+                .connection
+                .close(5_u8.into(), b"SOCKS5 policy changed");
+        }
+        tcp_port_lease.release().await;
+        if let Some(lease) = udp_port_lease.take() {
+            lease.release().await;
+        }
+        reject(
+            &state,
+            &mut stream,
+            "tunnel policy or HA leadership changed during registration",
+        )
+        .await;
+        return;
+    }
     let udp_enabled = udp_runtime.is_some();
     if let Some(previous) = state
         .socks5_proxies
@@ -405,6 +458,7 @@ pub(crate) async fn register_proxy(
         .metrics
         .tunnel_registrations_total
         .fetch_add(1, Ordering::Relaxed);
+    drop(registration_guard);
     record_audit(
         &state,
         "socks5_proxy.registered",
@@ -529,6 +583,14 @@ async fn run_registered_control(
     remove_registration(&state, policy_id, registration_id);
 }
 
+struct UdpControlReaderGuard(tokio::task::AbortHandle);
+
+impl Drop for UdpControlReaderGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 async fn run_udp_runtime(
     socket: DualStackUdpSocket,
     mut authenticated: AuthenticatedUdpConnection,
@@ -547,6 +609,7 @@ async fn run_udp_runtime(
             }
         }
     });
+    let _control_reader_guard = UdpControlReaderGuard(control_reader.abort_handle());
     let connection = authenticated.connection.clone();
     let mut reassembler = UdpReassembler::new(UdpReassemblyConfig::default())?;
     let mut socks_fragments = Socks5FragmentReassembler::new_with_global_budget(
@@ -555,7 +618,12 @@ async fn run_udp_runtime(
     )?;
     let mut receive_buffer = vec![0_u8; MAX_UDP_DATAGRAM_BYTES];
     let mut next_datagram_id = 1_u64;
-    let mut usage_pending = 0_u64;
+    let usage_meter = crate::traffic_control::usage_meter::TrafficUsageMeter::new(
+        context.state.traffic_usage_spool.clone(),
+        TrafficPolicyKind::Socks5,
+        context.policy_id,
+    );
+    usage_meter.ensure_open()?;
     let mut cleanup = interval(Duration::from_secs(1));
     cleanup.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
@@ -623,7 +691,7 @@ async fn run_udp_runtime(
                     }
                 }
                 statistics.udp_bytes_from_public.fetch_add(received as u64, Ordering::Relaxed);
-                usage_pending = usage_pending.saturating_add(received as u64);
+                usage_meter.add(received as u64)?;
                 let reassembled = match socks_fragments.push(
                     session_id,
                     socks_fragment,
@@ -744,28 +812,11 @@ async fn run_udp_runtime(
                 if socket.send_to(&payload, endpoint).await? == payload.len() {
                     statistics.udp_datagrams_to_public.fetch_add(1, Ordering::Relaxed);
                     statistics.udp_bytes_to_public.fetch_add(payload.len() as u64, Ordering::Relaxed);
-                    usage_pending = usage_pending.saturating_add(payload.len() as u64);
+                    usage_meter.add(payload.len() as u64)?;
                 }
             },
             _ = cleanup.tick() => {
-                if usage_pending != 0 {
-                    if let Err(error) = context
-                        .state
-                        .traffic_controls
-                        .lock()
-                        .expect("traffic control catalog lock poisoned")
-                        .record_bytes(
-                            TrafficPolicyKind::Socks5,
-                            context.policy_id,
-                            usage_pending,
-                            crate::unix_seconds(),
-                        )
-                    {
-                        tracing::warn!("Could not persist SOCKS5 UDP traffic usage: {error}");
-                    } else {
-                        usage_pending = 0;
-                    }
-                }
+
                 let expired = reassembler.expire(std::time::Instant::now());
                 statistics.udp_dropped_datagrams.fetch_add(
                     expired.incomplete_datagrams as u64,
@@ -782,22 +833,7 @@ async fn run_udp_runtime(
             }
         }
     }
-    if usage_pending != 0 {
-        if let Err(error) = context
-            .state
-            .traffic_controls
-            .lock()
-            .expect("traffic control catalog lock poisoned")
-            .record_bytes(
-                TrafficPolicyKind::Socks5,
-                context.policy_id,
-                usage_pending,
-                crate::unix_seconds(),
-            )
-        {
-            tracing::warn!("Could not persist final SOCKS5 UDP traffic usage: {error}");
-        }
-    }
+
     control_reader.abort();
     statistics
         .udp_fragment_inflight_datagrams
@@ -903,7 +939,7 @@ async fn accept_public_connections(
                         drop(stream);
                         continue;
                     }
-                    let decision = context.state.traffic_controls.lock().expect("traffic control catalog lock poisoned").authorize(TrafficPolicyKind::Socks5, context.policy_id, source.ip(), crate::unix_seconds());
+                    let decision = crate::traffic_control::usage_meter::authorize_traffic(&context.state, TrafficPolicyKind::Socks5, context.policy_id, source.ip()).await;
                     if !matches!(decision, Ok(TrafficDecision::Allowed)) {
                         context.statistics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                         continue;
@@ -1090,10 +1126,11 @@ async fn serve_public_connection(
                 _ = stop.changed() => None,
                 result = timeout(
                     CONNECTION_MAX_LIFETIME,
-                    copy_bidirectional_with_limit(
+                    copy_bidirectional_with_meter(
                         &mut external,
                         &mut agent_stream,
                         context.bandwidth_limiter.clone(),
+                &context.state, TrafficPolicyKind::Socks5, context.policy_id,
                     ),
                 ) => Some(result),
             };
@@ -1107,20 +1144,6 @@ async fn serve_public_connection(
                         .statistics
                         .bytes_to_public
                         .fetch_add(to_public, Ordering::Relaxed);
-                    if let Err(error) = context
-                        .state
-                        .traffic_controls
-                        .lock()
-                        .expect("traffic control catalog lock poisoned")
-                        .record_bytes(
-                            TrafficPolicyKind::Socks5,
-                            context.policy_id,
-                            from_public.saturating_add(to_public),
-                            crate::unix_seconds(),
-                        )
-                    {
-                        tracing::warn!("Could not persist SOCKS5 traffic usage: {error}");
-                    }
                 }
                 Some(Ok(Err(error))) => {
                     context
@@ -1327,18 +1350,14 @@ async fn serve_bound_listener(
             Ok(Err(_)) => break BindAcceptResult::Reply(0x01),
             Err(_) => break BindAcceptResult::Reply(0x06),
         };
-        let traffic_allowed = context
-            .state
-            .traffic_controls
-            .lock()
-            .expect("traffic control catalog lock poisoned")
-            .authorize(
-                TrafficPolicyKind::Socks5,
-                context.policy_id,
-                peer.ip(),
-                crate::unix_seconds(),
-            )
-            .is_ok_and(|decision| decision == TrafficDecision::Allowed);
+        let traffic_allowed = crate::traffic_control::usage_meter::authorize_traffic(
+            &context.state,
+            TrafficPolicyKind::Socks5,
+            context.policy_id,
+            peer.ip(),
+        )
+        .await
+        .is_ok_and(|decision| decision == TrafficDecision::Allowed);
         let global_permit = context
             .state
             .global_connection_permits
@@ -1405,10 +1424,11 @@ async fn serve_bound_listener(
         _ = stop.changed() => None,
         result = timeout(
             CONNECTION_MAX_LIFETIME,
-            copy_bidirectional_with_limit(
+            copy_bidirectional_with_meter(
                 external,
                 &mut incoming,
                 context.bandwidth_limiter.clone(),
+                &context.state, TrafficPolicyKind::Socks5, context.policy_id,
             ),
         ) => Some(result),
     };
@@ -1422,20 +1442,6 @@ async fn serve_bound_listener(
                 .statistics
                 .bytes_to_public
                 .fetch_add(to_public, Ordering::Relaxed);
-            if let Err(error) = context
-                .state
-                .traffic_controls
-                .lock()
-                .expect("traffic control catalog lock poisoned")
-                .record_bytes(
-                    TrafficPolicyKind::Socks5,
-                    context.policy_id,
-                    from_public.saturating_add(to_public),
-                    crate::unix_seconds(),
-                )
-            {
-                tracing::warn!("Could not persist SOCKS5 BIND traffic usage: {error}");
-            }
         }
         Some(Ok(Err(error))) => {
             context

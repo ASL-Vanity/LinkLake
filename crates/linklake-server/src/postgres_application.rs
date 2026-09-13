@@ -63,7 +63,7 @@ impl PostgresAdminAuth {
         ensure_postgres(&storage)?;
         let dummy_password_hash =
             admin_auth::hash_password("linklake-dummy-password-verification")?;
-        let mut client = storage.postgres_client().await?;
+        let client = storage.postgres_client().await?;
         let count: i64 = client
             .query_one("SELECT COUNT(*) FROM linklake_administrators", &[])
             .await?
@@ -115,7 +115,7 @@ impl PostgresAdminAuth {
         remote_addr: Option<&str>,
         user_agent: Option<&str>,
     ) -> anyhow::Result<LoginAttempt> {
-        let mut client = self.storage.postgres_client().await?;
+        let client = self.storage.postgres_client().await?;
         let row = client
             .query_opt(
                 "SELECT password_hash, must_change_password, enabled, role, display_name,
@@ -208,7 +208,7 @@ impl PostgresAdminAuth {
             return Ok(None);
         };
         let session_id_text = session_id.to_string();
-        let mut client = self.storage.postgres_client().await?;
+        let client = self.storage.postgres_client().await?;
         let row = client
             .query_opt(
                 "SELECT s.session_secret_hash, s.expires_unix_seconds, a.username,
@@ -315,7 +315,7 @@ impl PostgresAdminAuth {
     }
 
     pub(crate) async fn list_users(&self) -> anyhow::Result<Vec<UserRecord>> {
-        let mut client = self.storage.postgres_client().await?;
+        let client = self.storage.postgres_client().await?;
         let now = unix_seconds() as i64;
         client
             .execute(
@@ -336,7 +336,7 @@ impl PostgresAdminAuth {
                 &[&now],
             )
             .await?;
-        rows.into_iter().map(user_record_from_row).collect()
+        rows.iter().map(user_record_from_row).collect()
     }
 
     pub(crate) async fn create_user(&mut self, request: CreateUser) -> anyhow::Result<UserRecord> {
@@ -346,7 +346,7 @@ impl PostgresAdminAuth {
         let display_name = request.display_name.trim().to_owned();
         let role = request.role.as_str().to_owned();
         let now = unix_seconds() as i64;
-        let mut client = self.storage.postgres_client().await?;
+        let client = self.storage.postgres_client().await?;
         let result = client
             .execute(
                 "INSERT INTO linklake_administrators
@@ -557,7 +557,7 @@ impl PostgresAdminAuth {
         username: &str,
         code: &str,
     ) -> anyhow::Result<bool> {
-        let mut client = self.storage.postgres_client().await?;
+        let client = self.storage.postgres_client().await?;
         let secret = client
             .query_opt(
                 "SELECT totp_secret FROM linklake_administrators WHERE username = $1 AND totp_enabled = TRUE",
@@ -581,7 +581,7 @@ impl PostgresAdminAuth {
     }
 
     pub(crate) async fn list_sessions(&self) -> anyhow::Result<Vec<SessionRecord>> {
-        let mut client = self.storage.postgres_client().await?;
+        let client = self.storage.postgres_client().await?;
         let now = unix_seconds() as i64;
         client
             .execute(
@@ -623,7 +623,7 @@ impl PostgresAdminAuth {
     }
 
     async fn user(&self, username: &str) -> anyhow::Result<Option<UserRecord>> {
-        let mut client = self.storage.postgres_client().await?;
+        let client = self.storage.postgres_client().await?;
         let row = client
             .query_opt(
                 "SELECT a.username, a.display_name, a.role, a.enabled,
@@ -640,7 +640,7 @@ impl PostgresAdminAuth {
     }
 
     async fn enabled_administrator_count(&self) -> anyhow::Result<u64> {
-        let mut client = self.storage.postgres_client().await?;
+        let client = self.storage.postgres_client().await?;
         let count: i64 = client
             .query_one(
                 "SELECT COUNT(*) FROM linklake_administrators WHERE role = 'administrator' AND enabled = TRUE",
@@ -686,7 +686,7 @@ impl PostgresApiTokenCatalog {
         ensure_postgres(&storage)?;
         // 迁移已在 Storage::open 中完成；这里再次确认表存在，避免在错误的
         // 数据库或未完成迁移的连接上静默工作。
-        let mut client = storage.postgres_client().await?;
+        let client = storage.postgres_client().await?;
         let exists: bool = client
             .query_one(
                 "SELECT to_regclass('linklake_management_api_tokens') IS NOT NULL",
@@ -711,7 +711,7 @@ impl PostgresApiTokenCatalog {
                 &[],
             )
             .await?;
-        rows.into_iter().map(api_token_record_from_row).collect()
+        rows.iter().map(api_token_record_from_row).collect()
     }
 
     pub(crate) async fn create(
@@ -759,7 +759,7 @@ impl PostgresApiTokenCatalog {
         let fleet_source_instance_id = record
             .fleet_source_instance_id
             .map(|value| value.to_string());
-        let mut client = self.storage.postgres_client().await?;
+        let client = self.storage.postgres_client().await?;
         let result = client
             .execute(
                 "INSERT INTO linklake_management_api_tokens
@@ -809,7 +809,7 @@ impl PostgresApiTokenCatalog {
             return Ok(None);
         }
         let hash = crate::api_tokens::token_hash(token).to_vec();
-        let mut client = self.storage.postgres_client().await?;
+        let client = self.storage.postgres_client().await?;
         let row = client
             .query_opt(
                 "SELECT id, name, scope, created_unix_seconds, expires_unix_seconds,
@@ -884,7 +884,7 @@ pub(crate) struct PostgresClientRegistry {
 impl PostgresClientRegistry {
     pub(crate) async fn open(storage: CoordinationStorage) -> anyhow::Result<Self> {
         ensure_postgres(&storage)?;
-        let mut client = storage.postgres_client().await?;
+        let client = storage.postgres_client().await?;
         let exists: bool = client
             .query_one("SELECT to_regclass('linklake_clients') IS NOT NULL", &[])
             .await?
@@ -1019,7 +1019,7 @@ impl PostgresClientRegistry {
                      (client_id, agent_instance_id, agent_identity_public_key, name, platform,
                       tags_json, enabled, created_unix_seconds, access_token_hash,
                       last_seen_unix_seconds, config_mode, config_sync_status)
-                     VALUES ($1, $2, $3, $4, $5, $6::jsonb, TRUE, $7, $8, $7, $9, $10)",
+                     VALUES ($1, $2, $3, $4, $5, $6::text::jsonb, TRUE, $7, $8, $7, $9, $10)",
                     &[
                         &client_id_text,
                         &agent_instance_id_text,
@@ -1095,7 +1095,7 @@ impl PostgresClientRegistry {
             .await?
             .execute(
                 "UPDATE linklake_clients
-                 SET name = $1, group_name = $2, tags_json = $3::jsonb,
+                 SET name = $1, group_name = $2, tags_json = $3::text::jsonb,
                      notes = $4, enabled = $5
                  WHERE client_id = $6",
                 &[
@@ -1320,7 +1320,7 @@ impl AdminAuthStore {
     }
 
     pub(crate) async fn authenticate_session(
-        &self,
+        &mut self,
         cookie_value: &str,
     ) -> anyhow::Result<Option<SessionIdentity>> {
         match self {
@@ -1347,7 +1347,7 @@ impl AdminAuthStore {
         }
     }
 
-    pub(crate) async fn list_users(&self) -> anyhow::Result<Vec<UserRecord>> {
+    pub(crate) async fn list_users(&mut self) -> anyhow::Result<Vec<UserRecord>> {
         match self {
             Self::Sqlite(auth) => auth.list_users(),
             Self::Postgres(auth) => auth.list_users().await,
@@ -1438,7 +1438,7 @@ impl AdminAuthStore {
         }
     }
 
-    pub(crate) async fn list_sessions(&self) -> anyhow::Result<Vec<SessionRecord>> {
+    pub(crate) async fn list_sessions(&mut self) -> anyhow::Result<Vec<SessionRecord>> {
         match self {
             Self::Sqlite(auth) => auth.list_sessions(),
             Self::Postgres(auth) => auth.list_sessions().await,
@@ -1477,7 +1477,7 @@ impl ApiTokenStore {
         }
     }
 
-    pub(crate) async fn list(&self) -> anyhow::Result<Vec<ApiTokenRecord>> {
+    pub(crate) async fn list(&mut self) -> anyhow::Result<Vec<ApiTokenRecord>> {
         match self {
             Self::Sqlite(catalog) => catalog.list(),
             Self::Postgres(catalog) => catalog.list().await,
@@ -1534,21 +1534,21 @@ impl ClientRegistryStore {
         }
     }
 
-    pub(crate) async fn count(&self) -> anyhow::Result<usize> {
+    pub(crate) async fn count(&mut self) -> anyhow::Result<usize> {
         match self {
             Self::Sqlite(registry) => Ok(registry.count()),
             Self::Postgres(registry) => registry.count().await,
         }
     }
 
-    pub(crate) async fn contains(&self, client_id: Uuid) -> anyhow::Result<bool> {
+    pub(crate) async fn contains(&mut self, client_id: Uuid) -> anyhow::Result<bool> {
         match self {
             Self::Sqlite(registry) => Ok(registry.contains(client_id)),
             Self::Postgres(registry) => registry.contains(client_id).await,
         }
     }
 
-    pub(crate) async fn summaries(&self) -> anyhow::Result<Vec<ClientSummary>> {
+    pub(crate) async fn summaries(&mut self) -> anyhow::Result<Vec<ClientSummary>> {
         match self {
             Self::Sqlite(registry) => Ok(registry.summaries()),
             Self::Postgres(registry) => registry.summaries().await,
@@ -1556,7 +1556,7 @@ impl ClientRegistryStore {
     }
 
     pub(crate) async fn summary_by_id(
-        &self,
+        &mut self,
         client_id: Uuid,
     ) -> anyhow::Result<Option<ClientSummary>> {
         match self {

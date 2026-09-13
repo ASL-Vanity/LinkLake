@@ -5,7 +5,7 @@ config_version = 2
 [[servers]]
 name = "cloud-a"
 control = "a.example.com:32101"
-control_ca_cert = "C:\LinkLake\cloud-a-control-ca.pem"
+control_ca_cert = 'C:\LinkLake\cloud-a-control-ca.pem'
 control_server_name = "a.example.com"
 client_id = "00000000-0000-0000-0000-000000000001"
 client_token = "replace-with-cloud-a-client-token"
@@ -14,7 +14,7 @@ config_mode = "server_managed"
 [[servers]]
 name = "cloud-b"
 control = "b.example.com:32101"
-control_ca_cert = "C:\LinkLake\cloud-b-control-ca.pem"
+control_ca_cert = 'C:\LinkLake\cloud-b-control-ca.pem'
 control_server_name = "b.example.com"
 client_id = "00000000-0000-0000-0000-000000000002"
 client_token = "replace-with-cloud-b-client-token"

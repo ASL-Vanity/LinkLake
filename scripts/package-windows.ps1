@@ -55,6 +55,15 @@ Copy-Item -LiteralPath (Join-Path $projectRoot 'README.md'), (Join-Path $project
     (Join-Path $projectRoot 'THIRD_PARTY_LICENSES.html'), (Join-Path $projectRoot 'TRADEMARKS.md') `
     -Destination $stage
 
+$trackedDocuments = @(& git -c core.quotepath=false -C $projectRoot ls-files -- docs ':(exclude)docs/development-handoff.md')
+if ($LASTEXITCODE -ne 0) { throw 'Could not enumerate release documentation.' }
+$packageDocuments = $trackedDocuments + @('docs/user-guide.zh-CN.md', 'docs/user-guide.en.md')
+foreach ($document in ($packageDocuments | Sort-Object -Unique)) {
+    $documentDestination = Join-Path $stage $document
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $documentDestination) | Out-Null
+    Copy-Item -LiteralPath (Join-Path $projectRoot $document) -Destination $documentDestination
+}
+
 & (Join-Path $projectRoot 'scripts\sign-windows-artifacts.ps1') `
     -Mode $WindowsSigningMode `
     -Path @(

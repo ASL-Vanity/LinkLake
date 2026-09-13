@@ -63,7 +63,7 @@ fn decode_snapshot(
     })
 }
 
-fn validate_stored_policy(policy: &SecretTunnelPolicy) -> anyhow::Result<()> {
+pub(crate) fn validate_stored_policy(policy: &SecretTunnelPolicy) -> anyhow::Result<()> {
     let canonical = requested_policy(
         policy.id,
         policy.enabled,

@@ -120,10 +120,10 @@ impl PostgresFleetHealthCatalog {
             return Ok(FleetProbeResult { peer_id, accepted: false, duplicate: true,
                 previous_state, health: snapshot.health, transition_reason: "duplicate_event_ignored".to_owned() });
         }
-        let accepted = !snapshot
+        let accepted = snapshot
             .health
             .last_probe_unix_seconds
-            .is_some_and(|last| observation.observed_unix_seconds < last);
+            .is_none_or(|last| observation.observed_unix_seconds >= last);
         let transition_reason = if accepted {
             let (state, successes, failures, reason) = next_health_state(
                 previous_state,

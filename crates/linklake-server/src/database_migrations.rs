@@ -1064,7 +1064,10 @@ fn expected_migration(version: u32) -> anyhow::Result<(&'static str, String)> {
         11 => Ok((MIGRATION_V11_NAME, migration_v11_checksum())),
         12 => Ok((MIGRATION_V12_NAME, migration_v12_checksum())),
         13 => Ok((MIGRATION_V13_NAME, migration_v13_checksum())),
-        14 => Ok((MIGRATION_V14_NAME, migration_checksum(MIGRATION_V14_CONTRACT))),
+        14 => Ok((
+            MIGRATION_V14_NAME,
+            migration_checksum(MIGRATION_V14_CONTRACT),
+        )),
         _ => anyhow::bail!("unsupported database migration version {version}"),
     }
 }
@@ -1371,7 +1374,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("v13 ledger should read");
-        assert_eq!(version, 13);
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
         assert_eq!(acme, ("residue@example.com".into(), 17, "http-01".into()));
         assert_eq!(route, ("automatic".into(), 45, None));
         assert_eq!(v13_rows, 1);
