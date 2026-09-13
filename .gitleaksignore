@@ -14,3 +14,5 @@ d384cb70554685ab8a50a0b2708336ac73e42032:README.en.md:generic-api-key:433
 e1dcb4b0f75e5b4b5a94390ffd804fa45f9eaa10:README.en.md:generic-api-key:438
 # reason: README protocol inventory describes secret authentication without embedding credential material; expires: 2026-10-12
 14f7c52b338173e9785d3cf6621aef70a3eb807f:README.en.md:generic-api-key:474
+# reason: Historical README test-coverage paragraph mentions single-use credentials and authentication but contains no credential; expires: 2026-10-12
+698597b6e55e37d896147acb2a7ff5fd459fdbbd:README.en.md:generic-api-key:496
