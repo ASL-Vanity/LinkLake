@@ -15,6 +15,9 @@
 
 ## 1.1.1 - 2026-09-13
 
+> 注：`v1.1.1` 仅保留为用于门禁流程的不可变标签，未创建 GitHub Release；最新公开稳定版本仍为 `v1.0.0`。
+> Note: `v1.1.1` remains only as an immutable tag used by release-gate attempts and has no GitHub Release; the latest public stable version remains `v1.0.0`.
+
 ### 补丁发行 / Patch release
 
 - 刷新 Rust 依赖锁定版本和发布门禁资料，保持安全审计与供应链检查可重复执行；应用功能和数据迁移格式与 v1.1.0 保持兼容。
@@ -23,6 +26,9 @@
   Align the product version across Server, Client, Manager, the Helm chart and repository documentation at `1.1.1`, while preserving the historical v1.1.0 release notes and tag links.
 
 ## 1.1.0 - 2026-09-13
+
+> 注：`v1.1.0` 仅保留为用于门禁流程的不可变标签，未创建 GitHub Release；其历史内容并入当前 `v1.1.2` 发布目标。
+> Note: `v1.1.0` remains only as an immutable tag used by release-gate attempts and has no GitHub Release; its historical content is included in the current `v1.1.2` release target.
 
 ### 共享存储与高可用 / Shared storage and HA
 

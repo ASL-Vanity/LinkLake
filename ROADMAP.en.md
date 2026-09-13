@@ -2,21 +2,21 @@
 
 [中文](ROADMAP.md) | English
 
-This document separates capabilities implemented in the `v1.1.0` repository from continuing improvements. Experience, reliability, protocol-extension and high-availability work is consolidated into `v1.1.0`, with no separate `v1.0.1` planned. Future directions are not release-date commitments. See the [changelog](CHANGELOG.md) and the relevant Release for changes and published assets.
+This document separates the v1.1 feature line included in the current `v1.1.2` release target from continuing improvements. Experience, reliability, protocol-extension and high-availability work is consolidated into v1.1, with no separate `v1.0.1` planned. Future directions are not release-date commitments. See the [changelog](CHANGELOG.md) and the relevant Release for changes and published assets.
 
-## v1.1.0 status
+## v1.1.2 release target
 
 - PostgreSQL shares identities, sessions, all eight policy kinds, Fleet, certificate/ACME material, traffic and operational state. Standalone SQLite remains available; shared-read failures do not fall back to a local business database.
 - Instance leases, leader fencing, shared port ownership, atomic Fleet reconciliation and durable traffic spools are integrated. Every replica retains an independent persistent directory.
 - Web UI and Flutter Manager provide ACME challenge configuration, readiness, HA/Fleet management and role controls. Protocol capabilities include gRPC backend TLS, SOCKS5 BIND/bounded FRAG and dynamic egress protection.
 - Explicit PostgreSQL initialization, SQLite migration, rollback-eligibility checks and offline material-key rotation have maintenance commands. Update procedures distinguish standalone SQLite from PostgreSQL clusters.
-- Helm shared-state and per-replica volume configuration, installation/update safeguards, the [user guide (Chinese)](docs/user-guide.zh-CN.md) and bilingual READMEs have been updated for this version.
+- Helm shared-state and per-replica volume configuration, installation/update safeguards, the [user guide](docs/user-guide.en.md) and bilingual READMEs have been updated for this version.
 
-The remaining release work is the version commit, official builds and signatures, assets and release notes. Publication proceeds once these materials are ready, without adding another full regression cycle or a prescribed regional staging sequence. Production-server upgrades are scheduled separately; repository implementation and version publication do not imply that production nodes have been upgraded.
+The repository version and release target are `v1.1.2`. The latest public stable GitHub Release remains `v1.0.0` (August 6, 2026); `v1.1.0` and `v1.1.1` are immutable tags without corresponding public Releases. Official builds, signatures and assets are produced by the `v1.1.2` tag workflow. Production-server upgrades are scheduled separately; repository implementation and version publication do not imply that production nodes have been upgraded.
 
 ## Continuing improvements
 
-These items guide work after publication and are not additional prerequisites for this release.
+These items guide work after v1.1.2.
 
 ### Management surfaces
 
@@ -60,7 +60,7 @@ Continuing quality goals: consistent APIs and management entry points, fail-clos
 
 ## Continuing boundaries
 
-- Long-duration and weak-network coverage remains in a separate soak workflow and is not an additional prerequisite for this release.
+- Long-duration and weak-network coverage remains in a separate soak workflow.
 - macOS remains source- and CI-compatible; official packages, Developer ID, notarization, and automatic updates are not currently promised.
 - Official Windows assets remain unsigned with Authenticode under the personal open-source policy. Obtain them from the official Release and verify SHA-256, GitHub attestations, and the LinkLake Ed25519 manifest.
 - Release signing, database migration, authorization, and network-policy changes must fail closed and retain a verifiable recovery path.

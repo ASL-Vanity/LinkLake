@@ -2,7 +2,7 @@
 
 [简体中文](user-guide.zh-CN.md)
 
-This guide describes the commands and configuration in LinkLake v1.1. Use the complete package for your platform and verify its version, checksums, and signature. A version in the repository does not by itself mean that a public release has been published. Replace the example paths, domains, ports, and credentials with your own values.
+This guide describes the commands and configuration in the LinkLake v1.1 feature line and current `v1.1.2` release target. The latest public stable GitHub Release remains `v1.0.0`; a repository version does not by itself mean that a public release has been published. Use the complete package for your platform and verify its version, checksums, and signature. Replace the example paths, domains, ports, and credentials with your own values.
 
 ## 1. The three applications
 
