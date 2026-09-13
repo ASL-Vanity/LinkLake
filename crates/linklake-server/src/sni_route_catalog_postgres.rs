@@ -84,7 +84,6 @@ impl PostgresSniRouteCatalog {
         transaction.execute("INSERT INTO linklake_sni_route_policies(id,hostname,revision,policy) VALUES($1,$2,$3,$4::text::jsonb)",
             &[&policy.id.to_string(), &policy.hostname, &Uuid::new_v4().to_string(), &serde_json::to_string(&policy)?]).await?;
         ledger.assert_current().await?;
-        drop(ledger);
         transaction.commit().await?;
         Ok(policy)
     }
@@ -106,7 +105,6 @@ impl PostgresSniRouteCatalog {
         ensure_hostname_available(&transaction, &policy).await?;
         write_policy(&transaction, &policy).await?;
         ledger.assert_current().await?;
-        drop(ledger);
         transaction.commit().await?;
         Ok(Some(policy))
     }
@@ -122,7 +120,6 @@ impl PostgresSniRouteCatalog {
         policy.enabled = enabled;
         write_policy(&transaction, &policy).await?;
         ledger.assert_current().await?;
-        drop(ledger);
         transaction.commit().await?;
         Ok(true)
     }
@@ -142,7 +139,6 @@ impl PostgresSniRouteCatalog {
                 .await?;
         }
         ledger.assert_current().await?;
-        drop(ledger);
         transaction.commit().await?;
         Ok(policy)
     }

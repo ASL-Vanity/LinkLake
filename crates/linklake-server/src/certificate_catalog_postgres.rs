@@ -772,6 +772,26 @@ pub(crate) fn private_key_context(
     )
 }
 
+async fn bind_key(
+    transaction: &PgTransaction<'_>,
+    cipher: &CertificateMaterialCipher,
+) -> anyhow::Result<()> {
+    let fingerprint = cipher.fingerprint();
+    transaction.execute("INSERT INTO linklake_certificate_key_binding(singleton_id,fingerprint) VALUES(1,$1) ON CONFLICT(singleton_id) DO NOTHING", &[&fingerprint]).await?;
+    let stored: String = transaction
+        .query_one(
+            "SELECT fingerprint FROM linklake_certificate_key_binding WHERE singleton_id=1",
+            &[],
+        )
+        .await?
+        .get(0);
+    anyhow::ensure!(
+        stored == fingerprint,
+        "certificate material key differs from the configured cluster key"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod route_commit_tests {
     use super::*;
@@ -842,24 +862,4 @@ mod route_commit_tests {
             "*.example.com"
         ));
     }
-}
-
-async fn bind_key(
-    transaction: &PgTransaction<'_>,
-    cipher: &CertificateMaterialCipher,
-) -> anyhow::Result<()> {
-    let fingerprint = cipher.fingerprint();
-    transaction.execute("INSERT INTO linklake_certificate_key_binding(singleton_id,fingerprint) VALUES(1,$1) ON CONFLICT(singleton_id) DO NOTHING", &[&fingerprint]).await?;
-    let stored: String = transaction
-        .query_one(
-            "SELECT fingerprint FROM linklake_certificate_key_binding WHERE singleton_id=1",
-            &[],
-        )
-        .await?
-        .get(0);
-    anyhow::ensure!(
-        stored == fingerprint,
-        "certificate material key differs from the configured cluster key"
-    );
-    Ok(())
 }

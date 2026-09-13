@@ -1337,6 +1337,94 @@ fn conversion_error(error: anyhow::Error) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, error.into())
 }
 
+fn default_alert_rules() -> [CreateAlertRule; 4] {
+    [
+        CreateAlertRule {
+            name: "Client offline".to_owned(),
+            metric: AlertMetric::ClientOffline,
+            comparator: AlertComparator::GreaterOrEqual,
+            threshold: 1.0,
+            target: None,
+            evaluation_window_seconds: 120,
+            cooldown_seconds: 900,
+            severity: AlertSeverity::Warning,
+            notify_webhook: true,
+            notify_email: false,
+            enabled: true,
+        },
+        CreateAlertRule {
+            name: "Policy unavailable".to_owned(),
+            metric: AlertMetric::PolicyUnavailable,
+            comparator: AlertComparator::GreaterOrEqual,
+            threshold: 1.0,
+            target: None,
+            evaluation_window_seconds: 60,
+            cooldown_seconds: 900,
+            severity: AlertSeverity::Critical,
+            notify_webhook: true,
+            notify_email: true,
+            enabled: true,
+        },
+        CreateAlertRule {
+            name: "Authentication failures".to_owned(),
+            metric: AlertMetric::AuthenticationFailures,
+            comparator: AlertComparator::GreaterOrEqual,
+            threshold: 10.0,
+            target: None,
+            evaluation_window_seconds: 300,
+            cooldown_seconds: 900,
+            severity: AlertSeverity::Warning,
+            notify_webhook: true,
+            notify_email: false,
+            enabled: true,
+        },
+        CreateAlertRule {
+            name: "Certificate expiry".to_owned(),
+            metric: AlertMetric::CertificateDaysRemaining,
+            comparator: AlertComparator::LessOrEqual,
+            threshold: 30.0,
+            target: None,
+            evaluation_window_seconds: 300,
+            cooldown_seconds: 86_400,
+            severity: AlertSeverity::Warning,
+            notify_webhook: true,
+            notify_email: true,
+            enabled: true,
+        },
+    ]
+}
+
+fn default_slo_rules() -> [CreateAlertRule; 2] {
+    [
+        CreateAlertRule {
+            name: "SLO fast burn (5m and 1h)".to_owned(),
+            metric: AlertMetric::SloFastBurnRate,
+            comparator: AlertComparator::GreaterOrEqual,
+            threshold: 14.4,
+            target: Some("global".to_owned()),
+            evaluation_window_seconds: 300,
+            cooldown_seconds: 3_600,
+            severity: AlertSeverity::Critical,
+            notify_webhook: true,
+            notify_email: true,
+            enabled: true,
+        },
+        CreateAlertRule {
+            name: "SLO slow burn (6h and 24h)".to_owned(),
+            metric: AlertMetric::SloSlowBurnRate,
+            comparator: AlertComparator::GreaterOrEqual,
+            threshold: 6.0,
+            target: Some("global".to_owned()),
+            evaluation_window_seconds: 21_600,
+            cooldown_seconds: 21_600,
+            severity: AlertSeverity::Warning,
+            notify_webhook: true,
+            notify_email: true,
+            enabled: true,
+        },
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1690,92 +1778,4 @@ mod tests {
             NotificationDeliveryRetryOutcome::NotDeadLetter(NotificationDeliveryState::Pending)
         );
     }
-}
-
-fn default_alert_rules() -> [CreateAlertRule; 4] {
-    [
-        CreateAlertRule {
-            name: "Client offline".to_owned(),
-            metric: AlertMetric::ClientOffline,
-            comparator: AlertComparator::GreaterOrEqual,
-            threshold: 1.0,
-            target: None,
-            evaluation_window_seconds: 120,
-            cooldown_seconds: 900,
-            severity: AlertSeverity::Warning,
-            notify_webhook: true,
-            notify_email: false,
-            enabled: true,
-        },
-        CreateAlertRule {
-            name: "Policy unavailable".to_owned(),
-            metric: AlertMetric::PolicyUnavailable,
-            comparator: AlertComparator::GreaterOrEqual,
-            threshold: 1.0,
-            target: None,
-            evaluation_window_seconds: 60,
-            cooldown_seconds: 900,
-            severity: AlertSeverity::Critical,
-            notify_webhook: true,
-            notify_email: true,
-            enabled: true,
-        },
-        CreateAlertRule {
-            name: "Authentication failures".to_owned(),
-            metric: AlertMetric::AuthenticationFailures,
-            comparator: AlertComparator::GreaterOrEqual,
-            threshold: 10.0,
-            target: None,
-            evaluation_window_seconds: 300,
-            cooldown_seconds: 900,
-            severity: AlertSeverity::Warning,
-            notify_webhook: true,
-            notify_email: false,
-            enabled: true,
-        },
-        CreateAlertRule {
-            name: "Certificate expiry".to_owned(),
-            metric: AlertMetric::CertificateDaysRemaining,
-            comparator: AlertComparator::LessOrEqual,
-            threshold: 30.0,
-            target: None,
-            evaluation_window_seconds: 300,
-            cooldown_seconds: 86_400,
-            severity: AlertSeverity::Warning,
-            notify_webhook: true,
-            notify_email: true,
-            enabled: true,
-        },
-    ]
-}
-
-fn default_slo_rules() -> [CreateAlertRule; 2] {
-    [
-        CreateAlertRule {
-            name: "SLO fast burn (5m and 1h)".to_owned(),
-            metric: AlertMetric::SloFastBurnRate,
-            comparator: AlertComparator::GreaterOrEqual,
-            threshold: 14.4,
-            target: Some("global".to_owned()),
-            evaluation_window_seconds: 300,
-            cooldown_seconds: 3_600,
-            severity: AlertSeverity::Critical,
-            notify_webhook: true,
-            notify_email: true,
-            enabled: true,
-        },
-        CreateAlertRule {
-            name: "SLO slow burn (6h and 24h)".to_owned(),
-            metric: AlertMetric::SloSlowBurnRate,
-            comparator: AlertComparator::GreaterOrEqual,
-            threshold: 6.0,
-            target: Some("global".to_owned()),
-            evaluation_window_seconds: 21_600,
-            cooldown_seconds: 21_600,
-            severity: AlertSeverity::Warning,
-            notify_webhook: true,
-            notify_email: true,
-            enabled: true,
-        },
-    ]
 }

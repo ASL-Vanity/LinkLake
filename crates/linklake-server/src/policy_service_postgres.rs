@@ -1005,7 +1005,7 @@ mod shared_resource_tests {
             &clients,
             &catalog,
             &HashMap::new(),
-            &[old.clone()],
+            std::slice::from_ref(&old),
             &PublicPortPolicy::development_default(),
         )
         .unwrap();
@@ -1035,7 +1035,7 @@ mod shared_resource_tests {
             &HashMap::from([(agent, local)]),
             &catalog,
             &HashMap::new(),
-            &[old.clone()],
+            std::slice::from_ref(&old),
             &PublicPortPolicy::development_default()
         )
         .is_err());

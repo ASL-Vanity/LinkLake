@@ -1101,6 +1101,24 @@ impl PostgresTunnelCatalog {
     }
 }
 
+fn mappings(p: &PortGroupPolicy) -> anyhow::Result<Vec<PortGroupMapping>> {
+    Ok(parse_port_mappings(
+        &p.public_ports,
+        &p.target_ports,
+        1,
+        u16::MAX,
+        MAX_PORT_MAPPINGS,
+    )?
+    .pairs
+    .into_iter()
+    .map(|pair| PortGroupMapping {
+        public_port: pair.public_port,
+        target_port: pair.target_port,
+        target_addr: target_addr(&p.target_host, pair.target_port),
+    })
+    .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1270,22 +1288,4 @@ mod tests {
         current.password_hash = "b".repeat(64);
         assert_ne!(policy, current);
     }
-}
-
-fn mappings(p: &PortGroupPolicy) -> anyhow::Result<Vec<PortGroupMapping>> {
-    Ok(parse_port_mappings(
-        &p.public_ports,
-        &p.target_ports,
-        1,
-        u16::MAX,
-        MAX_PORT_MAPPINGS,
-    )?
-    .pairs
-    .into_iter()
-    .map(|pair| PortGroupMapping {
-        public_port: pair.public_port,
-        target_port: pair.target_port,
-        target_addr: target_addr(&p.target_host, pair.target_port),
-    })
-    .collect())
 }
