@@ -6146,10 +6146,17 @@ mod tests {
     // 签名时，生产代码会明确拒绝官方自动更新；测试夹具不能绕开或改变该门禁。
     const FIXTURE_TARGET: &str = "windows-x86_64";
 
+    fn canonical_test_temp_root(prefix: &str) -> PathBuf {
+        let base = normalize_windows_canonical_path(
+            fs::canonicalize(std::env::temp_dir()).expect("the system temp directory should exist"),
+        )
+        .expect("the canonical temp directory should be usable");
+        base.join(format!("linklake-{prefix}-{}", Uuid::new_v4()))
+    }
+
     #[test]
     fn remote_resume_quarantine_preserves_evidence_and_requires_safe_admin_clearance() {
-        let root =
-            std::env::temp_dir().join(format!("linklake-remote-quarantine-{}", Uuid::new_v4()));
+        let root = canonical_test_temp_root("remote-quarantine");
         let state = root.join("state");
         let client_id = Uuid::new_v4();
         let origin = "a".repeat(64);
@@ -6254,8 +6261,7 @@ mod tests {
 
     #[test]
     fn recovery_rejects_a_tampered_backup_before_touching_a_missing_target() {
-        let root =
-            std::env::temp_dir().join(format!("linklake-recovery-backup-{}", Uuid::new_v4()));
+        let root = canonical_test_temp_root("recovery-backup");
         let state = root.join("state");
         let install = root.join("install");
         let operation_id = Uuid::new_v4();
@@ -6315,14 +6321,15 @@ mod tests {
 
     #[test]
     fn non_server_recovery_is_explicit_and_returns_idle_without_an_active_marker() {
-        let root = tempfile::tempdir().unwrap();
-        let state = root.path().join("state");
+        let root = canonical_test_temp_root("recovery-idle");
+        let state = root.join("state");
         assert!(recover(UpdateProduct::Client, &state, false).is_err());
         assert!(recover(UpdateProduct::Server, &state, true).is_err());
 
         let status = recover(UpdateProduct::Client, &state, true).unwrap();
         assert_eq!(status.state, "idle");
         assert!(status.operation.is_none());
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn trusted_key_fixture(

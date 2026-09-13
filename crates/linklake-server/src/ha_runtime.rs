@@ -528,7 +528,9 @@ mod maintenance_tests {
                 metadata_json: "{}".to_owned(),
                 member_lease: Duration::from_secs(300),
                 leader_lease: Duration::from_secs(120),
-                heartbeat: Duration::from_millis(20),
+                // 心跳刷新会同步执行 SQLite 写事务；测试使用更宽的专用期限，
+                // 避免正常调度和写锁抖动被误判为租约丢失。
+                heartbeat: Duration::from_millis(250),
                 resource_lease: Duration::from_secs(60),
                 job_lease: Duration::from_secs(60),
                 target_success_threshold: 2,
@@ -647,7 +649,7 @@ mod maintenance_tests {
             worker
                 .supervise_with_maintenance(
                     shutdown_rx.clone(),
-                    worker.maintain_expired_leases(shutdown_rx, Duration::from_millis(10)),
+                    worker.maintain_expired_leases(shutdown_rx, Duration::from_millis(100)),
                 )
                 .await;
         });

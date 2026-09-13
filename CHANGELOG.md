@@ -2,6 +2,17 @@
 
 本项目采用语义化版本号；已发布版本与发行资产以 GitHub Releases 为准。
 
+## 1.1.2 - 2026-09-13
+
+### 兼容性补丁 / Compatibility patch
+
+- 刷新 `h2` 与 `chacha20` 相关 Rust 依赖锁定和第三方许可证清单，固定安全更新后的传输与加密依赖；不改变应用协议或数据格式。
+  Refresh the Rust lockfile and third-party license inventory for the `h2` and `chacha20` dependency paths, pinning the security-updated transport and encryption dependencies without changing application protocols or data formats.
+- 修复严格 Clippy 发布门禁反馈，并修正跨平台测试夹具的临时路径处理，使 Windows 与 Unix 验证使用同一套安全路径约束。
+  Fix strict-Clippy release-gate findings and cross-platform test-fixture path handling so Windows and Unix verification use the same safe path boundaries.
+- 将 Server、Client、Manager、Helm Chart 与仓库文档的产品版本统一为 `1.1.2`；沿用 v1.1 的协议、schema、配置和高可用语义。
+  Align the product version across Server, Client, Manager, the Helm chart and repository documentation at `1.1.2`, while retaining the v1.1 protocol, schema, configuration and high-availability semantics.
+
 ## 1.1.1 - 2026-09-13
 
 ### 补丁发行 / Patch release

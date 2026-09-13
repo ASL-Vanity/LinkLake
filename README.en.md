@@ -6,7 +6,7 @@ LinkLake is a cross-platform secure tunneling and service publishing platform wr
 
 The Server includes a Web UI. The optional Flutter desktop application, LinkLake Manager, manages servers and local clients. Server and Client can each run independently or as operating-system services.
 
-**The current repository version is `1.1.1`.** This page describes repository capabilities. Available versions and downloadable assets are listed in [GitHub Releases](https://github.com/ASL-Vanity/LinkLake/releases).
+**The current repository version and release target are `1.1.2`.** The latest public stable GitHub Release remains `v1.0.0` (August 6, 2026); `v1.1.0` and `v1.1.1` are immutable tags without corresponding public Releases. Available versions and downloadable assets are listed in [GitHub Releases](https://github.com/ASL-Vanity/LinkLake/releases).
 
 ## Core capabilities
 
@@ -25,7 +25,7 @@ UDP relay must be enabled separately and datagrams remain best effort. Direct P2
 
 ## Quick start
 
-The [user guide (Chinese)](docs/user-guide.zh-CN.md) covers release packages, TLS, system services and clusters. This local source example runs in **PowerShell 7** from the Rust repository root; `rust-toolchain.toml` pins Rust `1.91.0`. First prepare a working target service, such as `127.0.0.1:8080`.
+The [user guide](docs/user-guide.en.md) covers release packages, TLS, system services and clusters. This local source example runs in **PowerShell 7** from the Rust repository root; `rust-toolchain.toml` pins Rust `1.91.0`. First prepare a working target service, such as `127.0.0.1:8080`.
 
 Start the Server:
 

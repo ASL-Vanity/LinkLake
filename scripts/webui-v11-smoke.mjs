@@ -21,7 +21,10 @@ const browser = await ({ chromium, firefox, webkit })[browserEngine].launch({
 });
 const report = { ok: false, checks: [], pageErrors: [], consoleErrors: [], screenshots: [] };
 const expectedFields = ['enabled', 'environment', 'directory_url', 'contact_email', 'terms_accepted', 'challenge_type', 'renew_before_days'].sort();
-const requestConfig = (config) => Object.fromEntries(expectedFields.map(key => [key, config[key]]));
+const requestConfig = (config) => Object.fromEntries(expectedFields.map(key => [
+  key,
+  key === 'contact_email' ? (config[key] ?? '') : config[key],
+]));
 
 async function api(page, endpoint, method = 'GET', data) {
   const response = await page.request.fetch(`${baseUrl}${endpoint}`, {

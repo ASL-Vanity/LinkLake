@@ -820,6 +820,58 @@ impl PostgresPolicyService {
     }
 }
 
+fn stored_id(value: &str) -> anyhow::Result<Uuid> {
+    let id = Uuid::parse_str(value)?;
+    anyhow::ensure!(!id.is_nil(), "Fleet ledger contains a nil identity");
+    Ok(id)
+}
+
+fn read_source(row: &Row) -> anyhow::Result<FleetSourceStatus> {
+    Ok(FleetSourceStatus {
+        source_instance_id: stored_id(row.try_get(0)?)?,
+        generation: u64::try_from(row.try_get::<_, i64>(1)?)?,
+        revision: row.try_get(2)?,
+        applied_unix_seconds: u64::try_from(row.try_get::<_, i64>(3)?)?,
+        resource_count: usize::try_from(row.try_get::<_, i64>(4)?)?,
+    })
+}
+
+fn read_owned(row: &Row) -> anyhow::Result<OwnedResource> {
+    let kind = FleetPolicyKind::parse(row.try_get(2)?)?;
+    let credential_ref = row
+        .try_get::<_, Option<&str>>(5)?
+        .map(stored_id)
+        .transpose()?;
+    anyhow::ensure!(
+        kind.requires_credential() == credential_ref.is_some(),
+        "Fleet ownership credential kind mismatch"
+    );
+    let resource = OwnedResource {
+        source_instance_id: stored_id(row.try_get(0)?)?,
+        resource_id: stored_id(row.try_get(1)?)?,
+        kind,
+        policy_id: stored_id(row.try_get(3)?)?,
+        resource_sha256: row.try_get(4)?,
+        credential_ref,
+    };
+    anyhow::ensure!(
+        resource.resource_sha256.len() == 64
+            && resource
+                .resource_sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "Fleet resource digest is invalid"
+    );
+    if !kind.requires_credential() {
+        anyhow::ensure!(
+            resource.policy_id
+                == deterministic_policy_id(resource.source_instance_id, resource.resource_id, kind),
+            "Fleet derived policy identity mismatch"
+        );
+    }
+    Ok(resource)
+}
+
 #[cfg(test)]
 mod shared_resource_tests {
     use super::*;
@@ -1056,56 +1108,4 @@ mod shared_resource_tests {
         let settings = desired_control(&control).unwrap();
         assert_eq!(export_control(control.resource_id, settings), control);
     }
-}
-
-fn stored_id(value: &str) -> anyhow::Result<Uuid> {
-    let id = Uuid::parse_str(value)?;
-    anyhow::ensure!(!id.is_nil(), "Fleet ledger contains a nil identity");
-    Ok(id)
-}
-
-fn read_source(row: &Row) -> anyhow::Result<FleetSourceStatus> {
-    Ok(FleetSourceStatus {
-        source_instance_id: stored_id(row.try_get(0)?)?,
-        generation: u64::try_from(row.try_get::<_, i64>(1)?)?,
-        revision: row.try_get(2)?,
-        applied_unix_seconds: u64::try_from(row.try_get::<_, i64>(3)?)?,
-        resource_count: usize::try_from(row.try_get::<_, i64>(4)?)?,
-    })
-}
-
-fn read_owned(row: &Row) -> anyhow::Result<OwnedResource> {
-    let kind = FleetPolicyKind::parse(row.try_get(2)?)?;
-    let credential_ref = row
-        .try_get::<_, Option<&str>>(5)?
-        .map(stored_id)
-        .transpose()?;
-    anyhow::ensure!(
-        kind.requires_credential() == credential_ref.is_some(),
-        "Fleet ownership credential kind mismatch"
-    );
-    let resource = OwnedResource {
-        source_instance_id: stored_id(row.try_get(0)?)?,
-        resource_id: stored_id(row.try_get(1)?)?,
-        kind,
-        policy_id: stored_id(row.try_get(3)?)?,
-        resource_sha256: row.try_get(4)?,
-        credential_ref,
-    };
-    anyhow::ensure!(
-        resource.resource_sha256.len() == 64
-            && resource
-                .resource_sha256
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
-        "Fleet resource digest is invalid"
-    );
-    if !kind.requires_credential() {
-        anyhow::ensure!(
-            resource.policy_id
-                == deterministic_policy_id(resource.source_instance_id, resource.resource_id, kind),
-            "Fleet derived policy identity mismatch"
-        );
-    }
-    Ok(resource)
 }
