@@ -6,7 +6,7 @@ LinkLake is a cross-platform secure tunneling and service publishing platform wr
 
 The Server includes a Web UI. The optional Flutter desktop application, LinkLake Manager, manages servers and local clients. Server and Client can each run independently or as operating-system services.
 
-**The current repository version is `1.1.0`.** This page describes repository capabilities. Available versions and downloadable assets are listed in [GitHub Releases](https://github.com/ASL-Vanity/LinkLake/releases).
+**The current repository version is `1.1.1`.** This page describes repository capabilities. Available versions and downloadable assets are listed in [GitHub Releases](https://github.com/ASL-Vanity/LinkLake/releases).
 
 ## Core capabilities
 

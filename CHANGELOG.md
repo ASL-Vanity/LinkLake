@@ -2,6 +2,15 @@
 
 本项目采用语义化版本号；已发布版本与发行资产以 GitHub Releases 为准。
 
+## 1.1.1 - 2026-09-13
+
+### 补丁发行 / Patch release
+
+- 刷新 Rust 依赖锁定版本和发布门禁资料，保持安全审计与供应链检查可重复执行；应用功能和数据迁移格式与 v1.1.0 保持兼容。
+  Refresh the pinned Rust dependency set and release-gate metadata so security and supply-chain checks remain reproducible. Application behavior and data-migration formats remain compatible with v1.1.0.
+- 将 Server、Client、Manager、Helm Chart 与仓库文档的产品版本统一为 `1.1.1`，并保留 v1.1.0 的历史发行说明和标签链接不变。
+  Align the product version across Server, Client, Manager, the Helm chart and repository documentation at `1.1.1`, while preserving the historical v1.1.0 release notes and tag links.
+
 ## 1.1.0 - 2026-09-13
 
 ### 共享存储与高可用 / Shared storage and HA

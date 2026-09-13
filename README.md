@@ -6,7 +6,7 @@ LinkLake 是使用 Rust 实现的跨平台安全隧道与服务发布平台。�
 
 Server 自带 Web UI；可选的 Flutter 桌面程序 LinkLake Manager 用于管理服务器与本机客户端。Server 和 Client 都可以独立运行或安装为系统服务。
 
-**当前仓库版本为 `1.1.0`。** 本页说明当前仓库能力，可下载版本及资产以 [GitHub Releases](https://github.com/ASL-Vanity/LinkLake/releases) 为准。
+**当前仓库版本为 `1.1.1`。** 本页说明当前仓库能力，可下载版本及资产以 [GitHub Releases](https://github.com/ASL-Vanity/LinkLake/releases) 为准。
 
 ## 核心能力
 
