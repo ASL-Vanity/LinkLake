@@ -194,25 +194,49 @@ try {
     $adminPassword = 'LinkLake-E2E-Password-123!'
 
     $echoScript = @"
-        `$listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $targetPort)
-        `$listener.Start()
-        try {
-            while (`$true) {
-                `$client = `$listener.AcceptTcpClient()
-                try {
-                    `$stream = `$client.GetStream()
-                    `$buffer = [byte[]]::new(16384)
-                    while ((`$read = `$stream.Read(`$buffer, 0, `$buffer.Length)) -gt 0) {
-                        `$stream.Write(`$buffer, 0, `$read)
-                        `$stream.Flush()
-                    }
-                } finally {
-                    `$client.Dispose()
-                }
+Add-Type -TypeDefinition @'
+using System;
+using System.Net;
+using System.Net.Sockets;
+using System.Threading.Tasks;
+
+public static class LinkLakeConcurrentTcpEcho
+{
+    public static void Run(int port)
+    {
+        var listener = new TcpListener(IPAddress.Loopback, port);
+        listener.Start(128);
+        try
+        {
+            while (true)
+            {
+                var client = listener.AcceptTcpClient();
+                Task.Run((Action)(() => Echo(client)));
             }
-        } finally {
-            `$listener.Stop()
         }
+        finally
+        {
+            listener.Stop();
+        }
+    }
+
+    private static void Echo(TcpClient client)
+    {
+        using (client)
+        using (var stream = client.GetStream())
+        {
+            var buffer = new byte[16384];
+            int read;
+            while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+            {
+                stream.Write(buffer, 0, read);
+                stream.Flush();
+            }
+        }
+    }
+}
+'@
+[LinkLakeConcurrentTcpEcho]::Run($targetPort)
 "@
     $echoCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($echoScript))
     $echoProcess = Start-HiddenProcess -FilePath 'powershell.exe' -Arguments @(
