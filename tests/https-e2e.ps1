@@ -623,6 +623,20 @@ target = "127.0.0.1:$backendPort"
         throw 'HTTPS, ACME, certificate, or handshake metrics did not increase as expected.'
     }
 
+    # 将“重启加载已持久化证书”与后台自动续期分开验证。Pebble 测试环境会让
+    # 证书维护在重启后很快创建新订单；关闭调度不禁用路由 TLS 或删除证书。
+    $disabledAcme = Invoke-RestMethod -Method Put -Uri "$baseUrl/api/v1/acme/config" `
+        -WebSession $webSession -ContentType 'application/json' `
+        -Body (@{
+            enabled = $false
+            environment = 'custom'
+            directory_url = 'https://localhost:14000/dir'
+            contact_email = 'https-e2e@linklake.test'
+            terms_accepted = $true
+            renew_before_days = 30
+        } | ConvertTo-Json)
+    if ($disabledAcme.enabled) { throw 'ACME scheduling was not disabled before restart.' }
+
     Stop-ChildProcess -Process $serverProcess
     $serverProcess = $null
     $serverProcess = Start-LinkLakeServer -Environment $serverEnvironment
