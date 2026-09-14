@@ -68,6 +68,41 @@ struct PublicConnectionContext {
     global_permits: Arc<Semaphore>,
 }
 
+struct ActiveConnectionGuard {
+    statistics: Arc<TunnelStatistics>,
+    policy_permit: Option<OwnedSemaphorePermit>,
+    global_permit: Option<OwnedSemaphorePermit>,
+}
+
+impl ActiveConnectionGuard {
+    fn new(
+        statistics: Arc<TunnelStatistics>,
+        policy_permit: OwnedSemaphorePermit,
+        global_permit: OwnedSemaphorePermit,
+    ) -> Self {
+        statistics
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+        Self {
+            statistics,
+            policy_permit: Some(policy_permit),
+            global_permit: Some(global_permit),
+        }
+    }
+}
+
+impl Drop for ActiveConnectionGuard {
+    fn drop(&mut self) {
+        // 对外暴露 active=0 前先释放策略与全局许可，避免观察者立即发起
+        // 满额并发时仍被上一条已结束连接占用许可。
+        self.policy_permit.take();
+        self.global_permit.take();
+        self.statistics
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 impl BandwidthLimiter {
     pub(crate) fn new(bytes_per_second: u64) -> Self {
         Self {
@@ -955,8 +990,8 @@ async fn accept_public_connections(
 async fn serve_public_connection(
     context: PublicConnectionContext,
     mut external: TcpStream,
-    _permit: OwnedSemaphorePermit,
-    _global_permit: OwnedSemaphorePermit,
+    permit: OwnedSemaphorePermit,
+    global_permit: OwnedSemaphorePermit,
     mut stop: watch::Receiver<()>,
 ) {
     let PublicConnectionContext {
@@ -969,9 +1004,7 @@ async fn serve_public_connection(
         bandwidth_limiter,
         ..
     } = context;
-    statistics
-        .active_connections
-        .fetch_add(1, Ordering::Relaxed);
+    let _active_connection = ActiveConnectionGuard::new(statistics.clone(), permit, global_permit);
     let Ok(pending_permit) = state.pending_connection_permits.clone().try_acquire_owned() else {
         statistics
             .rejected_connections
@@ -979,9 +1012,6 @@ async fn serve_public_connection(
         statistics
             .rejected_pending_limit
             .fetch_add(1, Ordering::Relaxed);
-        statistics
-            .active_connections
-            .fetch_sub(1, Ordering::Relaxed);
         return;
     };
     let connection_id = Uuid::new_v4();
@@ -1003,15 +1033,11 @@ async fn serve_public_connection(
         statistics
             .failed_connections
             .fetch_add(1, Ordering::Relaxed);
-        statistics
-            .active_connections
-            .fetch_sub(1, Ordering::Relaxed);
         return;
     }
     let pair_result = tokio::select! {
         _ = stop.changed() => {
             state.pending_connections.lock().await.remove(&connection_id);
-            statistics.active_connections.fetch_sub(1, Ordering::Relaxed);
             return;
         }
         result = timeout(CONNECTION_PAIR_TIMEOUT, data_rx) => result,
@@ -1021,7 +1047,6 @@ async fn serve_public_connection(
             drop(pending_permit);
             let transfer_result = tokio::select! {
                 _ = stop.changed() => {
-                    statistics.active_connections.fetch_sub(1, Ordering::Relaxed);
                     return;
                 }
                 result = timeout(
@@ -1079,9 +1104,6 @@ async fn serve_public_connection(
                 .remove(&connection_id);
         }
     }
-    statistics
-        .active_connections
-        .fetch_sub(1, Ordering::Relaxed);
 }
 
 pub(crate) async fn copy_bidirectional_with_meter<A, B>(

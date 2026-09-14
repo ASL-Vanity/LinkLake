@@ -2,12 +2,14 @@
 
 本项目采用语义化版本号；已发布版本与发行资产以 GitHub Releases 为准。
 
-## 1.1.2 - 2026-09-13
+## 1.1.2 - 2026-09-14
 
 ### 兼容性补丁 / Compatibility patch
 
 - 修复持久 SQLite 服务强制终止后无法立即重启的问题：取得进程独占锁后仅执行一次旧租约恢复，保留单调递增的 fencing 序列；PostgreSQL 仍按共享租约判定接管。
   Recover stale standalone SQLite leases once after acquiring the exclusive process lock, allowing immediate restart after forced termination while preserving monotonically increasing fencing tokens. PostgreSQL retains shared lease-based takeover.
+- 修复 TCP 活动连接指标先于并发许可释放归零的竞态，确保观察到空闲后立即建立满额并发不会被上一条已结束连接错误拒绝。
+  Release TCP policy and global permits before publishing a lower active-connection count, so an immediate full-capacity batch is not rejected by a completed connection.
 - 刷新 `h2` 与 `chacha20` 相关 Rust 依赖锁定和第三方许可证清单，固定安全更新后的传输与加密依赖；不改变应用协议或数据格式。
   Refresh the Rust lockfile and third-party license inventory for the `h2` and `chacha20` dependency paths, pinning the security-updated transport and encryption dependencies without changing application protocols or data formats.
 - 修复严格 Clippy 发布门禁反馈，并修正跨平台测试夹具的临时路径处理，使 Windows 与 Unix 验证使用同一套安全路径约束。
