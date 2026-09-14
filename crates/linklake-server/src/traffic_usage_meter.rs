@@ -171,15 +171,16 @@ pub(crate) async fn authorize_traffic(
     let token = state.ha_runtime.fencing_token()?;
     anyhow::ensure!(state.accepts_public_work(), "Traffic admission is closed");
     let decision = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let _admission = state.traffic_usage_spool.lock_admission().await;
         state.traffic_usage_spool.ensure_forwarding()?;
         state.traffic_usage_spool.checkpoint_active()?;
-        if state.traffic_usage_spool.pending_count()? != 0 {
+        while state.traffic_usage_spool.pending_count()? != 0 {
             state
                 .traffic_usage_spool
                 .pump(&state.traffic_controls)
                 .await?;
         }
-        state.traffic_usage_spool.ensure_admission_ready()?;
+        state.traffic_usage_spool.ensure_forwarding()?;
         state
             .traffic_controls
             .authorize(kind, policy_id, source, crate::unix_seconds())

@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory)][ValidateRange(1, 65535)][int]$Port,
-    [Parameter(Mandatory)][string]$ObservationPath
+    [Parameter(Mandatory)][string]$ObservationPath,
+    [string]$BindAddress = '127.0.0.1'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -18,7 +19,7 @@ $socket = [System.Net.Sockets.UdpClient]::new(
 )
 $socket.Client.ReceiveBufferSize = 4 * 1024 * 1024
 $socket.Client.SendBufferSize = 4 * 1024 * 1024
-$socket.Client.Bind([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Loopback, $Port))
+$socket.Client.Bind([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Parse($BindAddress), $Port))
 $sha256 = [Security.Cryptography.SHA256]::Create()
 
 try {
@@ -31,7 +32,16 @@ try {
 
     while ($true) {
         $remote = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
-        $payload = $socket.Receive([ref]$remote)
+        try {
+            $payload = $socket.Receive([ref]$remote)
+        } catch [System.Net.Sockets.SocketException] {
+            # Windows can report ICMP Port Unreachable from a prior UDP reply
+            # as ConnectionReset on the next receive; keep the echo service alive.
+            if ($_.Exception.SocketErrorCode -eq [System.Net.Sockets.SocketError]::ConnectionReset) {
+                continue
+            }
+            throw
+        }
         $hash = [BitConverter]::ToString($sha256.ComputeHash($payload)).Replace('-', '')
         $writer.WriteLine((@{
             event = 'datagram'

@@ -297,6 +297,11 @@ access_key = "$($policy.access_key)"
             Where-Object { $_.id -eq $policy.id }
         $current.online
     }
+    $targetKey = "secret:$($policy.id):127.0.0.1:$targetPort"
+    Wait-ForCondition -Seconds 60 -Failure 'The secret target did not become healthy.' -Condition {
+        $health = Invoke-RestMethod -Uri "$baseUrl/api/v1/ha/targets" -Headers $headers
+        @($health.targets | Where-Object { $_.target_key -eq $targetKey -and $_.effective_healthy }).Count -eq 1
+    }
     try {
         Wait-ForCondition -Seconds 60 -Failure 'The provider did not register its P2P candidate.' -Condition {
             $nodes = @(Invoke-RestMethod -Uri "$baseUrl/api/v1/p2p/nodes" -Headers $headers)
@@ -332,7 +337,13 @@ access_key = "$($policy.access_key)"
         throw "Secret tunnel unexpectedly opened public server listener(s): $($unexpectedListeners -join ', ')."
     }
 
-    Invoke-Echo -Port $visitorPort -Message 'secret-tunnel-e2e'
+    try {
+        Invoke-Echo -Port $visitorPort -Message 'secret-tunnel-e2e'
+    } catch {
+        Write-ClientLogs -Process $providerProcess
+        Write-ClientLogs -Process $visitorProcess
+        throw
+    }
     Wait-ForCondition -Failure 'The direct P2P connection metric was not updated.' -Condition {
         (Invoke-RestMethod -Uri "$baseUrl/api/v1/metrics" -Headers $headers).p2p_direct_connections_total -ge 1
     }
@@ -360,6 +371,10 @@ p2p_iroh_enabled = false
         $node -and $node.fresh -eq $true -and $tcpCandidate -and
             $tcpCandidate.endpoint -eq "127.0.0.1:$p2pPort"
     }
+    Wait-ForCondition -Seconds 60 -Failure 'The TCP Noise secret target did not become healthy.' -Condition {
+        $health = Invoke-RestMethod -Uri "$baseUrl/api/v1/ha/targets" -Headers $headers
+        @($health.targets | Where-Object { $_.target_key -eq $targetKey -and $_.effective_healthy }).Count -eq 1
+    }
     Invoke-Echo -Port $visitorPort -Message 'secret-tunnel-tcp-noise'
     Wait-ForCondition -Failure 'The TCP Noise direct P2P metric was not updated.' -Condition {
         (Invoke-RestMethod -Uri "$baseUrl/api/v1/metrics" -Headers $headers).p2p_direct_connections_total -ge 2
@@ -380,6 +395,10 @@ managed_config_path = "$providerManagedTomlPath"
         $current = Invoke-RestMethod -Uri "$baseUrl/api/v1/secret-tunnels" -Headers $headers |
             Where-Object { $_.id -eq $policy.id }
         $current.online
+    }
+    Wait-ForCondition -Seconds 60 -Failure 'The relay secret target did not become healthy.' -Condition {
+        $health = Invoke-RestMethod -Uri "$baseUrl/api/v1/ha/targets" -Headers $headers
+        @($health.targets | Where-Object { $_.target_key -eq $targetKey -and $_.effective_healthy }).Count -eq 1
     }
     Invoke-Echo -Port $visitorPort -Message 'secret-tunnel-relay-fallback'
     Wait-ForCondition -Failure 'The explicit relay fallback metric was not updated.' -Condition {

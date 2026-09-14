@@ -1416,7 +1416,7 @@ async fn run_supervised_agents(
         identity.remote_update.clone(),
         identity.client_id,
         identity.client_token.clone(),
-        restart_tx,
+        restart_tx.clone(),
     )?;
     let managed_path = managed_config_path(&bootstrap_path, &identity);
     let local_config = local_managed_config(&config);

@@ -1,4 +1,4 @@
-param([switch]$SkipBuild)
+param([switch]$SkipBuild, [string]$TargetDir = '')
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -11,7 +11,8 @@ $root = Join-Path $projectRoot 'target\manager-update-e2e'
 $state = Join-Path $root 'state'
 $install = Join-Path $root 'installed-manager'
 $helper = Join-Path $root 'linklake-client.exe'
-$built = Join-Path $projectRoot 'target\debug\linklake-client.exe'
+$targetRoot = if ($TargetDir) { [IO.Path]::GetFullPath($TargetDir) } else { Join-Path $projectRoot 'target' }
+$built = Join-Path $targetRoot 'debug\linklake-client.exe'
 
 function Add-HashBytes {
     param(
@@ -172,8 +173,15 @@ function Assert-InstalledVersion([string]$Version) {
 }
 
 if (-not $SkipBuild) {
-    & cargo build -p linklake-client
-    if ($LASTEXITCODE -ne 0) { throw 'Could not build LinkLake client helper.' }
+    $previousTarget = $env:CARGO_TARGET_DIR
+    try {
+        $env:CARGO_TARGET_DIR = $targetRoot
+        & cargo build -p linklake-client
+        if ($LASTEXITCODE -ne 0) { throw 'Could not build LinkLake client helper.' }
+    } finally {
+        if ($null -eq $previousTarget) { Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue }
+        else { $env:CARGO_TARGET_DIR = $previousTarget }
+    }
 }
 if (-not (Test-Path -LiteralPath $built)) { throw "Missing updater helper: $built" }
 

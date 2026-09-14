@@ -194,6 +194,49 @@ function Invoke-RawProxyRequest {
     }
 }
 
+function Get-PrivateIpv4Address {
+    $interfaces = [Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
+        Where-Object { $_.OperationalStatus -eq [Net.NetworkInformation.OperationalStatus]::Up }
+    foreach ($interface in $interfaces | Sort-Object {
+        -[int]($_.GetIPProperties().GatewayAddresses.Count -gt 0)
+    }) {
+        foreach ($unicast in $interface.GetIPProperties().UnicastAddresses) {
+            $address = $unicast.Address
+            if ($address.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork) { continue }
+            $bytes = $address.GetAddressBytes()
+            if ($bytes[0] -eq 10 -or
+                ($bytes[0] -eq 172 -and $bytes[1] -ge 16 -and $bytes[1] -le 31) -or
+                ($bytes[0] -eq 192 -and $bytes[1] -eq 168)) {
+                return $address.ToString()
+            }
+        }
+    }
+    throw 'The HTTP proxy E2E test requires a private IPv4 address on the runner.'
+}
+
+function Wait-HttpProxyTrafficReady {
+    param(
+        [string]$Authorization,
+        [string]$TargetAddress,
+        [int]$TargetPort,
+        [int]$Seconds = 20
+    )
+    $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+    $lastError = 'no request attempted'
+    while ([DateTime]::UtcNow -lt $deadline) {
+        try {
+            $response = Invoke-RawProxyRequest -ReceiveTimeout 2000 -RequestText `
+                "GET http://${TargetAddress}:$TargetPort/readiness HTTP/1.1`r`nHost: ${TargetAddress}:$TargetPort`r`nProxy-Authorization: Basic $Authorization`r`nConnection: close`r`n`r`n"
+            if ($response -match '^HTTP/\d\.\d 200 ') { return }
+            $lastError = ($response -split "`r?`n", 2)[0]
+        } catch {
+            $lastError = $_.Exception.Message
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    throw "HTTP proxy did not become traffic-ready within $Seconds seconds. Last result: $lastError"
+}
+
 function Read-ProxyResponseHead {
     param([System.IO.Stream]$Stream)
     $bytes = [System.Collections.Generic.List[byte]]::new()
@@ -246,6 +289,26 @@ function Invoke-RouteRequest {
     } finally {
         $request.Dispose()
     }
+}
+
+function Wait-HttpRouteTrafficReady {
+    param(
+        [string]$HostHeader,
+        [string]$Path,
+        [int]$Seconds = 20
+    )
+    $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+    $lastResponse = $null
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $lastResponse = Invoke-RouteRequest -Path $Path -HostHeader $HostHeader
+        if ($lastResponse.StatusCode -eq 200) { return $lastResponse }
+        if ($lastResponse.StatusCode -ne 502) { break }
+        Start-Sleep -Milliseconds 200
+    }
+    if ($null -eq $lastResponse) {
+        throw "HTTP route did not become traffic-ready within $Seconds seconds."
+    }
+    throw "HTTP route did not become traffic-ready: HTTP $($lastResponse.StatusCode), body: $($lastResponse.Content)"
 }
 
 function Invoke-RawHttpRequest {
@@ -327,6 +390,7 @@ try {
     $httpPort = Get-FreePort
     $proxyPort = Get-FreePublicPort
     $backendPort = Get-FreePort
+    $backendAddress = Get-PrivateIpv4Address
     $baseUrl = "http://127.0.0.1:$managementPort"
     $hostname = 'site.e2e.test'
     $enrollmentToken = [guid]::NewGuid().ToString()
@@ -334,7 +398,7 @@ try {
 
     $backendScript = @'
 $ErrorActionPreference = 'Stop'
-$listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, __BACKEND_PORT__)
+$listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, __BACKEND_PORT__)
 $listener.Start()
 try {
     while ($true) {
@@ -446,7 +510,7 @@ try {
             client_id = $enrollment.client_id
             name = 'http-e2e'
             hostname = $hostname
-            target_addr = "127.0.0.1:$backendPort"
+            target_addr = "${backendAddress}:$backendPort"
             max_connections = 64
         } | ConvertTo-Json)
     $proxy = Invoke-RestMethod -Method Post -Uri "$baseUrl/api/v1/http-proxies" `
@@ -457,6 +521,7 @@ try {
             public_port = $proxyPort
             username = 'proxy-user'
             max_connections = 1
+            allow_private_networks = $true
         } | ConvertTo-Json)
     if ($proxy.password -notmatch '^llh_[0-9a-f]{64}$') {
         throw 'The generated HTTP proxy password has an invalid format.'
@@ -480,11 +545,12 @@ config_mode = "local"
 [[http_routes]]
 name = "http-e2e"
 hostname = "$hostname"
-target = "127.0.0.1:$backendPort"
+target = "${backendAddress}:$backendPort"
 
 [[http_proxies]]
 name = "http-forward-e2e"
 public_port = $proxyPort
+allow_private_networks = true
 "@
     [System.IO.File]::WriteAllText($configPath, $clientConfig, [Text.UTF8Encoding]::new($false))
     $clientArguments = @('run', '--config', "`"$configPath`"")
@@ -497,20 +563,23 @@ public_port = $proxyPort
     $baselineMetrics = Invoke-RestMethod -Uri "$baseUrl/api/v1/metrics" -WebSession $webSession
 
     $proxyAuth = Get-ProxyAuthorization -Username $proxy.username -Password $proxy.password
+    $stage = 'traffic readiness'
+    Wait-HttpProxyTrafficReady -Authorization $proxyAuth -TargetAddress $backendAddress `
+        -TargetPort $backendPort
     $stage = 'missing authentication'
-    $noAuthResponse = Invoke-RawProxyRequest -RequestText "GET http://127.0.0.1:$backendPort/no-auth HTTP/1.1`r`nHost: 127.0.0.1:$backendPort`r`nConnection: close`r`n`r`n"
+    $noAuthResponse = Invoke-RawProxyRequest -RequestText "GET http://${backendAddress}:$backendPort/no-auth HTTP/1.1`r`nHost: ${backendAddress}:$backendPort`r`nConnection: close`r`n`r`n"
     Assert-RawHttpStatus -Response $noAuthResponse -Expected 407 -Context 'HTTP proxy missing authentication'
 
     $stage = 'wrong authentication'
     $wrongAuth = Get-ProxyAuthorization -Username $proxy.username -Password ("llh_" + ('0' * 64))
-    $wrongAuthResponse = Invoke-RawProxyRequest -RequestText "GET http://127.0.0.1:$backendPort/wrong-auth HTTP/1.1`r`nHost: 127.0.0.1:$backendPort`r`nProxy-Authorization: Basic $wrongAuth`r`nConnection: close`r`n`r`n"
+    $wrongAuthResponse = Invoke-RawProxyRequest -RequestText "GET http://${backendAddress}:$backendPort/wrong-auth HTTP/1.1`r`nHost: ${backendAddress}:$backendPort`r`nProxy-Authorization: Basic $wrongAuth`r`nConnection: close`r`n`r`n"
     Assert-RawHttpStatus -Response $wrongAuthResponse -Expected 407 -Context 'HTTP proxy wrong authentication'
 
     $stage = 'absolute-form GET'
-    $forwardResponse = Invoke-RawProxyRequest -RequestText "GET http://127.0.0.1:$backendPort/proxy-get?value=1 HTTP/1.1`r`nHost: 127.0.0.1:$backendPort`r`nProxy-Authorization: Basic $proxyAuth`r`nProxy-Connection: keep-alive`r`nX-Proxy-Test: yes`r`n`r`n"
+    $forwardResponse = Invoke-RawProxyRequest -RequestText "GET http://${backendAddress}:$backendPort/proxy-get?value=1 HTTP/1.1`r`nHost: ${backendAddress}:$backendPort`r`nProxy-Authorization: Basic $proxyAuth`r`nProxy-Connection: keep-alive`r`nX-Proxy-Test: yes`r`n`r`n"
     Assert-RawHttpStatus -Response $forwardResponse -Expected 200 -Context 'Authenticated HTTP forward proxy GET'
     $forwardPayload = $forwardResponse.Substring($forwardResponse.IndexOf("`r`n`r`n") + 4) | ConvertFrom-Json
-    if ($forwardPayload.target -ne '/proxy-get?value=1' -or $forwardPayload.host -ne "127.0.0.1:$backendPort") {
+    if ($forwardPayload.target -ne '/proxy-get?value=1' -or $forwardPayload.host -ne "${backendAddress}:$backendPort") {
         throw 'The HTTP proxy did not convert the absolute URI to origin-form.'
     }
     if (-not [string]::IsNullOrEmpty($forwardPayload.proxy_authorization)) {
@@ -521,14 +590,14 @@ public_port = $proxyPort
     $stage = 'absolute-form POST'
     $proxyPostBody = 'LinkLake HTTP forward proxy body 20260730'
     $proxyPostLength = [Text.Encoding]::UTF8.GetByteCount($proxyPostBody)
-    $proxyPostResponse = Invoke-RawProxyRequest -RequestText "POST http://127.0.0.1:$backendPort/proxy-post HTTP/1.1`r`nHost: 127.0.0.1:$backendPort`r`nProxy-Authorization: Basic $proxyAuth`r`nContent-Length: $proxyPostLength`r`n`r`n$proxyPostBody"
+    $proxyPostResponse = Invoke-RawProxyRequest -RequestText "POST http://${backendAddress}:$backendPort/proxy-post HTTP/1.1`r`nHost: ${backendAddress}:$backendPort`r`nProxy-Authorization: Basic $proxyAuth`r`nContent-Length: $proxyPostLength`r`n`r`n$proxyPostBody"
     Assert-RawHttpStatus -Response $proxyPostResponse -Expected 200 -Context 'Authenticated HTTP forward proxy POST'
     $proxyPostPayload = $proxyPostResponse.Substring($proxyPostResponse.IndexOf("`r`n`r`n") + 4) | ConvertFrom-Json
     if ($proxyPostPayload.body -ne $proxyPostBody) { throw 'The HTTP proxy POST body was corrupted.' }
     Wait-HttpProxyIdle -BaseUrl $baseUrl -Session $webSession -ProxyId $proxy.id
 
     $stage = 'ambiguous framing'
-    $ambiguousResponse = Invoke-RawProxyRequest -RequestText "POST http://127.0.0.1:$backendPort/smuggling HTTP/1.1`r`nHost: 127.0.0.1:$backendPort`r`nProxy-Authorization: Basic $proxyAuth`r`nContent-Length: 1`r`nTransfer-Encoding: chunked`r`n`r`n0`r`n`r`n"
+    $ambiguousResponse = Invoke-RawProxyRequest -RequestText "POST http://${backendAddress}:$backendPort/smuggling HTTP/1.1`r`nHost: ${backendAddress}:$backendPort`r`nProxy-Authorization: Basic $proxyAuth`r`nContent-Length: 1`r`nTransfer-Encoding: chunked`r`n`r`n0`r`n`r`n"
     Assert-RawHttpStatus -Response $ambiguousResponse -Expected 400 -Context 'Ambiguous HTTP proxy message framing'
 
     $stage = 'CONNECT'
@@ -536,7 +605,7 @@ public_port = $proxyPort
     try {
         $connectClient.ReceiveTimeout = 10000
         $connectStream = $connectClient.GetStream()
-        $connectRequest = "CONNECT 127.0.0.1:$backendPort HTTP/1.1`r`nHost: 127.0.0.1:$backendPort`r`nProxy-Authorization: Basic $proxyAuth`r`n`r`n"
+        $connectRequest = "CONNECT ${backendAddress}:$backendPort HTTP/1.1`r`nHost: ${backendAddress}:$backendPort`r`nProxy-Authorization: Basic $proxyAuth`r`n`r`n"
         $connectBytes = [Text.Encoding]::ASCII.GetBytes($connectRequest)
         $connectStream.Write($connectBytes, 0, $connectBytes.Length)
         $connectStream.Flush()
@@ -545,14 +614,14 @@ public_port = $proxyPort
 
         $limitEnforced = $false
         try {
-            $limitedResponse = Invoke-RawProxyRequest -RequestText "GET http://127.0.0.1:$backendPort/limited HTTP/1.1`r`nHost: 127.0.0.1:$backendPort`r`nProxy-Authorization: Basic $proxyAuth`r`n`r`n" -ReceiveTimeout 2000
+            $limitedResponse = Invoke-RawProxyRequest -RequestText "GET http://${backendAddress}:$backendPort/limited HTTP/1.1`r`nHost: ${backendAddress}:$backendPort`r`nProxy-Authorization: Basic $proxyAuth`r`n`r`n" -ReceiveTimeout 2000
             $limitEnforced = [string]::IsNullOrEmpty($limitedResponse)
         } catch {
             $limitEnforced = $true
         }
         if (-not $limitEnforced) { throw 'The HTTP proxy connection limit was not enforced.' }
 
-        $tunneledRequest = "GET /through-connect HTTP/1.1`r`nHost: 127.0.0.1:$backendPort`r`nConnection: close`r`n`r`n"
+        $tunneledRequest = "GET /through-connect HTTP/1.1`r`nHost: ${backendAddress}:$backendPort`r`nConnection: close`r`n`r`n"
         $tunneledBytes = [Text.Encoding]::ASCII.GetBytes($tunneledRequest)
         $connectStream.Write($tunneledBytes, 0, $tunneledBytes.Length)
         $connectStream.Flush()
@@ -642,11 +711,12 @@ public_port = $proxyPort
     }
     try {
         for ($index = 0; $index -lt $concurrentTasks.Count; $index++) {
-            $response = $concurrentTasks[$index].GetAwaiter().GetResult()
-            try {
-                if ([int]$response.StatusCode -ne 200) {
-                    throw "Concurrent HTTP request $index returned $([int]$response.StatusCode)."
-                }
+                $response = $concurrentTasks[$index].GetAwaiter().GetResult()
+                try {
+                    if ([int]$response.StatusCode -ne 200) {
+                    $errorBody = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                    throw "Concurrent HTTP request $index returned $([int]$response.StatusCode): $errorBody"
+                    }
                 $payload = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult() | ConvertFrom-Json
                 if ($payload.target -ne "/concurrent/$index") {
                     throw "Concurrent HTTP response $index was routed to the wrong request target."
@@ -687,7 +757,7 @@ public_port = $proxyPort
     $clientProcess = Start-HiddenProcess -FilePath $clientPath -Arguments $clientArguments
     Wait-HttpRouteOnline -BaseUrl $baseUrl -Session $webSession -RouteId $route.id -Expected $true -Seconds 40
     Wait-HttpProxyOnline -BaseUrl $baseUrl -Session $webSession -ProxyId $proxy.id -Expected $true -Seconds 40
-    $recoveredResponse = Invoke-RouteRequest -Path '/recovered' -HostHeader $hostname
+    $recoveredResponse = Wait-HttpRouteTrafficReady -Path '/recovered' -HostHeader $hostname
     Assert-Status -Response $recoveredResponse -Expected 200 -Context 'Recovered HTTP route'
     $reconnectMetrics = Invoke-RestMethod -Uri "$baseUrl/api/v1/metrics" -WebSession $webSession
     if ($reconnectMetrics.tunnel_reconnects_total -lt 1) { throw 'The HTTP route reconnect metric was not updated.' }
@@ -701,7 +771,7 @@ public_port = $proxyPort
     Invoke-RestMethod -Method Post -Uri "$baseUrl/api/v1/http-routes/$($route.id)/enabled" `
         -WebSession $webSession -ContentType 'application/json' -Body '{"enabled":true}'
     Wait-HttpRouteOnline -BaseUrl $baseUrl -Session $webSession -RouteId $route.id -Expected $true -Seconds 40
-    $enabledResponse = Invoke-RouteRequest -Path '/enabled' -HostHeader $hostname
+    $enabledResponse = Wait-HttpRouteTrafficReady -Path '/enabled' -HostHeader $hostname
     Assert-Status -Response $enabledResponse -Expected 200 -Context 'Re-enabled HTTP route'
 
     Invoke-RestMethod -Method Post -Uri "$baseUrl/api/v1/http-proxies/$($proxy.id)/enabled" `
@@ -709,7 +779,7 @@ public_port = $proxyPort
     Wait-HttpProxyOnline -BaseUrl $baseUrl -Session $webSession -ProxyId $proxy.id -Expected $false
     $disabledProxyRejected = $false
     try {
-        $null = Invoke-RawProxyRequest -RequestText "GET http://127.0.0.1:$backendPort/disabled-proxy HTTP/1.1`r`nHost: 127.0.0.1:$backendPort`r`nProxy-Authorization: Basic $proxyAuth`r`n`r`n" -ReceiveTimeout 2000
+        $null = Invoke-RawProxyRequest -RequestText "GET http://${backendAddress}:$backendPort/disabled-proxy HTTP/1.1`r`nHost: ${backendAddress}:$backendPort`r`nProxy-Authorization: Basic $proxyAuth`r`n`r`n" -ReceiveTimeout 2000
     } catch {
         $disabledProxyRejected = $true
     }
@@ -718,7 +788,7 @@ public_port = $proxyPort
     Invoke-RestMethod -Method Post -Uri "$baseUrl/api/v1/http-proxies/$($proxy.id)/enabled" `
         -WebSession $webSession -ContentType 'application/json' -Body '{"enabled":true}'
     Wait-HttpProxyOnline -BaseUrl $baseUrl -Session $webSession -ProxyId $proxy.id -Expected $true -Seconds 40
-    $recoveredProxy = Invoke-RawProxyRequest -RequestText "GET http://127.0.0.1:$backendPort/recovered-proxy HTTP/1.1`r`nHost: 127.0.0.1:$backendPort`r`nProxy-Authorization: Basic $proxyAuth`r`n`r`n"
+    $recoveredProxy = Invoke-RawProxyRequest -RequestText "GET http://${backendAddress}:$backendPort/recovered-proxy HTTP/1.1`r`nHost: ${backendAddress}:$backendPort`r`nProxy-Authorization: Basic $proxyAuth`r`n`r`n"
     Assert-RawHttpStatus -Response $recoveredProxy -Expected 200 -Context 'Re-enabled HTTP proxy'
 
     Invoke-RestMethod -Method Delete -Uri "$baseUrl/api/v1/http-routes/$($route.id)" -WebSession $webSession

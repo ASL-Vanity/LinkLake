@@ -10,13 +10,14 @@ use std::sync::{
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::{
-    sync::watch,
+    sync::{watch, Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard},
     time::{Instant, MissedTickBehavior},
 };
 use uuid::Uuid;
 
 pub(crate) struct TrafficUsageSpool {
     connection: Mutex<Connection>,
+    admission: AsyncMutex<()>,
     faulted: AtomicBool,
     closing: AtomicBool,
     #[cfg(test)]
@@ -41,6 +42,7 @@ impl TrafficUsageSpool {
         )?;
         Ok(Self {
             connection: Mutex::new(connection),
+            admission: AsyncMutex::new(()),
             faulted: AtomicBool::new(false),
             closing: AtomicBool::new(false),
             #[cfg(test)]
@@ -72,6 +74,10 @@ impl TrafficUsageSpool {
                 false
             }
         }
+    }
+
+    pub(crate) async fn lock_admission(&self) -> AsyncMutexGuard<'_, ()> {
+        self.admission.lock().await
     }
 
     pub(crate) fn finish_meter(&self) {
@@ -109,16 +115,6 @@ impl TrafficUsageSpool {
 
     pub(crate) fn mark_fault(&self) {
         self.faulted.store(true, Ordering::Release);
-    }
-
-    /// 未上传的增量尚未进入共享配额，调用方应先pump后重试，不能继续按旧配额放行。
-    pub(crate) fn ensure_admission_ready(&self) -> anyhow::Result<()> {
-        self.ensure_forwarding()?;
-        anyhow::ensure!(
-            self.pending_count()? == 0,
-            "Traffic usage awaits durable shared upload"
-        );
-        Ok(())
     }
 
     pub(crate) fn close_admission(&self) {

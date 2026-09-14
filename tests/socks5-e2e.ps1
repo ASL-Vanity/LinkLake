@@ -276,6 +276,20 @@ try {
     $udpTargetPort = Get-FreeUdpPort
     $relayPort = Get-FreeUdpPort
     $proxyPort = Get-FreePort -Minimum 32000 -Maximum 32999
+    $physicalInterface = Get-NetAdapter -Physical | Where-Object { $_.Status -eq 'Up' } |
+        Select-Object -First 1
+    $privateAddresses = @(Get-NetIPAddress -AddressFamily IPv4 |
+        Where-Object { $_.AddressState -eq 'Preferred' -and
+            ($_.IPAddress -match '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)') })
+    $targetIp = if ($physicalInterface) {
+        $privateAddresses | Where-Object { $_.InterfaceIndex -eq $physicalInterface.InterfaceIndex } |
+            Select-Object -ExpandProperty IPAddress -First 1
+    }
+    if (-not $targetIp) {
+        $targetIp = $privateAddresses | Select-Object -ExpandProperty IPAddress -First 1
+    }
+    if (-not $targetIp) { throw 'No usable private IPv4 address exists on this host.' }
+    $targetAddress = [Net.IPAddress]::Parse($targetIp)
     $bindPeerPort = Get-FreePort
     do { $wrongBindPeerPort = Get-FreePort } while ($wrongBindPeerPort -eq $bindPeerPort)
     $baseUrl = "http://127.0.0.1:$managementPort"
@@ -284,7 +298,7 @@ try {
     $certificates = New-TestCertificates
 
     $echoScript = @"
-`$listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $targetPort)
+`$listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Parse('$($targetAddress.IPAddressToString)'), $targetPort)
 `$listener.Start()
 try {
     while (`$true) {
@@ -312,8 +326,13 @@ try {
     Start-HiddenProcess -FilePath 'powershell.exe' -Arguments @(
         '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
         ('"' + (Join-Path $PSScriptRoot 'udp-echo-service.ps1') + '"'),
-        '-Port', $udpTargetPort, '-ObservationPath', ('"' + $udpObservationPath + '"')
+        '-Port', $udpTargetPort, '-ObservationPath', ('"' + $udpObservationPath + '"'),
+        '-BindAddress', $targetAddress.IPAddressToString
     ) | Out-Null
+    Wait-ForCondition -Failure 'The private-network UDP echo service did not become ready.' -Condition {
+        (Test-Path -LiteralPath $udpObservationPath) -and
+            (Get-Content -LiteralPath $udpObservationPath -TotalCount 1) -match '"event":"ready"'
+    }
 
     $environmentNames = @(
         'LINKLAKE_BIND', 'LINKLAKE_CONTROL_BIND', 'LINKLAKE_ENROLLMENT_TOKEN',
@@ -361,6 +380,7 @@ try {
             public_port = $proxyPort
             username = 'linklake-user'
             max_connections = 1
+            allow_private_networks = $true
         } | ConvertTo-Json)
     if ($created.password -notmatch '^llp_[0-9a-f]{64}$') {
         throw 'The generated SOCKS5 password has an invalid format.'
@@ -408,9 +428,17 @@ managed_config_path = "$managedTomlPath"
     $stage = 'wrong-password rejection'
     Assert-WrongPasswordRejected -ProxyPort $proxyPort -Username $created.username
 
-    $stage = 'domain CONNECT'
+    $stage = 'loopback domain rejection'
     $connection = Open-Socks5Connection -ProxyPort $proxyPort -Username $created.username `
         -Password $created.password -TargetHost 'localhost' -TargetPort $targetPort
+    try {
+        if ($connection.Reply -ne 2) { throw 'A loopback hostname was accepted.' }
+    } finally {
+        $connection.Client.Dispose()
+    }
+    $stage = 'private IPv4 CONNECT'
+    $connection = Open-Socks5Connection -ProxyPort $proxyPort -Username $created.username `
+        -Password $created.password -TargetHost $targetAddress.IPAddressToString -TargetPort $targetPort
     try {
         if ($connection.Reply -ne 0) { throw "SOCKS5 CONNECT failed with reply $($connection.Reply)." }
         $payload = [Text.Encoding]::UTF8.GetBytes('socks5-domain-echo')
@@ -447,7 +475,7 @@ managed_config_path = "$managedTomlPath"
 
     $stage = 'constrained BIND'
     $bind = Open-Socks5Connection -ProxyPort $proxyPort -Username $created.username `
-        -Password $created.password -TargetHost '127.0.0.1' -TargetPort $bindPeerPort -Command 2
+        -Password $created.password -TargetHost $targetAddress.IPAddressToString -TargetPort $bindPeerPort -Command 2
     $wrongBindPeer = $null
     $matchingBindPeer = $null
     try {
@@ -463,8 +491,8 @@ managed_config_path = "$managedTomlPath"
         }
 
         $wrongBindPeer = [Net.Sockets.TcpClient]::new([Net.Sockets.AddressFamily]::InterNetwork)
-        $wrongBindPeer.Client.Bind([Net.IPEndPoint]::new([Net.IPAddress]::Loopback, $wrongBindPeerPort))
-        $wrongBindPeer.Connect([Net.IPAddress]::Loopback, $bind.BoundPort)
+        $wrongBindPeer.Client.Bind([Net.IPEndPoint]::new($targetAddress, $wrongBindPeerPort))
+        $wrongBindPeer.Connect($targetAddress, $bind.BoundPort)
         $wrongBindPeer.Dispose()
         $wrongBindPeer = $null
         Wait-ForCondition -Failure 'SOCKS5 BIND did not reject a peer with the wrong source port.' -Condition {
@@ -474,11 +502,11 @@ managed_config_path = "$managedTomlPath"
         }
 
         $matchingBindPeer = [Net.Sockets.TcpClient]::new([Net.Sockets.AddressFamily]::InterNetwork)
-        $matchingBindPeer.Client.Bind([Net.IPEndPoint]::new([Net.IPAddress]::Loopback, $bindPeerPort))
-        $matchingBindPeer.Connect([Net.IPAddress]::Loopback, $bind.BoundPort)
+        $matchingBindPeer.Client.Bind([Net.IPEndPoint]::new($targetAddress, $bindPeerPort))
+        $matchingBindPeer.Connect($targetAddress, $bind.BoundPort)
         $matchingBindPeer.GetStream().ReadTimeout = 10000
         $secondReply = Read-Socks5Reply -Stream $bind.Stream
-        if ($secondReply.Reply -ne 0 -or $secondReply.BoundAddress -ne '127.0.0.1' -or
+        if ($secondReply.Reply -ne 0 -or $secondReply.BoundAddress -ne $targetAddress.IPAddressToString -or
             $secondReply.BoundPort -ne $bindPeerPort) {
             throw 'SOCKS5 BIND returned an invalid second peer reply.'
         }
@@ -526,7 +554,7 @@ managed_config_path = "$managedTomlPath"
     }
     $stage = 'IPv4 CONNECT after recovery'
     $recovered = Open-Socks5Connection -ProxyPort $proxyPort -Username $created.username `
-        -Password $created.password -TargetHost '127.0.0.1' -TargetPort $targetPort
+        -Password $created.password -TargetHost $targetAddress.IPAddressToString -TargetPort $targetPort
     try {
         if ($recovered.Reply -ne 0) { throw 'The recovered SOCKS5 proxy could not connect.' }
     } finally {
@@ -553,7 +581,8 @@ managed_config_path = "$managedTomlPath"
         $udpClient.Client.ReceiveTimeout = 10000
         $udpPayload = [Text.Encoding]::UTF8.GetBytes('socks5-udp-echo')
         $udpRequest = [Collections.Generic.List[byte]]::new()
-        $udpRequest.AddRange([byte[]](0, 0, 0, 1, 127, 0, 0, 1))
+        $udpRequest.AddRange([byte[]](0, 0, 0, 1))
+        $udpRequest.AddRange($targetAddress.GetAddressBytes())
         $udpRequest.Add([byte](($udpTargetPort -shr 8) -band 255))
         $udpRequest.Add([byte]($udpTargetPort -band 255))
         $udpRequest.AddRange($udpPayload)
@@ -561,7 +590,16 @@ managed_config_path = "$managedTomlPath"
         $sent = $udpClient.Send($udpRequest.ToArray(), $udpRequest.Count, $relayEndpoint)
         if ($sent -ne $udpRequest.Count) { throw 'The SOCKS5 UDP request was truncated.' }
         $responseSource = [Net.IPEndPoint]::new([Net.IPAddress]::Any, 0)
-        $udpResponse = $udpClient.Receive([ref]$responseSource)
+        try { $udpResponse = $udpClient.Receive([ref]$responseSource) }
+        catch {
+            $proxyDiagnostics = Invoke-RestMethod -Uri "$baseUrl/api/v1/socks5-proxies" -Headers $headers |
+                Where-Object { $_.id -eq $created.id }
+            Write-Host "SOCKS5 UDP diagnostics: target=$($targetAddress.IPAddressToString); received=$($proxyDiagnostics.udp_datagrams_from_public); dropped=$($proxyDiagnostics.udp_dropped_datagrams)"
+            if (Test-Path -LiteralPath $udpObservationPath) {
+                Get-Content -LiteralPath $udpObservationPath -Tail 4 | Write-Host
+            }
+            throw
+        }
         if ($udpResponse.Length -lt 10 -or $udpResponse[0] -ne 0 -or $udpResponse[1] -ne 0 -or
             $udpResponse[2] -ne 0 -or $udpResponse[3] -ne 1) {
             throw 'The SOCKS5 UDP response header is invalid.'
@@ -574,12 +612,14 @@ managed_config_path = "$managedTomlPath"
         $fragmentPayloadOne = [Text.Encoding]::UTF8.GetBytes('socks5-frag-')
         $fragmentPayloadTwo = [Text.Encoding]::UTF8.GetBytes('echo')
         $fragmentOne = [Collections.Generic.List[byte]]::new()
-        $fragmentOne.AddRange([byte[]](0, 0, 1, 1, 127, 0, 0, 1))
+        $fragmentOne.AddRange([byte[]](0, 0, 1, 1))
+        $fragmentOne.AddRange($targetAddress.GetAddressBytes())
         $fragmentOne.Add([byte](($udpTargetPort -shr 8) -band 255))
         $fragmentOne.Add([byte]($udpTargetPort -band 255))
         $fragmentOne.AddRange($fragmentPayloadOne)
         $fragmentTwo = [Collections.Generic.List[byte]]::new()
-        $fragmentTwo.AddRange([byte[]](0, 0, 130, 1, 127, 0, 0, 1))
+        $fragmentTwo.AddRange([byte[]](0, 0, 130, 1))
+        $fragmentTwo.AddRange($targetAddress.GetAddressBytes())
         $fragmentTwo.Add([byte](($udpTargetPort -shr 8) -band 255))
         $fragmentTwo.Add([byte]($udpTargetPort -band 255))
         $fragmentTwo.AddRange($fragmentPayloadTwo)
@@ -640,7 +680,8 @@ managed_config_path = "$managedTomlPath"
         $udpV6Client.Client.ReceiveTimeout = 10000
         $udpV6Payload = [Text.Encoding]::UTF8.GetBytes('socks5-udp-ipv6-transport')
         $udpV6Request = [Collections.Generic.List[byte]]::new()
-        $udpV6Request.AddRange([byte[]](0, 0, 0, 1, 127, 0, 0, 1))
+        $udpV6Request.AddRange([byte[]](0, 0, 0, 1))
+        $udpV6Request.AddRange($targetAddress.GetAddressBytes())
         $udpV6Request.Add([byte](($udpTargetPort -shr 8) -band 255))
         $udpV6Request.Add([byte]($udpTargetPort -band 255))
         $udpV6Request.AddRange($udpV6Payload)
