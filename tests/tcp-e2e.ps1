@@ -115,6 +115,32 @@ function Wait-ActiveConnections {
     throw "Active TCP connection count did not become $Expected."
 }
 
+function Wait-TcpTunnelReady {
+    param(
+        [int]$Port,
+        [int]$Seconds = 20
+    )
+    $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $connection = [System.Net.Sockets.TcpClient]::new()
+        try {
+            $connection.ReceiveTimeout = 2000
+            $connection.SendTimeout = 2000
+            $connection.Connect('127.0.0.1', $Port)
+            $stream = $connection.GetStream()
+            $stream.WriteByte(90)
+            if ($stream.ReadByte() -eq 90) { return }
+        } catch {
+            # Control registration may precede the Client's first fail-closed
+            # target probe; retry until a real echo succeeds.
+        } finally {
+            $connection.Dispose()
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    throw "TCP tunnel did not become traffic-ready within $Seconds seconds."
+}
+
 function Start-HiddenProcess {
     param(
         [string]$FilePath,
@@ -298,6 +324,7 @@ public static class LinkLakeConcurrentTcpEcho
     $clientProcess = Start-HiddenProcess -FilePath $clientPath -Arguments $clientArguments
 
     Wait-TunnelOnline -BaseUrl $baseUrl -Session $webSession -PolicyId $policy.id
+    Wait-TcpTunnelReady -Port $publicPort
     $payload = [byte[]]::new(262144)
     [Random]::new(20260728).NextBytes($payload)
     $tcp = [System.Net.Sockets.TcpClient]::new('127.0.0.1', $publicPort)
