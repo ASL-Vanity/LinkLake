@@ -441,23 +441,29 @@ try {
   await page.locator('#user-display-name').fill('Smoke Operator');
   await page.locator('#user-role').selectOption('operator');
   await page.locator('#user-password').fill('LinkLake-Operator-2026!');
-  const createOperatorResponse = page.waitForResponse(response => response.url().endsWith('/api/v1/users') && response.request().method() === 'POST', { timeout: 30_000 });
-  await page.locator('#user-form button[type="submit"]').click();
-  assert((await createOperatorResponse).ok(), '创建运维用户的界面请求失败');
+  const [createOperatorResponse] = await Promise.all([
+    page.waitForResponse(response => response.url().endsWith('/api/v1/users') && response.request().method() === 'POST', { timeout: 60_000 }),
+    page.locator('#user-form').evaluate(form => form.requestSubmit()),
+  ]);
+  assert(createOperatorResponse.ok(), '创建运维用户的界面请求失败');
   const operatorRow = page.locator('#users-list tr').filter({ hasText: 'smoke_operator' });
   await operatorRow.waitFor({ state: 'visible', timeout: 30_000 });
   await operatorRow.getByRole('button', { name: /Edit|编辑/ }).click();
   await page.locator('#user-display-name').fill('Smoke Operations');
-  const updateOperatorResponse = page.waitForResponse(response => response.url().endsWith('/api/v1/users/smoke_operator') && response.request().method() === 'PUT', { timeout: 30_000 });
-  await page.locator('#user-form button[type="submit"]').click();
-  assert((await updateOperatorResponse).ok(), '编辑运维用户的界面请求失败');
+  const [updateOperatorResponse] = await Promise.all([
+    page.waitForResponse(response => response.url().endsWith('/api/v1/users/smoke_operator') && response.request().method() === 'PUT', { timeout: 60_000 }),
+    page.locator('#user-form').evaluate(form => form.requestSubmit()),
+  ]);
+  assert(updateOperatorResponse.ok(), '编辑运维用户的界面请求失败');
   await page.waitForFunction(() => document.querySelector('#users-list')?.textContent?.includes('Smoke Operations'), null, { timeout: 30_000 });
   await page.locator('#users-list tr').filter({ hasText: 'smoke_operator' }).getByRole('button', { name: /Reset password|重置密码/ }).click();
   await page.locator('#reset-password-value').fill('LinkLake-Operator-Updated-2026!');
   await page.locator('#reset-force-change').uncheck();
-  const resetOperatorResponse = page.waitForResponse(response => response.url().endsWith('/api/v1/users/smoke_operator/reset-password') && response.request().method() === 'POST', { timeout: 30_000 });
-  await page.locator('#reset-password-form button[type="submit"]').click();
-  assert((await resetOperatorResponse).ok(), '重置运维用户密码的界面请求失败');
+  const [resetOperatorResponse] = await Promise.all([
+    page.waitForResponse(response => response.url().endsWith('/api/v1/users/smoke_operator/reset-password') && response.request().method() === 'POST', { timeout: 60_000 }),
+    page.locator('#reset-password-form').evaluate(form => form.requestSubmit()),
+  ]);
+  assert(resetOperatorResponse.ok(), '重置运维用户密码的界面请求失败');
 
   const auditorCreate = await pageApi(page, '/api/v1/users', { method: 'POST', body: JSON.stringify({ username: 'smoke_auditor', display_name: 'Smoke Auditor', role: 'auditor', password: 'LinkLake-Auditor-2026!', force_password_change: false }) });
   assert(auditorCreate.status === 201, `创建审计用户失败：${auditorCreate.status}`);

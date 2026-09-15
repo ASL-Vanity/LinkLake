@@ -20,7 +20,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex, OnceLock,
     },
     time::Duration,
 };
@@ -381,6 +381,11 @@ async fn collect_response(response: Response<Incoming>) -> anyhow::Result<(Bytes
 }
 
 fn append_observation(path: &Path, value: serde_json::Value) {
+    static OBSERVATION_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = OBSERVATION_WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("observation write lock poisoned");
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(file, "{value}");
     }
