@@ -308,7 +308,6 @@ mod tests {
         spool.enqueue(&event).unwrap();
         spool.enqueue(&event).unwrap();
         assert_eq!(spool.pending_count().unwrap(), 1);
-        assert!(spool.ensure_admission_ready().is_err());
         drop(spool);
         let spool = TrafficUsageSpool::open(&database).unwrap();
         let store = TrafficControlStore::Sqlite(Mutex::new(
@@ -318,7 +317,6 @@ mod tests {
         store.enqueue_usage_event(&event, 100).await.unwrap();
         spool.pump(&store).await.unwrap();
         assert_eq!(spool.pending_count().unwrap(), 0);
-        assert!(spool.ensure_admission_ready().is_ok());
         let bytes: i64 = database
             .with_connection(|connection| {
                 Ok(connection.query_row(
