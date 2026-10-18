@@ -70,7 +70,7 @@ jobs:
       - name: Verify Flutter manager Windows package integrity (unsigned policy)
         shell: powershell
         run: .\scripts\verify-manager-windows.ps1
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linklake-windows-x86_64
           path: |
@@ -138,7 +138,7 @@ jobs:
         env:
           LINKLAKE_LINUX_GPG_FINGERPRINT: ${{ secrets.LINKLAKE_LINUX_GPG_FINGERPRINT }}
         run: sh scripts/verify-linux-release-signatures.sh dist
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linklake-linux-x86_64
           path: |
@@ -172,9 +172,9 @@ jobs:
         with:
           persist-credentials: false
       - name: Set up pinned Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Log in to GHCR with the job token
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -197,7 +197,7 @@ jobs:
           } >>"$GITHUB_OUTPUT"
       - name: Build and push OCI image with SBOM and provenance
         id: build
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           push: true
@@ -211,7 +211,7 @@ jobs:
         with:
           cosign-release: ${{ env.COSIGN_VERSION }}
       - name: Create GitHub image provenance attestation
-        uses: actions/attest-build-provenance@62fc1d596301d0ab9914e1fec14dc5c8d93f65cd # v3.2.0
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
         with:
           subject-name: ${{ steps.image.outputs.image }}
           subject-digest: ${{ steps.build.outputs.digest }}
@@ -240,7 +240,7 @@ jobs:
           evidence="container-evidence/container-image-$VERSION.txt"
           printf '%s@%s\n' "$IMAGE" "$DIGEST" >"$evidence"
           (cd container-evidence && sha256sum "$(basename "$evidence")" >"$(basename "$evidence").sha256")
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linklake-container-image
           path: container-evidence/*
@@ -269,7 +269,7 @@ jobs:
         run: rustup toolchain install 1.91.0 --profile minimal
       - name: Select pinned Rust toolchain
         run: rustup default 1.91.0
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
           pattern: 'linklake-*'
@@ -303,7 +303,7 @@ jobs:
           } >> "$GITHUB_ENV"
       - name: Install pinned Syft
         id: syft
-        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           syft-version: ${{ env.SYFT_VERSION }}
       - name: Reverify Linux OpenPGP signatures after artifact transfer
@@ -329,11 +329,11 @@ jobs:
             --key-id "$LINKLAKE_RELEASE_SIGNING_KEY_ID" \
             --minimum-updater-version 0.8.0-rc.1
       - name: Attest release build provenance
-        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-checksums: dist/linklake-${{ env.RELEASE_VERSION }}-release-subjects.sha256
       - name: Attest release SBOM
-        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-checksums: dist/linklake-${{ env.RELEASE_VERSION }}-release-subjects.sha256
           sbom-path: dist/linklake-${{ env.RELEASE_VERSION }}-release.spdx.json
